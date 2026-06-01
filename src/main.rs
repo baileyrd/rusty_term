@@ -9,6 +9,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+fn hex_to_ansi_color(hex: u32, is_bg: bool) -> String {
+    let r = (hex >> 16) & 0xFF;
+    let g = (hex >> 8) & 0xFF;
+    let b = hex & 0xFF;
+    if is_bg {
+        format!("\x1b[48;2;{};{};{}m", r, g, b)
+    } else {
+        format!("\x1b[38;2;{};{};{}m", r, g, b)
+    }
+}
+
 fn main() -> Result<(), std::io::Error> {
     let backend: Box<dyn Backend> = if cfg!(target_os = "windows") {
         Box::new(WindowsBackend)
@@ -19,14 +30,12 @@ fn main() -> Result<(), std::io::Error> {
     backend.set_raw_mode(true)?;
 
     let handle = backend.spawn_shell()?;
-    // We wrap the handle in Arc<Mutex<>> so it can be shared between threads
     let shared_handle = Arc::new(Mutex::new(handle));
     let buffer = Arc::new(Mutex::new(TerminalBuffer::new(80, 24)));
     
     let reader_handle = Arc::clone(&shared_handle);
     let reader_buffer = Arc::clone(&buffer);
     
-    // Thread 1: Read from Shell -> Update Buffer
     thread::spawn(move || {
         let mut parser = AnsiParser::new();
         loop {
@@ -42,7 +51,6 @@ fn main() -> Result<(), std::io::Error> {
     });
 
     let writer_handle = Arc::clone(&shared_handle);
-    // Thread 2: Read from User -> Write to Shell
     thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1];
@@ -54,22 +62,28 @@ fn main() -> Result<(), std::io::Error> {
         }
     });
 
-    // Main Thread: Render Loop
     loop {
         {
             let b = buffer.lock().unwrap();
-            // Clear screen and reset cursor using ANSI codes
-            print!("\x1b[2J\x1b[H");
+            // Use a string to buffer the frame to reduce flicker
+            let mut frame = String::with_capacity(80 * 24 * 20);
+            frame.push_str("\x1b[H"); // Cursor home
+            
             for y in 0..b.height {
                 for x in 0..b.width {
-                    print!("{}", b.cells[y * b.width + x].character);
+                    let cell = b.cells[y * b.width + x];
+                    frame.push_str(&hex_to_ansi_color(cell.fg_color, false));
+                    frame.push_str(&hex_to_ansi_color(cell.bg_color, true));
+                    frame.push(cell.character);
                 }
-                print!("\r\n");
+                frame.push_str("\x1b[0m\r\n");
             }
-            // Draw the cursor position for a little flair
-            print!("\x1b[{};{}H", b.cursor_y + 1, b.cursor_x + 1);
+            
+            print!("{}", frame);
+            // Restore cursor a bit more cleanly
+            print!("\x1b[{} ; {} H", b.cursor_y + 1, b.cursor_x + 1);
             std::io::stdout().flush().unwrap();
         }
-        thread::sleep(Duration::from_millis(33)); // ~30 FPS
+        thread::sleep(Duration::from_millis(33));
     }
 }
