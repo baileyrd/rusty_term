@@ -86,6 +86,10 @@ pub struct Grid {
     /// absolute cursor positioning (`CUP`/`HVP`/`VPA`) is relative to the scroll
     /// region top and the cursor is confined to the region.
     pub(crate) origin_mode: bool,
+    /// Whether insert mode (IRM, ANSI mode `4`, default off) is enabled. When
+    /// on, a printed glyph shifts the rest of the row right instead of
+    /// overwriting.
+    pub(crate) insert_mode: bool,
 }
 
 /// Build the default tab-stop table for a `cols`-wide grid: a stop at every
@@ -167,6 +171,7 @@ impl Grid {
             cursor_visible: true,
             autowrap: true,
             origin_mode: false,
+            insert_mode: false,
         }
     }
 
@@ -213,6 +218,26 @@ impl Grid {
             row.min(self.rows.saturating_sub(1))
         };
         self.cursor = (col.min(self.cols.saturating_sub(1)), y);
+    }
+
+    /// Move the cursor up `n` rows (`CUU`). The scroll region's top margin is a
+    /// floor when the cursor starts at or below it, so cursor-up can't escape
+    /// the region; above the region it floors at row 0.
+    pub(crate) fn cursor_up(&mut self, n: usize) {
+        let floor = if self.cursor.1 >= self.scroll_top { self.scroll_top } else { 0 };
+        self.cursor.1 = self.cursor.1.saturating_sub(n).max(floor);
+    }
+
+    /// Move the cursor down `n` rows (`CUD`). The scroll region's bottom margin
+    /// is a ceiling when the cursor starts at or above it; below the region it
+    /// ceilings at the last row.
+    pub(crate) fn cursor_down(&mut self, n: usize) {
+        let ceil = if self.cursor.1 <= self.scroll_bottom {
+            self.scroll_bottom
+        } else {
+            self.rows.saturating_sub(1)
+        };
+        self.cursor.1 = self.cursor.1.saturating_add(n).min(ceil);
     }
 
     /// The cursor home position: the top-left of the screen, or of the scroll
@@ -316,6 +341,10 @@ impl Grid {
                 // Autowrap off: keep the glyph in the last cell(s) of this row.
                 self.cursor.0 = self.cols.saturating_sub(w);
             }
+        }
+        // Insert mode (IRM): make room by shifting the rest of the row right.
+        if self.insert_mode {
+            self.insert_chars(w);
         }
         let (x, y) = self.cursor;
         let link = self.current_link;
@@ -693,6 +722,7 @@ impl Grid {
         self.cursor_visible = true;
         self.autowrap = true;
         self.origin_mode = false;
+        self.insert_mode = false;
         self.current_link = 0;
     }
 
@@ -706,6 +736,7 @@ impl Grid {
         self.cursor_visible = true;
         self.autowrap = true;
         self.origin_mode = false;
+        self.insert_mode = false;
         self.current_link = 0;
     }
 

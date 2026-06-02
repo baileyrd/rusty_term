@@ -1502,3 +1502,88 @@ fn ris_and_decstr_reset_origin_mode() {
     p.advance(&mut g, b"\x1b[!p"); // DECSTR
     assert!(!g.origin_mode);
 }
+
+#[test]
+fn irm_insert_mode_shifts_row_right() {
+    let mut g = parse(b"abcdef", 80, 24);
+    g.cursor = (2, 0);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[4h"); // IRM — insert mode on
+    p.advance(&mut g, b"XY"); // insert at col 2, pushing "cdef" right
+    assert_eq!(&row_text(&g, 0)[..8], "abXYcdef");
+}
+
+#[test]
+fn irm_replace_mode_overwrites_by_default() {
+    let mut g = parse(b"abcdef", 80, 24);
+    g.cursor = (2, 0);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"XY"); // default replace mode
+    assert_eq!(&row_text(&g, 0)[..6], "abXYef");
+}
+
+#[test]
+fn irm_is_toggled_and_reset() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[4h");
+    assert!(g.insert_mode);
+    p.advance(&mut g, b"\x1b[4l");
+    assert!(!g.insert_mode);
+    p.advance(&mut g, b"\x1b[4h");
+    p.advance(&mut g, b"\x1bc"); // RIS resets it
+    assert!(!g.insert_mode);
+    p.advance(&mut g, b"\x1b[4h");
+    p.advance(&mut g, b"\x1b[!p"); // DECSTR resets it
+    assert!(!g.insert_mode);
+}
+
+#[test]
+fn deckkm_cursor_key_mode_is_relayed_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1h"); // application cursor keys
+    assert_eq!(g.take_host_out(), b"\x1b[?1h");
+    p.advance(&mut g, b"\x1b[?1l"); // normal cursor keys
+    assert_eq!(g.take_host_out(), b"\x1b[?1l");
+}
+
+#[test]
+fn cuu_stops_at_region_top() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r"); // region rows 4..=19
+    g.cursor = (0, 10); // inside the region
+    p.advance(&mut g, b"\x1b[100A"); // CUU far past the top margin
+    assert_eq!(g.cursor.1, 4); // clamped to scroll_top
+}
+
+#[test]
+fn cud_stops_at_region_bottom() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    g.cursor = (0, 10);
+    p.advance(&mut g, b"\x1b[100B"); // CUD far past the bottom margin
+    assert_eq!(g.cursor.1, 19); // clamped to scroll_bottom
+}
+
+#[test]
+fn cuu_above_region_floors_at_screen_top() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    g.cursor = (0, 2); // above the region top margin
+    p.advance(&mut g, b"\x1b[100A");
+    assert_eq!(g.cursor.1, 0); // floors at row 0, not the margin
+}
+
+#[test]
+fn cud_below_region_ceilings_at_screen_bottom() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    g.cursor = (0, 21); // below the region bottom margin
+    p.advance(&mut g, b"\x1b[100B");
+    assert_eq!(g.cursor.1, 23); // ceilings at the last row, not the margin
+}
