@@ -82,6 +82,10 @@ pub struct Grid {
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
     pub(crate) autowrap: bool,
+    /// Whether origin mode (DECOM `?6`, default off) is enabled. When on,
+    /// absolute cursor positioning (`CUP`/`HVP`/`VPA`) is relative to the scroll
+    /// region top and the cursor is confined to the region.
+    pub(crate) origin_mode: bool,
 }
 
 /// Build the default tab-stop table for a `cols`-wide grid: a stop at every
@@ -162,6 +166,7 @@ impl Grid {
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
             autowrap: true,
+            origin_mode: false,
         }
     }
 
@@ -195,6 +200,32 @@ impl Grid {
             x.min(self.cols.saturating_sub(1)),
             y.min(self.rows.saturating_sub(1)),
         );
+    }
+
+    /// Absolute cursor positioning that honors origin mode (DECOM). `col`/`row`
+    /// are 0-based. With origin mode on, `row` is relative to the scroll region
+    /// top and the cursor is confined to the region; otherwise it is screen-
+    /// absolute. Used by `CUP`/`HVP` and `VPA`.
+    pub(crate) fn set_cursor_abs(&mut self, col: usize, row: usize) {
+        let y = if self.origin_mode {
+            (self.scroll_top + row).min(self.scroll_bottom)
+        } else {
+            row.min(self.rows.saturating_sub(1))
+        };
+        self.cursor = (col.min(self.cols.saturating_sub(1)), y);
+    }
+
+    /// The cursor home position: the top-left of the screen, or of the scroll
+    /// region when origin mode is on.
+    fn home_position(&self) -> (usize, usize) {
+        (0, if self.origin_mode { self.scroll_top } else { 0 })
+    }
+
+    /// Enable or disable origin mode (DECOM), moving the cursor to the (now
+    /// possibly origin-relative) home position as the spec requires.
+    pub(crate) fn set_origin_mode(&mut self, on: bool) {
+        self.origin_mode = on;
+        self.cursor = self.home_position();
     }
 
     /// Move the cursor to column 0 of the current row.
@@ -258,7 +289,7 @@ impl Grid {
             self.scroll_top = 0;
             self.scroll_bottom = self.rows.saturating_sub(1);
         }
-        self.cursor = (0, 0);
+        self.cursor = self.home_position();
     }
 
     /// Reset the scrolling region to span the full screen.
@@ -661,6 +692,7 @@ impl Grid {
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
         self.autowrap = true;
+        self.origin_mode = false;
         self.current_link = 0;
     }
 
@@ -673,6 +705,7 @@ impl Grid {
         self.saved_cursor = (0, 0);
         self.cursor_visible = true;
         self.autowrap = true;
+        self.origin_mode = false;
         self.current_link = 0;
     }
 
