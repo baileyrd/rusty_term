@@ -1,9 +1,11 @@
 //! Performance benchmark for rusty_term Grid handoff strategies.
 //! Compares "Full Grid Copy" vs "Dirty Row Snapshot".
 
-use std::time::{Instant, Duration};
-use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+// Fields exist to give `Cell` a realistic size; the benchmark only measures the
+// cost of copying them, not reading them.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Default)]
 struct Cell {
     ch: char,
@@ -11,6 +13,7 @@ struct Cell {
     bg: u32,
 }
 
+#[allow(dead_code)]
 struct Grid {
     cols: usize,
     rows: usize,
@@ -47,10 +50,6 @@ impl Grid {
             })
             .collect()
     }
-
-    fn clear_dirty(&mut self) {
-        self.dirty.fill(false);
-    }
 }
 
 fn main() {
@@ -58,8 +57,6 @@ fn main() {
     const ROWS: usize = 48;
     const ITERATIONS: u32 = 10_000;
 
-    let grid = Grid::new(COLS, ROWS);
-    
     println!("--- Performance Metrics: Grid Handoff ---");
     println!("Config: {}x{} Grid | {} Iterations", COLS, ROWS, ITERATIONS);
 
