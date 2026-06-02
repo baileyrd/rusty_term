@@ -245,6 +245,8 @@ enum ParserState {
     Esc,
     /// Inside a `CSI` (`ESC [`) sequence; accumulating parameter bytes.
     Csi,
+    /// Mid-way through a multibyte UTF-8 code point; awaiting continuation bytes.
+    Utf8,
     /// Inside an `OSC` (`ESC ]`) string; bytes are consumed until a `BEL` or
     /// `ST` terminator. We don't act on OSC payloads (titles, cwd reports), we
     /// just keep them from leaking onto the screen.
@@ -267,6 +269,10 @@ pub struct AnsiParser {
     /// Such sequences (e.g. DEC private mode set/reset) are consumed but not
     /// acted upon.
     csi_private: bool,
+    /// Code point accumulated so far while in [`ParserState::Utf8`].
+    utf8_acc: u32,
+    /// Number of UTF-8 continuation bytes still expected.
+    utf8_remaining: usize,
 }
 
 impl Default for AnsiParser {
@@ -284,6 +290,8 @@ impl AnsiParser {
             current_bg: DEFAULT_BG,
             param_buffer: String::new(),
             csi_private: false,
+            utf8_acc: 0,
+            utf8_remaining: 0,
         }
     }
 
@@ -292,26 +300,25 @@ impl AnsiParser {
     pub fn advance(&mut self, g: &mut Grid, bytes: &[u8]) {
         for &b in bytes {
             match self.state {
-                ParserState::Ground => match b {
-                    0x1b => self.state = ParserState::Esc,
-                    0x08 => g.cursor.0 = g.cursor.0.saturating_sub(1), // backspace
-                    b'\n' => {
-                        g.carriage_return();
-                        g.newline();
-                    }
-                    b'\r' => g.carriage_return(),
-                    b'\t' => {
-                        // Advance to the next 8-column tab stop, clamped at the
-                        // right margin so we never wrap/scroll on a tab.
-                        let next_stop = (g.cursor.0 / 8 + 1) * 8;
-                        let target = next_stop.min(g.cols.saturating_sub(1));
-                        while g.cursor.0 < target {
-                            g.put_char(' ', self.current_fg, self.current_bg);
+                ParserState::Ground => self.ground_byte(b, g),
+                ParserState::Utf8 => {
+                    if (0x80..=0xbf).contains(&b) {
+                        // Valid continuation byte: fold in its 6 payload bits.
+                        self.utf8_acc = (self.utf8_acc << 6) | (b as u32 & 0x3f);
+                        self.utf8_remaining -= 1;
+                        if self.utf8_remaining == 0 {
+                            let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
+                            g.put_char(ch, self.current_fg, self.current_bg);
+                            self.state = ParserState::Ground;
                         }
+                    } else {
+                        // Truncated sequence: emit a replacement char, then
+                        // reprocess this byte from the ground state.
+                        g.put_char('\u{FFFD}', self.current_fg, self.current_bg);
+                        self.state = ParserState::Ground;
+                        self.ground_byte(b, g);
                     }
-                    0x20..=0x7e => g.put_char(b as char, self.current_fg, self.current_bg),
-                    _ => {}
-                },
+                }
                 ParserState::Esc => match b {
                     b'[' => {
                         self.param_buffer.clear();
@@ -369,6 +376,54 @@ impl AnsiParser {
                 }
                 ParserState::EscCharset => self.state = ParserState::Ground,
             }
+        }
+    }
+
+    /// Handle a single byte while in the ground state: C0 controls, printable
+    /// ASCII, and the lead byte of a UTF-8 code point (which transitions into
+    /// [`ParserState::Utf8`]).
+    fn ground_byte(&mut self, b: u8, g: &mut Grid) {
+        match b {
+            0x1b => self.state = ParserState::Esc,
+            0x08 => g.cursor.0 = g.cursor.0.saturating_sub(1), // backspace
+            b'\n' => {
+                g.carriage_return();
+                g.newline();
+            }
+            b'\r' => g.carriage_return(),
+            b'\t' => {
+                // Advance to the next 8-column tab stop, clamped at the right
+                // margin so we never wrap/scroll on a tab.
+                let next_stop = (g.cursor.0 / 8 + 1) * 8;
+                let target = next_stop.min(g.cols.saturating_sub(1));
+                while g.cursor.0 < target {
+                    g.put_char(' ', self.current_fg, self.current_bg);
+                }
+            }
+            0x20..=0x7e => g.put_char(b as char, self.current_fg, self.current_bg),
+            // UTF-8 lead bytes: stash the payload bits and how many continuation
+            // bytes to expect. (0xC0/0xC1 are always overlong, hence excluded.)
+            0xc2..=0xdf => {
+                self.utf8_acc = (b as u32) & 0x1f;
+                self.utf8_remaining = 1;
+                self.state = ParserState::Utf8;
+            }
+            0xe0..=0xef => {
+                self.utf8_acc = (b as u32) & 0x0f;
+                self.utf8_remaining = 2;
+                self.state = ParserState::Utf8;
+            }
+            0xf0..=0xf4 => {
+                self.utf8_acc = (b as u32) & 0x07;
+                self.utf8_remaining = 3;
+                self.state = ParserState::Utf8;
+            }
+            // Stray continuation or otherwise invalid lead byte.
+            0x80..=0xbf | 0xc0..=0xc1 | 0xf5..=0xff => {
+                g.put_char('\u{FFFD}', self.current_fg, self.current_bg);
+            }
+            // Other C0 controls are ignored.
+            _ => {}
         }
     }
 
@@ -790,6 +845,56 @@ mod tests {
         let g = parse(b"\x1b(BZ", 80, 24);
         assert_eq!(g.cells[0].ch, 'Z');
         assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn utf8_two_byte_decodes() {
+        // U+00E9 'é' = C3 A9
+        let g = parse(b"\xc3\xa9", 80, 24);
+        assert_eq!(g.cells[0].ch, 'é');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn utf8_three_byte_decodes() {
+        // U+2794 '➔'-family arrow = E2 9E 94; the prompt arrow '➜' is E2 9E 9C.
+        let g = parse("➜".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, '➜');
+    }
+
+    #[test]
+    fn utf8_four_byte_emoji_decodes() {
+        // U+1F600 😀 = F0 9F 98 80
+        let g = parse("😀".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, '😀');
+    }
+
+    #[test]
+    fn utf8_split_across_chunks() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        let bytes = "é".as_bytes(); // C3 A9
+        p.advance(&mut g, &bytes[..1]); // lead byte only
+        assert_eq!(g.cells[0].ch, ' '); // nothing emitted yet
+        p.advance(&mut g, &bytes[1..]); // continuation
+        assert_eq!(g.cells[0].ch, 'é');
+    }
+
+    #[test]
+    fn utf8_invalid_yields_replacement() {
+        // Stray continuation byte.
+        let g = parse(b"\x80X", 80, 24);
+        assert_eq!(g.cells[0].ch, '\u{FFFD}');
+        assert_eq!(g.cells[1].ch, 'X');
+    }
+
+    #[test]
+    fn utf8_truncated_then_ascii_recovers() {
+        // Lead byte expecting a continuation, interrupted by an ASCII byte:
+        // emit replacement for the truncated char, then render the ASCII byte.
+        let g = parse(b"\xc3A", 80, 24);
+        assert_eq!(g.cells[0].ch, '\u{FFFD}');
+        assert_eq!(g.cells[1].ch, 'A');
     }
 
     #[test]
