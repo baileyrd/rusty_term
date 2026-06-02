@@ -1329,3 +1329,88 @@ fn cursor_visibility_mode_is_not_relayed() {
     p.advance(&mut g, b"\x1b[?25l");
     assert!(g.take_host_out().is_empty());
 }
+
+#[test]
+fn ris_resets_screen_cursor_and_region() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[31mhello"); // red text
+    p.advance(&mut g, b"\x1b[2;10r"); // scroll region (homes cursor)
+    p.advance(&mut g, b"\x1b[?25l"); // hide cursor
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.cells[0].ch, ' '); // screen cleared
+    assert_eq!(g.cursor, (0, 0)); // home
+    assert_eq!((g.scroll_top, g.scroll_bottom), (0, 23)); // region reset
+    assert!(g.cursor_visible); // cursor visible again
+}
+
+#[test]
+fn ris_resets_pen() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[31m"); // red pen
+    p.advance(&mut g, b"\x1bc"); // RIS resets the pen
+    p.advance(&mut g, b"X");
+    assert_eq!(g.cells[0].fg, DEFAULT_FG); // back to default color
+}
+
+#[test]
+fn ris_clears_scrollback() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC"); // 1 line of history
+    assert_eq!(g.scrollback.len(), 1);
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.scrollback.len(), 0);
+}
+
+#[test]
+fn decstr_soft_reset_keeps_screen() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"hello");
+    p.advance(&mut g, b"\x1b[3;10r"); // scroll region (homes cursor)
+    p.advance(&mut g, b"\x1b[!p"); // DECSTR
+    assert_eq!((g.scroll_top, g.scroll_bottom), (0, 23)); // region reset
+    assert_eq!(&row_text(&g, 0)[..5], "hello"); // screen NOT cleared
+    assert!(g.cursor_visible);
+    assert!(g.autowrap);
+}
+
+#[test]
+fn dectcem_toggles_cursor_visibility() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(g.cursor_visible); // default visible
+    p.advance(&mut g, b"\x1b[?25l");
+    assert!(!g.cursor_visible);
+    p.advance(&mut g, b"\x1b[?25h");
+    assert!(g.cursor_visible);
+}
+
+#[test]
+fn decawm_off_overwrites_last_column() {
+    let mut g = Grid::new(3, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?7l"); // autowrap off
+    p.advance(&mut g, b"abcd"); // 'd' overwrites 'c' in the last column
+    assert_eq!(row_text(&g, 0), "abd");
+    assert_eq!(g.cursor.1, 0); // never wrapped to the next row
+    assert_eq!(row_text(&g, 1), "   "); // row 1 untouched
+}
+
+#[test]
+fn decaln_fills_screen_with_e() {
+    let g = parse(b"\x1b#8", 4, 2); // DECALN
+    assert!(g.cells.iter().all(|c| c.ch == 'E'));
+    assert_eq!(g.cursor, (0, 0));
+}
+
+#[test]
+fn esc_hash_non_8_is_consumed_not_printed() {
+    // ESC # 3 (double-height top half) is consumed; the '#' and '3' must not
+    // leak, and the following 'X' still renders.
+    let g = parse(b"\x1b#3X", 4, 2);
+    assert_eq!(g.cells[0].ch, 'X');
+    assert_eq!(g.cursor, (1, 0));
+}
