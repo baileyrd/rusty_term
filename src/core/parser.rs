@@ -154,6 +154,22 @@ impl AnsiParser {
                         g.restore_cursor();
                         self.state = ParserState::Ground;
                     }
+                    // IND — index: down one line, scrolling at the region bottom.
+                    b'D' => {
+                        g.newline();
+                        self.state = ParserState::Ground;
+                    }
+                    // NEL — next line: carriage return followed by an index.
+                    b'E' => {
+                        g.carriage_return();
+                        g.newline();
+                        self.state = ParserState::Ground;
+                    }
+                    // RI — reverse index: up one line, scrolling at the region top.
+                    b'M' => {
+                        g.reverse_index();
+                        self.state = ParserState::Ground;
+                    }
                     // Charset designation (`ESC ( B`, etc.): one more byte follows.
                     b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
                     // String-type introducers — DCS (`P`), SOS (`X`), PM (`^`),
@@ -366,6 +382,15 @@ impl AnsiParser {
             b'X' => g.erase_chars(count),  // ECH
             b'L' => g.insert_lines(count), // IL
             b'M' => g.delete_lines(count), // DL
+            b'S' => g.scroll_up_n(count),  // SU
+            b'T' => {
+                // SD — scroll down. The multi-parameter `CSI Ps;Ps;Ps;Ps;Ps T`
+                // form is xterm highlight-mouse-tracking, which we don't model;
+                // only the single-parameter form is SD.
+                if params.len() <= 1 {
+                    g.scroll_down_n(count);
+                }
+            }
             b's' => g.save_cursor(),       // SCP
             b'u' => g.restore_cursor(),    // RCP
             b'r' => {
