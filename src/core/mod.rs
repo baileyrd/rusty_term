@@ -67,11 +67,18 @@ pub fn char_width(ch: char) -> usize {
     1
 }
 
-/// A single character cell: its glyph plus truecolor attributes.
+/// Maximum number of trailing combining marks stored per cell.
+pub const MAX_COMBINING: usize = 2;
+
+/// A single character cell: its base glyph, any trailing combining marks, and
+/// truecolor attributes. Kept `Copy` (combining marks live in a fixed inline
+/// array) so the grid can shift cells with `copy_within`.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Cell {
-    /// The displayed character.
+    /// The base (spacing) character.
     pub ch: char,
+    /// Zero-width combining marks applied to `ch`; unused slots are `'\0'`.
+    pub combining: [char; MAX_COMBINING],
     /// Foreground color as `0xRRGGBB`.
     pub fg: u32,
     /// Background color as `0xRRGGBB`.
@@ -83,7 +90,13 @@ pub struct Cell {
 impl Cell {
     /// Construct a blank cell (space glyph, default colors).
     fn blank() -> Self {
-        Cell { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG, flags: 0 }
+        Cell {
+            ch: ' ',
+            combining: ['\0'; MAX_COMBINING],
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            flags: 0,
+        }
     }
 }
 
@@ -249,8 +262,8 @@ impl Grid {
     pub fn put_char(&mut self, ch: char, fg: u32, bg: u32) {
         let w = char_width(ch);
         if w == 0 {
-            // Zero-width (combining marks): not modeled; dropped to avoid
-            // desyncing the cursor.
+            // Zero-width combining mark: attach it to the preceding glyph.
+            self.add_combining(ch);
             return;
         }
         if self.cursor.0 + w > self.cols {
@@ -258,12 +271,36 @@ impl Grid {
             self.newline();
         }
         let (x, y) = self.cursor;
-        self.set_cell(x, y, Cell { ch, fg, bg, flags: 0 });
+        self.set_cell(x, y, Cell { ch, combining: ['\0'; MAX_COMBINING], fg, bg, flags: 0 });
         if w == 2 && x + 1 < self.cols {
             // Trailing half: a flagged placeholder the renderer skips.
-            self.set_cell(x + 1, y, Cell { ch: ' ', fg, bg, flags: WIDE_TRAILER });
+            self.set_cell(
+                x + 1,
+                y,
+                Cell { ch: ' ', combining: ['\0'; MAX_COMBINING], fg, bg, flags: WIDE_TRAILER },
+            );
         }
         self.cursor.0 += w;
+    }
+
+    /// Attach a zero-width combining mark to the most recently written glyph
+    /// (the cell to the left of the cursor, stepping back over a wide-glyph
+    /// trailer to its head). Dropped at the start of a line, or once a cell's
+    /// combining slots are full.
+    fn add_combining(&mut self, mark: char) {
+        let (cx, cy) = self.cursor;
+        if cx == 0 || cy >= self.rows {
+            return;
+        }
+        let mut bx = cx - 1;
+        if self.cells[cy * self.cols + bx].flags & WIDE_TRAILER != 0 && bx >= 1 {
+            bx -= 1; // land on the wide glyph's head, not its trailer
+        }
+        let cell = &mut self.cells[cy * self.cols + bx];
+        if let Some(slot) = cell.combining.iter_mut().find(|s| **s == '\0') {
+            *slot = mark;
+            self.dirty[cy] = true;
+        }
     }
 
     /// Blank columns `[from, to)` of row `y`, marking it dirty.
@@ -1278,11 +1315,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_width_char_is_dropped() {
+    fn combining_mark_attaches_to_preceding_glyph() {
+        // 'a' + U+0301 (combining acute) + 'b'.
         let g = parse("a\u{0301}b".as_bytes(), 80, 24);
         assert_eq!(g.cells[0].ch, 'a');
-        assert_eq!(g.cells[1].ch, 'b'); // combining mark dropped, no cell consumed
+        assert_eq!(g.cells[0].combining[0], '\u{0301}'); // mark composed onto 'a'
+        assert_eq!(g.cells[1].ch, 'b'); // mark consumed no cell
         assert_eq!(g.cursor, (2, 0));
+    }
+
+    #[test]
+    fn multiple_combining_marks_and_overflow() {
+        let mut g = Grid::new(80, 24);
+        g.put_char('e', DEFAULT_FG, DEFAULT_BG);
+        // Two marks fill both slots; a third is dropped (bounded).
+        g.put_char('\u{0301}', DEFAULT_FG, DEFAULT_BG);
+        g.put_char('\u{0323}', DEFAULT_FG, DEFAULT_BG);
+        g.put_char('\u{0308}', DEFAULT_FG, DEFAULT_BG);
+        assert_eq!(g.cells[0].combining, ['\u{0301}', '\u{0323}']);
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn combining_mark_at_line_start_is_dropped() {
+        // No preceding glyph -> nothing to attach to.
+        let g = parse("\u{0301}x".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, 'x');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_wide_glyph_head() {
+        let g = parse("世\u{0301}".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, '世');
+        assert_eq!(g.cells[0].combining[0], '\u{0301}'); // on the head, not the trailer
+        assert_ne!(g.cells[1].flags & WIDE_TRAILER, 0);
     }
 
     #[test]
