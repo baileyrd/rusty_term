@@ -9,15 +9,19 @@ pub struct UnixBackend;
 impl crate::backend::Backend for UnixBackend {
     fn spawn_shell(&self) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         unsafe {
-            let mut slave_fd: libc::c_int = 0;
-            let master_fd = libc::openpty(
+            // openpty writes the master fd to the first out-param and the slave
+            // fd to the second, returning 0 on success / -1 on error. Both
+            // pointers must be valid — passing null for the slave segfaults.
+            let mut master_fd: libc::c_int = -1;
+            let mut slave_fd: libc::c_int = -1;
+            let rc = libc::openpty(
+                &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
             );
-            if master_fd < 0 {
+            if rc < 0 {
                 return Err(std::io::Error::last_os_error());
             }
 
