@@ -74,6 +74,10 @@ pub struct AnsiParser {
     /// and its `BEL`/`ST` terminator). Decoded as UTF-8 at dispatch. Capped at
     /// [`OSC_MAX`] so a pathological unterminated OSC can't grow without bound.
     osc_buffer: Vec<u8>,
+    /// The most recently printed graphic character, for `REP` (`CSI b`) to
+    /// repeat. Cleared by C0 controls (CR/LF/BS/HT) so `REP` only repeats a
+    /// character still adjacent to the cursor, matching xterm.
+    last_char: Option<char>,
 }
 
 /// Upper bound on the bytes buffered for a single OSC string. Real titles and
@@ -100,6 +104,7 @@ impl AnsiParser {
             utf8_remaining: 0,
             responses: Vec::new(),
             osc_buffer: Vec::new(),
+            last_char: None,
         }
     }
 
@@ -124,6 +129,7 @@ impl AnsiParser {
                         if self.utf8_remaining == 0 {
                             let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
                             g.put_char(ch, self.pen);
+                            self.last_char = Some(ch);
                             self.state = ParserState::Ground;
                         }
                     } else {
@@ -272,12 +278,19 @@ impl AnsiParser {
     fn ground_byte(&mut self, b: u8, g: &mut Grid) {
         match b {
             0x1b => self.state = ParserState::Esc,
-            0x08 => g.cursor.0 = g.cursor.0.saturating_sub(1), // backspace
+            0x08 => {
+                g.cursor.0 = g.cursor.0.saturating_sub(1); // backspace
+                self.last_char = None;
+            }
             b'\n' => {
                 g.carriage_return();
                 g.newline();
+                self.last_char = None;
             }
-            b'\r' => g.carriage_return(),
+            b'\r' => {
+                g.carriage_return();
+                self.last_char = None;
+            }
             b'\t' => {
                 // Advance to the next 8-column tab stop, clamped at the right
                 // margin so we never wrap/scroll on a tab.
@@ -286,8 +299,13 @@ impl AnsiParser {
                 while g.cursor.0 < target {
                     g.put_char(' ', self.pen);
                 }
+                self.last_char = None;
             }
-            0x20..=0x7e => g.put_char(b as char, self.pen),
+            0x20..=0x7e => {
+                let ch = b as char;
+                g.put_char(ch, self.pen);
+                self.last_char = Some(ch);
+            }
             // UTF-8 lead bytes: stash the payload bits and how many continuation
             // bytes to expect. (0xC0/0xC1 are always overlong, hence excluded.)
             0xc2..=0xdf => {
@@ -375,8 +393,18 @@ impl AnsiParser {
             b'B' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_add(count)), // CUD
             b'C' => g.set_cursor(g.cursor.0.saturating_add(count), g.cursor.1), // CUF
             b'D' => g.set_cursor(g.cursor.0.saturating_sub(count), g.cursor.1), // CUB
+            b'E' => g.set_cursor(0, g.cursor.1.saturating_add(count)),          // CNL
+            b'F' => g.set_cursor(0, g.cursor.1.saturating_sub(count)),          // CPL
             b'G' => g.set_cursor(p(0, 1).saturating_sub(1), g.cursor.1),        // CHA
             b'd' => g.set_cursor(g.cursor.0, p(0, 1).saturating_sub(1)),        // VPA
+            b'b' => {
+                // REP — repeat the last printed graphic character `count` times.
+                if let Some(ch) = self.last_char {
+                    for _ in 0..count {
+                        g.put_char(ch, self.pen);
+                    }
+                }
+            }
             b'@' => g.insert_chars(count), // ICH
             b'P' => g.delete_chars(count), // DCH
             b'X' => g.erase_chars(count),  // ECH

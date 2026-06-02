@@ -1119,3 +1119,70 @@ fn su_respects_scroll_region_without_scrollback() {
     assert_eq!(row_text(&g, 4), "EEEE"); // below region untouched
     assert_eq!(g.scrollback.len(), 0); // sub-region scroll never captures
 }
+
+#[test]
+fn cnl_moves_to_column_zero_and_down() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (3, 1);
+    p.advance(&mut g, b"\x1b[2E"); // CNL 2
+    assert_eq!(g.cursor, (0, 3));
+}
+
+#[test]
+fn cpl_moves_to_column_zero_and_up() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (3, 5);
+    p.advance(&mut g, b"\x1b[2F"); // CPL 2
+    assert_eq!(g.cursor, (0, 3));
+}
+
+#[test]
+fn cnl_default_count_is_one() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (7, 0);
+    p.advance(&mut g, b"\x1b[E"); // CNL (default 1)
+    assert_eq!(g.cursor, (0, 1));
+}
+
+#[test]
+fn rep_repeats_last_graphic_char() {
+    let g = parse(b"A\x1b[3b", 80, 24); // 'A' then repeat x3 -> "AAAA"
+    assert_eq!(&row_text(&g, 0)[..4], "AAAA");
+    assert_eq!(g.cursor, (4, 0));
+}
+
+#[test]
+fn rep_default_count_is_one() {
+    let g = parse(b"X\x1b[b", 80, 24); // repeat once -> "XX"
+    assert_eq!(&row_text(&g, 0)[..2], "XX");
+    assert_eq!(g.cursor, (2, 0));
+}
+
+#[test]
+fn rep_repeats_multibyte_char() {
+    let g = parse("é\x1b[2b".as_bytes(), 80, 24); // 'é' then x2 -> "ééé"
+    assert_eq!(g.cells[0].ch, 'é');
+    assert_eq!(g.cells[1].ch, 'é');
+    assert_eq!(g.cells[2].ch, 'é');
+    assert_eq!(g.cursor, (3, 0));
+}
+
+#[test]
+fn rep_after_newline_is_noop() {
+    // CR/LF clear the last-char memory, so REP across a line break does nothing.
+    let g = parse(b"A\r\n\x1b[3b", 80, 24);
+    assert_eq!(row_text(&g, 1).trim_end(), "");
+    assert_eq!(g.cursor, (0, 1));
+}
+
+#[test]
+fn rep_after_tab_is_noop() {
+    // A tab also clears the memory (the spaces it emits aren't a "last char").
+    let g = parse(b"A\t\x1b[2b", 80, 24);
+    // 'A' at col 0, tab to col 8, REP repeats nothing.
+    assert_eq!(g.cells[0].ch, 'A');
+    assert_eq!(g.cursor, (8, 0));
+}
