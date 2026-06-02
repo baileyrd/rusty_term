@@ -56,9 +56,33 @@ pub struct Grid {
     /// Cursor position stashed by a save (`DECSC` / `CSI s`) and restored by
     /// `DECRC` / `CSI u`.
     pub saved_cursor: (usize, usize),
+    /// When `Some`, the alternate screen is active and this holds the primary
+    /// screen to restore on exit. Kept the same dimensions as the live buffer.
+    primary: Option<SavedScreen>,
     /// Monotonic counter bumped on every parsed batch; lets the renderer
     /// reason about frame freshness.
     pub epoch: u64,
+}
+
+/// A stashed screen buffer plus its cursor, used to swap the primary screen out
+/// while the alternate screen is active.
+struct SavedScreen {
+    cells: Vec<Cell>,
+    cursor: (usize, usize),
+}
+
+/// Reflow `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows` buffer,
+/// preserving the top-left overlap and blank-filling any new area.
+fn reflow(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows: usize) -> Vec<Cell> {
+    let mut new = vec![Cell::blank(); cols * rows];
+    let copy_rows = rows.min(old_rows);
+    let copy_cols = cols.min(old_cols);
+    for y in 0..copy_rows {
+        let src = y * old_cols;
+        let dst = y * cols;
+        new[dst..dst + copy_cols].copy_from_slice(&old[src..src + copy_cols]);
+    }
+    new
 }
 
 impl Grid {
@@ -71,6 +95,7 @@ impl Grid {
             dirty: vec![false; rows],
             cursor: (0, 0),
             saved_cursor: (0, 0),
+            primary: None,
             epoch: 0,
         }
     }
@@ -161,21 +186,47 @@ impl Grid {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
         }
-        let mut new_cells = vec![Cell::blank(); cols * rows];
-        let copy_rows = rows.min(self.rows);
-        let copy_cols = cols.min(self.cols);
-        for y in 0..copy_rows {
-            let src = y * self.cols;
-            let dst = y * cols;
-            new_cells[dst..dst + copy_cols].copy_from_slice(&self.cells[src..src + copy_cols]);
+        let clamp = |(x, y): (usize, usize)| (x.min(cols - 1), y.min(rows - 1));
+        let new_cells = reflow(&self.cells, self.cols, self.rows, cols, rows);
+        // Keep the stashed primary screen the same size as the live buffer so
+        // it can be restored without a size mismatch.
+        if let Some(saved) = &mut self.primary {
+            saved.cells = reflow(&saved.cells, self.cols, self.rows, cols, rows);
+            saved.cursor = clamp(saved.cursor);
         }
         self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
         self.dirty = vec![true; rows];
-        let clamp = |(x, y): (usize, usize)| (x.min(cols - 1), y.min(rows - 1));
         self.cursor = clamp(self.cursor);
         self.saved_cursor = clamp(self.saved_cursor);
+    }
+
+    /// Switch to the alternate screen: stash the primary buffer and cursor,
+    /// then present a cleared screen. No-op if already on the alternate screen.
+    fn enter_alt_screen(&mut self) {
+        if self.primary.is_some() {
+            return;
+        }
+        self.primary = Some(SavedScreen {
+            cells: std::mem::replace(&mut self.cells, vec![Cell::blank(); self.cols * self.rows]),
+            cursor: self.cursor,
+        });
+        self.cursor = (0, 0);
+        self.dirty.iter_mut().for_each(|d| *d = true);
+    }
+
+    /// Switch back to the primary screen, restoring its buffer and cursor.
+    /// No-op if the alternate screen is not active.
+    fn leave_alt_screen(&mut self) {
+        if let Some(saved) = self.primary.take() {
+            self.cells = saved.cells;
+            self.cursor = (
+                saved.cursor.0.min(self.cols.saturating_sub(1)),
+                saved.cursor.1.min(self.rows.saturating_sub(1)),
+            );
+            self.dirty.iter_mut().for_each(|d| *d = true);
+        }
     }
 
     /// Save the current cursor position (`DECSC` / `CSI s`).
@@ -372,9 +423,12 @@ impl AnsiParser {
                     0x3c..=0x3f => self.csi_private = true,
                     // Intermediate bytes (space..`/`): ignored but part of the sequence.
                     0x20..=0x2f => {}
-                    // Final byte: dispatch (unless this is a private sequence) and reset.
+                    // Final byte: dispatch and reset. Private sequences (with a
+                    // `?`/`<`/`=`/`>` marker) go to their own handler.
                     0x40..=0x7e => {
-                        if !self.csi_private {
+                        if self.csi_private {
+                            self.handle_private_csi(b, g);
+                        } else {
                             self.handle_csi(b, g);
                         }
                         self.state = ParserState::Ground;
@@ -447,6 +501,35 @@ impl AnsiParser {
                 g.put_char('\u{FFFD}', self.current_fg, self.current_bg);
             }
             // Other C0 controls are ignored.
+            _ => {}
+        }
+    }
+
+    /// Handle a private CSI sequence (one carrying a `?`/`<`/`=`/`>` marker).
+    ///
+    /// Only the alternate-screen DEC modes are acted upon; other private modes
+    /// (bracketed paste `2004`, cursor visibility `25`, …) are consumed and
+    /// ignored so they never leak as text.
+    fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
+        let params: Vec<usize> = self.param_buffer
+            .split(';')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        // 47 / 1047 / 1049 all select the alternate screen buffer; 1049 also
+        // saves/restores the cursor, which enter/leave handle implicitly.
+        let is_alt_mode = |p: usize| matches!(p, 47 | 1047 | 1049);
+        match cmd {
+            b'h' => {
+                if params.iter().copied().any(is_alt_mode) {
+                    g.enter_alt_screen();
+                }
+            }
+            b'l' => {
+                if params.iter().copied().any(is_alt_mode) {
+                    g.leave_alt_screen();
+                }
+            }
             _ => {}
         }
     }
@@ -744,6 +827,38 @@ mod tests {
         p.advance(&mut g, b"\r\nnew");
         assert_eq!(row_text(&g, 0).trim_end(), "bot");
         assert_eq!(row_text(&g, 1).trim_end(), "new");
+    }
+
+    #[test]
+    fn alt_screen_saves_and_restores_primary() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"primary text");
+        assert_eq!(&row_text(&g, 0)[..12], "primary text");
+
+        // Enter alt screen (DEC private 1049): cleared, cursor home.
+        p.advance(&mut g, b"\x1b[?1049h");
+        assert_eq!(g.cells[0].ch, ' ');
+        assert_eq!(g.cursor, (0, 0));
+        p.advance(&mut g, b"ALT");
+        assert_eq!(&row_text(&g, 0)[..3], "ALT");
+
+        // Leave alt screen: primary content and cursor come back.
+        p.advance(&mut g, b"\x1b[?1049l");
+        assert_eq!(&row_text(&g, 0)[..12], "primary text");
+        assert_eq!(g.cursor, (12, 0));
+    }
+
+    #[test]
+    fn alt_screen_survives_resize() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"keep me");
+        p.advance(&mut g, b"\x1b[?1049h"); // to alt
+        g.resize(100, 30); // resize while on alt screen
+        p.advance(&mut g, b"\x1b[?1049l"); // back to primary
+        assert_eq!(g.cols, 100);
+        assert_eq!(&row_text(&g, 0)[..7], "keep me");
     }
 
     #[test]
