@@ -171,12 +171,26 @@ fn main() -> Result<(), std::io::Error> {
 
         // Apply a pending resize before snapshotting: reflow the grid, tell the
         // child its new size, and clear the screen so the full repaint is clean.
+        // Only act when the size actually changed — a spurious SIGWINCH must not
+        // clear the screen (the clear would flush ahead of a dirty-rows-only
+        // repaint and blank everything else).
         if RESIZE_PENDING.swap(false, Ordering::Relaxed)
             && let Some((cols, rows)) = backend.terminal_size()
         {
-            grid.lock().unwrap().resize(cols as usize, rows as usize);
-            let _ = resizer.set_winsize(cols, rows);
-            print!("\x1b[2J");
+            let changed = {
+                let mut g = grid.lock().unwrap();
+                let changed = g.cols != cols as usize || g.rows != rows as usize;
+                if changed {
+                    g.resize(cols as usize, rows as usize);
+                }
+                changed
+            };
+            if changed {
+                let _ = resizer.set_winsize(cols, rows);
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x1b[2J");
+                let _ = out.flush();
+            }
         }
 
         let frame = {
