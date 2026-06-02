@@ -3,9 +3,9 @@ mod core;
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::Backend;
 #[cfg(unix)]
@@ -21,6 +21,59 @@ use crate::core::{
 /// and the PTY in step with the host terminal. A plain atomic store is the only
 /// async-signal-safe work the handler does.
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Wakes the render thread when there is something new to paint, so it can park
+/// on a condvar instead of spinning on a fixed timer. The boolean is the
+/// "frame pending" predicate: producers (the parser on new output, the input
+/// pump on a scrollback move) set it and signal; the renderer clears it on each
+/// wake. Many producer events between two repaints collapse into one frame via
+/// the renderer's frame budget, so `notify` is deliberately cheap and idempotent.
+struct FrameSignal {
+    pending: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl FrameSignal {
+    fn new() -> Self {
+        Self { pending: Mutex::new(false), cv: Condvar::new() }
+    }
+
+    /// Mark a frame pending and wake the renderer if it is parked.
+    fn notify(&self) {
+        *self.pending.lock().unwrap() = true;
+        self.cv.notify_one();
+    }
+
+    /// Park until a frame is pending or `timeout` elapses, then clear the
+    /// predicate. Returns `true` when woken by a `notify` (real work), `false`
+    /// on a bare timeout — the periodic tick that lets a `SIGWINCH`-driven
+    /// resize be noticed even when no output is flowing. The timeout is the only
+    /// reason the renderer wakes while idle.
+    fn wait(&self, timeout: Duration) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if !*pending {
+            let (guard, res) = self.cv.wait_timeout(pending, timeout).unwrap();
+            pending = guard;
+            // A notify landing right at the timeout boundary still counts as work.
+            if res.timed_out() && !*pending {
+                return false;
+            }
+        }
+        *pending = false;
+        true
+    }
+}
+
+/// Minimum wall-clock spacing between repaints. Bursts of output coalesce into
+/// at most one frame per budget (~60 Hz), so a flood (`cat bigfile`) repaints
+/// smoothly instead of once per PTY read.
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
+/// How long the renderer parks when idle before waking to re-check for a
+/// pending resize. Output and scrollback moves wake it immediately; this bare
+/// tick exists only because the async-signal-safe `SIGWINCH` handler can set a
+/// flag but cannot touch the condvar, so it bounds resize latency while quiet.
+const IDLE_TICK: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
 extern "C" fn handle_sigwinch(_: libc::c_int) {
@@ -160,6 +213,7 @@ fn main() -> Result<(), std::io::Error> {
     let (init_cols, init_rows) = backend.terminal_size().unwrap_or((80, 24));
     let grid = Arc::new(Mutex::new(Grid::new(init_cols as usize, init_rows as usize)));
     let running = Arc::new(AtomicBool::new(true));
+    let signal = Arc::new(FrameSignal::new());
 
     // Raw mode stays enabled for the lifetime of this guard; it is restored on
     // any exit path, including a panic.
@@ -198,6 +252,7 @@ fn main() -> Result<(), std::io::Error> {
     // --- Thread 1: Parser (PTY -> Grid) ---
     let grid_parser = Arc::clone(&grid);
     let running_parser = Arc::clone(&running);
+    let signal_parser = Arc::clone(&signal);
 
     thread::spawn(move || {
         let mut parser = AnsiParser::new();
@@ -215,6 +270,8 @@ fn main() -> Result<(), std::io::Error> {
                         g.epoch += 1;
                         parser.take_responses()
                     };
+                    // New output landed in the grid — ask for a repaint.
+                    signal_parser.notify();
                     if !responses.is_empty() && reader.write(&responses).is_err() {
                         break;
                     }
@@ -225,6 +282,8 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
         running_parser.store(false, Ordering::Relaxed);
+        // Wake the renderer so it observes `running == false` and exits its park.
+        signal_parser.notify();
         // On this thread's own exit path (shell EOF/error) `reader` drops here
         // and reaps the child. On the stdin-EOF path the process exits while
         // this thread is blocked in read(), so Drop may not run — but the child
@@ -235,6 +294,7 @@ fn main() -> Result<(), std::io::Error> {
     // --- Thread 2: Input pump (stdin -> PTY) ---
     let running_input = Arc::clone(&running);
     let grid_input = Arc::clone(&grid);
+    let signal_input = Arc::clone(&signal);
 
     thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -260,14 +320,24 @@ fn main() -> Result<(), std::io::Error> {
                     let mut i = 0;
                     while i < buf.len() {
                         if buf[i..].starts_with(SCROLL_UP_KEY) {
-                            let mut g = grid_input.lock().unwrap();
-                            let page = g.rows.saturating_sub(1).max(1);
-                            g.scroll_view_up(page);
+                            let moved = {
+                                let mut g = grid_input.lock().unwrap();
+                                let page = g.rows.saturating_sub(1).max(1);
+                                g.scroll_view_up(page)
+                            };
+                            if moved {
+                                signal_input.notify();
+                            }
                             i += SCROLL_UP_KEY.len();
                         } else if buf[i..].starts_with(SCROLL_DN_KEY) {
-                            let mut g = grid_input.lock().unwrap();
-                            let page = g.rows.saturating_sub(1).max(1);
-                            g.scroll_view_down(page);
+                            let moved = {
+                                let mut g = grid_input.lock().unwrap();
+                                let page = g.rows.saturating_sub(1).max(1);
+                                g.scroll_view_down(page)
+                            };
+                            if moved {
+                                signal_input.notify();
+                            }
                             i += SCROLL_DN_KEY.len();
                         } else {
                             forward.push(buf[i]);
@@ -275,8 +345,12 @@ fn main() -> Result<(), std::io::Error> {
                         }
                     }
                     if !forward.is_empty() {
-                        // Real input returns the view to the live bottom.
-                        grid_input.lock().unwrap().reset_view();
+                        // Real input snaps the view to the live bottom; only wake
+                        // the renderer when that actually moved the viewport.
+                        let moved = grid_input.lock().unwrap().reset_view();
+                        if moved {
+                            signal_input.notify();
+                        }
                         if writer.write(&forward).is_err() {
                             break;
                         }
@@ -286,6 +360,8 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
         running_input.store(false, Ordering::Relaxed);
+        // Wake the renderer so it observes `running == false` and exits its park.
+        signal_input.notify();
     });
 
     // --- Thread 3: Renderer (main loop) ---
@@ -303,9 +379,26 @@ fn main() -> Result<(), std::io::Error> {
     // only in the live view and only when the child wants it (DECTCEM); it is
     // hidden while browsing scrollback or when the child issued `?25l`.
     let mut cursor_shown = true;
+    // Timestamp of the last actual paint, so the frame budget spaces real
+    // repaints rather than no-op wakes.
+    let mut last_frame = Instant::now();
 
-    while running.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(16));
+    loop {
+        // Park until a producer flags a pending frame, or the idle tick fires so
+        // a SIGWINCH-driven resize is still picked up while output is quiet.
+        let woke_for_work = signal.wait(IDLE_TICK);
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        // Coalesce bursts: when woken by output, hold off until the frame budget
+        // since the last paint has elapsed, so a flood repaints at ~60 Hz rather
+        // than once per read. Idle ticks are already older than the budget.
+        if woke_for_work {
+            let since = last_frame.elapsed();
+            if since < FRAME_BUDGET {
+                thread::sleep(FRAME_BUDGET - since);
+            }
+        }
 
         // Apply a pending resize before snapshotting: reflow the grid, tell the
         // child its new size, and clear the screen so the full repaint is clean.
@@ -377,6 +470,7 @@ fn main() -> Result<(), std::io::Error> {
             // or new output arriving underneath).
             if dirty_any {
                 draw(&frame, false);
+                last_frame = Instant::now();
             }
             // Force a cursor reposition on the first live frame after we return.
             last_cursor = None;
@@ -387,6 +481,7 @@ fn main() -> Result<(), std::io::Error> {
             if !frame.rows.is_empty() || last_cursor != Some(frame.cursor) {
                 last_cursor = Some(frame.cursor);
                 draw(&frame, true);
+                last_frame = Instant::now();
             }
         }
     }
@@ -405,4 +500,65 @@ fn main() -> Result<(), std::io::Error> {
 
     // `_raw_guard` drops here, restoring cooked mode.
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_signal_tests {
+    use super::FrameSignal;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // A notify issued before the wait must not be lost: the wait observes the
+    // pending predicate and returns `true` without parking for the timeout.
+    #[test]
+    fn notify_before_wait_returns_immediately() {
+        let signal = FrameSignal::new();
+        signal.notify();
+        let start = Instant::now();
+        let woke = signal.wait(Duration::from_secs(5));
+        assert!(woke, "a pre-set notify must report work");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "wait blocked despite a pending frame",
+        );
+    }
+
+    // A notify from another thread must wake a parked wait and report work, well
+    // before the (generous) timeout would fire.
+    #[test]
+    fn parked_wait_is_woken_by_cross_thread_notify() {
+        let signal = Arc::new(FrameSignal::new());
+        let notifier = Arc::clone(&signal);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            notifier.notify();
+        });
+        let start = Instant::now();
+        let woke = signal.wait(Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+        assert!(woke, "cross-thread notify must report work");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait was not woken by the notify",
+        );
+    }
+
+    // With no notify, wait must eventually report a bare timeout (`false`) — the
+    // periodic tick the renderer relies on to poll for a pending resize. Retried
+    // to absorb the rare spurious condvar wakeup, which the contract reports as
+    // `true`.
+    #[test]
+    fn wait_reports_bare_timeout_without_notify() {
+        let signal = FrameSignal::new();
+        let mut timed_out = false;
+        for _ in 0..40 {
+            if !signal.wait(Duration::from_millis(25)) {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(timed_out, "wait never reported a bare timeout");
+    }
 }
