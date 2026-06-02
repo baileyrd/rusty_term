@@ -71,6 +71,12 @@ fn draw(frame: &DirtyFrame) {
                 last = Some((cell.fg, cell.bg));
             }
             line_buf.push(cell.ch);
+            // Emit any combining marks so they render over the base glyph.
+            for &m in &cell.combining {
+                if m != '\0' {
+                    line_buf.push(m);
+                }
+            }
         }
         line_buf.push_str("\x1b[0m");
         let _ = write!(out, "{}", line_buf);
