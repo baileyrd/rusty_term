@@ -98,19 +98,25 @@ fn main() -> Result<(), std::io::Error> {
     // any exit path, including a panic.
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
+    // Install the SIGWINCH handler before spawning, so a resize during startup
+    // isn't lost to the default (ignore) disposition. sigaction with SA_RESTART
+    // keeps the parser's blocking read from being interrupted.
+    #[cfg(unix)]
+    unsafe {
+        let handler: extern "C" fn(libc::c_int) = handle_sigwinch;
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+    }
+
     // The reader owns the child (and reaps it on drop); the writer and resizer
     // are independent handles to the same PTY, so read, write, and winsize
     // updates never contend on a shared lock.
     let mut reader = backend.spawn_shell(init_cols, init_rows)?;
     let mut writer = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
-
-    // Resize the grid/PTY when the host window changes (Unix only).
-    #[cfg(unix)]
-    unsafe {
-        let handler: extern "C" fn(libc::c_int) = handle_sigwinch;
-        libc::signal(libc::SIGWINCH, handler as libc::sighandler_t);
-    }
 
     // --- Thread 1: Parser (PTY -> Grid) ---
     let grid_parser = Arc::clone(&grid);
@@ -135,7 +141,11 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
         running_parser.store(false, Ordering::Relaxed);
-        // `reader` drops here, reaping the child shell.
+        // On this thread's own exit path (shell EOF/error) `reader` drops here
+        // and reaps the child. On the stdin-EOF path the process exits while
+        // this thread is blocked in read(), so Drop may not run — but the child
+        // now has a controlling tty, so the kernel sends it SIGHUP when the
+        // master closes, and init reaps the orphan.
     });
 
     // --- Thread 2: Input pump (stdin -> PTY) ---
@@ -165,6 +175,10 @@ fn main() -> Result<(), std::io::Error> {
 
     // --- Thread 3: Renderer (main loop) ---
     print!("\x1b[2J");
+
+    // Last cursor position we positioned the host cursor at; used to repaint on
+    // cursor-only motion (arrows, Ctrl-A/E, backspace) that dirties no rows.
+    let mut last_cursor: Option<(usize, usize)> = None;
 
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(16));
@@ -200,7 +214,10 @@ fn main() -> Result<(), std::io::Error> {
             frame
         };
 
-        if !frame.rows.is_empty() {
+        // Draw when cells changed, or when only the cursor moved — `draw` emits
+        // the final cursor-positioning escape, so a pure motion still needs it.
+        if !frame.rows.is_empty() || last_cursor != Some(frame.cursor) {
+            last_cursor = Some(frame.cursor);
             draw(&frame);
         }
     }
