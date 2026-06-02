@@ -513,10 +513,19 @@ pub struct AnsiParser {
     /// Such sequences (e.g. DEC private mode set/reset) are consumed but not
     /// acted upon.
     csi_private: bool,
+    /// The actual private-marker byte (`?`/`<`/`=`/`>`) of the CSI in flight, or
+    /// `0` if none. Lets the dispatcher tell DA2 (`CSI > c`) from DEC private
+    /// modes (`CSI ? … h/l`). Reset at the start of each CSI.
+    csi_marker: u8,
     /// Code point accumulated so far while in [`ParserState::Utf8`].
     utf8_acc: u32,
     /// Number of UTF-8 continuation bytes still expected.
     utf8_remaining: usize,
+    /// Bytes the parser owes the host in reply to a query (DA1/DA2/DSR). The
+    /// driver drains these via [`AnsiParser::take_responses`] after each
+    /// `advance` and writes them back to the PTY master, where the child reads
+    /// them as terminal input.
+    responses: Vec<u8>,
 }
 
 impl Default for AnsiParser {
@@ -534,9 +543,18 @@ impl AnsiParser {
             current_bg: DEFAULT_BG,
             param_buffer: String::new(),
             csi_private: false,
+            csi_marker: 0,
             utf8_acc: 0,
             utf8_remaining: 0,
+            responses: Vec::new(),
         }
+    }
+
+    /// Drain the bytes the parser owes the host in reply to queries (DA1/DA2/
+    /// DSR). Returns an empty vector when there is nothing to send. The driver
+    /// calls this after `advance` and writes the result to the PTY master.
+    pub fn take_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.responses)
     }
 
     /// Feed a chunk of bytes, applying their effects to `g`. Parser state
@@ -567,6 +585,7 @@ impl AnsiParser {
                     b'[' => {
                         self.param_buffer.clear();
                         self.csi_private = false;
+                        self.csi_marker = 0;
                         self.state = ParserState::Csi;
                     }
                     b']' => self.state = ParserState::Osc,
@@ -593,8 +612,12 @@ impl AnsiParser {
                 ParserState::Csi => match b {
                     // Parameter bytes.
                     b'0'..=b'9' | b';' => self.param_buffer.push(b as char),
-                    // Private markers (`<`, `=`, `>`, `?`): flag and keep collecting.
-                    0x3c..=0x3f => self.csi_private = true,
+                    // Private markers (`<`, `=`, `>`, `?`): flag, remember which,
+                    // and keep collecting.
+                    0x3c..=0x3f => {
+                        self.csi_private = true;
+                        self.csi_marker = b;
+                    }
                     // Intermediate bytes (space..`/`): ignored but part of the sequence.
                     0x20..=0x2f => {}
                     // Final byte: dispatch and reset. Private sequences (with a
@@ -715,6 +738,13 @@ impl AnsiParser {
     /// (bracketed paste `2004`, cursor visibility `25`, …) are consumed and
     /// ignored so they never leak as text.
     fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
+        // DA2 (Secondary Device Attributes): `CSI > c`. Reply with a terminal
+        // type (0), a firmware "version", and a ROM cartridge field (0) — the
+        // values are conventional; programs care that an answer arrives.
+        if self.csi_marker == b'>' && cmd == b'c' {
+            self.responses.extend_from_slice(b"\x1b[>0;1;0c");
+            return;
+        }
         let params = self.parse_params();
         // 47 / 1047 / 1049 select the alternate screen buffer; the mode governs
         // cursor save/restore (only 1049). The leave path uses the mode stashed
@@ -808,6 +838,26 @@ impl AnsiParser {
                     _ => {}
                 }
             }
+            b'c' => {
+                // DA1 (Primary Device Attributes). Only the default/`0` form is
+                // a query; reply that we're a VT100 with Advanced Video Option,
+                // a level apps widely accept. A program that sent this would
+                // otherwise block waiting for the answer.
+                if p(0, 0) == 0 {
+                    self.responses.extend_from_slice(b"\x1b[?1;2c");
+                }
+            }
+            b'n' => match p(0, 0) {
+                // DSR — Device Status Report.
+                5 => self.responses.extend_from_slice(b"\x1b[0n"), // terminal OK
+                6 => {
+                    // CPR — report the cursor position, 1-based row;col.
+                    let (cx, cy) = g.cursor;
+                    self.responses
+                        .extend_from_slice(format!("\x1b[{};{}R", cy + 1, cx + 1).as_bytes());
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1530,5 +1580,56 @@ mod tests {
         let g = parse(b"\x1bPbody\x18X", 80, 24);
         assert_eq!(g.cells[0].ch, 'X');
         assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn da1_query_is_answered_and_not_printed() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        // Both the bare and explicit-0 forms are queries.
+        p.advance(&mut g, b"\x1b[c");
+        assert_eq!(p.take_responses(), b"\x1b[?1;2c");
+        p.advance(&mut g, b"\x1b[0c");
+        assert_eq!(p.take_responses(), b"\x1b[?1;2c");
+        // Nothing leaked onto the grid.
+        assert_eq!(g.cells[0].ch, ' ');
+        assert_eq!(g.cursor, (0, 0));
+    }
+
+    #[test]
+    fn da2_query_is_answered() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[>c");
+        assert_eq!(p.take_responses(), b"\x1b[>0;1;0c");
+        // The `>` marker must not be confused with a DEC private mode and must
+        // not disturb the alt screen.
+        assert!(g.cells[0].ch == ' ');
+    }
+
+    #[test]
+    fn dsr_status_report_is_answered() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[5n");
+        assert_eq!(p.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn dsr_cursor_position_report_uses_one_based_coords() {
+        let mut g = Grid::new(80, 24);
+        g.cursor = (4, 9); // col 4, row 9 (0-based)
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[6n");
+        assert_eq!(p.take_responses(), b"\x1b[10;5R"); // row 10, col 5 (1-based)
+    }
+
+    #[test]
+    fn no_query_means_no_response() {
+        // A normal print run owes the host nothing.
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"hello\x1b[31mworld");
+        assert!(p.take_responses().is_empty());
     }
 }

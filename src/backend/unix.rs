@@ -13,6 +13,16 @@ pub struct UnixBackend;
 
 impl crate::backend::Backend for UnixBackend {
     fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
+        // Honor the user's `$SHELL`, falling back to /bin/bash. Resolved in the
+        // parent (before fork) so the allocation never happens on the child's
+        // post-fork, pre-exec path, where only async-signal-safe work is sound.
+        // An interior NUL (impossible for a real path) falls back too.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .unwrap_or_else(|| std::ffi::CString::new("/bin/bash").unwrap());
+
         unsafe {
             // Seed the PTY with the initial window size so the child shell and
             // its children start out knowing the geometry.
@@ -62,7 +72,6 @@ impl crate::backend::Backend for UnixBackend {
                 libc::close(slave_fd);
                 libc::close(master_fd);
 
-                let shell = c"/bin/bash";
                 let args = [shell.as_ptr(), std::ptr::null()];
                 libc::execvp(shell.as_ptr(), args.as_ptr());
 
