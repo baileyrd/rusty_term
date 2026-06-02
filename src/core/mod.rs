@@ -103,6 +103,10 @@ pub struct Grid {
     /// Cursor position stashed by a save (`DECSC` / `CSI s`) and restored by
     /// `DECRC` / `CSI u`.
     pub saved_cursor: (usize, usize),
+    /// Top row of the scrolling region (inclusive, 0-based).
+    pub scroll_top: usize,
+    /// Bottom row of the scrolling region (inclusive, 0-based).
+    pub scroll_bottom: usize,
     /// When `Some`, the alternate screen is active and this holds the primary
     /// screen to restore on exit. Kept the same dimensions as the live buffer.
     primary: Option<SavedScreen>,
@@ -142,6 +146,8 @@ impl Grid {
             dirty: vec![false; rows],
             cursor: (0, 0),
             saved_cursor: (0, 0),
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             primary: None,
             epoch: 0,
         }
@@ -170,25 +176,54 @@ impl Grid {
         self.cursor.0 = 0;
     }
 
-    /// Advance the cursor one row, scrolling the viewport up if it would leave
-    /// the bottom of the grid.
+    /// Advance the cursor one row. At the bottom of the scrolling region this
+    /// scrolls the region up instead of moving the cursor past it.
     pub fn newline(&mut self) {
-        self.cursor.1 += 1;
-        if self.cursor.1 >= self.rows {
+        if self.cursor.1 == self.scroll_bottom {
             self.scroll_up();
-            self.cursor.1 = self.rows - 1;
+        } else if self.cursor.1 + 1 < self.rows {
+            self.cursor.1 += 1;
         }
     }
 
-    /// Scroll every row up by one, blanking the freed bottom row. Marks the
-    /// whole grid dirty.
+    /// Scroll the current scrolling region up by one row, blanking the freed
+    /// bottom row of the region. Only the region's rows are marked dirty.
     pub fn scroll_up(&mut self) {
-        self.cells.copy_within(self.cols.., 0);
-        let last_row_start = (self.rows - 1) * self.cols;
-        for c in &mut self.cells[last_row_start..] {
+        let (top, bottom) = (self.scroll_top, self.scroll_bottom);
+        if bottom <= top || bottom >= self.rows {
+            return;
+        }
+        let src = (top + 1) * self.cols;
+        let dst = top * self.cols;
+        let count = (bottom - top) * self.cols;
+        self.cells.copy_within(src..src + count, dst);
+        let last = bottom * self.cols;
+        for c in &mut self.cells[last..last + self.cols] {
             *c = Cell::blank();
         }
-        self.dirty.iter_mut().for_each(|d| *d = true);
+        for d in &mut self.dirty[top..=bottom] {
+            *d = true;
+        }
+    }
+
+    /// Set the scrolling region to rows `top..=bottom` (0-based, inclusive) and
+    /// home the cursor. An invalid range resets the region to the full screen.
+    fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows.saturating_sub(1);
+        }
+        self.cursor = (0, 0);
+    }
+
+    /// Reset the scrolling region to span the full screen.
+    fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     /// Write `ch` at the cursor with the given colors, wrapping to the next
@@ -258,6 +293,7 @@ impl Grid {
         self.dirty = vec![true; rows];
         self.cursor = clamp(self.cursor);
         self.saved_cursor = clamp(self.saved_cursor);
+        self.reset_scroll_region();
     }
 
     /// Switch to the alternate screen: stash the primary buffer and cursor,
@@ -271,6 +307,7 @@ impl Grid {
             cursor: self.cursor,
         });
         self.cursor = (0, 0);
+        self.reset_scroll_region();
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
@@ -283,6 +320,7 @@ impl Grid {
                 saved.cursor.0.min(self.cols.saturating_sub(1)),
                 saved.cursor.1.min(self.rows.saturating_sub(1)),
             );
+            self.reset_scroll_region();
             self.dirty.iter_mut().for_each(|d| *d = true);
         }
     }
@@ -630,6 +668,12 @@ impl AnsiParser {
             b'X' => g.erase_chars(count),  // ECH
             b's' => g.save_cursor(),       // SCP
             b'u' => g.restore_cursor(),    // RCP
+            b'r' => {
+                // DECSTBM — set top/bottom scrolling margins (1-based).
+                let top = params.first().copied().unwrap_or(1).saturating_sub(1);
+                let bottom = params.get(1).copied().unwrap_or(g.rows).saturating_sub(1);
+                g.set_scroll_region(top, bottom);
+            }
             b'J' => {
                 // ED — erase in display.
                 let (cx, cy) = g.cursor;
@@ -933,6 +977,41 @@ mod tests {
         g.resize(80, 24);
         assert_eq!(&row_text(&g, 0)[..5], "hello");
         assert_eq!(g.cells[79].ch, ' ');
+    }
+
+    #[test]
+    fn scroll_region_limits_scrolling_and_dirtying() {
+        // 1-row grid would be degenerate; use 5 rows, region = rows 2..=3 (1-based 3;4).
+        let mut g = Grid::new(4, 5);
+        let mut p = AnsiParser::new();
+        // Fill rows 2 and 3 with markers.
+        g.cursor = (0, 2);
+        p.advance(&mut g, b"AAAA");
+        g.cursor = (0, 3);
+        p.advance(&mut g, b"BBBB");
+        // Set region to rows 3..4 (1-based) = 2..=3 (0-based) and clear dirty.
+        p.advance(&mut g, b"\x1b[3;4r");
+        assert_eq!((g.scroll_top, g.scroll_bottom), (2, 3));
+        assert_eq!(g.cursor, (0, 0)); // DECSTBM homes the cursor
+        g.clear_dirty();
+
+        // Put cursor at region bottom and newline -> scroll only the region.
+        g.cursor = (0, 3);
+        p.advance(&mut g, b"\n");
+        assert_eq!(row_text(&g, 2).trim_end(), "BBBB"); // row 3 shifted up to row 2
+        assert_eq!(row_text(&g, 3).trim_end(), "");      // region bottom blanked
+        // Only region rows are dirty.
+        assert_eq!(g.dirty, vec![false, false, true, true, false]);
+    }
+
+    #[test]
+    fn scroll_region_resets_on_full_screen_request() {
+        let mut g = Grid::new(4, 5);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[2;4r");
+        assert_eq!((g.scroll_top, g.scroll_bottom), (1, 3));
+        p.advance(&mut g, b"\x1b[r"); // no params -> full screen
+        assert_eq!((g.scroll_top, g.scroll_bottom), (0, 4));
     }
 
     #[test]
