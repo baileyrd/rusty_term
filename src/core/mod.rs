@@ -32,6 +32,11 @@ pub const WIDE_TRAILER: u16 = 0b0000_0001;
 /// evicted from the front once this is exceeded.
 pub const SCROLLBACK_MAX: usize = 10_000;
 
+/// Maximum number of distinct hyperlink URIs interned from OSC 8. Past this,
+/// further links are dropped (rendered as plain text) rather than growing the
+/// table without bound.
+const LINK_MAX: usize = 4096;
+
 /// Display width of `ch` in terminal cells: `0` for zero-width (combining
 /// marks, joiners, variation selectors, …), `2` for wide East Asian / emoji
 /// code points, and `1` otherwise.
@@ -64,6 +69,8 @@ pub struct Cell {
     pub bg: u32,
     /// Attribute bitset (bold, italic, …). Reserved for future use.
     pub flags: u16,
+    /// Hyperlink id (OSC 8): `0` for none, else an index+1 into [`Grid::links`].
+    pub link: u16,
 }
 
 impl Cell {
@@ -75,6 +82,7 @@ impl Cell {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             flags: 0,
+            link: 0,
         }
     }
 }
@@ -120,6 +128,17 @@ pub struct Grid {
     /// `0` is the live view (bottom); the renderer composites history above the
     /// live grid when this is non-zero.
     pub view_offset: usize,
+    /// Bytes destined for the *host* terminal (not the grid): OSC 52 clipboard
+    /// requests forwarded verbatim. The renderer drains these via
+    /// [`Grid::take_host_out`] each frame and writes them to its stdout.
+    host_out: Vec<u8>,
+    /// Interned hyperlink URIs from OSC 8; a [`Cell::link`] of `n` refers to
+    /// `links[n - 1]` (`0` means no link). Append-only and bounded by
+    /// [`LINK_MAX`], so ids stay stable for cells held in scrollback.
+    links: Vec<String>,
+    /// The hyperlink id stamped onto cells written while an OSC 8 link is open
+    /// (`0` when none). Set by the parser via [`Grid::set_link`].
+    current_link: u16,
 }
 
 /// Which DEC private mode selected the alternate screen, which determines the
@@ -188,6 +207,9 @@ impl Grid {
             cwd: String::new(),
             scrollback: VecDeque::new(),
             view_offset: 0,
+            host_out: Vec::new(),
+            links: Vec::new(),
+            current_link: 0,
         }
     }
 
@@ -308,13 +330,14 @@ impl Grid {
             self.newline();
         }
         let (x, y) = self.cursor;
-        self.set_cell(x, y, Cell { ch, combining: ['\0'; MAX_COMBINING], fg, bg, flags: 0 });
+        let link = self.current_link;
+        self.set_cell(x, y, Cell { ch, combining: ['\0'; MAX_COMBINING], fg, bg, flags: 0, link });
         if w == 2 && x + 1 < self.cols {
             // Trailing half: a flagged placeholder the renderer skips.
             self.set_cell(
                 x + 1,
                 y,
-                Cell { ch: ' ', combining: ['\0'; MAX_COMBINING], fg, bg, flags: WIDE_TRAILER },
+                Cell { ch: ' ', combining: ['\0'; MAX_COMBINING], fg, bg, flags: WIDE_TRAILER, link },
             );
         }
         self.cursor.0 += w;
@@ -501,7 +524,7 @@ impl Grid {
                 (y, self.cells[start..start + self.cols].to_vec())
             })
             .collect();
-        DirtyFrame { cursor: self.cursor, rows }
+        DirtyFrame { cursor: self.cursor, rows, links: self.links.clone() }
     }
 
     /// Move the viewport up into history by up to `n` lines, clamped to the
@@ -562,7 +585,36 @@ impl Grid {
             };
             rows.push((y, cells));
         }
-        DirtyFrame { cursor: self.cursor, rows }
+        DirtyFrame { cursor: self.cursor, rows, links: self.links.clone() }
+    }
+
+    /// Drain bytes queued for the host terminal (forwarded OSC 52 clipboard
+    /// requests). Empty when there's nothing to send.
+    pub fn take_host_out(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.host_out)
+    }
+
+    /// Set the active hyperlink (OSC 8). `None` (or an empty URI) closes the
+    /// link; a URI is interned and its id stamped onto subsequently written
+    /// cells.
+    fn set_link(&mut self, uri: Option<&str>) {
+        self.current_link = match uri {
+            None | Some("") => 0,
+            Some(u) => self.intern_link(u),
+        };
+    }
+
+    /// Return the id for `uri`, interning it on first use. Ids are `index + 1`
+    /// so `0` can mean "no link". Returns `0` once the table is full.
+    fn intern_link(&mut self, uri: &str) -> u16 {
+        if let Some(i) = self.links.iter().position(|l| l == uri) {
+            return (i + 1) as u16;
+        }
+        if self.links.len() >= LINK_MAX {
+            return 0;
+        }
+        self.links.push(uri.to_string());
+        self.links.len() as u16
     }
 }
 
@@ -573,6 +625,9 @@ pub struct DirtyFrame {
     pub cursor: (usize, usize),
     /// Dirty rows as `(row_index, cells)` pairs.
     pub rows: Vec<(usize, Vec<Cell>)>,
+    /// Interned hyperlink URIs (OSC 8); a [`Cell::link`] of `n` indexes
+    /// `links[n - 1]`. Cloned so the renderer can resolve links without the lock.
+    pub links: Vec<String>,
 }
 
 /// States of the escape-sequence recognizer.
@@ -671,9 +726,9 @@ impl AnsiParser {
     }
 
     /// Act on the OSC string just collected in `osc_buffer`. The payload is
-    /// `<code> ; <text>`; we handle window title (0/2) and working-directory
-    /// (7) reports, recording them on the grid. Other OSC codes (4, 8, 52,
-    /// 133, …) are recognized as well-formed and ignored for now.
+    /// `<code> ; <text>`; we handle window title (0/2), working-directory (7),
+    /// hyperlinks (8), and clipboard (52). Other OSC codes (4, 133, …) are
+    /// recognized as well-formed and ignored for now.
     fn dispatch_osc(&mut self, g: &mut Grid) {
         let payload = String::from_utf8_lossy(&self.osc_buffer);
         let Some((code, text)) = payload.split_once(';') else {
@@ -684,6 +739,25 @@ impl AnsiParser {
             "0" | "2" => g.title = text.to_string(),
             // 7 reports the working directory (usually a file:// URI).
             "7" => g.cwd = text.to_string(),
+            // 8 sets/clears the active hyperlink: `8 ; params ; URI`. An empty
+            // URI (the `8 ; ;` close form) ends the link.
+            "8" => {
+                let uri = text.split_once(';').map(|(_, u)| u).unwrap_or("");
+                g.set_link(if uri.is_empty() { None } else { Some(uri) });
+            }
+            // 52 sets the clipboard: `52 ; <selection> ; <base64>`. We have no
+            // clipboard of our own yet, so forward set requests verbatim to the
+            // host terminal, which performs the write via its own OSC 52. Query
+            // (`?`) forms aren't forwarded — the reply path isn't wired.
+            "52" => {
+                let is_query = text.rsplit(';').next() == Some("?");
+                if !is_query {
+                    g.host_out.push(0x1b);
+                    g.host_out.push(b']');
+                    g.host_out.extend_from_slice(&self.osc_buffer);
+                    g.host_out.push(0x07);
+                }
+            }
             _ => {}
         }
     }
@@ -1919,5 +1993,52 @@ mod tests {
         p.advance(&mut g, b"\x1b[?1049h"); // enter alt screen
         assert!(!g.scroll_view_up(1)); // refused while on alt screen
         assert_eq!(g.view_offset, 0);
+    }
+
+    #[test]
+    fn osc_52_set_is_forwarded_to_host_and_not_printed() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]52;c;SGVsbG8=\x07X");
+        assert_eq!(g.take_host_out(), b"\x1b]52;c;SGVsbG8=\x07");
+        assert_eq!(g.cells[0].ch, 'X'); // payload didn't leak onto the screen
+        // Drained: a second take returns nothing.
+        assert!(g.take_host_out().is_empty());
+    }
+
+    #[test]
+    fn osc_52_query_is_not_forwarded() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]52;c;?\x07");
+        assert!(g.take_host_out().is_empty());
+    }
+
+    #[test]
+    fn osc_8_stamps_link_on_covered_cells() {
+        let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
+        assert_ne!(g.cells[0].link, 0);
+        assert_eq!(g.cells[0].link, g.cells[1].link); // A and B share the link
+        assert_eq!(g.links[(g.cells[0].link - 1) as usize], "http://example.com");
+        assert_eq!(g.cells[2].link, 0); // C is after the close
+    }
+
+    #[test]
+    fn osc_8_with_id_param_links_uri() {
+        // The params field (here `id=foo`) is skipped; the URI still links.
+        let g = parse(b"\x1b]8;id=foo;http://e.com\x1b\\Z", 80, 24);
+        assert_ne!(g.cells[0].link, 0);
+        assert_eq!(g.links[(g.cells[0].link - 1) as usize], "http://e.com");
+    }
+
+    #[test]
+    fn osc_8_interns_duplicate_uri_once() {
+        let g = parse(
+            b"\x1b]8;;http://e.com\x1b\\A\x1b]8;;\x1b\\ \x1b]8;;http://e.com\x1b\\B\x1b]8;;\x1b\\",
+            80,
+            24,
+        );
+        assert_eq!(g.cells[0].link, g.cells[2].link); // same interned id
+        assert_eq!(g.links.len(), 1); // URI stored once
     }
 }
