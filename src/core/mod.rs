@@ -128,6 +128,28 @@ pub struct Grid {
     pub epoch: u64,
 }
 
+/// Which DEC private mode selected the alternate screen, which determines the
+/// cursor save/restore behaviour on exit (per xterm: only `1049` does it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AltMode {
+    /// `?47` — bare buffer swap, no cursor save/restore.
+    Dec47,
+    /// `?1047` — buffer swap, no cursor save/restore.
+    Dec1047,
+    /// `?1049` — save cursor on entry (DECSC-style), restore on exit.
+    Dec1049,
+}
+
+/// Map a DEC private parameter to its alternate-screen mode, if any.
+fn alt_mode(param: usize) -> Option<AltMode> {
+    match param {
+        47 => Some(AltMode::Dec47),
+        1047 => Some(AltMode::Dec1047),
+        1049 => Some(AltMode::Dec1049),
+        _ => None,
+    }
+}
+
 /// A stashed screen buffer plus its cursor, used to swap the primary screen out
 /// while the alternate screen is active.
 struct SavedScreen {
@@ -136,6 +158,8 @@ struct SavedScreen {
     /// The DECSC/`CSI s` register at the time of the switch, kept separate from
     /// the alternate screen's so the two buffers don't share one save slot.
     saved_cursor: (usize, usize),
+    /// The mode that activated the alternate screen, governing exit behaviour.
+    mode: AltMode,
 }
 
 /// Reflow `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows` buffer,
@@ -351,9 +375,10 @@ impl Grid {
         self.reset_scroll_region();
     }
 
-    /// Switch to the alternate screen: stash the primary buffer and cursor,
-    /// then present a cleared screen. No-op if already on the alternate screen.
-    fn enter_alt_screen(&mut self) {
+    /// Switch to the alternate screen, stashing the primary buffer. Only
+    /// `?1049` saves the cursor and homes it; `?47`/`?1047` swap the buffer and
+    /// leave the cursor where it is. No-op if already on the alternate screen.
+    fn enter_alt_screen(&mut self, mode: AltMode) {
         if self.primary.is_some() {
             return;
         }
@@ -361,25 +386,32 @@ impl Grid {
             cells: std::mem::replace(&mut self.cells, vec![Cell::blank(); self.cols * self.rows]),
             cursor: self.cursor,
             saved_cursor: self.saved_cursor,
+            mode,
         });
-        self.cursor = (0, 0);
+        if mode == AltMode::Dec1049 {
+            self.cursor = (0, 0);
+        }
         self.reset_scroll_region();
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
-    /// Switch back to the primary screen, restoring its buffer and both cursor
-    /// registers. No-op if the alternate screen is not active.
+    /// Switch back to the primary screen, restoring its buffer. For `?1049` the
+    /// cursor (and DECSC register) saved on entry are restored; `?47`/`?1047`
+    /// leave the cursor as the alternate session left it. No-op if not on the
+    /// alternate screen.
     fn leave_alt_screen(&mut self) {
         if let Some(saved) = self.primary.take() {
             self.cells = saved.cells;
-            self.cursor = (
-                saved.cursor.0.min(self.cols.saturating_sub(1)),
-                saved.cursor.1.min(self.rows.saturating_sub(1)),
-            );
-            self.saved_cursor = (
-                saved.saved_cursor.0.min(self.cols.saturating_sub(1)),
-                saved.saved_cursor.1.min(self.rows.saturating_sub(1)),
-            );
+            if saved.mode == AltMode::Dec1049 {
+                self.cursor = (
+                    saved.cursor.0.min(self.cols.saturating_sub(1)),
+                    saved.cursor.1.min(self.rows.saturating_sub(1)),
+                );
+                self.saved_cursor = (
+                    saved.saved_cursor.0.min(self.cols.saturating_sub(1)),
+                    saved.saved_cursor.1.min(self.rows.saturating_sub(1)),
+                );
+            }
             self.reset_scroll_region();
             self.dirty.iter_mut().for_each(|d| *d = true);
         }
@@ -688,12 +720,13 @@ impl AnsiParser {
     /// ignored so they never leak as text.
     fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
         let params = self.parse_params();
-        // 47 / 1047 / 1049 all select the alternate screen buffer; 1049 also
-        // saves/restores the cursor, which enter/leave handle implicitly.
-        let is_alt = params.iter().flatten().any(|&v| matches!(v, 47 | 1047 | 1049));
-        match cmd {
-            b'h' if is_alt => g.enter_alt_screen(),
-            b'l' if is_alt => g.leave_alt_screen(),
+        // 47 / 1047 / 1049 select the alternate screen buffer; the mode governs
+        // cursor save/restore (only 1049). The leave path uses the mode stashed
+        // on entry, so the reset parameter's exact number doesn't matter.
+        let mode = params.iter().flatten().copied().find_map(alt_mode);
+        match (cmd, mode) {
+            (b'h', Some(mode)) => g.enter_alt_screen(mode),
+            (b'l', Some(_)) => g.leave_alt_screen(),
             _ => {}
         }
     }
@@ -1022,6 +1055,24 @@ mod tests {
         p.advance(&mut g, b"\x1b[?1049l");
         assert_eq!(&row_text(&g, 0)[..12], "primary text");
         assert_eq!(g.cursor, (12, 0));
+    }
+
+    #[test]
+    fn alt_screen_47_does_not_save_or_restore_cursor() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"primary");
+        g.cursor = (5, 5);
+
+        // ?47 swaps the buffer but must not home or save the cursor.
+        p.advance(&mut g, b"\x1b[?47h");
+        assert_eq!(g.cursor, (5, 5)); // not homed (unlike 1049)
+        g.cursor = (10, 3);
+
+        // ?47l swaps back without restoring the cursor.
+        p.advance(&mut g, b"\x1b[?47l");
+        assert_eq!(g.cursor, (10, 3)); // not restored
+        assert_eq!(&row_text(&g, 0)[..7], "primary"); // primary buffer back
     }
 
     #[test]
