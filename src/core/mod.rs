@@ -8,6 +8,8 @@
 //! The parser intentionally implements a pragmatic subset of the VT100/ECMA-48
 //! escape repertoire (SGR colors, cursor positioning, erase line/display).
 
+use std::collections::VecDeque;
+
 use unicode_width::UnicodeWidthChar;
 
 /// Default foreground color (white) used on reset and for blank cells.
@@ -25,6 +27,10 @@ const PALETTE_16: [u32; 16] = [
 /// [`Cell::flags`] bit marking the trailing (second) cell of a double-width
 /// character. The renderer skips these so the wide glyph occupies two columns.
 pub const WIDE_TRAILER: u16 = 0b0000_0001;
+
+/// Maximum number of lines retained in the scrollback history. Older lines are
+/// evicted from the front once this is exceeded.
+pub const SCROLLBACK_MAX: usize = 10_000;
 
 /// Display width of `ch` in terminal cells: `0` for zero-width (combining
 /// marks, joiners, variation selectors, …), `2` for wide East Asian / emoji
@@ -106,6 +112,14 @@ pub struct Grid {
     /// `file://host/path` URI). Captured for future use (e.g. "open new tab in
     /// the same directory"); empty until reported.
     pub cwd: String,
+    /// Lines that have scrolled off the top of the primary screen, oldest at the
+    /// front. Bounded by [`SCROLLBACK_MAX`]. Each line is stored at the width it
+    /// had when evicted and padded/truncated to the live width when viewed.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// How many lines the viewport is scrolled up into [`Grid::scrollback`].
+    /// `0` is the live view (bottom); the renderer composites history above the
+    /// live grid when this is non-zero.
+    pub view_offset: usize,
 }
 
 /// Which DEC private mode selected the alternate screen, which determines the
@@ -172,6 +186,8 @@ impl Grid {
             epoch: 0,
             title: String::new(),
             cwd: String::new(),
+            scrollback: VecDeque::new(),
+            view_offset: 0,
         }
     }
 
@@ -228,6 +244,21 @@ impl Grid {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         if bottom <= top || bottom >= self.rows {
             return;
+        }
+        // Capture the line leaving the top into scrollback, but only for a
+        // full-screen scroll on the primary buffer: partial-region scrolls
+        // (TUI apps using DECSTBM) and the alternate screen don't form history.
+        if top == 0 && bottom == self.rows - 1 && self.primary.is_none() {
+            self.scrollback.push_back(self.cells[0..self.cols].to_vec());
+            if self.scrollback.len() > SCROLLBACK_MAX {
+                self.scrollback.pop_front();
+            }
+            // If the user is browsing history, advance the offset in step with
+            // the incoming line so the viewed region stays put under new output.
+            if self.view_offset > 0 {
+                self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+                self.dirty.iter_mut().for_each(|d| *d = true);
+            }
         }
         let src = (top + 1) * self.cols;
         let dst = top * self.cols;
@@ -373,6 +404,8 @@ impl Grid {
         if mode == AltMode::Dec1049 {
             self.cursor = (0, 0);
         }
+        // History isn't browsable under a full-screen app; snap to the live view.
+        self.view_offset = 0;
         self.reset_scroll_region();
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
@@ -468,6 +501,67 @@ impl Grid {
                 (y, self.cells[start..start + self.cols].to_vec())
             })
             .collect();
+        DirtyFrame { cursor: self.cursor, rows }
+    }
+
+    /// Move the viewport up into history by up to `n` lines, clamped to the
+    /// available scrollback. No-op on the alternate screen (no history there).
+    /// Returns `true` if the view actually moved.
+    pub fn scroll_view_up(&mut self, n: usize) -> bool {
+        if self.primary.is_some() {
+            return false;
+        }
+        let target = (self.view_offset + n).min(self.scrollback.len());
+        self.set_view_offset(target)
+    }
+
+    /// Move the viewport back down toward the live bottom by up to `n` lines.
+    /// Returns `true` if the view actually moved.
+    pub fn scroll_view_down(&mut self, n: usize) -> bool {
+        let target = self.view_offset.saturating_sub(n);
+        self.set_view_offset(target)
+    }
+
+    /// Snap the viewport back to the live bottom. Returns `true` if it moved.
+    pub fn reset_view(&mut self) -> bool {
+        self.set_view_offset(0)
+    }
+
+    /// Set the scrollback view offset, marking every row dirty so the renderer
+    /// repaints the whole viewport. Returns `true` if the offset changed.
+    fn set_view_offset(&mut self, offset: usize) -> bool {
+        if offset == self.view_offset {
+            return false;
+        }
+        self.view_offset = offset;
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        true
+    }
+
+    /// Snapshot the entire visible viewport, compositing scrollback history
+    /// above the live grid according to [`Grid::view_offset`]. Every row is
+    /// included. History lines are padded/truncated to the current width.
+    /// Used by the renderer whenever the view is scrolled up.
+    pub fn snapshot_viewport(&self) -> DirtyFrame {
+        let history = self.scrollback.len();
+        let off = self.view_offset.min(history);
+        let mut rows = Vec::with_capacity(self.rows);
+        for y in 0..self.rows {
+            let cells = if y < off {
+                // Top `off` viewport rows show the tail of history.
+                let line = &self.scrollback[history - off + y];
+                let mut row = vec![Cell::blank(); self.cols];
+                let n = line.len().min(self.cols);
+                row[..n].copy_from_slice(&line[..n]);
+                row
+            } else {
+                // The rest shows the live grid, shifted down by `off`.
+                let gy = y - off;
+                let start = gy * self.cols;
+                self.cells[start..start + self.cols].to_vec()
+            };
+            rows.push((y, cells));
+        }
         DirtyFrame { cursor: self.cursor, rows }
     }
 }
@@ -1732,5 +1826,98 @@ mod tests {
         let g = parse(b"\x1b]52;c;SGVsbG8=\x07W", 80, 24);
         assert_eq!(g.title, "");
         assert_eq!(g.cells[0].ch, 'W');
+    }
+
+    #[test]
+    fn full_screen_scroll_captures_into_scrollback() {
+        // 4x2 grid: write two rows, then a third newline scrolls "row0" off.
+        let mut g = Grid::new(4, 2);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"AAAA\r\nBBBB");
+        assert_eq!(g.scrollback.len(), 0);
+        p.advance(&mut g, b"\r\nCCCC"); // scrolls AAAA off the top
+        assert_eq!(g.scrollback.len(), 1);
+        let line: String = g.scrollback[0].iter().map(|c| c.ch).collect();
+        assert_eq!(line, "AAAA");
+        // Live grid now shows BBBB / CCCC.
+        assert_eq!(row_text(&g, 0), "BBBB");
+        assert_eq!(row_text(&g, 1), "CCCC");
+    }
+
+    #[test]
+    fn partial_region_scroll_is_not_captured() {
+        // A DECSTBM sub-region scroll (TUI behavior) must not feed scrollback.
+        let mut g = Grid::new(4, 5);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[1;3r"); // region rows 1..=3 (0-based 0..=2)
+        g.cursor = (0, 2);
+        p.advance(&mut g, b"\n"); // scrolls within the region only
+        assert_eq!(g.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn alt_screen_scroll_is_not_captured() {
+        let mut g = Grid::new(4, 2);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[?1049h"); // enter alt screen
+        p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC"); // would scroll on alt
+        assert_eq!(g.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn scrollback_is_capped() {
+        let mut g = Grid::new(2, 2);
+        let mut p = AnsiParser::new();
+        // Each newline at the bottom scrolls one line into history.
+        for _ in 0..(SCROLLBACK_MAX + 50) {
+            p.advance(&mut g, b"\r\n");
+        }
+        assert_eq!(g.scrollback.len(), SCROLLBACK_MAX);
+    }
+
+    #[test]
+    fn viewport_composites_history_above_live_grid() {
+        let mut g = Grid::new(4, 2);
+        let mut p = AnsiParser::new();
+        // History: row "AAAA"; live: "BBBB" / "CCCC".
+        p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC");
+        assert_eq!(g.scrollback.len(), 1);
+
+        // Scroll up one line: top row shows history "AAAA", then live row 0.
+        assert!(g.scroll_view_up(1));
+        assert_eq!(g.view_offset, 1);
+        let vp = g.snapshot_viewport();
+        let text: Vec<String> = vp
+            .rows
+            .iter()
+            .map(|(_, cells)| cells.iter().map(|c| c.ch).collect())
+            .collect();
+        assert_eq!(text, vec!["AAAA".to_string(), "BBBB".to_string()]);
+    }
+
+    #[test]
+    fn scroll_view_clamps_and_resets() {
+        let mut g = Grid::new(4, 2);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC"); // 1 line of history
+        // Asking for more than exists clamps to the available history.
+        assert!(g.scroll_view_up(100));
+        assert_eq!(g.view_offset, 1);
+        // No further movement -> returns false.
+        assert!(!g.scroll_view_up(100));
+        // Reset snaps back to the live bottom.
+        assert!(g.reset_view());
+        assert_eq!(g.view_offset, 0);
+        assert!(!g.reset_view());
+    }
+
+    #[test]
+    fn no_history_browsing_on_alt_screen() {
+        let mut g = Grid::new(4, 2);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC"); // build some history
+        p.advance(&mut g, b"\x1b[?1049h"); // enter alt screen
+        assert!(!g.scroll_view_up(1)); // refused while on alt screen
+        assert_eq!(g.view_offset, 0);
     }
 }

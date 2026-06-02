@@ -50,7 +50,7 @@ fn sgr_for(fg: u32, bg: u32) -> String {
 /// where the shell's cursor is. SGR sequences are emitted only when the color
 /// changes within a row, so a run of same-colored cells costs one introducer
 /// instead of one per cell.
-fn draw(frame: &DirtyFrame) {
+fn draw(frame: &DirtyFrame, position_cursor: bool) {
     let out = std::io::stdout();
     let mut out = out.lock();
 
@@ -82,9 +82,12 @@ fn draw(frame: &DirtyFrame) {
         let _ = write!(out, "{}", line_buf);
     }
 
-    // Place the visible cursor where the shell expects it (1-indexed).
-    let (cx, cy) = frame.cursor;
-    let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+    // Place the visible cursor where the shell expects it (1-indexed). Skipped
+    // while browsing scrollback, where the live cursor position is meaningless.
+    if position_cursor {
+        let (cx, cy) = frame.cursor;
+        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
+    }
     let _ = out.flush();
 }
 
@@ -163,11 +166,19 @@ fn main() -> Result<(), std::io::Error> {
 
     // --- Thread 2: Input pump (stdin -> PTY) ---
     let running_input = Arc::clone(&running);
+    let grid_input = Arc::clone(&grid);
 
     thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut stdin_handle = stdin.lock();
         let mut input_buf = [0u8; 1024];
+
+        // Shift+PageUp / Shift+PageDown browse scrollback instead of reaching
+        // the child; everything else is forwarded and snaps the view to the
+        // live bottom. (A scroll key split across reads is forwarded verbatim —
+        // harmless, just won't scroll; keypresses arrive atomically in raw mode.)
+        const SCROLL_UP_KEY: &[u8] = b"\x1b[5;2~";
+        const SCROLL_DN_KEY: &[u8] = b"\x1b[6;2~";
 
         loop {
             if !running_input.load(Ordering::Relaxed) {
@@ -176,8 +187,31 @@ fn main() -> Result<(), std::io::Error> {
             match stdin_handle.read(&mut input_buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write(&input_buf[..n]).is_err() {
-                        break;
+                    let buf = &input_buf[..n];
+                    let mut forward: Vec<u8> = Vec::with_capacity(n);
+                    let mut i = 0;
+                    while i < buf.len() {
+                        if buf[i..].starts_with(SCROLL_UP_KEY) {
+                            let mut g = grid_input.lock().unwrap();
+                            let page = g.rows.saturating_sub(1).max(1);
+                            g.scroll_view_up(page);
+                            i += SCROLL_UP_KEY.len();
+                        } else if buf[i..].starts_with(SCROLL_DN_KEY) {
+                            let mut g = grid_input.lock().unwrap();
+                            let page = g.rows.saturating_sub(1).max(1);
+                            g.scroll_view_down(page);
+                            i += SCROLL_DN_KEY.len();
+                        } else {
+                            forward.push(buf[i]);
+                            i += 1;
+                        }
+                    }
+                    if !forward.is_empty() {
+                        // Real input returns the view to the live bottom.
+                        grid_input.lock().unwrap().reset_view();
+                        if writer.write(&forward).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -196,6 +230,9 @@ fn main() -> Result<(), std::io::Error> {
     // Last window title forwarded to the host, so OSC 0/2 updates are passed
     // through to the host terminal's title bar only when they actually change.
     let mut last_title: Option<String> = None;
+
+    // Whether we've hidden the host cursor while the user browses scrollback.
+    let mut cursor_hidden = false;
 
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(16));
@@ -224,11 +261,19 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        let (frame, title) = {
+        let (frame, title, viewing, dirty_any) = {
             let mut g = grid.lock().unwrap();
-            let frame = g.snapshot_dirty();
+            let viewing = g.view_offset > 0;
+            let dirty_any = g.dirty.iter().any(|&d| d);
+            // While scrolled back, composite history over the live grid; that
+            // snapshot covers every row, so it's only worth painting on a change.
+            let frame = if viewing {
+                g.snapshot_viewport()
+            } else {
+                g.snapshot_dirty()
+            };
             g.clear_dirty();
-            (frame, g.title.clone())
+            (frame, g.title.clone(), viewing, dirty_any)
         };
 
         // Forward a changed, non-empty window title to the host terminal so its
@@ -240,11 +285,34 @@ fn main() -> Result<(), std::io::Error> {
             last_title = Some(title);
         }
 
-        // Draw when cells changed, or when only the cursor moved — `draw` emits
-        // the final cursor-positioning escape, so a pure motion still needs it.
-        if !frame.rows.is_empty() || last_cursor != Some(frame.cursor) {
-            last_cursor = Some(frame.cursor);
-            draw(&frame);
+        if viewing {
+            // Repaint the whole viewport only when something changed (a scroll,
+            // or new output arriving underneath). Hide the cursor while browsing.
+            if dirty_any {
+                draw(&frame, false);
+            }
+            if !cursor_hidden {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x1b[?25l");
+                let _ = out.flush();
+                cursor_hidden = true;
+            }
+            // Force a cursor reposition on the first live frame after we return.
+            last_cursor = None;
+        } else {
+            if cursor_hidden {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x1b[?25h");
+                let _ = out.flush();
+                cursor_hidden = false;
+            }
+            // Draw when cells changed, or when only the cursor moved — `draw`
+            // emits the final cursor-positioning escape, so a pure motion still
+            // needs it.
+            if !frame.rows.is_empty() || last_cursor != Some(frame.cursor) {
+                last_cursor = Some(frame.cursor);
+                draw(&frame, true);
+            }
         }
     }
 
