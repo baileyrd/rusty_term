@@ -60,11 +60,27 @@ fn draw(frame: &DirtyFrame, position_cursor: bool) {
 
         let mut line_buf = String::with_capacity(cells.len() + 32);
         let mut last: Option<(u32, u32)> = None;
+        // Active hyperlink id while painting this row; reset per row so a link
+        // is reopened at the start of each line it covers and closed at row end.
+        let mut cur_link: u16 = 0;
         for cell in cells {
             // The trailing half of a wide glyph is not emitted; the glyph
             // itself already advances the host cursor by two columns.
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
+            }
+            // Open/close an OSC 8 hyperlink when the cell's link changes.
+            if cell.link != cur_link {
+                match frame.links.get(cell.link.wrapping_sub(1) as usize) {
+                    Some(uri) if cell.link != 0 => {
+                        line_buf.push_str("\x1b]8;;");
+                        line_buf.push_str(uri);
+                        line_buf.push_str("\x1b\\");
+                    }
+                    // link == 0, or an unknown id: close any open link.
+                    _ => line_buf.push_str("\x1b]8;;\x1b\\"),
+                }
+                cur_link = cell.link;
             }
             if last != Some((cell.fg, cell.bg)) {
                 line_buf.push_str(&sgr_for(cell.fg, cell.bg));
@@ -77,6 +93,10 @@ fn draw(frame: &DirtyFrame, position_cursor: bool) {
                     line_buf.push(m);
                 }
             }
+        }
+        // Close a still-open hyperlink before ending the row.
+        if cur_link != 0 {
+            line_buf.push_str("\x1b]8;;\x1b\\");
         }
         line_buf.push_str("\x1b[0m");
         let _ = write!(out, "{}", line_buf);
@@ -261,7 +281,7 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        let (frame, title, viewing, dirty_any) = {
+        let (frame, title, viewing, dirty_any, host_out) = {
             let mut g = grid.lock().unwrap();
             let viewing = g.view_offset > 0;
             let dirty_any = g.dirty.iter().any(|&d| d);
@@ -273,8 +293,15 @@ fn main() -> Result<(), std::io::Error> {
                 g.snapshot_dirty()
             };
             g.clear_dirty();
-            (frame, g.title.clone(), viewing, dirty_any)
+            (frame, g.title.clone(), viewing, dirty_any, g.take_host_out())
         };
+
+        // Forward any clipboard (OSC 52) bytes to the host terminal verbatim.
+        if !host_out.is_empty() {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&host_out);
+            let _ = out.flush();
+        }
 
         // Forward a changed, non-empty window title to the host terminal so its
         // title bar tracks what the child set via OSC 0/2.
