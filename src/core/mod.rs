@@ -53,6 +53,9 @@ pub struct Grid {
     pub dirty: Vec<bool>,
     /// Cursor position as `(col, row)`, both zero-based.
     pub cursor: (usize, usize),
+    /// Cursor position stashed by a save (`DECSC` / `CSI s`) and restored by
+    /// `DECRC` / `CSI u`.
+    pub saved_cursor: (usize, usize),
     /// Monotonic counter bumped on every parsed batch; lets the renderer
     /// reason about frame freshness.
     pub epoch: u64,
@@ -67,6 +70,7 @@ impl Grid {
             cells: vec![Cell::blank(); cols * rows],
             dirty: vec![false; rows],
             cursor: (0, 0),
+            saved_cursor: (0, 0),
             epoch: 0,
         }
     }
@@ -148,6 +152,60 @@ impl Grid {
         self.cells.fill(Cell::blank());
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
+    }
+
+    /// Save the current cursor position (`DECSC` / `CSI s`).
+    fn save_cursor(&mut self) {
+        self.saved_cursor = self.cursor;
+    }
+
+    /// Restore the saved cursor position (`DECRC` / `CSI u`), clamped.
+    fn restore_cursor(&mut self) {
+        let (x, y) = self.saved_cursor;
+        self.set_cursor(x, y);
+    }
+
+    /// Delete `n` characters at the cursor, shifting the remainder of the row
+    /// left and blanking the freed cells at the right (`DCH`).
+    fn delete_chars(&mut self, n: usize) {
+        let (x, y) = self.cursor;
+        if y >= self.rows || x >= self.cols || n == 0 {
+            return;
+        }
+        let base = y * self.cols;
+        let row_end = base + self.cols;
+        let from = base + x;
+        let n = n.min(self.cols - x);
+        self.cells.copy_within(from + n..row_end, from);
+        for c in &mut self.cells[row_end - n..row_end] {
+            *c = Cell::blank();
+        }
+        self.dirty[y] = true;
+    }
+
+    /// Insert `n` blank characters at the cursor, shifting the rest of the row
+    /// right and dropping cells that fall off the right margin (`ICH`).
+    fn insert_chars(&mut self, n: usize) {
+        let (x, y) = self.cursor;
+        if y >= self.rows || x >= self.cols || n == 0 {
+            return;
+        }
+        let base = y * self.cols;
+        let row_end = base + self.cols;
+        let from = base + x;
+        let n = n.min(self.cols - x);
+        self.cells.copy_within(from..row_end - n, from + n);
+        for c in &mut self.cells[from..from + n] {
+            *c = Cell::blank();
+        }
+        self.dirty[y] = true;
+    }
+
+    /// Blank `n` characters starting at the cursor without shifting (`ECH`).
+    fn erase_chars(&mut self, n: usize) {
+        let (x, y) = self.cursor;
+        let n = n.min(self.cols.saturating_sub(x));
+        self.clear_row_range(y, x, x + n);
     }
 
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.
@@ -236,6 +294,7 @@ impl AnsiParser {
             match self.state {
                 ParserState::Ground => match b {
                     0x1b => self.state = ParserState::Esc,
+                    0x08 => g.cursor.0 = g.cursor.0.saturating_sub(1), // backspace
                     b'\n' => {
                         g.carriage_return();
                         g.newline();
@@ -260,6 +319,15 @@ impl AnsiParser {
                         self.state = ParserState::Csi;
                     }
                     b']' => self.state = ParserState::Osc,
+                    // DECSC / DECRC: save and restore the cursor.
+                    b'7' => {
+                        g.save_cursor();
+                        self.state = ParserState::Ground;
+                    }
+                    b'8' => {
+                        g.restore_cursor();
+                        self.state = ParserState::Ground;
+                    }
                     // Charset designation (`ESC ( B`, etc.): one more byte follows.
                     b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
                     // Any other ESC X sequence is a single byte we don't model;
@@ -311,6 +379,10 @@ impl AnsiParser {
             .filter_map(|s| s.parse().ok())
             .collect();
 
+        // Most cursor-motion commands take a single optional count that
+        // defaults to (and treats 0 as) 1.
+        let count = params.first().copied().unwrap_or(1).max(1);
+
         match cmd {
             b'm' => self.apply_sgr(&params),
             b'H' | b'f' => {
@@ -319,6 +391,25 @@ impl AnsiParser {
                 let x = params.get(1).copied().unwrap_or(1);
                 g.set_cursor(x.saturating_sub(1), y.saturating_sub(1));
             }
+            b'A' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_sub(count)), // CUU
+            b'B' => g.set_cursor(g.cursor.0, g.cursor.1 + count),               // CUD
+            b'C' => g.set_cursor(g.cursor.0 + count, g.cursor.1),               // CUF
+            b'D' => g.set_cursor(g.cursor.0.saturating_sub(count), g.cursor.1), // CUB
+            b'G' => {
+                // CHA — cursor to absolute column (1-based).
+                let col = params.first().copied().unwrap_or(1);
+                g.set_cursor(col.saturating_sub(1), g.cursor.1);
+            }
+            b'd' => {
+                // VPA — cursor to absolute row (1-based).
+                let row = params.first().copied().unwrap_or(1);
+                g.set_cursor(g.cursor.0, row.saturating_sub(1));
+            }
+            b'@' => g.insert_chars(count), // ICH
+            b'P' => g.delete_chars(count), // DCH
+            b'X' => g.erase_chars(count),  // ECH
+            b's' => g.save_cursor(),       // SCP
+            b'u' => g.restore_cursor(),    // RCP
             b'J' => {
                 // ED — erase in display.
                 let (cx, cy) = g.cursor;
@@ -587,6 +678,86 @@ mod tests {
         assert_eq!(frame.cursor, (1, 0));
         g.clear_dirty();
         assert!(g.snapshot_dirty().rows.is_empty());
+    }
+
+    #[test]
+    fn cursor_motion_relative() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (10, 10);
+        p.advance(&mut g, b"\x1b[3C"); // forward 3
+        assert_eq!(g.cursor, (13, 10));
+        p.advance(&mut g, b"\x1b[5D"); // back 5
+        assert_eq!(g.cursor, (8, 10));
+        p.advance(&mut g, b"\x1b[2A"); // up 2
+        assert_eq!(g.cursor, (8, 8));
+        p.advance(&mut g, b"\x1b[B"); // down 1 (default)
+        assert_eq!(g.cursor, (8, 9));
+    }
+
+    #[test]
+    fn cursor_absolute_column_and_row() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (10, 10);
+        p.advance(&mut g, b"\x1b[1G"); // column 1 (0-based 0)
+        assert_eq!(g.cursor, (0, 10));
+        p.advance(&mut g, b"\x1b[5d"); // row 5 (0-based 4)
+        assert_eq!(g.cursor, (0, 4));
+    }
+
+    #[test]
+    fn backspace_moves_left() {
+        let mut g = parse(b"abc", 80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x08"); // cursor 3 -> 2
+        assert_eq!(g.cursor, (2, 0));
+        p.advance(&mut g, b"X"); // overwrites 'c'
+        assert_eq!(row_text(&g, 0).trim_end(), "abX");
+    }
+
+    #[test]
+    fn delete_chars_shifts_left() {
+        let mut g = parse(b"abcdef", 80, 24);
+        g.cursor = (1, 0);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[2P"); // delete "bc"
+        assert_eq!(&row_text(&g, 0)[..6], "adef  ");
+    }
+
+    #[test]
+    fn insert_chars_shifts_right() {
+        let mut g = parse(b"abcdef", 80, 24);
+        g.cursor = (1, 0);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[2@"); // insert 2 blanks at col 1
+        assert_eq!(&row_text(&g, 0)[..6], "a  bcd");
+    }
+
+    #[test]
+    fn erase_chars_blanks_without_shift() {
+        let mut g = parse(b"abcdef", 80, 24);
+        g.cursor = (2, 0);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[2X"); // blank "cd"
+        assert_eq!(&row_text(&g, 0)[..6], "ab  ef");
+    }
+
+    #[test]
+    fn save_and_restore_cursor() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (5, 5);
+        p.advance(&mut g, b"\x1b[s"); // save
+        g.cursor = (20, 20);
+        p.advance(&mut g, b"\x1b[u"); // restore
+        assert_eq!(g.cursor, (5, 5));
+        // DECSC/DECRC (ESC 7 / ESC 8) variant.
+        g.cursor = (1, 2);
+        p.advance(&mut g, b"\x1b7");
+        g.cursor = (9, 9);
+        p.advance(&mut g, b"\x1b8");
+        assert_eq!(g.cursor, (1, 2));
     }
 
     #[test]
