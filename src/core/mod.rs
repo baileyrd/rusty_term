@@ -8,6 +8,8 @@
 //! The parser intentionally implements a pragmatic subset of the VT100/ECMA-48
 //! escape repertoire (SGR colors, cursor positioning, erase line/display).
 
+use unicode_width::UnicodeWidthChar;
+
 /// Default foreground color (white) used on reset and for blank cells.
 pub const DEFAULT_FG: u32 = 0xFFFFFF;
 /// Default background color (black) used on reset and for blank cells.
@@ -24,47 +26,18 @@ const PALETTE_16: [u32; 16] = [
 /// character. The renderer skips these so the wide glyph occupies two columns.
 pub const WIDE_TRAILER: u16 = 0b0000_0001;
 
-/// Display width of `ch` in terminal cells: `0` for zero-width (combining marks
-/// and explicit zero-width characters), `2` for wide East Asian / emoji code
-/// points, and `1` otherwise.
+/// Display width of `ch` in terminal cells: `0` for zero-width (combining
+/// marks, joiners, variation selectors, …), `2` for wide East Asian / emoji
+/// code points, and `1` otherwise.
 ///
-/// This is a pragmatic, dependency-free approximation of Unicode East Asian
-/// Width — it covers the common CJK and emoji blocks rather than the full
-/// property table.
+/// Backed by the [`unicode-width`] crate, which implements the full Unicode
+/// East Asian Width (UAX #11) and emoji-presentation property tables. Control
+/// characters (for which the crate reports no width) collapse to `0`; the
+/// parser handles C0/C1 controls before they ever reach this function.
+///
+/// [`unicode-width`]: https://docs.rs/unicode-width
 pub fn char_width(ch: char) -> usize {
-    let c = ch as u32;
-    if c == 0 {
-        return 0;
-    }
-    // Zero-width: combining marks and explicit zero-width characters.
-    if matches!(c,
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF |
-        0x20D0..=0x20FF | 0xFE20..=0xFE2F)
-        || c == 0x200B
-        || c == 0xFEFF
-    {
-        return 0;
-    }
-    // Wide: East Asian Wide/Fullwidth plus emoji and pictographs.
-    if matches!(c,
-        0x1100..=0x115F |   // Hangul Jamo
-        0x2E80..=0x303E |   // CJK radicals, Kangxi, CJK symbols & punctuation
-        0x3041..=0x33FF |   // Hiragana .. CJK compatibility
-        0x3400..=0x4DBF |   // CJK Unified Ext A
-        0x4E00..=0x9FFF |   // CJK Unified Ideographs
-        0xA000..=0xA4CF |   // Yi
-        0xAC00..=0xD7A3 |   // Hangul syllables
-        0xF900..=0xFAFF |   // CJK compatibility ideographs
-        0xFE10..=0xFE19 |   // vertical forms
-        0xFE30..=0xFE6F |   // CJK compatibility / small forms
-        0xFF00..=0xFF60 |   // fullwidth forms
-        0xFFE0..=0xFFE6 |   // fullwidth signs
-        0x1F000..=0x1FAFF | // emoji, pictographs, symbols
-        0x20000..=0x3FFFD)  // CJK Unified Ext B and beyond
-    {
-        return 2;
-    }
-    1
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 /// Maximum number of trailing combining marks stored per cell.
@@ -1343,6 +1316,27 @@ mod tests {
         assert_eq!(char_width('世'), 2); // CJK
         assert_eq!(char_width('😀'), 2); // emoji
         assert_eq!(char_width('\u{0301}'), 0); // combining acute accent
+    }
+
+    #[test]
+    fn char_width_covers_cases_the_old_table_missed() {
+        // Zero-width characters the hand-rolled table didn't list. Getting any
+        // of these wrong shifts the rest of the line (cursor desync).
+        assert_eq!(char_width('\u{200D}'), 0); // ZWJ (emoji sequence glue)
+        assert_eq!(char_width('\u{200C}'), 0); // ZWNJ
+        assert_eq!(char_width('\u{FE0F}'), 0); // VS16 (emoji presentation selector)
+        assert_eq!(char_width('\u{064B}'), 0); // Arabic fathatan
+        assert_eq!(char_width('\u{094D}'), 0); // Devanagari virama
+        assert_eq!(char_width('\u{1160}'), 0); // Hangul conjoining jungseong filler
+
+        // Default-emoji-presentation symbols below the old 0x2E80 wide cutoff;
+        // these render double-width and were previously reported as 1.
+        assert_eq!(char_width('\u{231A}'), 2); // ⌚ WATCH
+        assert_eq!(char_width('\u{26A1}'), 2); // ⚡ HIGH VOLTAGE
+        assert_eq!(char_width('\u{2705}'), 2); // ✅ WHITE HEAVY CHECK MARK
+
+        // Text-presentation-by-default symbol stays width 1 (no VS16 follows).
+        assert_eq!(char_width('\u{2764}'), 1); // ❤ HEAVY BLACK HEART
     }
 
     #[test]

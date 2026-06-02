@@ -6,3 +6,4 @@ default-run = "rusty_term"
 
 [dependencies]
 libc = "0.2.186"
+unicode-width = "0.2"
