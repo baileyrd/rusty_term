@@ -8,7 +8,7 @@ impl crate::backend::Backend for UnixBackend {
     fn spawn_shell(&self) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         unsafe {
             let mut slave_fd: libc::c_int = 0;
-            let master_fd = libc::openpty(&mut slave_fd, std::ptr::null_mut());
+            let master_fd = libc::openpty(&mut slave_fd, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
             if master_fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }

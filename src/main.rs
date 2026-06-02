@@ -1,13 +1,14 @@
-
 mod backend;
 mod core;
 
-use backend::{Backend, UnixBackend, WindowsBackend, BackendHandle};
-use core::{AnsiParser, TerminalBuffer};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use crate::backend::{Backend, UnixBackend, WindowsBackend, BackendHandle};
+use crate::core::{AnsiParser, Grid, DirtyFrame};
 
 fn hex_to_ansi_color(hex: u32, is_bg: bool) -> String {
     let r = (hex >> 16) & 0xFF;
@@ -20,7 +21,36 @@ fn hex_to_ansi_color(hex: u32, is_bg: bool) -> String {
     }
 }
 
+fn draw(frame: &DirtyFrame) {
+    if frame.rows.is_empty() {
+        return;
+    }
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    
+    for (y, cells) in &frame.rows {
+        // Move cursor to start of line (1-indexed)
+        let _ = write!(out, "\x1b[{};0H", y + 1);
+        
+        let mut line_buf = String::with_capacity(cells.len() * 10);
+        for cell in cells {
+            line_buf.push_str(&hex_to_ansi_color(cell.fg, false));
+            line_buf.push_str(&hex_to_ansi_color(cell.bg, true));
+            line_buf.push(cell.ch);
+            line_buf.push_str("\x1b[0m"); 
+        }
+        let _ = write!(out, "{}", line_buf);
+    }
+    let _ = out.flush();
+}
+
 fn main() -> Result<(), std::io::Error> {
+    const COLS: usize = 80;
+    const ROWS: usize = 24;
+
+    let grid = Arc::new(Mutex::new(Grid::new(COLS, ROWS)));
+    let running = Arc::new(AtomicBool::new(true));
+
     let backend: Box<dyn Backend> = if cfg!(target_os = "windows") {
         Box::new(WindowsBackend)
     } else {
@@ -31,59 +61,83 @@ fn main() -> Result<(), std::io::Error> {
 
     let handle = backend.spawn_shell()?;
     let shared_handle = Arc::new(Mutex::new(handle));
-    let buffer = Arc::new(Mutex::new(TerminalBuffer::new(80, 24)));
     
-    let reader_handle = Arc::clone(&shared_handle);
-    let reader_buffer = Arc::clone(&buffer);
+    // --- Thread 1: The Parser (PTY -> Grid) ---
+    let grid_parser = Arc::clone(&grid);
+    let running_parser = Arc::clone(&running);
+    let handle_parser = Arc::clone(&shared_handle);
     
     thread::spawn(move || {
         let mut parser = AnsiParser::new();
+        let mut buf = [0u8; 64 * 1024];
         loop {
-            let mut h = reader_handle.lock().unwrap();
-            if let Ok(data) = h.read() {
-                if data.is_empty() { break; }
-                let mut b = reader_buffer.lock().unwrap();
-                parser.parse(&data, &mut b);
-            }
-            drop(h);
-            thread::sleep(Duration::from_millis(10));
-        }
-    });
-
-    let writer_handle = Arc::clone(&shared_handle);
-    thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 1];
-        loop {
-            if stdin.read(&mut buf).is_ok() {
-                let mut h = writer_handle.lock().unwrap();
-                if h.write(&buf).is_err() { break; }
-            }
-        }
-    });
-
-    loop {
-        {
-            let b = buffer.lock().unwrap();
-            // Use a string to buffer the frame to reduce flicker
-            let mut frame = String::with_capacity(80 * 24 * 20);
-            frame.push_str("\x1b[H"); // Cursor home
+            if !running_parser.load(Ordering::Relaxed) { break; }
             
-            for y in 0..b.height {
-                for x in 0..b.width {
-                    let cell = b.cells[y * b.width + x];
-                    frame.push_str(&hex_to_ansi_color(cell.fg_color, false));
-                    frame.push_str(&hex_to_ansi_color(cell.bg_color, true));
-                    frame.push(cell.character);
+            let n = {
+                let mut h = handle_parser.lock().unwrap();
+                match h.read() {
+                    Ok(data) if !data.is_empty() => {
+                        let len = data.len().min(buf.len());
+                        buf[..len].copy_from_slice(&data[..len]);
+                        len
+                    },
+                    _ => 0,
                 }
-                frame.push_str("\x1b[0m\r\n");
+            };
+
+            if n > 0 {
+                let mut g = grid_parser.lock().unwrap();
+                parser.advance(&mut g, &buf[..n]);
+                g.epoch += 1;
+            } else {
+                thread::sleep(Duration::from_millis(1));
             }
-            
-            print!("{}", frame);
-            // Restore cursor a bit more cleanly
-            print!("\x1b[{} ; {} H", b.cursor_y + 1, b.cursor_x + 1);
-            std::io::stdout().flush().unwrap();
         }
-        thread::sleep(Duration::from_millis(33));
+        running_parser.store(false, Ordering::Relaxed);
+    });
+
+    // --- Thread 2: The Input Pump (Stdin -> PTY) ---
+    let running_input = Arc::clone(&running);
+    let handle_input = Arc::clone(&shared_handle);
+    
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin_handle = stdin.lock();
+        let mut input_buf = [0u8; 1024];
+        
+        loop {
+            if !running_input.load(Ordering::Relaxed) { break; }
+            
+            match stdin_handle.read(&mut input_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut h = handle_input.lock().unwrap();
+                    if h.write(&input_buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        running_input.store(false, Ordering::Relaxed);
+    });
+
+    // --- Thread 3: The Renderer (Main Loop) ---
+    print!("\x1b[2J"); 
+    
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(16));
+        
+        let frame = {
+            let mut g = grid.lock().unwrap();
+            let frame = g.snapshot_dirty();
+            g.clear_dirty();
+            frame
+        };
+        
+        draw(&frame);
     }
+
+    backend.set_raw_mode(false)?;
+    Ok(())
 }
