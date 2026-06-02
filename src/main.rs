@@ -135,11 +135,18 @@ fn main() -> Result<(), std::io::Error> {
                 break;
             }
             match reader.read() {
-                // Non-empty data: fold it into the grid.
+                // Non-empty data: fold it into the grid, then send any query
+                // replies (DA/DSR) back to the child via the master fd.
                 Ok(data) if !data.is_empty() => {
-                    let mut g = grid_parser.lock().unwrap();
-                    parser.advance(&mut g, &data);
-                    g.epoch += 1;
+                    let responses = {
+                        let mut g = grid_parser.lock().unwrap();
+                        parser.advance(&mut g, &data);
+                        g.epoch += 1;
+                        parser.take_responses()
+                    };
+                    if !responses.is_empty() && reader.write(&responses).is_err() {
+                        break;
+                    }
                 }
                 // Empty read == EOF: the shell exited.
                 Ok(_) => break,
