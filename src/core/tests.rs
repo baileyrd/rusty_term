@@ -1263,3 +1263,69 @@ fn custom_tab_stops_survive_resize() {
     p.advance(&mut g, b"\t");
     assert_eq!(g.cursor.0, 3); // custom stop preserved across resize
 }
+
+#[test]
+fn mouse_mode_set_is_relayed_to_host_not_printed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1000h");
+    assert_eq!(g.take_host_out(), b"\x1b[?1000h"); // relayed verbatim
+    assert_eq!(g.cells[0].ch, ' '); // not printed onto the grid
+    assert_eq!(g.cursor, (0, 0));
+}
+
+#[test]
+fn mouse_mode_reset_is_relayed_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1000l");
+    assert_eq!(g.take_host_out(), b"\x1b[?1000l");
+}
+
+#[test]
+fn sgr_mouse_and_bracketed_paste_are_relayed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1006h"); // SGR mouse encoding
+    assert_eq!(g.take_host_out(), b"\x1b[?1006h");
+    p.advance(&mut g, b"\x1b[?2004h"); // bracketed paste
+    assert_eq!(g.take_host_out(), b"\x1b[?2004h");
+}
+
+#[test]
+fn focus_reporting_mode_is_relayed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1004h");
+    assert_eq!(g.take_host_out(), b"\x1b[?1004h");
+}
+
+#[test]
+fn combined_input_modes_in_one_sequence_are_each_relayed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1000;1006h"); // enable both at once
+    assert_eq!(g.take_host_out(), b"\x1b[?1000h\x1b[?1006h");
+}
+
+#[test]
+fn alt_screen_mode_is_not_relayed_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"primary");
+    p.advance(&mut g, b"\x1b[?1049h"); // enter alt — handled internally
+    assert!(g.take_host_out().is_empty());
+    p.advance(&mut g, b"\x1b[?1049l"); // leave alt
+    assert!(g.take_host_out().is_empty());
+    assert_eq!(&row_text(&g, 0)[..7], "primary"); // confirms it was handled, not ignored
+}
+
+#[test]
+fn cursor_visibility_mode_is_not_relayed() {
+    // ?25 (DECTCEM) is swallowed, not relayed — the renderer owns the host
+    // cursor's visibility (it hides it while browsing scrollback).
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?25l");
+    assert!(g.take_host_out().is_empty());
+}

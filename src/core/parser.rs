@@ -335,9 +335,11 @@ impl AnsiParser {
 
     /// Handle a private CSI sequence (one carrying a `?`/`<`/`=`/`>` marker).
     ///
-    /// Only the alternate-screen DEC modes are acted upon; other private modes
-    /// (bracketed paste `2004`, cursor visibility `25`, …) are consumed and
-    /// ignored so they never leak as text.
+    /// Alternate-screen DEC modes are acted upon internally. Input-generating
+    /// modes (mouse, focus, bracketed paste) are *relayed* to the host terminal
+    /// so it produces the corresponding input — see [`is_host_input_mode`].
+    /// Everything else (cursor visibility `25`, autowrap `7`, …) is consumed and
+    /// ignored so it never leaks as text.
     fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
         // DA2 (Secondary Device Attributes): `CSI > c`. Reply with a terminal
         // type (0), a firmware "version", and a ROM cartridge field (0) — the
@@ -346,15 +348,32 @@ impl AnsiParser {
             self.responses.extend_from_slice(b"\x1b[>0;1;0c");
             return;
         }
+        // Only DEC-private (`?`) set/reset (`h`/`l`) sequences are actionable
+        // here; other private forms are consumed without effect.
+        if self.csi_marker != b'?' || (cmd != b'h' && cmd != b'l') {
+            return;
+        }
+        let set = cmd == b'h';
         let params = self.parse_params();
-        // 47 / 1047 / 1049 select the alternate screen buffer; the mode governs
-        // cursor save/restore (only 1049). The leave path uses the mode stashed
-        // on entry, so the reset parameter's exact number doesn't matter.
-        let mode = params.iter().flatten().copied().find_map(alt_mode);
-        match (cmd, mode) {
-            (b'h', Some(mode)) => g.enter_alt_screen(mode),
-            (b'l', Some(_)) => g.leave_alt_screen(),
-            _ => {}
+        for param in params.iter().flatten().copied() {
+            if let Some(mode) = alt_mode(param) {
+                // 47 / 1047 / 1049 select the alternate screen buffer; the mode
+                // governs cursor save/restore (only 1049). The leave path uses
+                // the mode stashed on entry, so the reset value doesn't matter.
+                if set {
+                    g.enter_alt_screen(mode);
+                } else {
+                    g.leave_alt_screen();
+                }
+            } else if is_host_input_mode(param) {
+                // Relay verbatim to the host terminal so it starts/stops
+                // generating mouse/focus/paste input, which flows through our
+                // stdin back to the child. Queued on host_out, drained by the
+                // renderer each frame (same channel as OSC 52 clipboard).
+                g.host_out.extend_from_slice(b"\x1b[?");
+                g.host_out.extend_from_slice(param.to_string().as_bytes());
+                g.host_out.push(if set { b'h' } else { b'l' });
+            }
         }
     }
 
@@ -552,4 +571,16 @@ impl AnsiParser {
             i += 1;
         }
     }
+}
+
+/// Whether a DEC private mode controls *host-terminal input generation* —
+/// mouse tracking, focus reporting, or bracketed paste — and so must be relayed
+/// to the host rather than handled internally or ignored.
+///
+/// - `1000`/`1002`/`1003` — X11 mouse: click, button-event (drag), any-event
+/// - `1004` — focus in/out reporting
+/// - `1005`/`1006`/`1015`/`1016` — extended mouse coordinate encodings
+/// - `2004` — bracketed paste
+fn is_host_input_mode(param: usize) -> bool {
+    matches!(param, 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004)
 }
