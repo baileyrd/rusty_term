@@ -178,6 +178,16 @@ fn main() -> Result<(), std::io::Error> {
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
     }
 
+    // The child renders through rusty_term, not the host terminal, so it should
+    // see *our* identity and capabilities: a widely-compatible 256-color xterm
+    // plus truecolor (the renderer always emits 24-bit SGR). Set before spawning
+    // so the child inherits it. We're still single-threaded here, so this
+    // process-wide env mutation races with nothing.
+    unsafe {
+        std::env::set_var("TERM", "xterm-256color");
+        std::env::set_var("COLORTERM", "truecolor");
+    }
+
     // The reader owns the child (and reaps it on drop); the writer and resizer
     // are independent handles to the same PTY, so read, write, and winsize
     // updates never contend on a shared lock.
@@ -379,6 +389,18 @@ fn main() -> Result<(), std::io::Error> {
                 draw(&frame, true);
             }
         }
+    }
+
+    // Reset any host-terminal input modes we may have relayed on the child's
+    // behalf (mouse, focus, bracketed paste) and ensure the cursor is visible,
+    // so a child that exited without disabling them can't leave the host stuck
+    // emitting mouse escapes on every click.
+    {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?25h",
+        );
+        let _ = out.flush();
     }
 
     // `_raw_guard` drops here, restoring cooked mode.
