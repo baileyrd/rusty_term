@@ -70,6 +70,16 @@ pub struct Grid {
     /// The hyperlink id stamped onto cells written while an OSC 8 link is open
     /// (`0` when none). Set by the parser via [`Grid::set_link`].
     current_link: u16,
+    /// Columns at which a horizontal tab stops; `len() == cols`. Defaults to
+    /// every 8th column and is modified by `HTS` / `TBC`. A resize preserves
+    /// stops within the surviving width and defaults the new columns.
+    tab_stops: Vec<bool>,
+}
+
+/// Build the default tab-stop table for a `cols`-wide grid: a stop at every
+/// 8th column (0, 8, 16, …), matching the classic 8-column default.
+fn default_tab_stops(cols: usize) -> Vec<bool> {
+    (0..cols).map(|i| i % 8 == 0).collect()
 }
 
 /// Which DEC private mode selected the alternate screen, which determines the
@@ -141,6 +151,7 @@ impl Grid {
             host_out: Vec::new(),
             links: Vec::new(),
             current_link: 0,
+            tab_stops: default_tab_stops(cols),
         }
     }
 
@@ -345,6 +356,11 @@ impl Grid {
             saved.cursor = clamp(saved.cursor);
             saved.saved_cursor = clamp(saved.saved_cursor);
         }
+        // Preserve tab stops within the surviving width; default new columns.
+        let mut stops = default_tab_stops(cols);
+        let keep = cols.min(self.cols);
+        stops[..keep].copy_from_slice(&self.tab_stops[..keep]);
+        self.tab_stops = stops;
         self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
@@ -553,6 +569,63 @@ impl Grid {
         } else if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
         }
+    }
+
+    /// Move the cursor forward `n` tab stops (`HT` / `CHT`), without writing
+    /// over the cells it passes. Stops at the right margin when no further tab
+    /// stop exists.
+    pub(crate) fn tab_forward(&mut self, n: usize) {
+        let last = self.cols.saturating_sub(1);
+        let mut x = self.cursor.0;
+        for _ in 0..n {
+            if x >= last {
+                x = last;
+                break;
+            }
+            let mut nx = x + 1;
+            while nx < last && !self.tab_stops[nx] {
+                nx += 1;
+            }
+            x = nx;
+        }
+        self.cursor.0 = x.min(last);
+    }
+
+    /// Move the cursor back `n` tab stops (`CBT`). Stops at column 0.
+    pub(crate) fn tab_backward(&mut self, n: usize) {
+        let mut x = self.cursor.0.min(self.cols.saturating_sub(1));
+        for _ in 0..n {
+            if x == 0 {
+                break;
+            }
+            let mut nx = x - 1;
+            while nx > 0 && !self.tab_stops[nx] {
+                nx -= 1;
+            }
+            x = nx;
+        }
+        self.cursor.0 = x;
+    }
+
+    /// Set a tab stop at the current cursor column (`HTS`).
+    pub(crate) fn set_tab_stop(&mut self) {
+        let x = self.cursor.0;
+        if x < self.tab_stops.len() {
+            self.tab_stops[x] = true;
+        }
+    }
+
+    /// Clear the tab stop at the current cursor column (`TBC 0`).
+    pub(crate) fn clear_tab_stop(&mut self) {
+        let x = self.cursor.0;
+        if x < self.tab_stops.len() {
+            self.tab_stops[x] = false;
+        }
+    }
+
+    /// Clear every tab stop (`TBC 3`).
+    pub(crate) fn clear_all_tab_stops(&mut self) {
+        self.tab_stops.iter_mut().for_each(|s| *s = false);
     }
 
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.
