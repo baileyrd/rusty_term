@@ -20,6 +20,53 @@ const PALETTE_16: [u32; 16] = [
     0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
 ];
 
+/// [`Cell::flags`] bit marking the trailing (second) cell of a double-width
+/// character. The renderer skips these so the wide glyph occupies two columns.
+pub const WIDE_TRAILER: u16 = 0b0000_0001;
+
+/// Display width of `ch` in terminal cells: `0` for zero-width (combining marks
+/// and explicit zero-width characters), `2` for wide East Asian / emoji code
+/// points, and `1` otherwise.
+///
+/// This is a pragmatic, dependency-free approximation of Unicode East Asian
+/// Width — it covers the common CJK and emoji blocks rather than the full
+/// property table.
+pub fn char_width(ch: char) -> usize {
+    let c = ch as u32;
+    if c == 0 {
+        return 0;
+    }
+    // Zero-width: combining marks and explicit zero-width characters.
+    if matches!(c,
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF |
+        0x20D0..=0x20FF | 0xFE20..=0xFE2F)
+        || c == 0x200B
+        || c == 0xFEFF
+    {
+        return 0;
+    }
+    // Wide: East Asian Wide/Fullwidth plus emoji and pictographs.
+    if matches!(c,
+        0x1100..=0x115F |   // Hangul Jamo
+        0x2E80..=0x303E |   // CJK radicals, Kangxi, CJK symbols & punctuation
+        0x3041..=0x33FF |   // Hiragana .. CJK compatibility
+        0x3400..=0x4DBF |   // CJK Unified Ext A
+        0x4E00..=0x9FFF |   // CJK Unified Ideographs
+        0xA000..=0xA4CF |   // Yi
+        0xAC00..=0xD7A3 |   // Hangul syllables
+        0xF900..=0xFAFF |   // CJK compatibility ideographs
+        0xFE10..=0xFE19 |   // vertical forms
+        0xFE30..=0xFE6F |   // CJK compatibility / small forms
+        0xFF00..=0xFF60 |   // fullwidth forms
+        0xFFE0..=0xFFE6 |   // fullwidth signs
+        0x1F000..=0x1FAFF | // emoji, pictographs, symbols
+        0x20000..=0x3FFFD)  // CJK Unified Ext B and beyond
+    {
+        return 2;
+    }
+    1
+}
+
 /// A single character cell: its glyph plus truecolor attributes.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -145,15 +192,26 @@ impl Grid {
     }
 
     /// Write `ch` at the cursor with the given colors, wrapping to the next
-    /// line at the right margin, then advancing the cursor one column.
+    /// line if it would not fit, then advancing the cursor by the glyph's
+    /// display width. A double-width glyph also writes a flagged trailing cell.
     pub fn put_char(&mut self, ch: char, fg: u32, bg: u32) {
-        if self.cursor.0 >= self.cols {
+        let w = char_width(ch);
+        if w == 0 {
+            // Zero-width (combining marks): not modeled; dropped to avoid
+            // desyncing the cursor.
+            return;
+        }
+        if self.cursor.0 + w > self.cols {
             self.carriage_return();
             self.newline();
         }
         let (x, y) = self.cursor;
         self.set_cell(x, y, Cell { ch, fg, bg, flags: 0 });
-        self.cursor.0 += 1;
+        if w == 2 && x + 1 < self.cols {
+            // Trailing half: a flagged placeholder the renderer skips.
+            self.set_cell(x + 1, y, Cell { ch: ' ', fg, bg, flags: WIDE_TRAILER });
+        }
+        self.cursor.0 += w;
     }
 
     /// Blank columns `[from, to)` of row `y`, marking it dirty.
@@ -1000,6 +1058,45 @@ mod tests {
         let g = parse(b"\x1b(BZ", 80, 24);
         assert_eq!(g.cells[0].ch, 'Z');
         assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn char_width_classifies_common_cases() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('é'), 1);
+        assert_eq!(char_width('世'), 2); // CJK
+        assert_eq!(char_width('😀'), 2); // emoji
+        assert_eq!(char_width('\u{0301}'), 0); // combining acute accent
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells() {
+        let g = parse("世x".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, '世');
+        assert_eq!(g.cells[0].flags & WIDE_TRAILER, 0);
+        assert_ne!(g.cells[1].flags & WIDE_TRAILER, 0); // trailer flagged
+        assert_eq!(g.cells[2].ch, 'x'); // next glyph after the wide pair
+        assert_eq!(g.cursor, (3, 0));
+    }
+
+    #[test]
+    fn wide_char_wraps_when_it_would_not_fit() {
+        // Width-3 grid: 'a' at col 0, wide '世' needs cols 1-2 -> fits at 1..3.
+        let g = parse("a世".as_bytes(), 3, 24);
+        assert_eq!(g.cells[0].ch, 'a');
+        assert_eq!(g.cells[1].ch, '世');
+        // Now only 1 column free; a second wide char must wrap to the next row.
+        let g2 = parse("ab世".as_bytes(), 3, 24);
+        assert_eq!(row_text(&g2, 0), "ab ");
+        assert_eq!(g2.cells[3].ch, '世'); // wrapped to row 1, col 0
+    }
+
+    #[test]
+    fn zero_width_char_is_dropped() {
+        let g = parse("a\u{0301}b".as_bytes(), 80, 24);
+        assert_eq!(g.cells[0].ch, 'a');
+        assert_eq!(g.cells[1].ch, 'b'); // combining mark dropped, no cell consumed
+        assert_eq!(g.cursor, (2, 0));
     }
 
     #[test]

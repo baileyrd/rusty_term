@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::backend::{Backend, UnixBackend, WindowsBackend};
-use crate::core::{AnsiParser, DirtyFrame, Grid};
+use crate::core::{AnsiParser, DirtyFrame, Grid, WIDE_TRAILER};
 
 /// Set by the `SIGWINCH` handler; the render loop drains it to resize the grid
 /// and the PTY in step with the host terminal. A plain atomic store is the only
@@ -61,6 +61,11 @@ fn draw(frame: &DirtyFrame) {
         let mut line_buf = String::with_capacity(cells.len() + 32);
         let mut last: Option<(u32, u32)> = None;
         for cell in cells {
+            // The trailing half of a wide glyph is not emitted; the glyph
+            // itself already advances the host cursor by two columns.
+            if cell.flags & WIDE_TRAILER != 0 {
+                continue;
+            }
             if last != Some((cell.fg, cell.bg)) {
                 line_buf.push_str(&sgr_for(cell.fg, cell.bg));
                 last = Some((cell.fg, cell.bg));
