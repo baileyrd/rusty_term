@@ -1013,3 +1013,109 @@ fn insert_lines_outside_region_is_noop() {
     assert_eq!(row_text(&g, 2), "CCCC");
     assert_eq!(row_text(&g, 3), "DDDD");
 }
+
+#[test]
+fn ind_moves_down_preserving_column() {
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    g.cursor = (2, 0);
+    p.advance(&mut g, b"\x1bD"); // IND
+    assert_eq!(g.cursor, (2, 1)); // down one row, column unchanged
+}
+
+#[test]
+fn ind_at_bottom_scrolls_and_captures_scrollback() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB");
+    g.cursor = (0, 1); // region bottom (full-screen)
+    p.advance(&mut g, b"\x1bD"); // IND scrolls up
+    assert_eq!(row_text(&g, 0), "BBBB");
+    assert_eq!(row_text(&g, 1), "    ");
+    assert_eq!(g.scrollback.len(), 1);
+    let line: String = g.scrollback[0].iter().map(|c| c.ch).collect();
+    assert_eq!(line, "AAAA");
+}
+
+#[test]
+fn nel_carriage_returns_then_indexes() {
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    g.cursor = (3, 0);
+    p.advance(&mut g, b"\x1bE"); // NEL
+    assert_eq!(g.cursor, (0, 1)); // column reset to 0, down one row
+}
+
+#[test]
+fn ri_moves_up_preserving_column() {
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    g.cursor = (2, 2);
+    p.advance(&mut g, b"\x1bM"); // RI
+    assert_eq!(g.cursor, (2, 1)); // up one row, column unchanged
+}
+
+#[test]
+fn ri_at_top_scrolls_region_down() {
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC");
+    g.cursor = (0, 0); // region top
+    p.advance(&mut g, b"\x1bM"); // RI scrolls down
+    assert_eq!(row_text(&g, 0), "    "); // blank inserted at top
+    assert_eq!(row_text(&g, 1), "AAAA"); // shifted down
+    assert_eq!(row_text(&g, 2), "BBBB"); // CCCC pushed past the bottom, lost
+}
+
+#[test]
+fn su_scrolls_region_up_n() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    p.advance(&mut g, b"\x1b[2S"); // SU 2
+    assert_eq!(row_text(&g, 0), "CCCC");
+    assert_eq!(row_text(&g, 1), "DDDD");
+    assert_eq!(row_text(&g, 2), "    ");
+    assert_eq!(row_text(&g, 3), "    ");
+    // Full-screen SU on the primary buffer captures displaced lines.
+    assert_eq!(g.scrollback.len(), 2);
+}
+
+#[test]
+fn sd_scrolls_region_down_n_and_blanks_top() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    p.advance(&mut g, b"\x1b[2T"); // SD 2
+    assert_eq!(row_text(&g, 0), "    ");
+    assert_eq!(row_text(&g, 1), "    ");
+    assert_eq!(row_text(&g, 2), "AAAA");
+    assert_eq!(row_text(&g, 3), "BBBB");
+}
+
+#[test]
+fn sd_multi_parameter_form_is_ignored() {
+    // CSI 1;2;3;4;5 T is xterm highlight mouse tracking, not SD — leave the
+    // grid untouched rather than scrolling by a bogus count.
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    p.advance(&mut g, b"\x1b[1;2;3;4;5T");
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 3), "DDDD");
+}
+
+#[test]
+fn su_respects_scroll_region_without_scrollback() {
+    let mut g = Grid::new(4, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE");
+    p.advance(&mut g, b"\x1b[2;4r"); // region rows 1..=3 (0-based); homes cursor
+    p.advance(&mut g, b"\x1b[1S"); // SU 1 within the region
+    assert_eq!(row_text(&g, 0), "AAAA"); // above region untouched
+    assert_eq!(row_text(&g, 1), "CCCC"); // BBBB scrolled off within region
+    assert_eq!(row_text(&g, 2), "DDDD");
+    assert_eq!(row_text(&g, 3), "    "); // region bottom blanked
+    assert_eq!(row_text(&g, 4), "EEEE"); // below region untouched
+    assert_eq!(g.scrollback.len(), 0); // sub-region scroll never captures
+}

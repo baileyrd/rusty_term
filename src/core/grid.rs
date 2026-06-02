@@ -508,6 +508,53 @@ impl Grid {
         }
     }
 
+    /// Scroll the current scrolling region up by `n` rows (`SU`). Reuses the
+    /// single-row [`Grid::scroll_up`] per line, so a full-screen scroll on the
+    /// primary buffer captures the displaced lines into scrollback exactly as a
+    /// line feed would.
+    pub(crate) fn scroll_up_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.scroll_up();
+        }
+    }
+
+    /// Scroll the current scrolling region down by `n` rows (`SD`): shift the
+    /// region's rows down and blank the `n` freed rows at the top. Displaced
+    /// bottom rows are lost (scrollback is never un-scrolled).
+    pub(crate) fn scroll_down_n(&mut self, n: usize) {
+        let (top, bottom) = (self.scroll_top, self.scroll_bottom);
+        if bottom <= top || bottom >= self.rows {
+            return;
+        }
+        let n = n.min(bottom + 1 - top);
+        let cols = self.cols;
+        // Shift rows [top, bottom - n] down by n.
+        let count = (bottom + 1 - top - n) * cols;
+        if count > 0 {
+            let src = top * cols;
+            let dst = (top + n) * cols;
+            self.cells.copy_within(src..src + count, dst);
+        }
+        // Blank the n freed rows at the region top.
+        let blank_end = (top + n) * cols;
+        for c in &mut self.cells[top * cols..blank_end] {
+            *c = Cell::blank();
+        }
+        for d in &mut self.dirty[top..=bottom] {
+            *d = true;
+        }
+    }
+
+    /// Move the cursor up one row, scrolling the region down when already at its
+    /// top (`RI`, reverse index). The mirror of a line feed at the region bottom.
+    pub(crate) fn reverse_index(&mut self) {
+        if self.cursor.1 == self.scroll_top {
+            self.scroll_down_n(1);
+        } else if self.cursor.1 > 0 {
+            self.cursor.1 -= 1;
+        }
+    }
+
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.
     pub fn clear_dirty(&mut self) {
         self.dirty.iter_mut().for_each(|d| *d = false);
