@@ -1414,3 +1414,91 @@ fn esc_hash_non_8_is_consumed_not_printed() {
     assert_eq!(g.cells[0].ch, 'X');
     assert_eq!(g.cursor, (1, 0));
 }
+
+#[test]
+fn decom_makes_cup_relative_to_region() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r"); // region rows 5..=20 (0-based 4..=19)
+    p.advance(&mut g, b"\x1b[?6h"); // origin mode on -> homes to (0, 4)
+    assert_eq!(g.cursor, (0, 4));
+    p.advance(&mut g, b"\x1b[3;10H"); // CUP row 3 col 10 -> region row 4+2=6
+    assert_eq!(g.cursor, (9, 6));
+}
+
+#[test]
+fn decom_confines_cursor_to_region() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    p.advance(&mut g, b"\x1b[?6h");
+    p.advance(&mut g, b"\x1b[100;1H"); // far past the region bottom
+    assert_eq!(g.cursor.1, 19); // clamped to scroll_bottom, not screen bottom
+}
+
+#[test]
+fn decom_bare_cup_homes_to_region_top() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    p.advance(&mut g, b"\x1b[?6h");
+    g.cursor = (10, 10);
+    p.advance(&mut g, b"\x1b[H"); // bare CUP -> origin-relative home
+    assert_eq!(g.cursor, (0, 4));
+}
+
+#[test]
+fn decom_vpa_is_region_relative() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r");
+    p.advance(&mut g, b"\x1b[?6h");
+    p.advance(&mut g, b"\x1b[3d"); // VPA row 3 -> region row 4+2=6
+    assert_eq!(g.cursor.1, 6);
+}
+
+#[test]
+fn decom_toggle_homes_the_cursor() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r"); // homes to (0,0) (origin off)
+    g.cursor = (10, 10);
+    p.advance(&mut g, b"\x1b[?6h"); // on -> homes to region top (0,4)
+    assert_eq!(g.cursor, (0, 4));
+    g.cursor = (10, 10);
+    p.advance(&mut g, b"\x1b[?6l"); // off -> homes to screen top (0,0)
+    assert_eq!(g.cursor, (0, 0));
+}
+
+#[test]
+fn decstbm_homes_to_region_top_when_origin_mode_on() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?6h"); // origin on (region still full -> home 0,0)
+    p.advance(&mut g, b"\x1b[5;20r"); // set region -> homes to (0,4)
+    assert_eq!(g.cursor, (0, 4));
+}
+
+#[test]
+fn cup_is_absolute_when_origin_mode_off() {
+    // Regression: with origin mode off, CUP ignores the scroll region.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[5;20r"); // region set, origin off
+    p.advance(&mut g, b"\x1b[3;10H"); // absolute row 2, col 9
+    assert_eq!(g.cursor, (9, 2));
+}
+
+#[test]
+fn ris_and_decstr_reset_origin_mode() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?6h");
+    assert!(g.origin_mode);
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert!(!g.origin_mode);
+    p.advance(&mut g, b"\x1b[?6h");
+    assert!(g.origin_mode);
+    p.advance(&mut g, b"\x1b[!p"); // DECSTR
+    assert!(!g.origin_mode);
+}

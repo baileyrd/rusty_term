@@ -406,6 +406,9 @@ impl AnsiParser {
             } else if param == 7 {
                 // DECAWM — autowrap mode.
                 g.autowrap = set;
+            } else if param == 6 {
+                // DECOM — origin mode; toggling it homes the cursor.
+                g.set_origin_mode(set);
             }
         }
     }
@@ -439,8 +442,8 @@ impl AnsiParser {
                 self.apply_sgr(&sgr);
             }
             b'H' | b'f' => {
-                // CSI row ; col H — both 1-based; default to 1.
-                g.set_cursor(p(1, 1).saturating_sub(1), p(0, 1).saturating_sub(1));
+                // CSI row ; col H — both 1-based; default to 1. Origin-aware.
+                g.set_cursor_abs(p(1, 1).saturating_sub(1), p(0, 1).saturating_sub(1));
             }
             b'A' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_sub(count)), // CUU
             b'B' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_add(count)), // CUD
@@ -449,7 +452,7 @@ impl AnsiParser {
             b'E' => g.set_cursor(0, g.cursor.1.saturating_add(count)),          // CNL
             b'F' => g.set_cursor(0, g.cursor.1.saturating_sub(count)),          // CPL
             b'G' => g.set_cursor(p(0, 1).saturating_sub(1), g.cursor.1),        // CHA
-            b'd' => g.set_cursor(g.cursor.0, p(0, 1).saturating_sub(1)),        // VPA
+            b'd' => g.set_cursor_abs(g.cursor.0, p(0, 1).saturating_sub(1)),    // VPA (origin-aware)
             b'b' => {
                 // REP — repeat the last printed graphic character `count` times.
                 if let Some(ch) = self.last_char {
