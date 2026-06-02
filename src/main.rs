@@ -10,6 +10,16 @@ use std::time::Duration;
 use crate::backend::{Backend, UnixBackend, WindowsBackend};
 use crate::core::{AnsiParser, DirtyFrame, Grid};
 
+/// Set by the `SIGWINCH` handler; the render loop drains it to resize the grid
+/// and the PTY in step with the host terminal. A plain atomic store is the only
+/// async-signal-safe work the handler does.
+static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_sigwinch(_: libc::c_int) {
+    RESIZE_PENDING.store(true, Ordering::Relaxed);
+}
+
 /// Restores the host terminal out of raw mode when dropped, so an early return
 /// or a panic can never leave the user's shell with echo/line-editing disabled.
 struct RawModeGuard<'a> {
@@ -68,27 +78,34 @@ fn draw(frame: &DirtyFrame) {
 }
 
 fn main() -> Result<(), std::io::Error> {
-    const COLS: usize = 80;
-    const ROWS: usize = 24;
-
-    let grid = Arc::new(Mutex::new(Grid::new(COLS, ROWS)));
-    let running = Arc::new(AtomicBool::new(true));
-
     let backend: Box<dyn Backend> = if cfg!(target_os = "windows") {
         Box::new(WindowsBackend)
     } else {
         Box::new(UnixBackend)
     };
 
+    // Start at the host terminal's actual size, falling back to 80x24.
+    let (init_cols, init_rows) = backend.terminal_size().unwrap_or((80, 24));
+    let grid = Arc::new(Mutex::new(Grid::new(init_cols as usize, init_rows as usize)));
+    let running = Arc::new(AtomicBool::new(true));
+
     // Raw mode stays enabled for the lifetime of this guard; it is restored on
     // any exit path, including a panic.
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
-    // The reader owns the child (and reaps it on drop); the writer is an
-    // independent handle to the same PTY, so read and write never contend on a
-    // shared lock.
-    let mut reader = backend.spawn_shell()?;
+    // The reader owns the child (and reaps it on drop); the writer and resizer
+    // are independent handles to the same PTY, so read, write, and winsize
+    // updates never contend on a shared lock.
+    let mut reader = backend.spawn_shell(init_cols, init_rows)?;
     let mut writer = reader.try_clone()?;
+    let mut resizer = reader.try_clone()?;
+
+    // Resize the grid/PTY when the host window changes (Unix only).
+    #[cfg(unix)]
+    unsafe {
+        let handler: extern "C" fn(libc::c_int) = handle_sigwinch;
+        libc::signal(libc::SIGWINCH, handler as libc::sighandler_t);
+    }
 
     // --- Thread 1: Parser (PTY -> Grid) ---
     let grid_parser = Arc::clone(&grid);
@@ -146,6 +163,16 @@ fn main() -> Result<(), std::io::Error> {
 
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(16));
+
+        // Apply a pending resize before snapshotting: reflow the grid, tell the
+        // child its new size, and clear the screen so the full repaint is clean.
+        if RESIZE_PENDING.swap(false, Ordering::Relaxed)
+            && let Some((cols, rows)) = backend.terminal_size()
+        {
+            grid.lock().unwrap().resize(cols as usize, rows as usize);
+            let _ = resizer.set_winsize(cols, rows);
+            print!("\x1b[2J");
+        }
 
         let frame = {
             let mut g = grid.lock().unwrap();

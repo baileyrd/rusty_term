@@ -154,6 +154,30 @@ impl Grid {
         self.cursor = (0, 0);
     }
 
+    /// Resize the grid to `cols`×`rows`, preserving the top-left overlap of the
+    /// existing content. The cursor (and saved cursor) are clamped into the new
+    /// bounds and every row is marked dirty so the next frame repaints fully.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
+            return;
+        }
+        let mut new_cells = vec![Cell::blank(); cols * rows];
+        let copy_rows = rows.min(self.rows);
+        let copy_cols = cols.min(self.cols);
+        for y in 0..copy_rows {
+            let src = y * self.cols;
+            let dst = y * cols;
+            new_cells[dst..dst + copy_cols].copy_from_slice(&self.cells[src..src + copy_cols]);
+        }
+        self.cells = new_cells;
+        self.cols = cols;
+        self.rows = rows;
+        self.dirty = vec![true; rows];
+        let clamp = |(x, y): (usize, usize)| (x.min(cols - 1), y.min(rows - 1));
+        self.cursor = clamp(self.cursor);
+        self.saved_cursor = clamp(self.saved_cursor);
+    }
+
     /// Save the current cursor position (`DECSC` / `CSI s`).
     fn save_cursor(&mut self) {
         self.saved_cursor = self.cursor;
@@ -720,6 +744,22 @@ mod tests {
         p.advance(&mut g, b"\r\nnew");
         assert_eq!(row_text(&g, 0).trim_end(), "bot");
         assert_eq!(row_text(&g, 1).trim_end(), "new");
+    }
+
+    #[test]
+    fn resize_preserves_content_and_clamps_cursor() {
+        let mut g = parse(b"hello", 80, 24);
+        g.cursor = (40, 20);
+        g.resize(10, 5);
+        assert_eq!(g.cols, 10);
+        assert_eq!(g.rows, 5);
+        assert_eq!(&row_text(&g, 0)[..5], "hello"); // top-left content kept
+        assert_eq!(g.cursor, (9, 4)); // clamped into new bounds
+        assert!(g.dirty.iter().all(|&d| d)); // full repaint queued
+        // Growing back keeps the surviving content and blanks new area.
+        g.resize(80, 24);
+        assert_eq!(&row_text(&g, 0)[..5], "hello");
+        assert_eq!(g.cells[79].ch, ' ');
     }
 
     #[test]

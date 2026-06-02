@@ -5,12 +5,16 @@
 pub struct WindowsBackend;
 
 impl crate::backend::Backend for WindowsBackend {
-    fn spawn_shell(&self) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
+    fn spawn_shell(&self, _cols: u16, _rows: u16) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         Err(std::io::Error::other("Windows driver not yet implemented"))
     }
 
     fn set_raw_mode(&self, _enabled: bool) -> Result<(), std::io::Error> {
         Err(std::io::Error::other("Windows driver not yet implemented"))
+    }
+
+    fn terminal_size(&self) -> Option<(u16, u16)> {
+        None
     }
 }
 
@@ -30,5 +34,9 @@ impl crate::backend::BackendHandle for WindowsHandle {
 
     fn try_clone(&self) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         Ok(Box::new(WindowsHandle))
+    }
+
+    fn set_winsize(&mut self, _cols: u16, _rows: u16) -> Result<(), std::io::Error> {
+        Ok(())
     }
 }

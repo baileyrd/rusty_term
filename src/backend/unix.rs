@@ -7,8 +7,17 @@ use std::os::unix::io::RawFd;
 pub struct UnixBackend;
 
 impl crate::backend::Backend for UnixBackend {
-    fn spawn_shell(&self) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
+    fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         unsafe {
+            // Seed the PTY with the initial window size so the child shell and
+            // its children start out knowing the geometry.
+            let ws = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+
             // openpty writes the master fd to the first out-param and the slave
             // fd to the second, returning 0 on success / -1 on error. Both
             // pointers must be valid — passing null for the slave segfaults.
@@ -19,7 +28,7 @@ impl crate::backend::Backend for UnixBackend {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &ws,
             );
             if rc < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -81,6 +90,18 @@ impl crate::backend::Backend for UnixBackend {
         }
         Ok(())
     }
+
+    fn terminal_size(&self) -> Option<(u16, u16)> {
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            let rc = libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws);
+            if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                Some((ws.ws_col, ws.ws_row))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Owns the master side of the PTY. The handle created by `spawn_shell` also
@@ -128,6 +149,19 @@ impl crate::backend::BackendHandle for UnixHandle {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Box::new(UnixHandle { fd: dup_fd, child: None }))
+    }
+
+    fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error> {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(self.fd, libc::TIOCSWINSZ, &ws) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
