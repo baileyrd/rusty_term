@@ -97,10 +97,10 @@ impl crate::backend::Backend for UnixBackend {
                 if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-            } else if let Some(orig) = ORIGINAL_TERMIOS.lock().unwrap().take() {
-                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            } else if let Some(orig) = ORIGINAL_TERMIOS.lock().unwrap().take()
+                && libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig) == -1
+            {
+                return Err(std::io::Error::last_os_error());
             }
         }
         Ok(())
