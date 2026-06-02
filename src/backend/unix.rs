@@ -2,6 +2,11 @@
 //! and exposes the master side as a [`BackendHandle`].
 
 use std::os::unix::io::RawFd;
+use std::sync::Mutex;
+
+/// The host terminal's `termios` captured when raw mode was enabled, so it can
+/// be restored exactly on exit.
+static ORIGINAL_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
 
 /// Unit type implementing [`Backend`](crate::backend::Backend) for Unix-likes.
 pub struct UnixBackend;
@@ -42,9 +47,13 @@ impl crate::backend::Backend for UnixBackend {
             }
 
             if pid == 0 {
-                // Child: detach from the controlling terminal and attach to the
-                // PTY slave as stdin/stdout/stderr, then exec the shell.
+                // Child: start a new session, then claim the slave as this
+                // session's controlling terminal. Without TIOCSCTTY the kernel
+                // never sets the slave's foreground process group, so Ctrl-C
+                // wouldn't reach the shell and TIOCSWINSZ wouldn't deliver
+                // SIGWINCH to it (a dup'd fd does not auto-acquire a ctty).
                 libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
 
                 libc::dup2(slave_fd, libc::STDIN_FILENO);
                 libc::dup2(slave_fd, libc::STDOUT_FILENO);
@@ -69,23 +78,29 @@ impl crate::backend::Backend for UnixBackend {
 
     fn set_raw_mode(&self, enabled: bool) -> Result<(), std::io::Error> {
         unsafe {
-            let mut termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-
             if enabled {
-                // Disable canonical mode (line buffering) and echo.
-                termios.c_lflag &= !(libc::ICANON | libc::ECHO);
-                // Block until at least one byte is available, no inter-byte timer.
-                termios.c_cc[libc::VMIN] = 1;
-                termios.c_cc[libc::VTIME] = 0;
-            } else {
-                termios.c_lflag |= libc::ICANON | libc::ECHO;
-            }
+                let mut termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Stash the original so it can be restored verbatim on exit.
+                *ORIGINAL_TERMIOS.lock().unwrap() = Some(termios);
 
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &termios) == -1 {
-                return Err(std::io::Error::last_os_error());
+                // Full raw mode: this clears ISIG (so Ctrl-C/Z/\ are forwarded
+                // as bytes to the child instead of signalling us), IXON, ICRNL,
+                // OPOST, ICANON, and ECHO. Without ISIG cleared, Ctrl-C would
+                // kill the emulator instead of the running command.
+                let mut raw = termios;
+                libc::cfmakeraw(&mut raw);
+                raw.c_cc[libc::VMIN] = 1;
+                raw.c_cc[libc::VTIME] = 0;
+                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if let Some(orig) = ORIGINAL_TERMIOS.lock().unwrap().take() {
+                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
         }
         Ok(())
@@ -131,14 +146,29 @@ impl crate::backend::BackendHandle for UnixHandle {
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
-        let n = unsafe {
-            libc::write(self.fd, data.as_ptr() as *const libc::c_void, data.len())
-        };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if (n as usize) < data.len() {
-            return Err(std::io::Error::other("Partial write to PTY"));
+        // Short writes are normal on a PTY master (the slave's input queue is
+        // finite), so loop until everything is accepted. Retry on EINTR; treat
+        // a real error as fatal.
+        let mut written = 0;
+        while written < data.len() {
+            let n = unsafe {
+                libc::write(
+                    self.fd,
+                    data[written..].as_ptr() as *const libc::c_void,
+                    data.len() - written,
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                return Err(std::io::Error::other("PTY write returned 0"));
+            }
+            written += n as usize;
         }
         Ok(())
     }
@@ -168,12 +198,28 @@ impl crate::backend::BackendHandle for UnixHandle {
 impl Drop for UnixHandle {
     fn drop(&mut self) {
         unsafe {
-            // Reap the child if we own it, hanging it up first so an idle shell
-            // doesn't linger as a zombie.
+            // Reap the child if we own it. SIGHUP first, but escalate: a shell
+            // that traps/ignores HUP must not wedge us in a blocking waitpid.
             if let Some(pid) = self.child.take() {
-                libc::kill(pid, libc::SIGHUP);
                 let mut status = 0;
-                libc::waitpid(pid, &mut status, 0);
+                let reaped = |status: &mut libc::c_int| {
+                    libc::waitpid(pid, status, libc::WNOHANG) == pid
+                };
+                libc::kill(pid, libc::SIGHUP);
+                let mut done = false;
+                for _ in 0..25 {
+                    // ~250ms grace
+                    if reaped(&mut status) {
+                        done = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if !done {
+                    // SIGKILL cannot be trapped, so the final wait is bounded.
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
             }
             if self.fd >= 0 {
                 libc::close(self.fd);
