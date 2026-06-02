@@ -187,6 +187,15 @@ enum ParserState {
     Esc,
     /// Inside a `CSI` (`ESC [`) sequence; accumulating parameter bytes.
     Csi,
+    /// Inside an `OSC` (`ESC ]`) string; bytes are consumed until a `BEL` or
+    /// `ST` terminator. We don't act on OSC payloads (titles, cwd reports), we
+    /// just keep them from leaking onto the screen.
+    Osc,
+    /// Saw `ESC` while inside an OSC string; awaiting the `\` of an `ST`
+    /// (`ESC \`) terminator.
+    OscEsc,
+    /// A charset-designation escape (`ESC ( B`, etc.); consume one more byte.
+    EscCharset,
 }
 
 /// Incremental parser that turns a shell's output byte stream into [`Grid`]
@@ -196,6 +205,10 @@ pub struct AnsiParser {
     current_fg: u32,
     current_bg: u32,
     param_buffer: String,
+    /// Set when a CSI sequence carries a private marker (`?`, `<`, `=`, `>`).
+    /// Such sequences (e.g. DEC private mode set/reset) are consumed but not
+    /// acted upon.
+    csi_private: bool,
 }
 
 impl Default for AnsiParser {
@@ -212,6 +225,7 @@ impl AnsiParser {
             current_fg: DEFAULT_FG,
             current_bg: DEFAULT_BG,
             param_buffer: String::new(),
+            csi_private: false,
         }
     }
 
@@ -239,23 +253,53 @@ impl AnsiParser {
                     0x20..=0x7e => g.put_char(b as char, self.current_fg, self.current_bg),
                     _ => {}
                 },
-                ParserState::Esc => {
-                    self.state = if b == b'[' { ParserState::Csi } else { ParserState::Ground };
-                    if self.state == ParserState::Csi {
+                ParserState::Esc => match b {
+                    b'[' => {
                         self.param_buffer.clear();
+                        self.csi_private = false;
+                        self.state = ParserState::Csi;
                     }
-                }
-                ParserState::Csi => {
-                    // Collect parameter and intermediate bytes; any other byte
-                    // is the final command byte that terminates the sequence.
-                    if b.is_ascii_digit() || b == b';' {
-                        self.param_buffer.push(b as char);
-                    } else {
-                        self.handle_csi(b, g);
+                    b']' => self.state = ParserState::Osc,
+                    // Charset designation (`ESC ( B`, etc.): one more byte follows.
+                    b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
+                    // Any other ESC X sequence is a single byte we don't model;
+                    // consuming b returns us to ground without leaking it.
+                    _ => self.state = ParserState::Ground,
+                },
+                ParserState::Csi => match b {
+                    // Parameter bytes.
+                    b'0'..=b'9' | b';' => self.param_buffer.push(b as char),
+                    // Private markers (`<`, `=`, `>`, `?`): flag and keep collecting.
+                    0x3c..=0x3f => self.csi_private = true,
+                    // Intermediate bytes (space..`/`): ignored but part of the sequence.
+                    0x20..=0x2f => {}
+                    // Final byte: dispatch (unless this is a private sequence) and reset.
+                    0x40..=0x7e => {
+                        if !self.csi_private {
+                            self.handle_csi(b, g);
+                        }
                         self.state = ParserState::Ground;
                         self.param_buffer.clear();
+                        self.csi_private = false;
                     }
+                    // Anything else aborts the malformed sequence.
+                    _ => {
+                        self.state = ParserState::Ground;
+                        self.param_buffer.clear();
+                        self.csi_private = false;
+                    }
+                },
+                ParserState::Osc => match b {
+                    0x07 => self.state = ParserState::Ground, // BEL terminator
+                    0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
+                    _ => {}                                   // consume payload byte
+                },
+                ParserState::OscEsc => {
+                    // Whether or not this is the `\` of an ST, the OSC string is
+                    // over; drop the byte and return to ground.
+                    self.state = ParserState::Ground;
                 }
+                ParserState::EscCharset => self.state = ParserState::Ground,
             }
         }
     }
@@ -543,6 +587,38 @@ mod tests {
         assert_eq!(frame.cursor, (1, 0));
         g.clear_dirty();
         assert!(g.snapshot_dirty().rows.is_empty());
+    }
+
+    #[test]
+    fn osc_title_is_consumed_not_printed() {
+        // OSC 2 (set window title) terminated by BEL, then real text.
+        let g = parse(b"\x1b]2;my title\x07X", 80, 24);
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn osc_terminated_by_st_is_consumed() {
+        // OSC 7 (cwd) terminated by ST (ESC \).
+        let g = parse(b"\x1b]7;file://host/path\x1b\\Y", 80, 24);
+        assert_eq!(g.cells[0].ch, 'Y');
+    }
+
+    #[test]
+    fn csi_private_mode_is_consumed_not_printed() {
+        // Bracketed-paste enable/disable must not leak "2004h"/"2004l".
+        let g = parse(b"\x1b[?2004hA\x1b[?2004lB", 80, 24);
+        assert_eq!(g.cells[0].ch, 'A');
+        assert_eq!(g.cells[1].ch, 'B');
+        assert_eq!(g.cursor, (2, 0));
+    }
+
+    #[test]
+    fn charset_designation_is_consumed() {
+        // ESC ( B (designate ASCII) must not leak the 'B'.
+        let g = parse(b"\x1b(BZ", 80, 24);
+        assert_eq!(g.cells[0].ch, 'Z');
+        assert_eq!(g.cursor, (1, 0));
     }
 
     #[test]
