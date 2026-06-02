@@ -519,6 +519,14 @@ enum ParserState {
     OscEsc,
     /// A charset-designation escape (`ESC ( B`, etc.); consume one more byte.
     EscCharset,
+    /// Inside a string-type control sequence — DCS (`ESC P`), APC (`ESC _`),
+    /// PM (`ESC ^`), or SOS (`ESC X`). Like [`ParserState::Osc`], the body is
+    /// consumed opaquely (we don't act on Sixel, DECRQSS, Kitty graphics, …)
+    /// so it never leaks onto the screen. Terminated by `ST` (`ESC \`).
+    StrSink,
+    /// Saw `ESC` while inside a [`ParserState::StrSink`] string; awaiting the
+    /// `\` of an `ST` terminator.
+    StrSinkEsc,
 }
 
 /// Incremental parser that turns a shell's output byte stream into [`Grid`]
@@ -600,6 +608,11 @@ impl AnsiParser {
                     }
                     // Charset designation (`ESC ( B`, etc.): one more byte follows.
                     b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
+                    // String-type introducers — DCS (`P`), SOS (`X`), PM (`^`),
+                    // APC (`_`). Their bodies are consumed opaquely until ST so
+                    // they don't leak as printed text (cf. tmux DCS passthrough,
+                    // DECRQSS replies, Kitty graphics, Sixel).
+                    b'P' | b'X' | b'^' | b'_' => self.state = ParserState::StrSink,
                     // Any other ESC X sequence is a single byte we don't model;
                     // consuming b returns us to ground without leaking it.
                     _ => self.state = ParserState::Ground,
@@ -661,6 +674,16 @@ impl AnsiParser {
                     self.state = ParserState::Ground;
                 }
                 ParserState::EscCharset => self.state = ParserState::Ground,
+                ParserState::StrSink => match b {
+                    0x1b => self.state = ParserState::StrSinkEsc, // possible ST (ESC \)
+                    0x18 | 0x1a => self.state = ParserState::Ground, // CAN / SUB abort
+                    _ => {}                                          // consume body byte
+                },
+                ParserState::StrSinkEsc => {
+                    // Whether or not this is the `\` of an ST, the string is
+                    // over; drop the byte and return to ground.
+                    self.state = ParserState::Ground;
+                }
             }
         }
     }
@@ -1460,5 +1483,58 @@ mod tests {
         p.advance(&mut g, b"\x1b[3");
         p.advance(&mut g, b"1mX");
         assert_eq!(g.cells[0].fg, PALETTE_16[1]); // SGR 31
+    }
+
+    #[test]
+    fn dcs_string_is_consumed_not_printed() {
+        // DCS (ESC P) … ST (ESC \) — e.g. a DECRQSS status reply. The body must
+        // not leak onto the screen.
+        let g = parse(b"\x1bP1$r0m\x1b\\X", 80, 24);
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn apc_string_is_consumed_not_printed() {
+        // APC (ESC _) … ST — e.g. the Kitty graphics protocol introducer.
+        let g = parse(b"\x1b_Gf=100,a=T;base64data\x1b\\X", 80, 24);
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn pm_string_is_consumed_not_printed() {
+        // PM (ESC ^) … ST.
+        let g = parse(b"\x1b^private message\x1b\\X", 80, 24);
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn sos_string_is_consumed_not_printed() {
+        // SOS (ESC X) … ST.
+        let g = parse(b"\x1bXstart of string\x1b\\Y", 80, 24);
+        assert_eq!(g.cells[0].ch, 'Y');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn dcs_string_split_across_chunks_is_consumed() {
+        // The string sink state must persist across read boundaries.
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1bP1$r");
+        p.advance(&mut g, b"sixel-ish body");
+        p.advance(&mut g, b"\x1b\\Z");
+        assert_eq!(g.cells[0].ch, 'Z');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn dcs_string_aborted_by_can() {
+        // CAN (0x18) cancels the string; subsequent bytes render normally.
+        let g = parse(b"\x1bPbody\x18X", 80, 24);
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
     }
 }
