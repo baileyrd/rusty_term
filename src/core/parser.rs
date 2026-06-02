@@ -445,8 +445,8 @@ impl AnsiParser {
                 // CSI row ; col H — both 1-based; default to 1. Origin-aware.
                 g.set_cursor_abs(p(1, 1).saturating_sub(1), p(0, 1).saturating_sub(1));
             }
-            b'A' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_sub(count)), // CUU
-            b'B' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_add(count)), // CUD
+            b'A' => g.cursor_up(count),   // CUU (margin-aware)
+            b'B' => g.cursor_down(count), // CUD (margin-aware)
             b'C' => g.set_cursor(g.cursor.0.saturating_add(count), g.cursor.1), // CUF
             b'D' => g.set_cursor(g.cursor.0.saturating_sub(count), g.cursor.1), // CUB
             b'E' => g.set_cursor(0, g.cursor.1.saturating_add(count)),          // CNL
@@ -520,6 +520,14 @@ impl AnsiParser {
                     1 => g.clear_row_range(cy, 0, cx + 1),
                     2 => g.clear_row_range(cy, 0, g.cols),
                     _ => {}
+                }
+            }
+            b'h' | b'l' => {
+                // ANSI (non-private) mode set/reset. Only IRM (mode 4 —
+                // insert/replace) is modeled; other ANSI modes are ignored.
+                let set = cmd == b'h';
+                if params.iter().flatten().any(|&m| m == 4) {
+                    g.insert_mode = set;
                 }
             }
             b'p' if self.csi_intermediate == b'!' => {
@@ -616,13 +624,15 @@ impl AnsiParser {
 }
 
 /// Whether a DEC private mode controls *host-terminal input generation* —
-/// mouse tracking, focus reporting, or bracketed paste — and so must be relayed
-/// to the host rather than handled internally or ignored.
+/// cursor-key encoding, mouse tracking, focus reporting, or bracketed paste —
+/// and so must be relayed to the host rather than handled internally or ignored.
 ///
+/// - `1` — DECCKM cursor-keys mode (arrows send `SS3` vs `CSI`); relaying it
+///   keeps the host's arrow encoding in step with what the child expects
 /// - `1000`/`1002`/`1003` — X11 mouse: click, button-event (drag), any-event
 /// - `1004` — focus in/out reporting
 /// - `1005`/`1006`/`1015`/`1016` — extended mouse coordinate encodings
 /// - `2004` — bracketed paste
 fn is_host_input_mode(param: usize) -> bool {
-    matches!(param, 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004)
+    matches!(param, 1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004)
 }
