@@ -7,7 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::backend::{Backend, UnixBackend, WindowsBackend};
+use crate::backend::Backend;
+#[cfg(unix)]
+use crate::backend::UnixBackend;
+#[cfg(windows)]
+use crate::backend::WindowsBackend;
 use crate::core::{AnsiParser, DirtyFrame, Grid, WIDE_TRAILER};
 
 /// Set by the `SIGWINCH` handler; the render loop drains it to resize the grid
@@ -112,11 +116,10 @@ fn draw(frame: &DirtyFrame, position_cursor: bool) {
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let backend: Box<dyn Backend> = if cfg!(target_os = "windows") {
-        Box::new(WindowsBackend)
-    } else {
-        Box::new(UnixBackend)
-    };
+    #[cfg(unix)]
+    let backend: Box<dyn Backend> = Box::new(UnixBackend);
+    #[cfg(windows)]
+    let backend: Box<dyn Backend> = Box::new(WindowsBackend);
 
     // Start at the host terminal's actual size, falling back to 80x24.
     let (init_cols, init_rows) = backend.terminal_size().unwrap_or((80, 24));

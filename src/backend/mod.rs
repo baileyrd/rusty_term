@@ -29,8 +29,14 @@ pub trait BackendHandle: Send {
     fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error>;
 }
 
+// Each backend only compiles on its own platform — the Unix one leans on
+// platform-specific libc (openpty, termios, …), the Windows one on ConPTY.
+#[cfg(unix)]
 pub mod unix;
+#[cfg(windows)]
 pub mod windows;
 
+#[cfg(unix)]
 pub use unix::UnixBackend;
+#[cfg(windows)]
 pub use windows::WindowsBackend;
