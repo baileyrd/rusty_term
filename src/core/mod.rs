@@ -99,6 +99,13 @@ pub struct Grid {
     /// Monotonic counter bumped on every parsed batch; lets the renderer
     /// reason about frame freshness.
     pub epoch: u64,
+    /// Window title last set by the child via OSC 0/2. The renderer forwards
+    /// changes to the host terminal's title bar; empty until the child sets one.
+    pub title: String,
+    /// Working directory last reported by the child via OSC 7 (typically a
+    /// `file://host/path` URI). Captured for future use (e.g. "open new tab in
+    /// the same directory"); empty until reported.
+    pub cwd: String,
 }
 
 /// Which DEC private mode selected the alternate screen, which determines the
@@ -163,6 +170,8 @@ impl Grid {
             scroll_bottom: rows.saturating_sub(1),
             primary: None,
             epoch: 0,
+            title: String::new(),
+            cwd: String::new(),
         }
     }
 
@@ -526,7 +535,16 @@ pub struct AnsiParser {
     /// `advance` and writes them back to the PTY master, where the child reads
     /// them as terminal input.
     responses: Vec<u8>,
+    /// Raw bytes of the OSC string currently being collected (between `ESC ]`
+    /// and its `BEL`/`ST` terminator). Decoded as UTF-8 at dispatch. Capped at
+    /// [`OSC_MAX`] so a pathological unterminated OSC can't grow without bound.
+    osc_buffer: Vec<u8>,
 }
+
+/// Upper bound on the bytes buffered for a single OSC string. Real titles and
+/// cwd URIs are far shorter; past this we keep consuming the string but stop
+/// storing it.
+const OSC_MAX: usize = 4096;
 
 impl Default for AnsiParser {
     fn default() -> Self {
@@ -547,6 +565,7 @@ impl AnsiParser {
             utf8_acc: 0,
             utf8_remaining: 0,
             responses: Vec::new(),
+            osc_buffer: Vec::new(),
         }
     }
 
@@ -555,6 +574,24 @@ impl AnsiParser {
     /// calls this after `advance` and writes the result to the PTY master.
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.responses)
+    }
+
+    /// Act on the OSC string just collected in `osc_buffer`. The payload is
+    /// `<code> ; <text>`; we handle window title (0/2) and working-directory
+    /// (7) reports, recording them on the grid. Other OSC codes (4, 8, 52,
+    /// 133, …) are recognized as well-formed and ignored for now.
+    fn dispatch_osc(&mut self, g: &mut Grid) {
+        let payload = String::from_utf8_lossy(&self.osc_buffer);
+        let Some((code, text)) = payload.split_once(';') else {
+            return; // no separator — nothing actionable
+        };
+        match code {
+            // 0 sets icon name *and* window title; 2 sets the window title.
+            "0" | "2" => g.title = text.to_string(),
+            // 7 reports the working directory (usually a file:// URI).
+            "7" => g.cwd = text.to_string(),
+            _ => {}
+        }
     }
 
     /// Feed a chunk of bytes, applying their effects to `g`. Parser state
@@ -588,7 +625,10 @@ impl AnsiParser {
                         self.csi_marker = 0;
                         self.state = ParserState::Csi;
                     }
-                    b']' => self.state = ParserState::Osc,
+                    b']' => {
+                        self.osc_buffer.clear();
+                        self.state = ParserState::Osc;
+                    }
                     // DECSC / DECRC: save and restore the cursor.
                     b'7' => {
                         g.save_cursor();
@@ -660,13 +700,23 @@ impl AnsiParser {
                     }
                 },
                 ParserState::Osc => match b {
-                    0x07 => self.state = ParserState::Ground, // BEL terminator
+                    0x07 => {
+                        // BEL terminator: act on the collected string.
+                        self.dispatch_osc(g);
+                        self.state = ParserState::Ground;
+                    }
                     0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
-                    _ => {}                                   // consume payload byte
+                    _ => {
+                        // Accumulate the payload byte, bounded.
+                        if self.osc_buffer.len() < OSC_MAX {
+                            self.osc_buffer.push(b);
+                        }
+                    }
                 },
                 ParserState::OscEsc => {
                     // Whether or not this is the `\` of an ST, the OSC string is
-                    // over; drop the byte and return to ground.
+                    // over; act on it and return to ground.
+                    self.dispatch_osc(g);
                     self.state = ParserState::Ground;
                 }
                 ParserState::EscCharset => self.state = ParserState::Ground,
@@ -1631,5 +1681,56 @@ mod tests {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"hello\x1b[31mworld");
         assert!(p.take_responses().is_empty());
+    }
+
+    #[test]
+    fn osc_2_sets_window_title() {
+        let mut g = parse(b"\x1b]2;My Title\x07", 80, 24);
+        assert_eq!(g.title, "My Title");
+        // OSC 0 also sets the title.
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]0;Another\x07");
+        assert_eq!(g.title, "Another");
+    }
+
+    #[test]
+    fn osc_7_sets_working_directory() {
+        let g = parse(b"\x1b]7;file://host/home/user\x1b\\", 80, 24);
+        assert_eq!(g.cwd, "file://host/home/user");
+    }
+
+    #[test]
+    fn osc_title_decodes_utf8_and_does_not_print() {
+        // Multi-byte payload must round-trip, and the trailing 'X' still renders.
+        let g = parse("\x1b]2;café 世\x07X".as_bytes(), 80, 24);
+        assert_eq!(g.title, "café 世");
+        assert_eq!(g.cells[0].ch, 'X');
+        assert_eq!(g.cursor, (1, 0));
+    }
+
+    #[test]
+    fn osc_split_across_chunks_is_captured() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]2;split ");
+        p.advance(&mut g, b"title\x07");
+        assert_eq!(g.title, "split title");
+    }
+
+    #[test]
+    fn osc_without_separator_is_ignored() {
+        // No ';' — not actionable, and must not panic or print.
+        let g = parse(b"\x1b]999\x07Z", 80, 24);
+        assert_eq!(g.title, "");
+        assert_eq!(g.cwd, "");
+        assert_eq!(g.cells[0].ch, 'Z');
+    }
+
+    #[test]
+    fn osc_unknown_code_is_ignored_but_consumed() {
+        // OSC 52 (clipboard) isn't acted on yet, but must not leak or set title.
+        let g = parse(b"\x1b]52;c;SGVsbG8=\x07W", 80, 24);
+        assert_eq!(g.title, "");
+        assert_eq!(g.cells[0].ch, 'W');
     }
 }

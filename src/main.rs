@@ -193,6 +193,10 @@ fn main() -> Result<(), std::io::Error> {
     // cursor-only motion (arrows, Ctrl-A/E, backspace) that dirties no rows.
     let mut last_cursor: Option<(usize, usize)> = None;
 
+    // Last window title forwarded to the host, so OSC 0/2 updates are passed
+    // through to the host terminal's title bar only when they actually change.
+    let mut last_title: Option<String> = None;
+
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(16));
 
@@ -220,12 +224,21 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        let frame = {
+        let (frame, title) = {
             let mut g = grid.lock().unwrap();
             let frame = g.snapshot_dirty();
             g.clear_dirty();
-            frame
+            (frame, g.title.clone())
         };
+
+        // Forward a changed, non-empty window title to the host terminal so its
+        // title bar tracks what the child set via OSC 0/2.
+        if !title.is_empty() && last_title.as_deref() != Some(title.as_str()) {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b]0;{}\x07", title);
+            let _ = out.flush();
+            last_title = Some(title);
+        }
 
         // Draw when cells changed, or when only the cursor moved — `draw` emits
         // the final cursor-positioning escape, so a pure motion still needs it.
