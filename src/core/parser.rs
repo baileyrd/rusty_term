@@ -176,6 +176,11 @@ impl AnsiParser {
                         g.reverse_index();
                         self.state = ParserState::Ground;
                     }
+                    // HTS — set a tab stop at the current column.
+                    b'H' => {
+                        g.set_tab_stop();
+                        self.state = ParserState::Ground;
+                    }
                     // Charset designation (`ESC ( B`, etc.): one more byte follows.
                     b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
                     // String-type introducers — DCS (`P`), SOS (`X`), PM (`^`),
@@ -292,13 +297,9 @@ impl AnsiParser {
                 self.last_char = None;
             }
             b'\t' => {
-                // Advance to the next 8-column tab stop, clamped at the right
-                // margin so we never wrap/scroll on a tab.
-                let next_stop = (g.cursor.0 / 8 + 1) * 8;
-                let target = next_stop.min(g.cols.saturating_sub(1));
-                while g.cursor.0 < target {
-                    g.put_char(' ', self.pen);
-                }
+                // Advance to the next tab stop (non-destructive), clamped at the
+                // right margin so we never wrap/scroll on a tab.
+                g.tab_forward(1);
                 self.last_char = None;
             }
             0x20..=0x7e => {
@@ -406,6 +407,13 @@ impl AnsiParser {
                 }
             }
             b'@' => g.insert_chars(count), // ICH
+            b'I' => g.tab_forward(count),  // CHT
+            b'Z' => g.tab_backward(count), // CBT
+            b'g' => match p(0, 0) {
+                0 => g.clear_tab_stop(),       // TBC 0 — clear stop at cursor
+                3 => g.clear_all_tab_stops(),  // TBC 3 — clear all stops
+                _ => {}
+            },
             b'P' => g.delete_chars(count), // DCH
             b'X' => g.erase_chars(count),  // ECH
             b'L' => g.insert_lines(count), // IL

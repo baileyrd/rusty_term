@@ -1180,9 +1180,86 @@ fn rep_after_newline_is_noop() {
 
 #[test]
 fn rep_after_tab_is_noop() {
-    // A tab also clears the memory (the spaces it emits aren't a "last char").
+    // A tab also clears the memory (it is a cursor move, not a "last char").
     let g = parse(b"A\t\x1b[2b", 80, 24);
     // 'A' at col 0, tab to col 8, REP repeats nothing.
     assert_eq!(g.cells[0].ch, 'A');
     assert_eq!(g.cursor, (8, 0));
+}
+
+#[test]
+fn ht_is_non_destructive() {
+    // A tab moves the cursor without erasing the cells it passes over.
+    let mut g = parse(b"abcdef", 80, 24);
+    g.cursor = (2, 0);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\t"); // HT from col 2 -> col 8
+    assert_eq!(g.cursor.0, 8);
+    assert_eq!(&row_text(&g, 0)[..6], "abcdef"); // text under the tab preserved
+}
+
+#[test]
+fn hts_sets_a_custom_tab_stop() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (3, 0);
+    p.advance(&mut g, b"\x1bH"); // HTS — stop at col 3
+    g.cursor = (0, 0);
+    p.advance(&mut g, b"\t"); // HT -> custom stop at 3 (before the default 8)
+    assert_eq!(g.cursor.0, 3);
+}
+
+#[test]
+fn tbc_clears_stop_at_cursor() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (8, 0);
+    p.advance(&mut g, b"\x1b[g"); // TBC 0 — clear the default stop at col 8
+    g.cursor = (0, 0);
+    p.advance(&mut g, b"\t"); // HT skips the cleared stop -> 16
+    assert_eq!(g.cursor.0, 16);
+}
+
+#[test]
+fn tbc_3_clears_all_stops() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[3g"); // TBC 3 — clear every stop
+    g.cursor = (0, 0);
+    p.advance(&mut g, b"\t"); // no stops -> right margin
+    assert_eq!(g.cursor.0, 79);
+}
+
+#[test]
+fn cht_moves_forward_n_stops() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (0, 0);
+    p.advance(&mut g, b"\x1b[3I"); // CHT 3 -> stops 8, 16, 24
+    assert_eq!(g.cursor.0, 24);
+}
+
+#[test]
+fn cbt_moves_backward_n_stops() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (20, 0);
+    p.advance(&mut g, b"\x1b[2Z"); // CBT 2 -> 16, then 8
+    assert_eq!(g.cursor.0, 8);
+    // Default count is 1.
+    g.cursor = (20, 0);
+    p.advance(&mut g, b"\x1b[Z"); // CBT 1 -> 16
+    assert_eq!(g.cursor.0, 16);
+}
+
+#[test]
+fn custom_tab_stops_survive_resize() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.cursor = (3, 0);
+    p.advance(&mut g, b"\x1bH"); // custom stop at col 3
+    g.resize(100, 30); // grow — surviving columns keep their stops
+    g.cursor = (0, 0);
+    p.advance(&mut g, b"\t");
+    assert_eq!(g.cursor.0, 3); // custom stop preserved across resize
 }
