@@ -120,6 +120,9 @@ pub struct Grid {
 struct SavedScreen {
     cells: Vec<Cell>,
     cursor: (usize, usize),
+    /// The DECSC/`CSI s` register at the time of the switch, kept separate from
+    /// the alternate screen's so the two buffers don't share one save slot.
+    saved_cursor: (usize, usize),
 }
 
 /// Reflow `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows` buffer,
@@ -286,6 +289,7 @@ impl Grid {
         if let Some(saved) = &mut self.primary {
             saved.cells = reflow(&saved.cells, self.cols, self.rows, cols, rows);
             saved.cursor = clamp(saved.cursor);
+            saved.saved_cursor = clamp(saved.saved_cursor);
         }
         self.cells = new_cells;
         self.cols = cols;
@@ -305,20 +309,25 @@ impl Grid {
         self.primary = Some(SavedScreen {
             cells: std::mem::replace(&mut self.cells, vec![Cell::blank(); self.cols * self.rows]),
             cursor: self.cursor,
+            saved_cursor: self.saved_cursor,
         });
         self.cursor = (0, 0);
         self.reset_scroll_region();
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
-    /// Switch back to the primary screen, restoring its buffer and cursor.
-    /// No-op if the alternate screen is not active.
+    /// Switch back to the primary screen, restoring its buffer and both cursor
+    /// registers. No-op if the alternate screen is not active.
     fn leave_alt_screen(&mut self) {
         if let Some(saved) = self.primary.take() {
             self.cells = saved.cells;
             self.cursor = (
                 saved.cursor.0.min(self.cols.saturating_sub(1)),
                 saved.cursor.1.min(self.rows.saturating_sub(1)),
+            );
+            self.saved_cursor = (
+                saved.saved_cursor.0.min(self.cols.saturating_sub(1)),
+                saved.saved_cursor.1.min(self.rows.saturating_sub(1)),
             );
             self.reset_scroll_region();
             self.dirty.iter_mut().for_each(|d| *d = true);
@@ -531,11 +540,31 @@ impl AnsiParser {
                         self.param_buffer.clear();
                         self.csi_private = false;
                     }
-                    // Anything else aborts the malformed sequence.
-                    _ => {
+                    // CAN / SUB cancel the sequence.
+                    0x18 | 0x1a => {
                         self.state = ParserState::Ground;
                         self.param_buffer.clear();
                         self.csi_private = false;
+                    }
+                    // ESC starts a fresh escape sequence.
+                    0x1b => {
+                        self.state = ParserState::Esc;
+                        self.param_buffer.clear();
+                        self.csi_private = false;
+                    }
+                    // Other C0 controls execute in place; the CSI continues
+                    // (VT500 parser semantics) so its parameters are preserved.
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                        self.ground_byte(b, g);
+                        self.state = ParserState::Csi;
+                    }
+                    // DEL is ignored inside a CSI; any other byte aborts.
+                    _ => {
+                        if b != 0x7f {
+                            self.state = ParserState::Ground;
+                            self.param_buffer.clear();
+                            self.csi_private = false;
+                        }
                     }
                 },
                 ParserState::Osc => match b {
@@ -607,62 +636,55 @@ impl AnsiParser {
     /// (bracketed paste `2004`, cursor visibility `25`, …) are consumed and
     /// ignored so they never leak as text.
     fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
-        let params: Vec<usize> = self.param_buffer
-            .split(';')
-            .filter_map(|s| s.parse().ok())
-            .collect();
-
+        let params = self.parse_params();
         // 47 / 1047 / 1049 all select the alternate screen buffer; 1049 also
         // saves/restores the cursor, which enter/leave handle implicitly.
-        let is_alt_mode = |p: usize| matches!(p, 47 | 1047 | 1049);
+        let is_alt = params.iter().flatten().any(|&v| matches!(v, 47 | 1047 | 1049));
         match cmd {
-            b'h' => {
-                if params.iter().copied().any(is_alt_mode) {
-                    g.enter_alt_screen();
-                }
-            }
-            b'l' => {
-                if params.iter().copied().any(is_alt_mode) {
-                    g.leave_alt_screen();
-                }
-            }
+            b'h' if is_alt => g.enter_alt_screen(),
+            b'l' if is_alt => g.leave_alt_screen(),
             _ => {}
         }
     }
 
+    /// Parse `param_buffer` into positional parameters. An empty slot (e.g. the
+    /// leading field of `CSI ;5H`) becomes `None` so callers can apply the
+    /// per-command default in the correct position, per ECMA-48 §5.4.2.
+    fn parse_params(&self) -> Vec<Option<usize>> {
+        if self.param_buffer.is_empty() {
+            return Vec::new();
+        }
+        self.param_buffer
+            .split(';')
+            .map(|s| if s.is_empty() { None } else { s.parse().ok() })
+            .collect()
+    }
+
     /// Dispatch a completed CSI sequence given its final command byte.
     fn handle_csi(&mut self, cmd: u8, g: &mut Grid) {
-        let params: Vec<usize> = self.param_buffer
-            .split(';')
-            .filter_map(|s| s.parse().ok())
-            .collect();
-
-        // Most cursor-motion commands take a single optional count that
-        // defaults to (and treats 0 as) 1.
-        let count = params.first().copied().unwrap_or(1).max(1);
+        let params = self.parse_params();
+        // Positional parameter `i` with `default` applied to an absent/empty slot.
+        let p = |i: usize, default: usize| params.get(i).copied().flatten().unwrap_or(default);
+        // Most cursor-motion commands take a single count that defaults to (and
+        // treats 0 as) 1.
+        let count = p(0, 1).max(1);
 
         match cmd {
-            b'm' => self.apply_sgr(&params),
+            b'm' => {
+                // SGR: an empty list resets; otherwise an empty slot means 0.
+                let sgr: Vec<usize> = params.iter().map(|o| o.unwrap_or(0)).collect();
+                self.apply_sgr(&sgr);
+            }
             b'H' | b'f' => {
                 // CSI row ; col H — both 1-based; default to 1.
-                let y = params.first().copied().unwrap_or(1);
-                let x = params.get(1).copied().unwrap_or(1);
-                g.set_cursor(x.saturating_sub(1), y.saturating_sub(1));
+                g.set_cursor(p(1, 1).saturating_sub(1), p(0, 1).saturating_sub(1));
             }
             b'A' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_sub(count)), // CUU
-            b'B' => g.set_cursor(g.cursor.0, g.cursor.1 + count),               // CUD
-            b'C' => g.set_cursor(g.cursor.0 + count, g.cursor.1),               // CUF
+            b'B' => g.set_cursor(g.cursor.0, g.cursor.1.saturating_add(count)), // CUD
+            b'C' => g.set_cursor(g.cursor.0.saturating_add(count), g.cursor.1), // CUF
             b'D' => g.set_cursor(g.cursor.0.saturating_sub(count), g.cursor.1), // CUB
-            b'G' => {
-                // CHA — cursor to absolute column (1-based).
-                let col = params.first().copied().unwrap_or(1);
-                g.set_cursor(col.saturating_sub(1), g.cursor.1);
-            }
-            b'd' => {
-                // VPA — cursor to absolute row (1-based).
-                let row = params.first().copied().unwrap_or(1);
-                g.set_cursor(g.cursor.0, row.saturating_sub(1));
-            }
+            b'G' => g.set_cursor(p(0, 1).saturating_sub(1), g.cursor.1),        // CHA
+            b'd' => g.set_cursor(g.cursor.0, p(0, 1).saturating_sub(1)),        // VPA
             b'@' => g.insert_chars(count), // ICH
             b'P' => g.delete_chars(count), // DCH
             b'X' => g.erase_chars(count),  // ECH
@@ -670,14 +692,14 @@ impl AnsiParser {
             b'u' => g.restore_cursor(),    // RCP
             b'r' => {
                 // DECSTBM — set top/bottom scrolling margins (1-based).
-                let top = params.first().copied().unwrap_or(1).saturating_sub(1);
-                let bottom = params.get(1).copied().unwrap_or(g.rows).saturating_sub(1);
+                let top = p(0, 1).saturating_sub(1);
+                let bottom = p(1, g.rows).saturating_sub(1);
                 g.set_scroll_region(top, bottom);
             }
             b'J' => {
                 // ED — erase in display.
                 let (cx, cy) = g.cursor;
-                match params.first().copied().unwrap_or(0) {
+                match p(0, 0) {
                     0 => {
                         // Cursor to end of screen.
                         g.clear_row_range(cy, cx, g.cols);
@@ -699,7 +721,7 @@ impl AnsiParser {
             b'K' => {
                 // EL — erase in line.
                 let (cx, cy) = g.cursor;
-                match params.first().copied().unwrap_or(0) {
+                match p(0, 0) {
                     0 => g.clear_row_range(cy, cx, g.cols),
                     1 => g.clear_row_range(cy, 0, cx + 1),
                     2 => g.clear_row_range(cy, 0, g.cols),
@@ -1025,6 +1047,56 @@ mod tests {
         assert_eq!(frame.cursor, (1, 0));
         g.clear_dirty();
         assert!(g.snapshot_dirty().rows.is_empty());
+    }
+
+    #[test]
+    fn csi_empty_leading_param_keeps_position() {
+        // CSI ;5H -> row defaults to 1, column = 5 -> (col 4, row 0).
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (10, 10);
+        p.advance(&mut g, b"\x1b[;5H");
+        assert_eq!(g.cursor, (4, 0));
+        // CSI ;10r -> top defaults to 1 (row 0), bottom = 10 (row 9).
+        p.advance(&mut g, b"\x1b[;10r");
+        assert_eq!((g.scroll_top, g.scroll_bottom), (0, 9));
+    }
+
+    #[test]
+    fn csi_huge_count_does_not_overflow() {
+        // CUD/CUF with a near-usize::MAX count must saturate, not panic/wrap.
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (5, 5);
+        p.advance(&mut g, b"\x1b[18446744073709551610B"); // CUD
+        assert_eq!(g.cursor.1, 23); // clamped to last row
+        p.advance(&mut g, b"\x1b[18446744073709551610C"); // CUF
+        assert_eq!(g.cursor.0, 79); // clamped to last column
+    }
+
+    #[test]
+    fn c0_control_inside_csi_executes_and_continues() {
+        // CSI 5 \r ; 10 H: the CR executes mid-sequence, the CSI continues, and
+        // nothing leaks as printed text.
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[5\r;10H");
+        assert_eq!(g.cursor, (9, 4)); // CUP row 5, col 10 applied
+        assert_eq!(g.cells[0].ch, ' '); // ";10H" not printed
+    }
+
+    #[test]
+    fn alt_screen_does_not_leak_saved_cursor() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        g.cursor = (5, 5);
+        p.advance(&mut g, b"\x1b7"); // DECSC on primary -> saved (5,5)
+        p.advance(&mut g, b"\x1b[?1049h"); // to alt
+        g.cursor = (10, 10);
+        p.advance(&mut g, b"\x1b7"); // DECSC on alt -> alt's saved (10,10)
+        p.advance(&mut g, b"\x1b[?1049l"); // back to primary
+        p.advance(&mut g, b"\x1b8"); // DECRC on primary
+        assert_eq!(g.cursor, (5, 5)); // primary's saved cursor intact
     }
 
     #[test]
