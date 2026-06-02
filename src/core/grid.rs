@@ -74,6 +74,14 @@ pub struct Grid {
     /// every 8th column and is modified by `HTS` / `TBC`. A resize preserves
     /// stops within the surviving width and defaults the new columns.
     tab_stops: Vec<bool>,
+    /// Whether the text cursor is visible (DECTCEM `?25`, default on). The
+    /// renderer shows/hides the host cursor accordingly — independent of the
+    /// separate hide it applies while browsing scrollback.
+    pub cursor_visible: bool,
+    /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
+    /// printed at the right margin overwrites the last column instead of
+    /// wrapping to the next line.
+    pub(crate) autowrap: bool,
 }
 
 /// Build the default tab-stop table for a `cols`-wide grid: a stop at every
@@ -152,6 +160,8 @@ impl Grid {
             links: Vec::new(),
             current_link: 0,
             tab_stops: default_tab_stops(cols),
+            cursor_visible: true,
+            autowrap: true,
         }
     }
 
@@ -268,8 +278,13 @@ impl Grid {
             return;
         }
         if self.cursor.0 + w > self.cols {
-            self.carriage_return();
-            self.newline();
+            if self.autowrap {
+                self.carriage_return();
+                self.newline();
+            } else {
+                // Autowrap off: keep the glyph in the last cell(s) of this row.
+                self.cursor.0 = self.cols.saturating_sub(w);
+            }
         }
         let (x, y) = self.cursor;
         let link = self.current_link;
@@ -626,6 +641,49 @@ impl Grid {
     /// Clear every tab stop (`TBC 3`).
     pub(crate) fn clear_all_tab_stops(&mut self) {
         self.tab_stops.iter_mut().for_each(|s| *s = false);
+    }
+
+    /// Full reset (`RIS`): return the grid to its power-on state — blank primary
+    /// screen, home cursor, full-screen scroll region, default tab stops,
+    /// cleared scrollback, cursor visible, autowrap on. The window title and cwd
+    /// are intentionally left alone (a hardware reset doesn't relabel the tab).
+    /// The parser separately resets its pen.
+    pub(crate) fn reset(&mut self) {
+        self.primary = None; // leave the alternate screen if active
+        self.cells = vec![Cell::blank(); self.cols * self.rows];
+        self.dirty = vec![true; self.rows];
+        self.cursor = (0, 0);
+        self.saved_cursor = (0, 0);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.scrollback.clear();
+        self.view_offset = 0;
+        self.tab_stops = default_tab_stops(self.cols);
+        self.cursor_visible = true;
+        self.autowrap = true;
+        self.current_link = 0;
+    }
+
+    /// Soft reset (`DECSTR`): reset terminal modes without clearing the screen
+    /// or moving the active cursor — full-screen scroll region, saved cursor to
+    /// home, cursor visible, autowrap on. The parser separately resets its pen.
+    pub(crate) fn soft_reset(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.saved_cursor = (0, 0);
+        self.cursor_visible = true;
+        self.autowrap = true;
+        self.current_link = 0;
+    }
+
+    /// Screen-alignment test (`DECALN`, `ESC # 8`): fill every cell with `E` and
+    /// home the cursor. Used to check character positioning.
+    pub(crate) fn fill_alignment(&mut self) {
+        let mut e = Cell::blank();
+        e.ch = 'E';
+        self.cells.fill(e);
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        self.cursor = (0, 0);
     }
 
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.

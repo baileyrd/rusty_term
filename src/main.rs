@@ -299,8 +299,10 @@ fn main() -> Result<(), std::io::Error> {
     // through to the host terminal's title bar only when they actually change.
     let mut last_title: Option<String> = None;
 
-    // Whether we've hidden the host cursor while the user browses scrollback.
-    let mut cursor_hidden = false;
+    // Current visibility of the host cursor (starts shown). The cursor is shown
+    // only in the live view and only when the child wants it (DECTCEM); it is
+    // hidden while browsing scrollback or when the child issued `?25l`.
+    let mut cursor_shown = true;
 
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(16));
@@ -329,7 +331,7 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        let (frame, title, viewing, dirty_any, host_out) = {
+        let (frame, title, viewing, dirty_any, host_out, app_cursor_visible) = {
             let mut g = grid.lock().unwrap();
             let viewing = g.view_offset > 0;
             let dirty_any = g.dirty.iter().any(|&d| d);
@@ -341,7 +343,7 @@ fn main() -> Result<(), std::io::Error> {
                 g.snapshot_dirty()
             };
             g.clear_dirty();
-            (frame, g.title.clone(), viewing, dirty_any, g.take_host_out())
+            (frame, g.title.clone(), viewing, dirty_any, g.take_host_out(), g.cursor_visible)
         };
 
         // Forward any clipboard (OSC 52) bytes to the host terminal verbatim.
@@ -360,27 +362,25 @@ fn main() -> Result<(), std::io::Error> {
             last_title = Some(title);
         }
 
+        // The host cursor is shown only in the live view and only when the child
+        // wants it visible. Sync the host's state on any change.
+        let want_cursor = !viewing && app_cursor_visible;
+        if want_cursor != cursor_shown {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(if want_cursor { b"\x1b[?25h" } else { b"\x1b[?25l" });
+            let _ = out.flush();
+            cursor_shown = want_cursor;
+        }
+
         if viewing {
             // Repaint the whole viewport only when something changed (a scroll,
-            // or new output arriving underneath). Hide the cursor while browsing.
+            // or new output arriving underneath).
             if dirty_any {
                 draw(&frame, false);
-            }
-            if !cursor_hidden {
-                let mut out = std::io::stdout();
-                let _ = out.write_all(b"\x1b[?25l");
-                let _ = out.flush();
-                cursor_hidden = true;
             }
             // Force a cursor reposition on the first live frame after we return.
             last_cursor = None;
         } else {
-            if cursor_hidden {
-                let mut out = std::io::stdout();
-                let _ = out.write_all(b"\x1b[?25h");
-                let _ = out.flush();
-                cursor_hidden = false;
-            }
             // Draw when cells changed, or when only the cursor moved — `draw`
             // emits the final cursor-positioning escape, so a pure motion still
             // needs it.

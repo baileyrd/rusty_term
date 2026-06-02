@@ -35,6 +35,8 @@ enum ParserState {
     OscEsc,
     /// A charset-designation escape (`ESC ( B`, etc.); consume one more byte.
     EscCharset,
+    /// An `ESC #` sequence; the next byte selects the function (`8` = DECALN).
+    EscHash,
     /// Inside a string-type control sequence — DCS (`ESC P`), APC (`ESC _`),
     /// PM (`ESC ^`), or SOS (`ESC X`). Like [`ParserState::Osc`], the body is
     /// consumed opaquely (we don't act on Sixel, DECRQSS, Kitty graphics, …)
@@ -61,6 +63,10 @@ pub struct AnsiParser {
     /// `0` if none. Lets the dispatcher tell DA2 (`CSI > c`) from DEC private
     /// modes (`CSI ? … h/l`). Reset at the start of each CSI.
     csi_marker: u8,
+    /// The last intermediate byte (`0x20..=0x2f`) seen in the CSI in flight, or
+    /// `0` if none. Distinguishes e.g. DECSTR (`CSI ! p`) from a bare `CSI p`.
+    /// Reset at the start of each CSI.
+    csi_intermediate: u8,
     /// Code point accumulated so far while in [`ParserState::Utf8`].
     utf8_acc: u32,
     /// Number of UTF-8 continuation bytes still expected.
@@ -100,6 +106,7 @@ impl AnsiParser {
             param_buffer: String::new(),
             csi_private: false,
             csi_marker: 0,
+            csi_intermediate: 0,
             utf8_acc: 0,
             utf8_remaining: 0,
             responses: Vec::new(),
@@ -145,6 +152,7 @@ impl AnsiParser {
                         self.param_buffer.clear();
                         self.csi_private = false;
                         self.csi_marker = 0;
+                        self.csi_intermediate = 0;
                         self.state = ParserState::Csi;
                     }
                     b']' => {
@@ -181,6 +189,15 @@ impl AnsiParser {
                         g.set_tab_stop();
                         self.state = ParserState::Ground;
                     }
+                    // RIS — reset to initial state (full reset).
+                    b'c' => {
+                        g.reset();
+                        self.pen = Pen::default();
+                        self.last_char = None;
+                        self.state = ParserState::Ground;
+                    }
+                    // ESC # — the next byte selects the function (8 = DECALN).
+                    b'#' => self.state = ParserState::EscHash,
                     // Charset designation (`ESC ( B`, etc.): one more byte follows.
                     b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
                     // String-type introducers — DCS (`P`), SOS (`X`), PM (`^`),
@@ -201,8 +218,9 @@ impl AnsiParser {
                         self.csi_private = true;
                         self.csi_marker = b;
                     }
-                    // Intermediate bytes (space..`/`): ignored but part of the sequence.
-                    0x20..=0x2f => {}
+                    // Intermediate bytes (space..`/`): remembered (the last one
+                    // is enough to tell DECSTR `CSI ! p` from a bare `CSI p`).
+                    0x20..=0x2f => self.csi_intermediate = b,
                     // Final byte: dispatch and reset. Private sequences (with a
                     // `?`/`<`/`=`/`>` marker) go to their own handler.
                     0x40..=0x7e => {
@@ -263,6 +281,14 @@ impl AnsiParser {
                     self.state = ParserState::Ground;
                 }
                 ParserState::EscCharset => self.state = ParserState::Ground,
+                ParserState::EscHash => {
+                    // `ESC # 8` is DECALN (screen-alignment fill); other `ESC #`
+                    // functions (double-width/height lines) are consumed.
+                    if b == b'8' {
+                        g.fill_alignment();
+                    }
+                    self.state = ParserState::Ground;
+                }
                 ParserState::StrSink => match b {
                     0x1b => self.state = ParserState::StrSinkEsc, // possible ST (ESC \)
                     0x18 | 0x1a => self.state = ParserState::Ground, // CAN / SUB abort
@@ -373,6 +399,13 @@ impl AnsiParser {
                 g.host_out.extend_from_slice(b"\x1b[?");
                 g.host_out.extend_from_slice(param.to_string().as_bytes());
                 g.host_out.push(if set { b'h' } else { b'l' });
+            } else if param == 25 {
+                // DECTCEM — text cursor enable. The renderer reads this to show
+                // or hide the host cursor; not relayed (we own the host cursor).
+                g.cursor_visible = set;
+            } else if param == 7 {
+                // DECAWM — autowrap mode.
+                g.autowrap = set;
             }
         }
     }
@@ -485,6 +518,12 @@ impl AnsiParser {
                     2 => g.clear_row_range(cy, 0, g.cols),
                     _ => {}
                 }
+            }
+            b'p' if self.csi_intermediate == b'!' => {
+                // DECSTR — soft terminal reset (`CSI ! p`).
+                g.soft_reset();
+                self.pen = Pen::default();
+                self.last_char = None;
             }
             b'c' => {
                 // DA1 (Primary Device Attributes). Only the default/`0` form is
