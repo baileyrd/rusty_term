@@ -450,9 +450,9 @@ fn wide_char_occupies_two_cells() {
 #[test]
 fn overwriting_wide_head_clears_orphan_trailer() {
     let mut g = Grid::new(80, 24);
-    g.put_char('世', DEFAULT_FG, DEFAULT_BG); // head col 0, trailer col 1
+    g.put_char('世', Pen::default()); // head col 0, trailer col 1
     g.cursor = (0, 0);
-    g.put_char('a', DEFAULT_FG, DEFAULT_BG); // overwrite the head
+    g.put_char('a', Pen::default()); // overwrite the head
     assert_eq!(g.cells[0].ch, 'a');
     assert_eq!(g.cells[1].ch, ' '); // orphaned trailer blanked
     assert_eq!(g.cells[1].flags & WIDE_TRAILER, 0);
@@ -461,9 +461,9 @@ fn overwriting_wide_head_clears_orphan_trailer() {
 #[test]
 fn overwriting_wide_trailer_clears_orphan_head() {
     let mut g = Grid::new(80, 24);
-    g.put_char('世', DEFAULT_FG, DEFAULT_BG); // head col 0, trailer col 1
+    g.put_char('世', Pen::default()); // head col 0, trailer col 1
     g.cursor = (1, 0);
-    g.put_char('b', DEFAULT_FG, DEFAULT_BG); // overwrite the trailer
+    g.put_char('b', Pen::default()); // overwrite the trailer
     assert_eq!(g.cells[1].ch, 'b');
     assert_eq!(g.cells[0].ch, ' '); // orphaned head blanked
 }
@@ -493,11 +493,11 @@ fn combining_mark_attaches_to_preceding_glyph() {
 #[test]
 fn multiple_combining_marks_and_overflow() {
     let mut g = Grid::new(80, 24);
-    g.put_char('e', DEFAULT_FG, DEFAULT_BG);
+    g.put_char('e', Pen::default());
     // Two marks fill both slots; a third is dropped (bounded).
-    g.put_char('\u{0301}', DEFAULT_FG, DEFAULT_BG);
-    g.put_char('\u{0323}', DEFAULT_FG, DEFAULT_BG);
-    g.put_char('\u{0308}', DEFAULT_FG, DEFAULT_BG);
+    g.put_char('\u{0301}', Pen::default());
+    g.put_char('\u{0323}', Pen::default());
+    g.put_char('\u{0308}', Pen::default());
     assert_eq!(g.cells[0].combining, ['\u{0301}', '\u{0323}']);
     assert_eq!(g.cursor, (1, 0));
 }
@@ -870,4 +870,146 @@ fn osc_8_interns_duplicate_uri_once() {
     );
     assert_eq!(g.cells[0].link, g.cells[2].link); // same interned id
     assert_eq!(g.links.len(), 1); // URI stored once
+}
+
+#[test]
+fn sgr_sets_text_attribute_bits() {
+    let g = parse(b"\x1b[1mA\x1b[4mB", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_BOLD, 0); // A is bold
+    // B is bold + underline (attributes accumulate until reset).
+    assert_ne!(g.cells[1].flags & ATTR_BOLD, 0);
+    assert_ne!(g.cells[1].flags & ATTR_UNDERLINE, 0);
+}
+
+#[test]
+fn sgr_combined_attributes_in_one_sequence() {
+    // Bold + italic + reverse set together, with a color, in one CSI m.
+    let g = parse(b"\x1b[1;3;7;31mX", 80, 24);
+    let f = g.cells[0].flags;
+    assert_ne!(f & ATTR_BOLD, 0);
+    assert_ne!(f & ATTR_ITALIC, 0);
+    assert_ne!(f & ATTR_REVERSE, 0);
+    assert_eq!(g.cells[0].fg, PALETTE_16[1]); // 31 still applied
+}
+
+#[test]
+fn sgr_reset_clears_all_attributes() {
+    let g = parse(b"\x1b[1;4;7mA\x1b[0mB", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_MASK, 0); // A styled
+    assert_eq!(g.cells[1].flags & ATTR_MASK, 0); // B fully reset
+}
+
+#[test]
+fn sgr_selective_attribute_resets() {
+    // 22 clears bold (and dim), leaving underline; 24 then clears underline.
+    let g = parse(b"\x1b[1;4mA\x1b[22mB\x1b[24mC", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_BOLD, 0);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
+    assert_eq!(g.cells[1].flags & ATTR_BOLD, 0); // bold cleared
+    assert_ne!(g.cells[1].flags & ATTR_UNDERLINE, 0); // underline kept
+    assert_eq!(g.cells[2].flags & ATTR_UNDERLINE, 0); // underline cleared
+}
+
+#[test]
+fn sgr_22_clears_both_bold_and_dim() {
+    let g = parse(b"\x1b[1;2mA\x1b[22mB", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_BOLD, 0);
+    assert_ne!(g.cells[0].flags & ATTR_DIM, 0);
+    assert_eq!(g.cells[1].flags & (ATTR_BOLD | ATTR_DIM), 0);
+}
+
+#[test]
+fn wide_trailer_carries_only_layout_bit_under_attributes() {
+    // A bold wide glyph: the head carries the bold bit; the trailer carries
+    // only WIDE_TRAILER, never a rendition attribute.
+    let g = parse("\x1b[1m世".as_bytes(), 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_BOLD, 0); // head is bold
+    assert_eq!(g.cells[1].flags, WIDE_TRAILER); // trailer: layout bit only
+}
+
+#[test]
+fn insert_lines_shifts_down_and_blanks() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    g.cursor = (0, 1);
+    p.advance(&mut g, b"\x1b[L"); // IL 1 at row 1
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "    "); // blank inserted
+    assert_eq!(row_text(&g, 2), "BBBB"); // shifted down
+    assert_eq!(row_text(&g, 3), "CCCC");
+    // DDDD was pushed past the bottom and lost.
+}
+
+#[test]
+fn delete_lines_shifts_up_and_blanks() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    g.cursor = (0, 1);
+    p.advance(&mut g, b"\x1b[M"); // DL 1 at row 1
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "CCCC"); // pulled up
+    assert_eq!(row_text(&g, 2), "DDDD");
+    assert_eq!(row_text(&g, 3), "    "); // bottom blanked
+}
+
+#[test]
+fn insert_lines_clamps_to_region_and_marks_dirty() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+    g.cursor = (0, 1);
+    g.clear_dirty();
+    p.advance(&mut g, b"\x1b[10L"); // IL 10 -> clamped to 3 rows below cursor
+    assert_eq!(row_text(&g, 0), "AAAA"); // above cursor untouched
+    assert_eq!(row_text(&g, 1), "    ");
+    assert_eq!(row_text(&g, 2), "    ");
+    assert_eq!(row_text(&g, 3), "    ");
+    // Rows 1..=3 are dirty, row 0 is not.
+    assert_eq!(g.dirty, vec![false, true, true, true]);
+}
+
+#[test]
+fn insert_lines_respects_scroll_region() {
+    let mut g = Grid::new(4, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE");
+    p.advance(&mut g, b"\x1b[2;4r"); // region rows 2..=4 (0-based 1..=3); homes cursor
+    g.cursor = (0, 2); // inside the region
+    p.advance(&mut g, b"\x1b[L"); // IL 1
+    assert_eq!(row_text(&g, 0), "AAAA"); // above region untouched
+    assert_eq!(row_text(&g, 1), "BBBB");
+    assert_eq!(row_text(&g, 2), "    "); // blank inserted at cursor
+    assert_eq!(row_text(&g, 3), "CCCC"); // shifted down within region
+    assert_eq!(row_text(&g, 4), "EEEE"); // below region untouched (DDDD lost)
+}
+
+#[test]
+fn delete_lines_blanks_at_region_bottom() {
+    let mut g = Grid::new(4, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE");
+    p.advance(&mut g, b"\x1b[2;4r"); // region rows 1..=3 (0-based)
+    g.cursor = (0, 1);
+    p.advance(&mut g, b"\x1b[M"); // DL 1
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "CCCC"); // pulled up within region
+    assert_eq!(row_text(&g, 2), "DDDD");
+    assert_eq!(row_text(&g, 3), "    "); // region bottom blanked
+    assert_eq!(row_text(&g, 4), "EEEE"); // below region untouched
+}
+
+#[test]
+fn insert_lines_outside_region_is_noop() {
+    let mut g = Grid::new(4, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE");
+    p.advance(&mut g, b"\x1b[2;4r"); // region rows 1..=3 (0-based)
+    g.cursor = (0, 0); // above the region top
+    p.advance(&mut g, b"\x1b[L"); // IL -> no-op
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "BBBB");
+    assert_eq!(row_text(&g, 2), "CCCC");
+    assert_eq!(row_text(&g, 3), "DDDD");
 }

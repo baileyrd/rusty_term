@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use super::cell::{char_width, Cell, MAX_COMBINING, WIDE_TRAILER};
+use super::cell::{char_width, Cell, Pen, MAX_COMBINING, WIDE_TRAILER};
 
 /// Maximum number of lines retained in the scrollback history. Older lines are
 /// evicted from the front once this is exceeded.
@@ -246,10 +246,10 @@ impl Grid {
         self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
-    /// Write `ch` at the cursor with the given colors, wrapping to the next
+    /// Write `ch` at the cursor with the given [`Pen`], wrapping to the next
     /// line if it would not fit, then advancing the cursor by the glyph's
     /// display width. A double-width glyph also writes a flagged trailing cell.
-    pub fn put_char(&mut self, ch: char, fg: u32, bg: u32) {
+    pub fn put_char(&mut self, ch: char, pen: Pen) {
         let w = char_width(ch);
         if w == 0 {
             // Zero-width combining mark: attach it to the preceding glyph.
@@ -262,13 +262,25 @@ impl Grid {
         }
         let (x, y) = self.cursor;
         let link = self.current_link;
-        self.set_cell(x, y, Cell { ch, combining: ['\0'; MAX_COMBINING], fg, bg, flags: 0, link });
+        self.set_cell(
+            x,
+            y,
+            Cell { ch, combining: ['\0'; MAX_COMBINING], fg: pen.fg, bg: pen.bg, flags: pen.attrs, link },
+        );
         if w == 2 && x + 1 < self.cols {
-            // Trailing half: a flagged placeholder the renderer skips.
+            // Trailing half: a flagged placeholder the renderer skips. It keeps
+            // the pen's colors but only the WIDE_TRAILER layout bit.
             self.set_cell(
                 x + 1,
                 y,
-                Cell { ch: ' ', combining: ['\0'; MAX_COMBINING], fg, bg, flags: WIDE_TRAILER, link },
+                Cell {
+                    ch: ' ',
+                    combining: ['\0'; MAX_COMBINING],
+                    fg: pen.fg,
+                    bg: pen.bg,
+                    flags: WIDE_TRAILER,
+                    link,
+                },
             );
         }
         self.cursor.0 += w;
@@ -438,6 +450,62 @@ impl Grid {
         let (x, y) = self.cursor;
         let n = n.min(self.cols.saturating_sub(x));
         self.clear_row_range(y, x, x + n);
+    }
+
+    /// Insert `n` blank lines at the cursor row, pushing the rows below it down
+    /// within the scrolling region; rows pushed past the region bottom are lost
+    /// (`IL`). A no-op when the cursor is outside the scrolling region.
+    pub(crate) fn insert_lines(&mut self, n: usize) {
+        let cy = self.cursor.1;
+        if cy < self.scroll_top || cy > self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom + 1 - cy);
+        let cols = self.cols;
+        // Shift rows [cy, scroll_bottom - n] down by n. copy_within is a memmove,
+        // so the forward (overlapping) copy is well-defined.
+        let count = (self.scroll_bottom + 1 - cy - n) * cols;
+        if count > 0 {
+            let src = cy * cols;
+            let dst = (cy + n) * cols;
+            self.cells.copy_within(src..src + count, dst);
+        }
+        // Blank the n freed rows at the cursor.
+        let blank_end = (cy + n) * cols;
+        for c in &mut self.cells[cy * cols..blank_end] {
+            *c = Cell::blank();
+        }
+        for d in &mut self.dirty[cy..=self.scroll_bottom] {
+            *d = true;
+        }
+    }
+
+    /// Delete `n` lines at the cursor row, pulling the rows below it up within
+    /// the scrolling region and blanking the freed rows at the region bottom
+    /// (`DL`). A no-op when the cursor is outside the scrolling region.
+    pub(crate) fn delete_lines(&mut self, n: usize) {
+        let cy = self.cursor.1;
+        if cy < self.scroll_top || cy > self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom + 1 - cy);
+        let cols = self.cols;
+        // Shift rows [cy + n, scroll_bottom] up by n.
+        let count = (self.scroll_bottom + 1 - cy - n) * cols;
+        if count > 0 {
+            let src = (cy + n) * cols;
+            let dst = cy * cols;
+            self.cells.copy_within(src..src + count, dst);
+        }
+        // Blank the n rows freed at the region bottom.
+        let first_blank = (self.scroll_bottom + 1 - n) * cols;
+        let region_end = (self.scroll_bottom + 1) * cols;
+        for c in &mut self.cells[first_blank..region_end] {
+            *c = Cell::blank();
+        }
+        for d in &mut self.dirty[cy..=self.scroll_bottom] {
+            *d = true;
+        }
     }
 
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.

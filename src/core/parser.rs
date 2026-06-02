@@ -7,7 +7,10 @@
 //! colors across `advance` calls. OSC strings are handed to [`osc::dispatch`];
 //! DCS/APC/PM/SOS strings are consumed opaquely so they never leak as text.
 
-use super::cell::{DEFAULT_BG, DEFAULT_FG};
+use super::cell::{
+    Pen, ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
+    ATTR_UNDERLINE, DEFAULT_BG, DEFAULT_FG,
+};
 use super::color::{parse_extended_color, PALETTE_16};
 use super::grid::{alt_mode, Grid};
 use super::osc;
@@ -46,8 +49,9 @@ enum ParserState {
 /// mutations. Tracks the current SGR colors across `advance` calls.
 pub struct AnsiParser {
     state: ParserState,
-    current_fg: u32,
-    current_bg: u32,
+    /// Current SGR graphic rendition (colors + attributes) stamped onto each
+    /// glyph written to the grid.
+    pen: Pen,
     param_buffer: String,
     /// Set when a CSI sequence carries a private marker (`?`, `<`, `=`, `>`).
     /// Such sequences (e.g. DEC private mode set/reset) are consumed but not
@@ -88,8 +92,7 @@ impl AnsiParser {
     pub fn new() -> Self {
         Self {
             state: ParserState::Ground,
-            current_fg: DEFAULT_FG,
-            current_bg: DEFAULT_BG,
+            pen: Pen::default(),
             param_buffer: String::new(),
             csi_private: false,
             csi_marker: 0,
@@ -120,13 +123,13 @@ impl AnsiParser {
                         self.utf8_remaining -= 1;
                         if self.utf8_remaining == 0 {
                             let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
-                            g.put_char(ch, self.current_fg, self.current_bg);
+                            g.put_char(ch, self.pen);
                             self.state = ParserState::Ground;
                         }
                     } else {
                         // Truncated sequence: emit a replacement char, then
                         // reprocess this byte from the ground state.
-                        g.put_char('\u{FFFD}', self.current_fg, self.current_bg);
+                        g.put_char('\u{FFFD}', self.pen);
                         self.state = ParserState::Ground;
                         self.ground_byte(b, g);
                     }
@@ -265,10 +268,10 @@ impl AnsiParser {
                 let next_stop = (g.cursor.0 / 8 + 1) * 8;
                 let target = next_stop.min(g.cols.saturating_sub(1));
                 while g.cursor.0 < target {
-                    g.put_char(' ', self.current_fg, self.current_bg);
+                    g.put_char(' ', self.pen);
                 }
             }
-            0x20..=0x7e => g.put_char(b as char, self.current_fg, self.current_bg),
+            0x20..=0x7e => g.put_char(b as char, self.pen),
             // UTF-8 lead bytes: stash the payload bits and how many continuation
             // bytes to expect. (0xC0/0xC1 are always overlong, hence excluded.)
             0xc2..=0xdf => {
@@ -288,7 +291,7 @@ impl AnsiParser {
             }
             // Stray continuation or otherwise invalid lead byte.
             0x80..=0xbf | 0xc0..=0xc1 | 0xf5..=0xff => {
-                g.put_char('\u{FFFD}', self.current_fg, self.current_bg);
+                g.put_char('\u{FFFD}', self.pen);
             }
             // Other C0 controls are ignored.
             _ => {}
@@ -361,6 +364,8 @@ impl AnsiParser {
             b'@' => g.insert_chars(count), // ICH
             b'P' => g.delete_chars(count), // DCH
             b'X' => g.erase_chars(count),  // ECH
+            b'L' => g.insert_lines(count), // IL
+            b'M' => g.delete_lines(count), // DL
             b's' => g.save_cursor(),       // SCP
             b'u' => g.restore_cursor(),    // RCP
             b'r' => {
@@ -425,15 +430,16 @@ impl AnsiParser {
         }
     }
 
-    /// Reset SGR state to the default colors.
+    /// Reset SGR state to the default pen (default colors, no attributes).
     fn reset_sgr(&mut self) {
-        self.current_fg = DEFAULT_FG;
-        self.current_bg = DEFAULT_BG;
+        self.pen = Pen::default();
     }
 
-    /// Apply an SGR (`CSI … m`) parameter list. Supports reset, the 16-color
-    /// palette (normal + bright), and the extended `38/48;5;n` (256-color) and
-    /// `38/48;2;r;g;b` (truecolor) forms. An empty list means reset.
+    /// Apply an SGR (`CSI … m`) parameter list. Supports reset, the text
+    /// attributes (bold/dim/italic/underline/blink/reverse/hidden/strike and
+    /// their resets), the 16-color palette (normal + bright), and the extended
+    /// `38/48;5;n` (256-color) and `38/48;2;r;g;b` (truecolor) forms. An empty
+    /// list means reset.
     fn apply_sgr(&mut self, params: &[usize]) {
         if params.is_empty() {
             self.reset_sgr();
@@ -443,24 +449,43 @@ impl AnsiParser {
         while i < params.len() {
             match params[i] {
                 0 => self.reset_sgr(),
-                30..=37 => self.current_fg = PALETTE_16[params[i] - 30],
+                // Set text attributes.
+                1 => self.pen.attrs |= ATTR_BOLD,
+                2 => self.pen.attrs |= ATTR_DIM,
+                3 => self.pen.attrs |= ATTR_ITALIC,
+                4 => self.pen.attrs |= ATTR_UNDERLINE,
+                // 5 (slow) and 6 (rapid) blink both map to our single blink bit.
+                5 | 6 => self.pen.attrs |= ATTR_BLINK,
+                7 => self.pen.attrs |= ATTR_REVERSE,
+                8 => self.pen.attrs |= ATTR_HIDDEN,
+                9 => self.pen.attrs |= ATTR_STRIKE,
+                // Reset text attributes. 22 clears both bold and dim.
+                22 => self.pen.attrs &= !(ATTR_BOLD | ATTR_DIM),
+                23 => self.pen.attrs &= !ATTR_ITALIC,
+                24 => self.pen.attrs &= !ATTR_UNDERLINE,
+                25 => self.pen.attrs &= !ATTR_BLINK,
+                27 => self.pen.attrs &= !ATTR_REVERSE,
+                28 => self.pen.attrs &= !ATTR_HIDDEN,
+                29 => self.pen.attrs &= !ATTR_STRIKE,
+                // Colors.
+                30..=37 => self.pen.fg = PALETTE_16[params[i] - 30],
                 38 => {
                     if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
-                        self.current_fg = color;
+                        self.pen.fg = color;
                         i += consumed;
                     }
                 }
-                39 => self.current_fg = DEFAULT_FG,
-                40..=47 => self.current_bg = PALETTE_16[params[i] - 40],
+                39 => self.pen.fg = DEFAULT_FG,
+                40..=47 => self.pen.bg = PALETTE_16[params[i] - 40],
                 48 => {
                     if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
-                        self.current_bg = color;
+                        self.pen.bg = color;
                         i += consumed;
                     }
                 }
-                49 => self.current_bg = DEFAULT_BG,
-                90..=97 => self.current_fg = PALETTE_16[8 + (params[i] - 90)],
-                100..=107 => self.current_bg = PALETTE_16[8 + (params[i] - 100)],
+                49 => self.pen.bg = DEFAULT_BG,
+                90..=97 => self.pen.fg = PALETTE_16[8 + (params[i] - 90)],
+                100..=107 => self.pen.bg = PALETTE_16[8 + (params[i] - 100)],
                 _ => {}
             }
             i += 1;

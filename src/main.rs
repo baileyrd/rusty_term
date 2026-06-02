@@ -12,7 +12,10 @@ use crate::backend::Backend;
 use crate::backend::UnixBackend;
 #[cfg(windows)]
 use crate::backend::WindowsBackend;
-use crate::core::{AnsiParser, DirtyFrame, Grid, WIDE_TRAILER};
+use crate::core::{
+    ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
+    ATTR_STRIKE, ATTR_UNDERLINE, AnsiParser, DirtyFrame, Grid, WIDE_TRAILER,
+};
 
 /// Set by the `SIGWINCH` handler; the render loop drains it to resize the grid
 /// and the PTY in step with the host terminal. A plain atomic store is the only
@@ -43,11 +46,40 @@ impl Drop for RawModeGuard<'_> {
     }
 }
 
-/// Build the combined truecolor SGR introducer for a foreground/background pair.
-fn sgr_for(fg: u32, bg: u32) -> String {
+/// Build the combined SGR introducer for a foreground/background/attribute
+/// triple. Starts with a reset (`0`) so attributes left active by the previous
+/// run are cleared, then re-states the active attributes and truecolor pair.
+fn sgr_for(fg: u32, bg: u32, attrs: u16) -> String {
+    let mut s = String::from("\x1b[0");
+    if attrs & ATTR_BOLD != 0 {
+        s.push_str(";1");
+    }
+    if attrs & ATTR_DIM != 0 {
+        s.push_str(";2");
+    }
+    if attrs & ATTR_ITALIC != 0 {
+        s.push_str(";3");
+    }
+    if attrs & ATTR_UNDERLINE != 0 {
+        s.push_str(";4");
+    }
+    if attrs & ATTR_BLINK != 0 {
+        s.push_str(";5");
+    }
+    if attrs & ATTR_REVERSE != 0 {
+        s.push_str(";7");
+    }
+    if attrs & ATTR_HIDDEN != 0 {
+        s.push_str(";8");
+    }
+    if attrs & ATTR_STRIKE != 0 {
+        s.push_str(";9");
+    }
     let (fr, fg_, fb) = ((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
     let (br, bg_, bb) = ((bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF);
-    format!("\x1b[38;2;{};{};{};48;2;{};{};{}m", fr, fg_, fb, br, bg_, bb)
+    use std::fmt::Write as _;
+    let _ = write!(s, ";38;2;{};{};{};48;2;{};{};{}m", fr, fg_, fb, br, bg_, bb);
+    s
 }
 
 /// Paint the dirty rows of `frame` to stdout, then position the hardware cursor
@@ -63,7 +95,7 @@ fn draw(frame: &DirtyFrame, position_cursor: bool) {
         let _ = write!(out, "\x1b[{};1H", y + 1);
 
         let mut line_buf = String::with_capacity(cells.len() + 32);
-        let mut last: Option<(u32, u32)> = None;
+        let mut last: Option<(u32, u32, u16)> = None;
         // Active hyperlink id while painting this row; reset per row so a link
         // is reopened at the start of each line it covers and closed at row end.
         let mut cur_link: u16 = 0;
@@ -86,9 +118,12 @@ fn draw(frame: &DirtyFrame, position_cursor: bool) {
                 }
                 cur_link = cell.link;
             }
-            if last != Some((cell.fg, cell.bg)) {
-                line_buf.push_str(&sgr_for(cell.fg, cell.bg));
-                last = Some((cell.fg, cell.bg));
+            // Style key excludes the WIDE_TRAILER layout bit (trailers are
+            // skipped above, so only rendition attributes reach here).
+            let attrs = cell.flags & ATTR_MASK;
+            if last != Some((cell.fg, cell.bg, attrs)) {
+                line_buf.push_str(&sgr_for(cell.fg, cell.bg, attrs));
+                last = Some((cell.fg, cell.bg, attrs));
             }
             line_buf.push(cell.ch);
             // Emit any combining marks so they render over the base glyph.

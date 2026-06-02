@@ -13,10 +13,56 @@ pub const DEFAULT_BG: u32 = 0x000000;
 
 /// [`Cell::flags`] bit marking the trailing (second) cell of a double-width
 /// character. The renderer skips these so the wide glyph occupies two columns.
-pub const WIDE_TRAILER: u16 = 0b0000_0001;
+///
+/// This is a *layout* flag (bit 0); the `ATTR_*` rendition bits live above it,
+/// so a cell's `flags` is `WIDE_TRAILER | <pen attributes>`.
+pub const WIDE_TRAILER: u16 = 1 << 0;
+
+// SGR text-attribute bits, stored in [`Cell::flags`] and carried by [`Pen`].
+// They occupy bits 1.. so they never collide with [`WIDE_TRAILER`].
+/// SGR 1 — bold / increased intensity.
+pub const ATTR_BOLD: u16 = 1 << 1;
+/// SGR 2 — dim / decreased intensity.
+pub const ATTR_DIM: u16 = 1 << 2;
+/// SGR 3 — italic.
+pub const ATTR_ITALIC: u16 = 1 << 3;
+/// SGR 4 — underline.
+pub const ATTR_UNDERLINE: u16 = 1 << 4;
+/// SGR 5 — blink.
+pub const ATTR_BLINK: u16 = 1 << 5;
+/// SGR 7 — reverse video (swap fg/bg).
+pub const ATTR_REVERSE: u16 = 1 << 6;
+/// SGR 8 — concealed / hidden.
+pub const ATTR_HIDDEN: u16 = 1 << 7;
+/// SGR 9 — crossed-out / strikethrough.
+pub const ATTR_STRIKE: u16 = 1 << 8;
+
+/// Mask of every rendition attribute bit (everything except [`WIDE_TRAILER`]).
+pub const ATTR_MASK: u16 =
+    ATTR_BOLD | ATTR_DIM | ATTR_ITALIC | ATTR_UNDERLINE | ATTR_BLINK | ATTR_REVERSE | ATTR_HIDDEN | ATTR_STRIKE;
 
 /// Maximum number of trailing combining marks stored per cell.
 pub const MAX_COMBINING: usize = 2;
+
+/// The current SGR graphic rendition — foreground/background color and the set
+/// of active text attributes — that the parser stamps onto each glyph it
+/// writes. A single source of truth for "how the next character looks".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pen {
+    /// Foreground color as `0xRRGGBB`.
+    pub fg: u32,
+    /// Background color as `0xRRGGBB`.
+    pub bg: u32,
+    /// Active text-attribute bits (`ATTR_*`).
+    pub attrs: u16,
+}
+
+impl Default for Pen {
+    /// The reset pen: default colors and no attributes.
+    fn default() -> Self {
+        Pen { fg: DEFAULT_FG, bg: DEFAULT_BG, attrs: 0 }
+    }
+}
 
 /// Display width of `ch` in terminal cells: `0` for zero-width (combining
 /// marks, joiners, variation selectors, …), `2` for wide East Asian / emoji
