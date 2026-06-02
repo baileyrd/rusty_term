@@ -1,1 +1,4 @@
 /target
+.gitnexus
+# WSL/NTFS download metadata (alternate data streams)
+*:Zone.Identifier
