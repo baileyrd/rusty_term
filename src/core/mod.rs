@@ -158,11 +158,25 @@ impl Grid {
 
     /// Write `cell` at `(x, y)`, marking the row dirty. Out-of-bounds writes
     /// are silently ignored (the caller is responsible for clamping).
+    ///
+    /// If the write lands on one half of an existing double-width glyph, the
+    /// orphaned partner cell is blanked so no stale head/trailer is left behind.
     pub fn set_cell(&mut self, x: usize, y: usize, cell: Cell) {
-        if x < self.cols && y < self.rows {
-            self.cells[y * self.cols + x] = cell;
-            self.dirty[y] = true;
+        if x >= self.cols || y >= self.rows {
+            return;
         }
+        let idx = y * self.cols + x;
+        if self.cells[idx].flags & WIDE_TRAILER != 0 {
+            // Overwriting the trailing half: blank the head to its left.
+            if x >= 1 {
+                self.cells[idx - 1] = Cell::blank();
+            }
+        } else if x + 1 < self.cols && self.cells[idx + 1].flags & WIDE_TRAILER != 0 {
+            // Overwriting the leading half: blank the orphaned trailer to its right.
+            self.cells[idx + 1] = Cell::blank();
+        }
+        self.cells[idx] = cell;
+        self.dirty[y] = true;
     }
 
     /// Move the cursor to `(x, y)`, clamping into the grid so a malformed or
@@ -1228,6 +1242,27 @@ mod tests {
         assert_ne!(g.cells[1].flags & WIDE_TRAILER, 0); // trailer flagged
         assert_eq!(g.cells[2].ch, 'x'); // next glyph after the wide pair
         assert_eq!(g.cursor, (3, 0));
+    }
+
+    #[test]
+    fn overwriting_wide_head_clears_orphan_trailer() {
+        let mut g = Grid::new(80, 24);
+        g.put_char('世', DEFAULT_FG, DEFAULT_BG); // head col 0, trailer col 1
+        g.cursor = (0, 0);
+        g.put_char('a', DEFAULT_FG, DEFAULT_BG); // overwrite the head
+        assert_eq!(g.cells[0].ch, 'a');
+        assert_eq!(g.cells[1].ch, ' '); // orphaned trailer blanked
+        assert_eq!(g.cells[1].flags & WIDE_TRAILER, 0);
+    }
+
+    #[test]
+    fn overwriting_wide_trailer_clears_orphan_head() {
+        let mut g = Grid::new(80, 24);
+        g.put_char('世', DEFAULT_FG, DEFAULT_BG); // head col 0, trailer col 1
+        g.cursor = (1, 0);
+        g.put_char('b', DEFAULT_FG, DEFAULT_BG); // overwrite the trailer
+        assert_eq!(g.cells[1].ch, 'b');
+        assert_eq!(g.cells[0].ch, ' '); // orphaned head blanked
     }
 
     #[test]
