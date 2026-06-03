@@ -42,15 +42,18 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 > Finally, the **native window-backend fork** was built (features `gui`/`gui-gpu`):
 > a `winit` window with CPU (`softbuffer`) and GPU (`wgpu`) renderers + `ab_glyph`
 > glyphs + native key encoding — the jump from TUI-mode to a standalone window
-> (`--gui`). Its font/CPU-render/input/GPU-pipeline layers are headless-tested;
-> live presentation and the GPU draw aren't verifiable in this headless env (no
-> display; software Vulkan drivers crash on submit). Remaining `[ ]` items are now
+> (`--gui`). Its font/CPU-render/input/GPU-pipeline layers are headless-tested,
+> and the live window (CPU **and** GPU) has since been run and verified on
+> Windows 11 — including a maximized window past the 2048px GPU texture limit,
+> after fixing a `Surface::configure` panic that the resize first surfaced. It
+> still can't run in this headless CI env (no display; software Vulkan drivers
+> crash on submit). Remaining `[ ]` items are now
 > only small leftovers (iTerm2, XTGETTCAP, OSC notifications, bidi, DAP/Jupyter,
 > in-window mouse/clipboard/IME, …).
 
 ## Appendix C — Minimum Viable Modern Terminal
 
-- [x] **OS interface** — POSIX.1 (`libc`) + Windows ConPTY (`windows-sys`). Hand-rolled, not `portable-pty`. Windows path type-checked but unrun (`src/backend/windows.rs:10`).
+- [x] **OS interface** — POSIX.1 (`libc`) + Windows ConPTY (`windows-sys`). Hand-rolled, not `portable-pty`. The Windows path is **run & verified on Windows 11** (build 26200): shell spawn, child `TERM`/`COLORTERM` env, bidirectional relay, and OSC title capture; host resize propagation is a known gap (no `SIGWINCH` equivalent wired; `src/backend/windows.rs`).
 - [x] **PTY** — Unix98 `openpty` + fork/exec/`TIOCSCTTY` (`src/backend/unix.rs:41`); `CreatePseudoConsole` (`src/backend/windows.rs`).
 - [x] **Line discipline** — host raw mode via `cfmakeraw` + `VMIN=1/VTIME=0`, exact save/restore (`src/backend/unix.rs:88`). Complete for a PTY emulator: the cooked-mode line discipline (echo, canonical editing, signal chars, CR/LF) is the **kernel's** `N_TTY` on the PTY slave, configured by the child — not the emulator's to implement.
 - [x] **Encoding** — UTF-8 decode + UAX #11 width + **UAX #29 grapheme clustering** (`unicode-segmentation`; ZWJ emoji, skin tones, unbounded combining via interned clusters, `src/core/grid.rs`).
@@ -202,11 +205,14 @@ DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
     - **Verified headless:** font rasterization, the CPU `Grid`→pixel-buffer
       compositor (render-to-buffer asserts), key encoding, and GPU adapter +
       WGSL-shader + pipeline + atlas creation (`gpu_core_builds`).
-    - **Unverifiable in this environment (built, compile-checked):** live window
-      presentation (no display server) and the GPU draw+readback — the headless
-      software drivers (lavapipe, dzn) segfault on submit, so the
-      `gpu_renders_to_texture` readback test is `#[ignore]`d for a real GPU.
+    - **Verified on real Windows 11 hardware (not headless CI):** the live window
+      runs in both CPU and GPU modes — including a maximized GPU window past the
+      2048px texture limit, after the `Surface::configure` surface-limit fix
+      (#26) that the resize first surfaced. The headless CI box still can't run
+      it (lavapipe/dzn segfault on submit), so `gpu_renders_to_texture` stays
+      `#[ignore]`d there.
     - **Documented gaps (not stubs):** mouse reporting, clipboard/OSC 52, IME,
-      DECCKM tracking in the window, in-window scrollback/cursor, and the
-      Windows window path. Text is now pixel-resolution; inline images still
-      render at cell resolution (half-blocks) as in TUI mode.
+      DECCKM tracking in the window, in-window scrollback/cursor, and host resize
+      propagation on Windows (no `SIGWINCH` equivalent wired). Text is now
+      pixel-resolution; inline images still render at cell resolution
+      (half-blocks) as in TUI mode.

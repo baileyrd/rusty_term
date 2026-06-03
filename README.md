@@ -20,10 +20,14 @@ and the narrative design synthesis in
 [`docs/research/terminal-stack-synthesis.md`](docs/research/terminal-stack-synthesis.md).
 
 > **Platform support.** Unix (Linux/macOS) is the primary, fully exercised
-> target. A Windows ConPTY backend exists and type-checks but is currently
-> unrun. The optional window backend drives a live window and so is not
-> exercisable in a headless CI environment (its font, compositor, input, and
-> GPU-pipeline layers are unit-tested independently).
+> target. The Windows ConPTY backend has been run and verified on Windows 11
+> (build 26200): shell spawn, child `TERM`/`COLORTERM` env, bidirectional relay,
+> and OSC window-title capture all work — though host **resize propagation is a
+> known gap** there (no `SIGWINCH` equivalent is wired yet). The optional window
+> backend has likewise been run on Windows (CPU and GPU), including a maximized
+> window past the 2048px GPU texture limit; it can't be exercised in a headless
+> CI environment, so there its font, compositor, input, and GPU-pipeline layers
+> are unit-tested independently.
 
 ## Build & run
 
