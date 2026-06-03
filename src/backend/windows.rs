@@ -7,8 +7,9 @@
 //!
 //! This module is only compiled on Windows (gated in `backend/mod.rs`).
 //!
-//! NOTE: this path has been type-checked (via a cross-target `cargo check`) but
-//! not run — it needs a real Windows host to exercise.
+//! NOTE: run and verified on Windows 11 (build 26200) — shell spawn, child
+//! `TERM`/`COLORTERM`, bidirectional relay, and OSC title capture all work.
+//! Host resize propagation is a known gap (no `SIGWINCH` equivalent is wired).
 
 use crate::backend::{Backend, BackendHandle};
 use parking_lot::Mutex;

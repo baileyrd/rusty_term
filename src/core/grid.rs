@@ -909,8 +909,11 @@ impl Grid {
     /// Scroll the current scrolling region up by `n` rows (`SU`). Reuses the
     /// single-row [`Grid::scroll_up`] per line, so a full-screen scroll on the
     /// primary buffer captures the displaced lines into scrollback exactly as a
-    /// line feed would.
+    /// line feed would. `n` is clamped to the region height: scrolling past it
+    /// clears the region, and the cap bounds the per-row loop against a hostile
+    /// count (e.g. `CSI 9999999999 S`) that would otherwise run for minutes.
     pub(crate) fn scroll_up_n(&mut self, n: usize) {
+        let n = n.min(self.scroll_bottom + 1 - self.scroll_top);
         for _ in 0..n {
             self.scroll_up();
         }

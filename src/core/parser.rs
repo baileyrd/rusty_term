@@ -15,7 +15,7 @@ use super::cell::{
 use super::channel;
 use super::charset::Charset;
 use super::color::Palette;
-use super::grid::{Grid, LineAttr, alt_mode};
+use super::grid::{Grid, LineAttr, SCROLLBACK_MAX, alt_mode};
 use super::kitty;
 use super::osc;
 use super::sixel;
@@ -663,8 +663,13 @@ impl AnsiParser {
             b'd' => g.set_cursor_abs(g.cursor.0, p(0, 1).saturating_sub(1)), // VPA (origin-aware)
             b'b' => {
                 // REP — repeat the last printed graphic character `count` times.
+                // Clamp to the addressable capacity (screen + scrollback): a
+                // larger count only overwrites cells it has already filled, while
+                // an unclamped value (parsed up to `usize`) would spin under the
+                // held grid lock and hang the terminal on hostile input.
                 if let Some(ch) = self.last_char {
-                    for _ in 0..count {
+                    let cap = g.rows.saturating_add(SCROLLBACK_MAX).saturating_mul(g.cols);
+                    for _ in 0..count.min(cap) {
                         g.put_char(ch, self.pen);
                     }
                 }

@@ -2497,3 +2497,38 @@ fn ris_clears_bracketed_paste_and_selection() {
     assert!(!g.bracketed_paste);
     assert_eq!(g.selection, None);
 }
+
+// --- Adversarial input: untrusted child output must never hang the parser ---
+// (all of these run under the held grid lock, so an unbounded loop would freeze
+// the whole terminal). Each previously looped on an attacker-controlled count.
+
+#[test]
+fn sixel_huge_repeat_count_is_bounded() {
+    // `!<huge>` clamps to the column cap (MAX_DIM = 2000) instead of spinning the
+    // inner paint loop ~usize::MAX times. A ~25-byte payload must decode promptly.
+    let img = decode(b"#0;2;100;0;0!999999999999999999~");
+    assert!(img.width > 0, "the band still paints");
+    assert!(img.width <= 2000, "repeat clamped to the column cap, got {}", img.width);
+}
+
+#[test]
+fn rep_huge_count_is_bounded_to_capacity() {
+    // `CSI 99999999 b` is clamped to the addressable capacity (screen +
+    // scrollback); without the clamp this would loop ~1e8+ times under the lock.
+    // The fill still completes; the top row is a fully repeated, scrolled-up line.
+    let g = parse(b"A\x1b[99999999b", 4, 2);
+    assert_eq!(row_text(&g, 0), "AAAA", "the clamped REP still fills the screen");
+}
+
+#[test]
+fn su_huge_count_clears_region_without_flooding_scrollback() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"top\r\nbot");
+    p.advance(&mut g, b"\x1b[9999999999S"); // SU by an enormous count
+    // Clamped to the region height (2): the region clears, and scrollback gains
+    // exactly the two displaced lines — not 9_999_999_999 blank entries.
+    assert_eq!(row_text(&g, 0).trim_end(), "");
+    assert_eq!(row_text(&g, 1).trim_end(), "");
+    assert_eq!(g.scrollback.len(), 2, "only the region's rows reach scrollback");
+}

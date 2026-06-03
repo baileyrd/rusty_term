@@ -91,10 +91,13 @@ impl Decoder {
                     repeat = 1;
                     i += 1;
                 }
-                // `!Pn` — repeat the next data byte Pn times.
+                // `!Pn` — repeat the next data byte Pn times. Clamped to MAX_DIM:
+                // the column ceiling bounds useful output, and an unclamped count
+                // (parse_num saturates to usize::MAX) would otherwise spin the
+                // inner loop indefinitely on hostile input.
                 b'!' => {
                     i += 1;
-                    repeat = parse_num(data, &mut i).max(1);
+                    repeat = parse_num(data, &mut i).clamp(1, MAX_DIM);
                 }
                 // `#Pc` selects a register; `#Pc;Pu;Px;Py;Pz` defines one.
                 b'#' => {
