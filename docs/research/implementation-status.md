@@ -31,9 +31,11 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 > then landed — Sixel **and** Kitty (a from-scratch base64/inflate/PNG stack, no
 > crates) rendered as half-blocks — and **L09 input** was completed by relaying the
 > Kitty keyboard + xterm modifyOtherKeys protocols to the host. Checkboxes below
-> reflect all of this; the only remaining `[ ]` items are the L13 structured
-> channel, the native window-backend fork, and small leftovers (iTerm2, XTGETTCAP,
-> OSC notifications, bidi, …).
+> reflect all of this. **L13** then landed too: a full-duplex JSON-RPC structured
+> side-channel over a private OSC (feature `l13`), hosting a complete MCP server
+> (terminal introspection) plus LSP/ACP negotiation, built on `rusty_lsp`. The
+> only remaining `[ ]` items are the native window-backend fork and small
+> leftovers (iTerm2, XTGETTCAP, OSC notifications, bidi, DAP/Jupyter, …).
 
 ## Appendix C — Minimum Viable Modern Terminal
 
@@ -48,7 +50,7 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] **Identification (DA1·XTVERSION·terminfo)** — DA1/DA2/DA3 ✓, XTVERSION ✓ (`src/core/parser.rs`), XTGETTCAP still missing; `rusty_term` terminfo entry shipped (`extra/rusty_term.terminfo`) with probe-and-fallback `TERM` selection (`src/term.rs`).
 - [x] **Truecolor** — full 24-bit + 256-color (`src/core/color.rs`, `src/core/parser.rs:602`); advertises `COLORTERM=truecolor` (`src/main.rs:35`).
 - [x] **Shell integration** — OSC 133 emitter scripts for bash/zsh/fish/pwsh (`extra/shell-integration/`).
-- [ ] **Structured channel** — private OSC + schema + fallback: not started.
+- [x] **Structured channel** — full-duplex JSON-RPC over a private OSC (`OSC 5379 ; <protocol> ; <json> ST`) with capability negotiation and graceful ANSI fallback (`src/core/channel.rs`, feature `l13`). Hosts a complete **MCP** server (terminal introspection) plus **LSP/ACP** negotiation; reuses `rusty_lsp`'s JSON-RPC model + LSP types.
 
 ## Layer-by-layer (L00–L13)
 
@@ -124,9 +126,13 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 ### L11 Shell — [x] (by delegation)
 - [x] Spawns external `$SHELL`/bash (Unix) and `%COMSPEC%`/cmd (Windows)
 
-### L13 Adjacent protocols — [ ]
-- [ ] Structured side-channel (private OSC + schema + ANSI fallback) — the synthesis's flagship novelty
-- [ ] LSP/DAP/MCP/Jupyter bridges
+### L13 Adjacent protocols — [x] (channel + MCP complete; LSP/ACP negotiable)
+- [x] Structured side-channel: full-duplex JSON-RPC 2.0 over a private OSC (`OSC 5379 ; <protocol> ; <json> ST`), one message per OSC, replies written to the child's stdin via the response channel; unaware terminals ignore the OSC (graceful degradation). Feature-gated `l13`, runtime-agnostic. (`src/core/channel.rs`, parser routing in `finish_osc`)
+- [x] Capability negotiation: `channel`/`initialize` advertises the supported protocols + terminal info
+- [x] **MCP** server exposing the terminal to agents — `initialize`, `tools/list`, `tools/call` with `get_screen` / `get_scrollback` / `get_cwd` / `get_title` / `get_dimensions` (the complete exemplar)
+- [x] **LSP** and **ACP** negotiable endpoints — `initialize` handshakes implemented (LSP via `rusty_lsp`'s `InitializeResult`/`ServerCapabilities`; ACP per the v1 schema); deeper methods return `method not found` until a language/agent backend is registered
+- [x] Built on `rusty_lsp` (JSON-RPC 2.0 `Message` model + LSP types), no reinvented RPC
+- [ ] DAP / Jupyter bridges; full LSP/ACP backends (need a language server / agent behind them)
 
 ## Backlog
 
@@ -163,10 +169,12 @@ fork remain. Ordered by leverage-to-effort for a TUI-mode (host-rendered) termin
    decoder, plus a full `base64`/`inflate`/`png` stack feeding the Kitty APC
    protocol (raw, PNG, `o=z`, chunked, responses). Both render via the shared
    half-block `Grid::render_image`. Remaining: iTerm2 (needs a JPEG decoder too).
-9. **L13 structured side-channel** — the synthesis's headline novelty: a private
-    OSC carrying a versioned JSON/msgpack schema with graceful ANSI fallback.
-    Worth a design doc before code (channel framing, capability negotiation via
-    XTVERSION/XTGETTCAP, fallback contract).
+9. **L13 structured side-channel.** [x] **Done** — full-duplex JSON-RPC over a
+    private OSC (`OSC 5379`), one message per OSC, with capability negotiation
+    (`channel/initialize`) and graceful ANSI fallback. Hosts a complete MCP
+    server (terminal introspection) plus LSP/ACP `initialize` negotiation, built
+    on `rusty_lsp` (JSON-RPC model + LSP types). Feature `l13`, runtime-agnostic.
+    Remaining: DAP/Jupyter bridges and full LSP/ACP backends.
 
 ### Architectural fork (blocks P3 graphics at scale)
 10. **Native window backend** (`tcore-font` + `tcore-app`, synthesis §12):

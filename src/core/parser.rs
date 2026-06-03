@@ -11,6 +11,8 @@ use super::cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
     ATTR_UNDERLINE, Pen,
 };
+#[cfg(feature = "l13")]
+use super::channel;
 use super::charset::Charset;
 use super::color::Palette;
 use super::grid::{Grid, LineAttr, alt_mode};
@@ -335,13 +337,7 @@ impl AnsiParser {
                 ParserState::Osc => match b {
                     0x07 => {
                         // BEL terminator: act on the collected string.
-                        osc::dispatch(
-                            &self.osc_buffer,
-                            g,
-                            &mut self.palette,
-                            &mut self.responses,
-                            &mut self.pen,
-                        );
+                        self.finish_osc(g);
                         self.state = ParserState::Ground;
                     }
                     0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
@@ -355,13 +351,7 @@ impl AnsiParser {
                 ParserState::OscEsc => {
                     // Whether or not this is the `\` of an ST, the OSC string is
                     // over; act on it and return to ground.
-                    osc::dispatch(
-                        &self.osc_buffer,
-                        g,
-                        &mut self.palette,
-                        &mut self.responses,
-                        &mut self.pen,
-                    );
+                    self.finish_osc(g);
                     self.state = ParserState::Ground;
                 }
                 ParserState::EscCharset => {
@@ -461,6 +451,23 @@ impl AnsiParser {
             kitty::feed(&mut self.kitty, &self.apc_buffer, g, &mut self.responses);
         }
         self.apc_buffer.clear();
+    }
+
+    /// Act on a completed OSC string. The L13 structured channel claims its
+    /// private OSC code (`OSC 5379 ; …`); everything else goes to [`osc::dispatch`].
+    fn finish_osc(&mut self, g: &mut Grid) {
+        #[cfg(feature = "l13")]
+        if let Some(payload) = self.osc_buffer.strip_prefix(channel::OSC_PREFIX) {
+            channel::handle(payload, g, &mut self.responses);
+            return;
+        }
+        osc::dispatch(
+            &self.osc_buffer,
+            g,
+            &mut self.palette,
+            &mut self.responses,
+            &mut self.pen,
+        );
     }
 
     /// Handle a single byte while in the ground state: C0 controls, printable
