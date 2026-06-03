@@ -2,23 +2,28 @@
 
 Status of the codebase mapped against `terminal-stack-spec-tree.html` (14-layer
 catalog) and `terminal-stack-synthesis.md` (milestone ladder). Verified against
-`src/` and the ~130-test suite in `src/core/tests.rs` on 2026-06-03.
+`src/` and the test suite (~220 tests; 230 with `--features l13`, plus the
+`gui`/`gui-gpu` window-backend tests) on 2026-06-03.
 
 ## Architecture lens (read this first)
 
-`rusty_term` is a **passthrough/relay terminal emulator that renders into a host
-terminal** — it parses a child shell's output into a `Grid`, then re-emits ANSI
-to its own stdout. It does **not** own a GPU window. Consequences:
+`rusty_term` has two front-ends over one shared parser + `Grid` core:
 
-- The entire windowed stack (font shaping, GPU raster, winit/wgpu, IME,
-  accessibility) is **out of the current architecture**, not merely unbuilt.
-- Mouse, bracketed paste, focus reporting, cursor-key mode, and clipboard are
-  **deliberately relayed to the host terminal** (`is_host_input_mode`,
-  `src/core/parser.rs:636`; OSC 52, `src/core/osc.rs:31`). Apps get working
-  behavior via passthrough; the encodings themselves are not implemented here.
+- **TUI mode (default).** A **passthrough/relay** emulator: it parses a child
+  shell's output into a `Grid`, then re-emits ANSI to its own stdout, running
+  inside a host terminal. It owns no window here, so input-generating modes
+  (mouse, bracketed paste, focus, cursor-key, clipboard) are **deliberately
+  relayed to the host** (`is_host_input_mode`, `src/core/parser.rs:636`; OSC 52,
+  `src/core/osc.rs:31`) — apps get working behavior via passthrough; the
+  encodings themselves aren't implemented here.
+- **Native window backend (optional, features `gui` / `gui-gpu`).** A standalone
+  `winit` window that renders the same `Grid` with real glyphs and encodes key
+  events natively (see L09 and backlog #10). `--gui` selects it; `--gpu` picks
+  the `wgpu` GPU renderer over the `softbuffer` CPU one.
 
-By the synthesis milestone ladder this sits at the **"Week" milestone**: a
-working TUI-mode terminal you could run inside another terminal. The parser +
+By the synthesis milestone ladder the core sits past the **"Week" milestone** —
+a working TUI-mode terminal you can run inside another terminal — and the
+optional window backend begins the jump to a standalone GUI app. The parser +
 grid core is built and well-tested.
 
 Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
@@ -116,11 +121,13 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [~] 52 clipboard: set-requests relayed to host; query (`?`) path unwired
 - [ ] 9 / 777 notifications; 633 (VS Code), 1337 (iTerm2)
 
-### L09 Input — [x] (relay model; native encoding awaits the window fork)
+### L09 Input — [x] (TUI mode relays; native key encoding in the `gui` backend)
 - [x] Scrollback browse + prompt-nav keys intercepted locally (`src/input.rs`)
 - [x] Host stdin forwarded verbatim to child
 - [x] All input-generating modes relayed to the host: mouse 1000/1002/1003/1005/1006/1015/1016, focus 1004, paste 2004, DECCKM 1 (`is_host_input_mode`), **Kitty keyboard (`CSI >/</=/? … u`) and xterm modifyOtherKeys / XTMODKEYS (`CSI > … m`)** (`handle_private_csi`)
-- [ ] Native mouse/key *encoding* — impossible in TUI-mode (no key-event source); unlocked only by the native window backend (#10)
+- [x] Native **key** encoding in the `gui` window backend — winit key → terminal
+  bytes, incl. DECCKM application-cursor + modifier params (`src/gui/input.rs`, #10)
+- [ ] Native **mouse** encoding in the window backend (not yet wired; documented gap)
 
 ### L10 Identification — [x] (XTGETTCAP out)
 - [x] DA1 (`CSI c` → `?1;2c`), DA2 (`CSI > c`), DA3 (`CSI = c`)
@@ -142,8 +149,10 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 
 ## Backlog
 
-P0–P2 are **done** (see the 2026-06-03 update note); P3 and the architectural
-fork remain. Ordered by leverage-to-effort for a TUI-mode (host-rendered) terminal.
+P0–P2, P3, and the architectural fork (#10, the native window backend) have all
+landed (see the 2026-06-03 update note). Items below are kept as a record; the
+only open work is the long-tail leftovers flagged inline (iTerm2 images,
+DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
 
 ### P0 — Correctness gaps that silently corrupted output — DONE
 1. [x] **Charset designation + DEC Special Graphics line-drawing** — G0–G3
