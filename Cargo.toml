@@ -19,6 +19,12 @@ tokio-runtime = ["dep:tokio"]
 # crate for its JSON-RPC 2.0 model + LSP types, and serde_json for payloads.
 # Opt-in so the default terminal stays lean.
 l13 = ["dep:rusty_lsp", "dep:serde_json"]
+# Native window backend (the tcore-font/tcore-app fork): a standalone window
+# instead of rendering into a host terminal. winit for windowing/input,
+# softbuffer for CPU presentation, ab_glyph for glyph rasterization.
+gui = ["dep:ab_glyph", "dep:winit", "dep:softbuffer"]
+# Adds the wgpu GPU renderer alongside the CPU (softbuffer) one.
+gui-gpu = ["gui", "dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 [dependencies]
 libc = "0.2.186"
@@ -35,6 +41,12 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 ] }
 rusty_lsp = { path = "../rusty_lsp", optional = true }
 serde_json = { version = "1", optional = true }
+ab_glyph = { version = "0.2", optional = true }
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+wgpu = { version = "22", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.3", optional = true }
 
 # ConPTY backend: Windows-only, so the Linux/macOS build never pulls it in.
 [target.'cfg(windows)'.dependencies]

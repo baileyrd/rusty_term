@@ -33,9 +33,15 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 > Kitty keyboard + xterm modifyOtherKeys protocols to the host. Checkboxes below
 > reflect all of this. **L13** then landed too: a full-duplex JSON-RPC structured
 > side-channel over a private OSC (feature `l13`), hosting a complete MCP server
-> (terminal introspection) plus LSP/ACP negotiation, built on `rusty_lsp`. The
-> only remaining `[ ]` items are the native window-backend fork and small
-> leftovers (iTerm2, XTGETTCAP, OSC notifications, bidi, DAP/Jupyter, …).
+> (terminal introspection) plus LSP/ACP negotiation, built on `rusty_lsp`.
+> Finally, the **native window-backend fork** was built (features `gui`/`gui-gpu`):
+> a `winit` window with CPU (`softbuffer`) and GPU (`wgpu`) renderers + `ab_glyph`
+> glyphs + native key encoding — the jump from TUI-mode to a standalone window
+> (`--gui`). Its font/CPU-render/input/GPU-pipeline layers are headless-tested;
+> live presentation and the GPU draw aren't verifiable in this headless env (no
+> display; software Vulkan drivers crash on submit). Remaining `[ ]` items are now
+> only small leftovers (iTerm2, XTGETTCAP, OSC notifications, bidi, DAP/Jupyter,
+> in-window mouse/clipboard/IME, …).
 
 ## Appendix C — Minimum Viable Modern Terminal
 
@@ -176,8 +182,22 @@ fork remain. Ordered by leverage-to-effort for a TUI-mode (host-rendered) termin
     on `rusty_lsp` (JSON-RPC model + LSP types). Feature `l13`, runtime-agnostic.
     Remaining: DAP/Jupyter bridges and full LSP/ACP backends.
 
-### Architectural fork (blocks P3 graphics at scale)
-10. **Native window backend** (`tcore-font` + `tcore-app`, synthesis §12):
-    winit/wgpu window + cosmic-text/swash shaping. This is the jump from
-    "TUI-mode" to a standalone terminal and unlocks real graphics, mouse, IME,
-    and accessibility instead of relaying them. Large, separate track.
+### Architectural fork — native window backend
+10. **Native window backend** (`tcore-font` + `tcore-app`, synthesis §12). [x]
+    **Built** behind `gui` (CPU) / `gui-gpu` (GPU): a `winit` window driving the
+    shared parser/grid, with a `Renderer` trait over a `softbuffer` CPU
+    compositor and a `wgpu` GPU compositor (glyph-atlas + instanced quads,
+    WGSL), `ab_glyph` rasterization, **native** key encoding (the L09 native
+    side, replacing relay), and resize→`TIOCSWINSZ`. `--gui` launches it,
+    `--gpu` selects the GPU renderer (CPU fallback).
+    - **Verified headless:** font rasterization, the CPU `Grid`→pixel-buffer
+      compositor (render-to-buffer asserts), key encoding, and GPU adapter +
+      WGSL-shader + pipeline + atlas creation (`gpu_core_builds`).
+    - **Unverifiable in this environment (built, compile-checked):** live window
+      presentation (no display server) and the GPU draw+readback — the headless
+      software drivers (lavapipe, dzn) segfault on submit, so the
+      `gpu_renders_to_texture` readback test is `#[ignore]`d for a real GPU.
+    - **Documented gaps (not stubs):** mouse reporting, clipboard/OSC 52, IME,
+      DECCKM tracking in the window, in-window scrollback/cursor, and the
+      Windows window path. Text is now pixel-resolution; inline images still
+      render at cell resolution (half-blocks) as in TUI mode.
