@@ -7,16 +7,28 @@
 
 use std::collections::VecDeque;
 
-use super::cell::{char_width, Cell, Pen, MAX_COMBINING, WIDE_TRAILER};
+use super::cell::{Cell, DEFAULT_BG, DEFAULT_FG, Pen, WIDE_TRAILER, char_width};
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::sixel::SixelImage;
 
 /// Maximum number of lines retained in the scrollback history. Older lines are
 /// evicted from the front once this is exceeded.
 pub const SCROLLBACK_MAX: usize = 10_000;
 
+/// Maximum number of prompt marks (OSC 133;A) retained for navigation. Older
+/// marks are dropped once exceeded — far more than any real session needs.
+const PROMPT_MARKS_MAX: usize = 1024;
+
 /// Maximum number of distinct hyperlink URIs interned from OSC 8. Past this,
 /// further links are dropped (rendered as plain text) rather than growing the
 /// table without bound.
 const LINK_MAX: usize = 4096;
+
+/// Maximum number of distinct grapheme-continuation strings interned from
+/// multi-scalar glyphs. Past this, further continuations are dropped (the base
+/// glyph still renders) rather than growing the table without bound.
+const CLUSTER_MAX: usize = 8192;
 
 /// The authoritative screen buffer: a row-major grid of [`Cell`]s plus a
 /// per-row damage (`dirty`) tracker and a cursor position.
@@ -67,6 +79,10 @@ pub struct Grid {
     /// `links[n - 1]` (`0` means no link). Append-only and bounded by
     /// [`LINK_MAX`], so ids stay stable for cells held in scrollback.
     pub(crate) links: Vec<String>,
+    /// Interned grapheme-continuation strings; a [`Cell::cluster`] of `n` refers
+    /// to `clusters[n - 1]` (`0` means a lone `ch`). Append-only and bounded by
+    /// [`CLUSTER_MAX`], so ids stay stable for cells held in scrollback.
+    pub(crate) clusters: Vec<String>,
     /// The hyperlink id stamped onto cells written while an OSC 8 link is open
     /// (`0` when none). Set by the parser via [`Grid::set_link`].
     current_link: u16,
@@ -90,12 +106,42 @@ pub struct Grid {
     /// on, a printed glyph shifts the rest of the row right instead of
     /// overwriting.
     pub(crate) insert_mode: bool,
+    /// Default foreground/background colors (OSC 10/11), mirrored from the
+    /// parser's palette. The background doubles as the erase-fill color, so a
+    /// theme set via OSC 11 colors cleared regions, not just freshly written text.
+    default_fg: u32,
+    default_bg: u32,
+    /// Logical line indices (counting from the oldest retained scrollback line)
+    /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
+    /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
+    prompt_marks: Vec<usize>,
+    /// Per-row line size attributes (DECDWL/DECDHL); `len() == rows`. The
+    /// renderer relays each to the host so double-width/height lines display
+    /// correctly, and they shift with the rows they label as the screen scrolls.
+    line_attrs: Vec<LineAttr>,
 }
 
 /// Build the default tab-stop table for a `cols`-wide grid: a stop at every
 /// 8th column (0, 8, 16, …), matching the classic 8-column default.
 fn default_tab_stops(cols: usize) -> Vec<bool> {
     (0..cols).map(|i| i % 8 == 0).collect()
+}
+
+/// Per-row size attribute set by `ESC # 3/4/5/6` (DECDHL/DECDWL/DECSWL). A
+/// double-width or double-height line renders at twice the cell width, so only
+/// the left half of the columns is displayed; the renderer relays the attribute
+/// to the host terminal, which does the scaling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LineAttr {
+    /// Normal single-width, single-height (`ESC # 5`, the default).
+    #[default]
+    Single,
+    /// Double-width, single-height (`ESC # 6`).
+    DoubleWidth,
+    /// Top half of a double-width, double-height line (`ESC # 3`).
+    DoubleTop,
+    /// Bottom half of a double-width, double-height line (`ESC # 4`).
+    DoubleBottom,
 }
 
 /// Which DEC private mode selected the alternate screen, which determines the
@@ -130,6 +176,8 @@ struct SavedScreen {
     saved_cursor: (usize, usize),
     /// The mode that activated the alternate screen, governing exit behaviour.
     mode: AltMode,
+    /// Line size attributes of the stashed screen, swapped back on exit.
+    line_attrs: Vec<LineAttr>,
 }
 
 /// Reflow `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows` buffer,
@@ -166,12 +214,17 @@ impl Grid {
             view_offset: 0,
             host_out: Vec::new(),
             links: Vec::new(),
+            clusters: Vec::new(),
             current_link: 0,
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
             autowrap: true,
             origin_mode: false,
             insert_mode: false,
+            default_fg: DEFAULT_FG,
+            default_bg: DEFAULT_BG,
+            line_attrs: vec![LineAttr::Single; rows],
+            prompt_marks: Vec::new(),
         }
     }
 
@@ -224,7 +277,11 @@ impl Grid {
     /// floor when the cursor starts at or below it, so cursor-up can't escape
     /// the region; above the region it floors at row 0.
     pub(crate) fn cursor_up(&mut self, n: usize) {
-        let floor = if self.cursor.1 >= self.scroll_top { self.scroll_top } else { 0 };
+        let floor = if self.cursor.1 >= self.scroll_top {
+            self.scroll_top
+        } else {
+            0
+        };
         self.cursor.1 = self.cursor.1.saturating_sub(n).max(floor);
     }
 
@@ -268,6 +325,73 @@ impl Grid {
         }
     }
 
+    /// Render an RGB(A) image at the cursor as truecolor half-block glyphs
+    /// (`▀`/`▄`) — one cell per pixel column, two pixel rows per cell. `pixels`
+    /// is row-major `width × height`, `None` meaning transparent. The image is
+    /// shrunk to fit the columns remaining from the cursor (aspect-preserving,
+    /// never enlarged), placed top-left at the cursor, and scrolled like printed
+    /// lines if it runs past the bottom; the cursor ends at column 0 of the row
+    /// below it (xterm "sixel scrolling"). Shared by the Sixel and Kitty paths.
+    pub(crate) fn render_image(&mut self, width: usize, height: usize, pixels: &[Option<u32>]) {
+        if width == 0 || height == 0 || pixels.len() < width * height {
+            return;
+        }
+        // Nearest-neighbor source sample for target pixel `(tx, ty)`.
+        let sample = |tx: usize, ty: usize, tw: usize, th: usize| -> Option<u32> {
+            if ty >= th {
+                return None;
+            }
+            pixels[(ty * height / th) * width + (tx * width / tw)]
+        };
+        // Combine the two pixels of one cell into a half-block glyph; an unset
+        // half takes the default background, both unset leaves the cell alone.
+        let half_block = |top: Option<u32>, bottom: Option<u32>, def_bg: u32| {
+            let mk = |ch, fg, bg| Cell {
+                ch,
+                cluster: 0,
+                fg,
+                bg,
+                flags: 0,
+                link: 0,
+            };
+            match (top, bottom) {
+                (None, None) => None,
+                (Some(t), Some(b)) => Some(mk('\u{2580}', t, b)),
+                (Some(t), None) => Some(mk('\u{2580}', t, def_bg)),
+                (None, Some(b)) => Some(mk('\u{2584}', b, def_bg)),
+            }
+        };
+
+        let origin = self.cursor.0;
+        let avail = self.cols.saturating_sub(origin).max(1);
+        // Fit to the available width (shrink only), preserving aspect.
+        let tw = width.min(avail);
+        let th = (height * tw / width).max(1);
+        let cell_rows = th.div_ceil(2);
+
+        for cr in 0..cell_rows {
+            let y = self.cursor.1;
+            for cc in 0..tw {
+                let col = origin + cc;
+                if col >= self.cols {
+                    break;
+                }
+                let top = sample(cc, cr * 2, tw, th);
+                let bottom = sample(cc, cr * 2 + 1, tw, th);
+                if let Some(cell) = half_block(top, bottom, self.default_bg) {
+                    self.set_cell(col, y, cell);
+                }
+            }
+            self.newline();
+        }
+        self.carriage_return();
+    }
+
+    /// Render a decoded Sixel image (delegates to [`Grid::render_image`]).
+    pub(crate) fn render_sixel(&mut self, img: &SixelImage) {
+        self.render_image(img.width, img.height, &img.pixels);
+    }
+
     /// Scroll the current scrolling region up by one row, blanking the freed
     /// bottom row of the region. Only the region's rows are marked dirty.
     pub fn scroll_up(&mut self) {
@@ -282,6 +406,7 @@ impl Grid {
             self.scrollback.push_back(self.cells[0..self.cols].to_vec());
             if self.scrollback.len() > SCROLLBACK_MAX {
                 self.scrollback.pop_front();
+                self.evict_prompt_mark();
             }
             // If the user is browsing history, advance the offset in step with
             // the incoming line so the viewed region stays put under new output.
@@ -295,9 +420,11 @@ impl Grid {
         let count = (bottom - top) * self.cols;
         self.cells.copy_within(src..src + count, dst);
         let last = bottom * self.cols;
+        let blank = self.erase_cell();
         for c in &mut self.cells[last..last + self.cols] {
-            *c = Cell::blank();
+            *c = blank;
         }
+        self.shift_line_attrs(top + 1, top, bottom - top, bottom..bottom + 1);
         for d in &mut self.dirty[top..=bottom] {
             *d = true;
         }
@@ -327,12 +454,22 @@ impl Grid {
     /// line if it would not fit, then advancing the cursor by the glyph's
     /// display width. A double-width glyph also writes a flagged trailing cell.
     pub fn put_char(&mut self, ch: char, pen: Pen) {
-        let w = char_width(ch);
-        if w == 0 {
-            // Zero-width combining mark: attach it to the preceding glyph.
-            self.add_combining(ch);
-            return;
+        // A non-ASCII scalar may continue the grapheme in the cell to the left
+        // (combining mark, ZWJ join, skin tone, variation selector). ASCII is
+        // always its own grapheme, so the common path skips the check entirely.
+        if !ch.is_ascii() {
+            if let Some((bx, by)) = self.left_base()
+                && self.continues_grapheme(bx, by, ch)
+            {
+                self.append_to_glyph(bx, by, ch);
+                return;
+            }
+            // Not a continuation: a zero-width scalar has no cell of its own.
+            if char_width(ch) == 0 {
+                return;
+            }
         }
+        let w = char_width(ch); // >= 1 here (zero-width non-continuations dropped above)
         if self.cursor.0 + w > self.cols {
             if self.autowrap {
                 self.carriage_return();
@@ -351,7 +488,14 @@ impl Grid {
         self.set_cell(
             x,
             y,
-            Cell { ch, combining: ['\0'; MAX_COMBINING], fg: pen.fg, bg: pen.bg, flags: pen.attrs, link },
+            Cell {
+                ch,
+                cluster: 0,
+                fg: pen.fg,
+                bg: pen.bg,
+                flags: pen.attrs,
+                link,
+            },
         );
         if w == 2 && x + 1 < self.cols {
             // Trailing half: a flagged placeholder the renderer skips. It keeps
@@ -361,7 +505,7 @@ impl Grid {
                 y,
                 Cell {
                     ch: ' ',
-                    combining: ['\0'; MAX_COMBINING],
+                    cluster: 0,
                     fg: pen.fg,
                     bg: pen.bg,
                     flags: WIDE_TRAILER,
@@ -372,24 +516,74 @@ impl Grid {
         self.cursor.0 += w;
     }
 
-    /// Attach a zero-width combining mark to the most recently written glyph
-    /// (the cell to the left of the cursor, stepping back over a wide-glyph
-    /// trailer to its head). Dropped at the start of a line, or once a cell's
-    /// combining slots are full.
-    fn add_combining(&mut self, mark: char) {
+    /// The base cell of the grapheme immediately left of the cursor, stepping
+    /// back over a wide glyph's trailer to its head. `None` at column 0.
+    fn left_base(&self) -> Option<(usize, usize)> {
         let (cx, cy) = self.cursor;
-        if cx == 0 || cy >= self.rows {
-            return;
+        if cy >= self.rows || cx == 0 {
+            return None;
         }
-        let mut bx = cx - 1;
-        if self.cells[cy * self.cols + bx].flags & WIDE_TRAILER != 0 && bx >= 1 {
-            bx -= 1; // land on the wide glyph's head, not its trailer
+        let left = cx - 1;
+        if self.cells[cy * self.cols + left].flags & WIDE_TRAILER != 0 && left >= 1 {
+            Some((left - 1, cy)) // land on the wide glyph's head, not its trailer
+        } else {
+            Some((left, cy))
         }
-        let cell = &mut self.cells[cy * self.cols + bx];
-        if let Some(slot) = cell.combining.iter_mut().find(|s| **s == '\0') {
-            *slot = mark;
-            self.dirty[cy] = true;
+    }
+
+    /// Whether appending `next` to the glyph at `(x, y)` keeps it a single
+    /// grapheme cluster (UAX #29) — i.e. `next` continues that glyph rather than
+    /// starting a new one.
+    fn continues_grapheme(&self, x: usize, y: usize, next: char) -> bool {
+        let mut s = self.glyph_text(x, y);
+        s.push(next);
+        s.graphemes(true).count() == 1
+    }
+
+    /// The full glyph text at `(x, y)`: the base scalar plus any interned
+    /// grapheme continuation.
+    fn glyph_text(&self, x: usize, y: usize) -> String {
+        let cell = self.cells[y * self.cols + x];
+        let mut s = String::new();
+        s.push(cell.ch);
+        if cell.cluster != 0
+            && let Some(suffix) = self.clusters.get((cell.cluster - 1) as usize)
+        {
+            s.push_str(suffix);
         }
+        s
+    }
+
+    /// Append `ch` to the grapheme continuation of the cell at `(x, y)`,
+    /// re-interning the grown suffix and marking the row dirty.
+    fn append_to_glyph(&mut self, x: usize, y: usize, ch: char) {
+        let idx = y * self.cols + x;
+        let mut suffix = match self.cells[idx].cluster {
+            0 => String::new(),
+            id => self
+                .clusters
+                .get((id - 1) as usize)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        suffix.push(ch);
+        let id = self.intern_cluster(suffix);
+        self.cells[idx].cluster = id;
+        self.dirty[y] = true;
+    }
+
+    /// Return the id for grapheme continuation `suffix`, interning it on first
+    /// use. Ids are `index + 1` so `0` means "no continuation". Returns `0` once
+    /// the table is full (the continuation is dropped; the base glyph remains).
+    fn intern_cluster(&mut self, suffix: String) -> u16 {
+        if let Some(i) = self.clusters.iter().position(|c| *c == suffix) {
+            return (i + 1) as u16;
+        }
+        if self.clusters.len() >= CLUSTER_MAX {
+            return 0;
+        }
+        self.clusters.push(suffix);
+        self.clusters.len() as u16
     }
 
     /// Blank columns `[from, to)` of row `y`, marking it dirty.
@@ -402,17 +596,36 @@ impl Grid {
             return;
         }
         let base = y * self.cols;
+        let blank = self.erase_cell();
         for c in &mut self.cells[base + from..base + to] {
-            *c = Cell::blank();
+            *c = blank;
         }
         self.dirty[y] = true;
     }
 
     /// Blank every cell and home the cursor (used by `CSI 2 J`).
     pub(crate) fn clear_all(&mut self) {
-        self.cells.fill(Cell::blank());
+        let blank = self.erase_cell();
+        self.cells.fill(blank);
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
+    }
+
+    /// A blank cell painted in the current default colors — the fill used by
+    /// every erase / scroll-clear path, so a default background set via OSC 11
+    /// applies to cleared regions, not only to text.
+    fn erase_cell(&self) -> Cell {
+        let mut c = Cell::blank();
+        c.fg = self.default_fg;
+        c.bg = self.default_bg;
+        c
+    }
+
+    /// Update the default foreground/background colors (OSC 10/11). Mirrors the
+    /// parser's palette so subsequent erases fill with the new background.
+    pub(crate) fn set_default_colors(&mut self, fg: u32, bg: u32) {
+        self.default_fg = fg;
+        self.default_bg = bg;
     }
 
     /// Resize the grid to `cols`×`rows`, preserving the top-left overlap of the
@@ -428,6 +641,7 @@ impl Grid {
         // it can be restored without a size mismatch.
         if let Some(saved) = &mut self.primary {
             saved.cells = reflow(&saved.cells, self.cols, self.rows, cols, rows);
+            saved.line_attrs = vec![LineAttr::Single; rows];
             saved.cursor = clamp(saved.cursor);
             saved.saved_cursor = clamp(saved.saved_cursor);
         }
@@ -439,9 +653,11 @@ impl Grid {
         self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
+        self.line_attrs = vec![LineAttr::Single; rows];
         self.dirty = vec![true; rows];
         self.cursor = clamp(self.cursor);
         self.saved_cursor = clamp(self.saved_cursor);
+        self.prompt_marks.clear();
         self.reset_scroll_region();
     }
 
@@ -452,11 +668,13 @@ impl Grid {
         if self.primary.is_some() {
             return;
         }
+        let blank = self.erase_cell();
         self.primary = Some(SavedScreen {
-            cells: std::mem::replace(&mut self.cells, vec![Cell::blank(); self.cols * self.rows]),
+            cells: std::mem::replace(&mut self.cells, vec![blank; self.cols * self.rows]),
             cursor: self.cursor,
             saved_cursor: self.saved_cursor,
             mode,
+            line_attrs: std::mem::replace(&mut self.line_attrs, vec![LineAttr::Single; self.rows]),
         });
         if mode == AltMode::Dec1049 {
             self.cursor = (0, 0);
@@ -474,6 +692,7 @@ impl Grid {
     pub(crate) fn leave_alt_screen(&mut self) {
         if let Some(saved) = self.primary.take() {
             self.cells = saved.cells;
+            self.line_attrs = saved.line_attrs;
             if saved.mode == AltMode::Dec1049 {
                 self.cursor = (
                     saved.cursor.0.min(self.cols.saturating_sub(1)),
@@ -512,8 +731,9 @@ impl Grid {
         let from = base + x;
         let n = n.min(self.cols - x);
         self.cells.copy_within(from + n..row_end, from);
+        let blank = self.erase_cell();
         for c in &mut self.cells[row_end - n..row_end] {
-            *c = Cell::blank();
+            *c = blank;
         }
         self.dirty[y] = true;
     }
@@ -530,8 +750,9 @@ impl Grid {
         let from = base + x;
         let n = n.min(self.cols - x);
         self.cells.copy_within(from..row_end - n, from + n);
+        let blank = self.erase_cell();
         for c in &mut self.cells[from..from + n] {
-            *c = Cell::blank();
+            *c = blank;
         }
         self.dirty[y] = true;
     }
@@ -563,9 +784,11 @@ impl Grid {
         }
         // Blank the n freed rows at the cursor.
         let blank_end = (cy + n) * cols;
+        let blank = self.erase_cell();
         for c in &mut self.cells[cy * cols..blank_end] {
-            *c = Cell::blank();
+            *c = blank;
         }
+        self.shift_line_attrs(cy, cy + n, count / cols, cy..cy + n);
         for d in &mut self.dirty[cy..=self.scroll_bottom] {
             *d = true;
         }
@@ -591,9 +814,16 @@ impl Grid {
         // Blank the n rows freed at the region bottom.
         let first_blank = (self.scroll_bottom + 1 - n) * cols;
         let region_end = (self.scroll_bottom + 1) * cols;
+        let blank = self.erase_cell();
         for c in &mut self.cells[first_blank..region_end] {
-            *c = Cell::blank();
+            *c = blank;
         }
+        self.shift_line_attrs(
+            cy + n,
+            cy,
+            count / cols,
+            (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1),
+        );
         for d in &mut self.dirty[cy..=self.scroll_bottom] {
             *d = true;
         }
@@ -628,9 +858,11 @@ impl Grid {
         }
         // Blank the n freed rows at the region top.
         let blank_end = (top + n) * cols;
+        let blank = self.erase_cell();
         for c in &mut self.cells[top * cols..blank_end] {
-            *c = Cell::blank();
+            *c = blank;
         }
+        self.shift_line_attrs(top, top + n, count / cols, top..top + n);
         for d in &mut self.dirty[top..=bottom] {
             *d = true;
         }
@@ -643,6 +875,34 @@ impl Grid {
             self.scroll_down_n(1);
         } else if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
+        }
+    }
+
+    /// Set the current cursor row's line size attribute (`ESC # 3/4/5/6`).
+    pub(crate) fn set_line_attr(&mut self, attr: LineAttr) {
+        let y = self.cursor.1;
+        if y < self.line_attrs.len() {
+            self.line_attrs[y] = attr;
+            self.dirty[y] = true;
+        }
+    }
+
+    /// Mirror a region scroll on the line-attribute table: move `count` rows
+    /// from `src_row` to begin at `dst_row`, then reset the rows in `blank` to
+    /// single width. Keeps line size glued to its content as the screen scrolls.
+    fn shift_line_attrs(
+        &mut self,
+        src_row: usize,
+        dst_row: usize,
+        count: usize,
+        blank: std::ops::Range<usize>,
+    ) {
+        if count > 0 {
+            self.line_attrs
+                .copy_within(src_row..src_row + count, dst_row);
+        }
+        for a in &mut self.line_attrs[blank] {
+            *a = LineAttr::Single;
         }
     }
 
@@ -712,17 +972,21 @@ impl Grid {
         self.primary = None; // leave the alternate screen if active
         self.cells = vec![Cell::blank(); self.cols * self.rows];
         self.dirty = vec![true; self.rows];
+        self.line_attrs = vec![LineAttr::Single; self.rows];
         self.cursor = (0, 0);
         self.saved_cursor = (0, 0);
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
         self.scrollback.clear();
+        self.prompt_marks.clear();
         self.view_offset = 0;
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.default_fg = DEFAULT_FG;
+        self.default_bg = DEFAULT_BG;
         self.current_link = 0;
     }
 
@@ -737,7 +1001,12 @@ impl Grid {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.default_fg = DEFAULT_FG;
+        self.default_bg = DEFAULT_BG;
         self.current_link = 0;
+        for a in &mut self.line_attrs {
+            *a = LineAttr::Single;
+        }
     }
 
     /// Screen-alignment test (`DECALN`, `ESC # 8`): fill every cell with `E` and
@@ -746,6 +1015,9 @@ impl Grid {
         let mut e = Cell::blank();
         e.ch = 'E';
         self.cells.fill(e);
+        for a in &mut self.line_attrs {
+            *a = LineAttr::Single;
+        }
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
     }
@@ -758,14 +1030,23 @@ impl Grid {
     /// Snapshot only the rows currently marked dirty, cloning their cells into
     /// a [`DirtyFrame`]. This is the high-locality handoff the renderer consumes.
     pub fn snapshot_dirty(&self) -> DirtyFrame {
-        let rows = self.dirty.iter().enumerate()
+        let rows = self
+            .dirty
+            .iter()
+            .enumerate()
             .filter(|&(_, d)| *d)
             .map(|(y, _)| {
                 let start = y * self.cols;
                 (y, self.cells[start..start + self.cols].to_vec())
             })
             .collect();
-        DirtyFrame { cursor: self.cursor, rows, links: self.links.clone() }
+        DirtyFrame {
+            cursor: self.cursor,
+            rows,
+            links: self.links.clone(),
+            clusters: self.clusters.clone(),
+            line_attrs: self.line_attrs.clone(),
+        }
     }
 
     /// Move the viewport up into history by up to `n` lines, clamped to the
@@ -802,6 +1083,73 @@ impl Grid {
         true
     }
 
+    /// Record a shell prompt start (OSC 133;A) at the current cursor row, for
+    /// prompt-to-prompt scrollback navigation. No-op on the alternate screen,
+    /// which has no history. Marks are logical line indices (0 = oldest retained
+    /// scrollback line), kept sorted and deduplicated.
+    pub(crate) fn mark_prompt(&mut self) {
+        if self.primary.is_some() {
+            return;
+        }
+        let line = self.scrollback.len() + self.cursor.1;
+        if let Err(pos) = self.prompt_marks.binary_search(&line) {
+            self.prompt_marks.insert(pos, line);
+            if self.prompt_marks.len() > PROMPT_MARKS_MAX {
+                self.prompt_marks.remove(0);
+            }
+        }
+    }
+
+    /// One scrollback line was evicted from the front: every logical index drops
+    /// by one, and a mark on the evicted line (index 0) is discarded.
+    fn evict_prompt_mark(&mut self) {
+        self.prompt_marks.retain(|&l| l != 0);
+        for l in &mut self.prompt_marks {
+            *l -= 1;
+        }
+    }
+
+    /// Scroll the viewport up to the nearest prompt mark above the current top
+    /// visible line (OSC 133 navigation). Returns `true` if it moved.
+    pub fn scroll_to_prev_prompt(&mut self) -> bool {
+        if self.primary.is_some() {
+            return false;
+        }
+        let h = self.scrollback.len();
+        let top_visible = h - self.view_offset.min(h);
+        match self
+            .prompt_marks
+            .iter()
+            .copied()
+            .filter(|&l| l < top_visible)
+            .max()
+        {
+            Some(l) => self.set_view_offset(h - l),
+            None => false,
+        }
+    }
+
+    /// Scroll the viewport down to the nearest prompt mark below the current top
+    /// visible line, snapping to the live bottom when the next mark is on the
+    /// live screen or there is none. Returns `true` if it moved.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        if self.primary.is_some() {
+            return false;
+        }
+        let h = self.scrollback.len();
+        let top_visible = h - self.view_offset.min(h);
+        match self
+            .prompt_marks
+            .iter()
+            .copied()
+            .filter(|&l| l > top_visible)
+            .min()
+        {
+            Some(l) if l < h => self.set_view_offset(h - l),
+            _ => self.reset_view(),
+        }
+    }
+
     /// Snapshot the entire visible viewport, compositing scrollback history
     /// above the live grid according to [`Grid::view_offset`]. Every row is
     /// included. History lines are padded/truncated to the current width.
@@ -810,6 +1158,7 @@ impl Grid {
         let history = self.scrollback.len();
         let off = self.view_offset.min(history);
         let mut rows = Vec::with_capacity(self.rows);
+        let mut attrs = Vec::with_capacity(self.rows);
         for y in 0..self.rows {
             let cells = if y < off {
                 // Top `off` viewport rows show the tail of history.
@@ -825,8 +1174,19 @@ impl Grid {
                 self.cells[start..start + self.cols].to_vec()
             };
             rows.push((y, cells));
+            attrs.push(if y < off {
+                LineAttr::Single // history lines are always single width
+            } else {
+                self.line_attrs[y - off]
+            });
         }
-        DirtyFrame { cursor: self.cursor, rows, links: self.links.clone() }
+        DirtyFrame {
+            cursor: self.cursor,
+            rows,
+            links: self.links.clone(),
+            clusters: self.clusters.clone(),
+            line_attrs: attrs,
+        }
     }
 
     /// Drain bytes queued for the host terminal (forwarded OSC 52 clipboard
@@ -869,4 +1229,11 @@ pub struct DirtyFrame {
     /// Interned hyperlink URIs (OSC 8); a [`Cell::link`] of `n` indexes
     /// `links[n - 1]`. Cloned so the renderer can resolve links without the lock.
     pub links: Vec<String>,
+    /// Interned grapheme continuations (see [`Grid::clusters`]); a
+    /// [`Cell::cluster`] of `n` indexes `clusters[n - 1]`. Cloned so the renderer
+    /// can resolve glyphs without holding the grid lock.
+    pub clusters: Vec<String>,
+    /// Per-row line size attributes (DECDWL/DECDHL), indexed by each row's `y`
+    /// in [`rows`](Self::rows). Cloned so the renderer can relay them to the host.
+    pub line_attrs: Vec<LineAttr>,
 }

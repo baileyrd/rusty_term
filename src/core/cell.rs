@@ -1,8 +1,9 @@
 //! Cell model and character-width classification (L05).
 //!
-//! The [`Cell`] is the atom of the screen buffer — a base glyph, any trailing
-//! combining marks, and truecolor attributes — and [`char_width`] classifies a
-//! code point's display width per Unicode UAX #11.
+//! The [`Cell`] is the atom of the screen buffer — a base glyph plus any trailing
+//! grapheme continuation (combining marks, ZWJ joins, …) and truecolor
+//! attributes — and [`char_width`] classifies a code point's display width per
+//! Unicode UAX #11.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -38,11 +39,14 @@ pub const ATTR_HIDDEN: u16 = 1 << 7;
 pub const ATTR_STRIKE: u16 = 1 << 8;
 
 /// Mask of every rendition attribute bit (everything except [`WIDE_TRAILER`]).
-pub const ATTR_MASK: u16 =
-    ATTR_BOLD | ATTR_DIM | ATTR_ITALIC | ATTR_UNDERLINE | ATTR_BLINK | ATTR_REVERSE | ATTR_HIDDEN | ATTR_STRIKE;
-
-/// Maximum number of trailing combining marks stored per cell.
-pub const MAX_COMBINING: usize = 2;
+pub const ATTR_MASK: u16 = ATTR_BOLD
+    | ATTR_DIM
+    | ATTR_ITALIC
+    | ATTR_UNDERLINE
+    | ATTR_BLINK
+    | ATTR_REVERSE
+    | ATTR_HIDDEN
+    | ATTR_STRIKE;
 
 /// The current SGR graphic rendition — foreground/background color and the set
 /// of active text attributes — that the parser stamps onto each glyph it
@@ -60,7 +64,11 @@ pub struct Pen {
 impl Default for Pen {
     /// The reset pen: default colors and no attributes.
     fn default() -> Self {
-        Pen { fg: DEFAULT_FG, bg: DEFAULT_BG, attrs: 0 }
+        Pen {
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            attrs: 0,
+        }
     }
 }
 
@@ -78,15 +86,19 @@ pub fn char_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-/// A single character cell: its base glyph, any trailing combining marks, and
-/// truecolor attributes. Kept `Copy` (combining marks live in a fixed inline
-/// array) so the grid can shift cells with `copy_within`.
+/// A single character cell: its base glyph, an optional grapheme-cluster id for
+/// glyphs that span more than one code point (combining marks, ZWJ emoji
+/// sequences, …), and truecolor attributes. Kept `Copy` so the grid can shift
+/// cells with `copy_within`.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Cell {
-    /// The base (spacing) character.
+    /// The base (first) scalar of the grapheme. Used for width classification
+    /// and as the whole glyph when [`cluster`](Self::cluster) is `0`.
     pub ch: char,
-    /// Zero-width combining marks applied to `ch`; unused slots are `'\0'`.
-    pub combining: [char; MAX_COMBINING],
+    /// Grapheme-continuation id: `0` for a lone `ch`, else an index+1 into
+    /// `Grid::clusters`, whose string is the continuation appended after `ch`
+    /// (combining marks, ZWJ-joined scalars, variation selectors, …).
+    pub cluster: u16,
     /// Foreground color as `0xRRGGBB`.
     pub fg: u32,
     /// Background color as `0xRRGGBB`.
@@ -102,7 +114,7 @@ impl Cell {
     pub(crate) fn blank() -> Self {
         Cell {
             ch: ' ',
-            combining: ['\0'; MAX_COMBINING],
+            cluster: 0,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             flags: 0,

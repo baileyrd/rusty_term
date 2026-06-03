@@ -42,7 +42,9 @@ impl Grid {
 
     // Strategy 2: Dirty Snapshot (The current implementation)
     fn snapshot_dirty(&self) -> Vec<(usize, Vec<Cell>)> {
-        self.dirty.iter().enumerate()
+        self.dirty
+            .iter()
+            .enumerate()
             .filter(|&(_, d)| *d)
             .map(|(y, _)| {
                 let start = y * self.cols;
@@ -80,16 +82,29 @@ fn main() {
         let duration_dirty = start_dirty.elapsed();
 
         println!("\n[Scenario: High Locality (2/{} rows dirty)]", ROWS);
-        println!("Full Copy:    {:?} (avg {:?} per frame)", duration_full, duration_full / ITERATIONS);
-        println!("Dirty Snap:   {:?} (avg {:?} per frame)", duration_dirty, duration_dirty / ITERATIONS);
-        println!("Gain:         {:.2}x faster", duration_full.as_nanos() as f64 / duration_dirty.as_nanos() as f64);
+        println!(
+            "Full Copy:    {:?} (avg {:?} per frame)",
+            duration_full,
+            duration_full / ITERATIONS
+        );
+        println!(
+            "Dirty Snap:   {:?} (avg {:?} per frame)",
+            duration_dirty,
+            duration_dirty / ITERATIONS
+        );
+        println!(
+            "Gain:         {:.2}x faster",
+            duration_full.as_nanos() as f64 / duration_dirty.as_nanos() as f64
+        );
     }
 
     // Scenario B: Full Screen Flush (All rows changing)
     // This happens during a clear-screen or a massive `cat` of a file.
     {
         let mut g = Grid::new(COLS, ROWS);
-        for r in 0..ROWS { g.mark_dirty(r); }
+        for r in 0..ROWS {
+            g.mark_dirty(r);
+        }
 
         let start_full = Instant::now();
         for _ in 0..ITERATIONS {
@@ -104,8 +119,19 @@ fn main() {
         let duration_dirty = start_dirty.elapsed();
 
         println!("\n[Scenario: Full Flush ({}/{} rows dirty)]", ROWS, ROWS);
-        println!("Full Copy:    {:?} (avg {:?} per frame)", duration_full, duration_full / ITERATIONS);
-        println!("Dirty Snap:   {:?} (avg {:?} per frame)", duration_dirty, duration_dirty / ITERATIONS);
-        println!("Gain:         {:.2}x", duration_full.as_nanos() as f64 / duration_dirty.as_nanos() as f64);
+        println!(
+            "Full Copy:    {:?} (avg {:?} per frame)",
+            duration_full,
+            duration_full / ITERATIONS
+        );
+        println!(
+            "Dirty Snap:   {:?} (avg {:?} per frame)",
+            duration_dirty,
+            duration_dirty / ITERATIONS
+        );
+        println!(
+            "Gain:         {:.2}x",
+            duration_full.as_nanos() as f64 / duration_dirty.as_nanos() as f64
+        );
     }
 }
