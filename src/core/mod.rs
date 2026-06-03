@@ -15,17 +15,23 @@
 //! renderer a [`DirtyFrame`] snapshot. The parser intentionally implements a
 //! pragmatic subset of the VT100/ECMA-48 escape repertoire.
 
+mod base64;
 mod cell;
+mod charset;
 mod color;
 mod grid;
+mod inflate;
+mod kitty;
 mod osc;
 mod parser;
+mod png;
+mod sixel;
 
 pub use cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
     ATTR_STRIKE, ATTR_UNDERLINE, WIDE_TRAILER,
 };
-pub use grid::{DirtyFrame, Grid};
+pub use grid::{DirtyFrame, Grid, LineAttr};
 pub use parser::AnsiParser;
 
 #[cfg(test)]

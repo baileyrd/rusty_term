@@ -8,12 +8,15 @@
 //! DCS/APC/PM/SOS strings are consumed opaquely so they never leak as text.
 
 use super::cell::{
-    Pen, ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
-    ATTR_UNDERLINE, DEFAULT_BG, DEFAULT_FG,
+    ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
+    ATTR_UNDERLINE, Pen,
 };
-use super::color::{parse_extended_color, PALETTE_16};
-use super::grid::{alt_mode, Grid};
+use super::charset::Charset;
+use super::color::Palette;
+use super::grid::{Grid, LineAttr, alt_mode};
+use super::kitty;
 use super::osc;
+use super::sixel;
 
 /// States of the escape-sequence recognizer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,14 +40,24 @@ enum ParserState {
     EscCharset,
     /// An `ESC #` sequence; the next byte selects the function (`8` = DECALN).
     EscHash,
-    /// Inside a string-type control sequence — DCS (`ESC P`), APC (`ESC _`),
-    /// PM (`ESC ^`), or SOS (`ESC X`). Like [`ParserState::Osc`], the body is
-    /// consumed opaquely (we don't act on Sixel, DECRQSS, Kitty graphics, …)
-    /// so it never leaks onto the screen. Terminated by `ST` (`ESC \`).
+    /// Inside a SOS (`ESC X`) or PM (`ESC ^`) string. The body is consumed
+    /// opaquely until `ST` so it never leaks as printed text.
     StrSink,
     /// Saw `ESC` while inside a [`ParserState::StrSink`] string; awaiting the
     /// `\` of an `ST` terminator.
     StrSinkEsc,
+    /// Inside a DCS (`ESC P`) string; the body is buffered into `dcs_buffer` so
+    /// a Sixel image (`<params> q <data>`) can be decoded at `ST`. Other DCS
+    /// types are recognized and discarded.
+    Dcs,
+    /// Saw `ESC` while inside a [`ParserState::Dcs`] string; awaiting `ST`.
+    DcsEsc,
+    /// Inside an APC (`ESC _`) string; buffered into `apc_buffer` so a Kitty
+    /// graphics command (`G…`) can be decoded at `ST`. Other APC strings are
+    /// recognized and discarded.
+    Apc,
+    /// Saw `ESC` while inside a [`ParserState::Apc`] string; awaiting `ST`.
+    ApcEsc,
 }
 
 /// Incremental parser that turns a shell's output byte stream into [`Grid`]
@@ -80,16 +93,41 @@ pub struct AnsiParser {
     /// and its `BEL`/`ST` terminator). Decoded as UTF-8 at dispatch. Capped at
     /// [`OSC_MAX`] so a pathological unterminated OSC can't grow without bound.
     osc_buffer: Vec<u8>,
+    /// Raw bytes of the DCS string currently being collected (between `ESC P`
+    /// and its `ST`), used to decode Sixel images. Capped at [`DCS_MAX`].
+    dcs_buffer: Vec<u8>,
+    /// Raw bytes of the APC string currently being collected (between `ESC _`
+    /// and its `ST`), used to decode Kitty graphics. Capped at [`DCS_MAX`].
+    apc_buffer: Vec<u8>,
+    /// In-flight Kitty graphics transmission, accumulated across APC chunks.
+    kitty: kitty::Transmission,
     /// The most recently printed graphic character, for `REP` (`CSI b`) to
     /// repeat. Cleared by C0 controls (CR/LF/BS/HT) so `REP` only repeats a
     /// character still adjacent to the cursor, matching xterm.
     last_char: Option<char>,
+    /// The four G0–G3 character-set slots, designated by `ESC ( ) * +`. G0 is
+    /// active in GL initially; SI/SO switch GL between G0 and G1.
+    charsets: [Charset; 4],
+    /// Active GL slot: `0` (G0, selected by SI) or `1` (G1, selected by SO).
+    /// The printable-byte path maps through `charsets[gl]`.
+    gl: usize,
+    /// The G-slot a pending `ESC ( ) * +` designation writes to, captured when
+    /// the intermediate byte is seen so the final byte lands in the right slot.
+    charset_slot: usize,
+    /// The live color table: 256 indexed colors plus the dynamic default
+    /// fg/bg/cursor. SGR color selectors resolve through it; OSC 4/10/11/12
+    /// mutate it.
+    palette: Palette,
 }
 
 /// Upper bound on the bytes buffered for a single OSC string. Real titles and
 /// cwd URIs are far shorter; past this we keep consuming the string but stop
 /// storing it.
 const OSC_MAX: usize = 4096;
+
+/// Upper bound on the bytes buffered for a single DCS string. Sixel images can
+/// be large but are bounded here; past this we keep consuming but stop storing.
+const DCS_MAX: usize = 4 * 1024 * 1024;
 
 impl Default for AnsiParser {
     fn default() -> Self {
@@ -111,7 +149,14 @@ impl AnsiParser {
             utf8_remaining: 0,
             responses: Vec::new(),
             osc_buffer: Vec::new(),
+            dcs_buffer: Vec::new(),
+            apc_buffer: Vec::new(),
+            kitty: kitty::Transmission::default(),
             last_char: None,
+            charsets: [Charset::Ascii; 4],
+            gl: 0,
+            charset_slot: 0,
+            palette: Palette::new(),
         }
     }
 
@@ -192,19 +237,46 @@ impl AnsiParser {
                     // RIS — reset to initial state (full reset).
                     b'c' => {
                         g.reset();
+                        self.palette.reset();
                         self.pen = Pen::default();
+                        self.charsets = [Charset::Ascii; 4];
+                        self.gl = 0;
                         self.last_char = None;
                         self.state = ParserState::Ground;
                     }
                     // ESC # — the next byte selects the function (8 = DECALN).
                     b'#' => self.state = ParserState::EscHash,
-                    // Charset designation (`ESC ( B`, etc.): one more byte follows.
-                    b'(' | b')' | b'*' | b'+' => self.state = ParserState::EscCharset,
-                    // String-type introducers — DCS (`P`), SOS (`X`), PM (`^`),
-                    // APC (`_`). Their bodies are consumed opaquely until ST so
-                    // they don't leak as printed text (cf. tmux DCS passthrough,
-                    // DECRQSS replies, Kitty graphics, Sixel).
-                    b'P' | b'X' | b'^' | b'_' => self.state = ParserState::StrSink,
+                    // Charset designation: `ESC ( ) * +` choose the G0–G3 slot
+                    // the next (final) byte designates into.
+                    b'(' => {
+                        self.charset_slot = 0;
+                        self.state = ParserState::EscCharset;
+                    }
+                    b')' => {
+                        self.charset_slot = 1;
+                        self.state = ParserState::EscCharset;
+                    }
+                    b'*' => {
+                        self.charset_slot = 2;
+                        self.state = ParserState::EscCharset;
+                    }
+                    b'+' => {
+                        self.charset_slot = 3;
+                        self.state = ParserState::EscCharset;
+                    }
+                    // DCS (`ESC P`) is buffered so a Sixel image can be decoded
+                    // at ST (see `finish_dcs`); other DCS types are discarded.
+                    // SOS (`X`), PM (`^`), and APC (`_`, e.g. Kitty graphics) are
+                    // consumed opaquely so they don't leak as printed text.
+                    b'P' => {
+                        self.dcs_buffer.clear();
+                        self.state = ParserState::Dcs;
+                    }
+                    b'_' => {
+                        self.apc_buffer.clear();
+                        self.state = ParserState::Apc;
+                    }
+                    b'X' | b'^' => self.state = ParserState::StrSink,
                     // Any other ESC X sequence is a single byte we don't model;
                     // consuming b returns us to ground without leaking it.
                     _ => self.state = ParserState::Ground,
@@ -263,7 +335,13 @@ impl AnsiParser {
                 ParserState::Osc => match b {
                     0x07 => {
                         // BEL terminator: act on the collected string.
-                        osc::dispatch(&self.osc_buffer, g);
+                        osc::dispatch(
+                            &self.osc_buffer,
+                            g,
+                            &mut self.palette,
+                            &mut self.responses,
+                            &mut self.pen,
+                        );
                         self.state = ParserState::Ground;
                     }
                     0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
@@ -277,30 +355,112 @@ impl AnsiParser {
                 ParserState::OscEsc => {
                     // Whether or not this is the `\` of an ST, the OSC string is
                     // over; act on it and return to ground.
-                    osc::dispatch(&self.osc_buffer, g);
+                    osc::dispatch(
+                        &self.osc_buffer,
+                        g,
+                        &mut self.palette,
+                        &mut self.responses,
+                        &mut self.pen,
+                    );
                     self.state = ParserState::Ground;
                 }
-                ParserState::EscCharset => self.state = ParserState::Ground,
+                ParserState::EscCharset => {
+                    // The final byte designates a charset into the slot chosen
+                    // by the `( ) * +` intermediate; `0` is DEC line-drawing.
+                    self.charsets[self.charset_slot] = Charset::from_designator(b);
+                    self.state = ParserState::Ground;
+                }
                 ParserState::EscHash => {
-                    // `ESC # 8` is DECALN (screen-alignment fill); other `ESC #`
-                    // functions (double-width/height lines) are consumed.
-                    if b == b'8' {
-                        g.fill_alignment();
+                    // `ESC # 8` is DECALN (screen-alignment fill); `ESC # 3/4/5/6`
+                    // set the current line's size (DECDHL top/bottom, DECDWL,
+                    // DECSWL). Anything else is consumed without effect.
+                    match b {
+                        b'8' => g.fill_alignment(),
+                        b'3' => g.set_line_attr(LineAttr::DoubleTop),
+                        b'4' => g.set_line_attr(LineAttr::DoubleBottom),
+                        b'5' => g.set_line_attr(LineAttr::Single),
+                        b'6' => g.set_line_attr(LineAttr::DoubleWidth),
+                        _ => {}
                     }
                     self.state = ParserState::Ground;
                 }
                 ParserState::StrSink => match b {
                     0x1b => self.state = ParserState::StrSinkEsc, // possible ST (ESC \)
                     0x18 | 0x1a => self.state = ParserState::Ground, // CAN / SUB abort
-                    _ => {}                                          // consume body byte
+                    _ => {}                                       // consume body byte
                 },
                 ParserState::StrSinkEsc => {
                     // Whether or not this is the `\` of an ST, the string is
                     // over; drop the byte and return to ground.
                     self.state = ParserState::Ground;
                 }
+                ParserState::Dcs => match b {
+                    0x1b => self.state = ParserState::DcsEsc, // possible ST (ESC \)
+                    0x18 | 0x1a => {
+                        // CAN / SUB abort the string with no action.
+                        self.dcs_buffer.clear();
+                        self.state = ParserState::Ground;
+                    }
+                    _ => {
+                        if self.dcs_buffer.len() < DCS_MAX {
+                            self.dcs_buffer.push(b);
+                        }
+                    }
+                },
+                ParserState::DcsEsc => {
+                    // The DCS string is over (ST or otherwise); act on it.
+                    self.finish_dcs(g);
+                    self.state = ParserState::Ground;
+                }
+                ParserState::Apc => match b {
+                    0x1b => self.state = ParserState::ApcEsc, // possible ST (ESC \)
+                    0x18 | 0x1a => {
+                        // CAN / SUB abort the string with no action.
+                        self.apc_buffer.clear();
+                        self.state = ParserState::Ground;
+                    }
+                    _ => {
+                        if self.apc_buffer.len() < DCS_MAX {
+                            self.apc_buffer.push(b);
+                        }
+                    }
+                },
+                ParserState::ApcEsc => {
+                    // The APC string is over (ST or otherwise); act on it.
+                    self.finish_apc(g);
+                    self.state = ParserState::Ground;
+                }
             }
         }
+    }
+
+    /// Finalize a collected DCS string. If it's a Sixel (`<params> q <data>`),
+    /// decode it and render it into the grid as half-block cells; other DCS
+    /// types are ignored. Clears the buffer either way.
+    fn finish_dcs(&mut self, g: &mut Grid) {
+        let mut i = 0;
+        // Skip the Sixel parameter bytes (digits and `;`) to the final byte,
+        // which for Sixel is `q`.
+        while i < self.dcs_buffer.len()
+            && (self.dcs_buffer[i].is_ascii_digit() || self.dcs_buffer[i] == b';')
+        {
+            i += 1;
+        }
+        if self.dcs_buffer.get(i) == Some(&b'q') {
+            let img = sixel::decode(&self.dcs_buffer[i + 1..]);
+            g.render_sixel(&img);
+        }
+        self.dcs_buffer.clear();
+    }
+
+    /// Finalize a collected APC string. Kitty graphics commands begin with `G`;
+    /// hand those to the Kitty decoder (which may render an image and queue a
+    /// response). Other APC strings are ignored. Clears the buffer either way.
+    fn finish_apc(&mut self, g: &mut Grid) {
+        if self.apc_buffer.first() == Some(&b'G') {
+            kitty::feed(&mut self.kitty, &self.apc_buffer, g, &mut self.responses);
+        }
+        self.apc_buffer.clear();
     }
 
     /// Handle a single byte while in the ground state: C0 controls, printable
@@ -328,8 +488,12 @@ impl AnsiParser {
                 g.tab_forward(1);
                 self.last_char = None;
             }
+            // SO / SI — locking shifts selecting G1 / G0 into GL. ncurses
+            // toggles these around line-drawing runs (`smacs` / `rmacs`).
+            0x0e => self.gl = 1,
+            0x0f => self.gl = 0,
             0x20..=0x7e => {
-                let ch = b as char;
+                let ch = self.charsets[self.gl].map(b);
                 g.put_char(ch, self.pen);
                 self.last_char = Some(ch);
             }
@@ -362,8 +526,9 @@ impl AnsiParser {
     /// Handle a private CSI sequence (one carrying a `?`/`<`/`=`/`>` marker).
     ///
     /// Alternate-screen DEC modes are acted upon internally. Input-generating
-    /// modes (mouse, focus, bracketed paste) are *relayed* to the host terminal
-    /// so it produces the corresponding input — see [`is_host_input_mode`].
+    /// modes (mouse, focus, bracketed paste, and the Kitty keyboard / xterm
+    /// modifyOtherKeys protocols) are *relayed* to the host terminal so it
+    /// produces the corresponding input — see [`is_host_input_mode`].
     /// Everything else (cursor visibility `25`, autowrap `7`, …) is consumed and
     /// ignored so it never leaks as text.
     fn handle_private_csi(&mut self, cmd: u8, g: &mut Grid) {
@@ -372,6 +537,37 @@ impl AnsiParser {
         // values are conventional; programs care that an answer arrives.
         if self.csi_marker == b'>' && cmd == b'c' {
             self.responses.extend_from_slice(b"\x1b[>0;1;0c");
+            return;
+        }
+        // XTVERSION (`CSI > q`): report terminal name + version in xterm's
+        // `DCS > | <name>(<version>) ST` form. Feature-detection probes read it.
+        if self.csi_marker == b'>' && cmd == b'q' {
+            self.responses.extend_from_slice(
+                concat!("\x1bP>|rusty_term(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes(),
+            );
+            return;
+        }
+        // DA3 (Tertiary Device Attributes): `CSI = c`. Reply with the xterm-style
+        // `DCS ! | <unit id> ST`; the id is a conventional all-zero site code.
+        if self.csi_marker == b'=' && cmd == b'c' {
+            self.responses.extend_from_slice(b"\x1bP!|00000000\x1b\\");
+            return;
+        }
+        // Kitty keyboard protocol (`CSI > flags u` push, `= flags ; mode u` set,
+        // `< n u` pop, `? u` query) and the xterm key-modifier resources /
+        // modifyOtherKeys (`CSI > Pp ; Pv m`) are input-generating: relay them
+        // verbatim so a capable host performs the enhanced key encoding and
+        // answers the query — the same delegation as mouse/paste. Native
+        // encoding isn't possible here; we receive the host's already-encoded
+        // bytes, not key-press events.
+        let kitty_keyboard = cmd == b'u' && matches!(self.csi_marker, b'>' | b'<' | b'=' | b'?');
+        let modify_keys = cmd == b'm' && self.csi_marker == b'>';
+        if kitty_keyboard || modify_keys {
+            g.host_out.push(0x1b);
+            g.host_out.push(b'[');
+            g.host_out.push(self.csi_marker);
+            g.host_out.extend_from_slice(self.param_buffer.as_bytes());
+            g.host_out.push(cmd);
             return;
         }
         // Only DEC-private (`?`) set/reset (`h`/`l`) sequences are actionable
@@ -449,10 +645,10 @@ impl AnsiParser {
             b'B' => g.cursor_down(count), // CUD (margin-aware)
             b'C' => g.set_cursor(g.cursor.0.saturating_add(count), g.cursor.1), // CUF
             b'D' => g.set_cursor(g.cursor.0.saturating_sub(count), g.cursor.1), // CUB
-            b'E' => g.set_cursor(0, g.cursor.1.saturating_add(count)),          // CNL
-            b'F' => g.set_cursor(0, g.cursor.1.saturating_sub(count)),          // CPL
-            b'G' => g.set_cursor(p(0, 1).saturating_sub(1), g.cursor.1),        // CHA
-            b'd' => g.set_cursor_abs(g.cursor.0, p(0, 1).saturating_sub(1)),    // VPA (origin-aware)
+            b'E' => g.set_cursor(0, g.cursor.1.saturating_add(count)), // CNL
+            b'F' => g.set_cursor(0, g.cursor.1.saturating_sub(count)), // CPL
+            b'G' => g.set_cursor(p(0, 1).saturating_sub(1), g.cursor.1), // CHA
+            b'd' => g.set_cursor_abs(g.cursor.0, p(0, 1).saturating_sub(1)), // VPA (origin-aware)
             b'b' => {
                 // REP — repeat the last printed graphic character `count` times.
                 if let Some(ch) = self.last_char {
@@ -465,8 +661,8 @@ impl AnsiParser {
             b'I' => g.tab_forward(count),  // CHT
             b'Z' => g.tab_backward(count), // CBT
             b'g' => match p(0, 0) {
-                0 => g.clear_tab_stop(),       // TBC 0 — clear stop at cursor
-                3 => g.clear_all_tab_stops(),  // TBC 3 — clear all stops
+                0 => g.clear_tab_stop(),      // TBC 0 — clear stop at cursor
+                3 => g.clear_all_tab_stops(), // TBC 3 — clear all stops
                 _ => {}
             },
             b'P' => g.delete_chars(count), // DCH
@@ -482,8 +678,8 @@ impl AnsiParser {
                     g.scroll_down_n(count);
                 }
             }
-            b's' => g.save_cursor(),       // SCP
-            b'u' => g.restore_cursor(),    // RCP
+            b's' => g.save_cursor(),    // SCP
+            b'u' => g.restore_cursor(), // RCP
             b'r' => {
                 // DECSTBM — set top/bottom scrolling margins (1-based).
                 let top = p(0, 1).saturating_sub(1);
@@ -533,8 +729,11 @@ impl AnsiParser {
             b'p' if self.csi_intermediate == b'!' => {
                 // DECSTR — soft terminal reset (`CSI ! p`).
                 g.soft_reset();
+                self.palette.reset();
                 self.pen = Pen::default();
                 self.last_char = None;
+                self.charsets = [Charset::Ascii; 4];
+                self.gl = 0;
             }
             b'c' => {
                 // DA1 (Primary Device Attributes). Only the default/`0` form is
@@ -562,7 +761,11 @@ impl AnsiParser {
 
     /// Reset SGR state to the default pen (default colors, no attributes).
     fn reset_sgr(&mut self) {
-        self.pen = Pen::default();
+        self.pen = Pen {
+            fg: self.palette.fg,
+            bg: self.palette.bg,
+            attrs: 0,
+        };
     }
 
     /// Apply an SGR (`CSI … m`) parameter list. Supports reset, the text
@@ -598,24 +801,24 @@ impl AnsiParser {
                 28 => self.pen.attrs &= !ATTR_HIDDEN,
                 29 => self.pen.attrs &= !ATTR_STRIKE,
                 // Colors.
-                30..=37 => self.pen.fg = PALETTE_16[params[i] - 30],
+                30..=37 => self.pen.fg = self.palette.index(params[i] - 30),
                 38 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
+                    if let Some((color, consumed)) = self.palette.extended(&params[i + 1..]) {
                         self.pen.fg = color;
                         i += consumed;
                     }
                 }
-                39 => self.pen.fg = DEFAULT_FG,
-                40..=47 => self.pen.bg = PALETTE_16[params[i] - 40],
+                39 => self.pen.fg = self.palette.fg,
+                40..=47 => self.pen.bg = self.palette.index(params[i] - 40),
                 48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
+                    if let Some((color, consumed)) = self.palette.extended(&params[i + 1..]) {
                         self.pen.bg = color;
                         i += consumed;
                     }
                 }
-                49 => self.pen.bg = DEFAULT_BG,
-                90..=97 => self.pen.fg = PALETTE_16[8 + (params[i] - 90)],
-                100..=107 => self.pen.bg = PALETTE_16[8 + (params[i] - 100)],
+                49 => self.pen.bg = self.palette.bg,
+                90..=97 => self.pen.fg = self.palette.index(8 + (params[i] - 90)),
+                100..=107 => self.pen.bg = self.palette.index(8 + (params[i] - 100)),
                 _ => {}
             }
             i += 1;
@@ -634,5 +837,8 @@ impl AnsiParser {
 /// - `1005`/`1006`/`1015`/`1016` — extended mouse coordinate encodings
 /// - `2004` — bracketed paste
 fn is_host_input_mode(param: usize) -> bool {
-    matches!(param, 1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004)
+    matches!(
+        param,
+        1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004
+    )
 }

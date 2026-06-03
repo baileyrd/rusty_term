@@ -11,25 +11,24 @@
 //! not run — it needs a real Windows host to exercise.
 
 use crate::backend::{Backend, BackendHandle};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, HANDLE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, HANDLE,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo,
-    GetStdHandle, ResizePseudoConsole, SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO, COORD,
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, HPCON, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+    CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole, ENABLE_ECHO_INPUT,
+    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Unit type implementing [`Backend`](crate::backend::Backend) for Windows.
@@ -57,7 +56,10 @@ impl Backend for WindowsBackend {
             }
 
             // Allocate the pseudoconsole over the child-side pipe ends.
-            let size = COORD { X: cols as i16, Y: rows as i16 };
+            let size = COORD {
+                X: cols as i16,
+                Y: rows as i16,
+            };
             let mut hpc: HPCON = 0;
             let hr = CreatePseudoConsole(size, input_read, output_write, 0, &mut hpc);
             // ConPTY duplicates the child-side handles; release our copies.
@@ -152,11 +154,12 @@ impl Backend for WindowsBackend {
             if enabled {
                 let mut in_mode: u32 = 0;
                 let mut out_mode: u32 = 0;
-                if GetConsoleMode(hin, &mut in_mode) == 0 || GetConsoleMode(hout, &mut out_mode) == 0
+                if GetConsoleMode(hin, &mut in_mode) == 0
+                    || GetConsoleMode(hout, &mut out_mode) == 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                *ORIGINAL_MODES.lock().unwrap() = Some((in_mode, out_mode));
+                *ORIGINAL_MODES.lock() = Some((in_mode, out_mode));
                 // Raw input: no line buffering, echo, or Ctrl-C handling, but do
                 // decode VT input sequences. Output: enable VT processing.
                 let new_in = (in_mode
@@ -167,7 +170,7 @@ impl Backend for WindowsBackend {
                 if SetConsoleMode(hin, new_in) == 0 || SetConsoleMode(hout, new_out) == 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-            } else if let Some((in_mode, out_mode)) = ORIGINAL_MODES.lock().unwrap().take() {
+            } else if let Some((in_mode, out_mode)) = ORIGINAL_MODES.lock().take() {
                 SetConsoleMode(hin, in_mode);
                 SetConsoleMode(hout, out_mode);
             }
@@ -267,8 +270,15 @@ impl BackendHandle for WindowsHandle {
             let proc = GetCurrentProcess();
             let mut dup_in: HANDLE = std::ptr::null_mut();
             let mut dup_out: HANDLE = std::ptr::null_mut();
-            if DuplicateHandle(proc, self.input_write, proc, &mut dup_in, 0, 0, DUPLICATE_SAME_ACCESS)
-                == 0
+            if DuplicateHandle(
+                proc,
+                self.input_write,
+                proc,
+                &mut dup_in,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) == 0
                 || DuplicateHandle(
                     proc,
                     self.output_read,
@@ -296,7 +306,10 @@ impl BackendHandle for WindowsHandle {
     }
 
     fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error> {
-        let size = COORD { X: cols as i16, Y: rows as i16 };
+        let size = COORD {
+            X: cols as i16,
+            Y: rows as i16,
+        };
         let hr = unsafe { ResizePseudoConsole(self.hpc, size) };
         if hr != 0 {
             return Err(std::io::Error::from_raw_os_error(hr));

@@ -1,8 +1,8 @@
 //! Unix PTY backend: forks `/bin/bash` onto a freshly allocated pseudo-terminal
 //! and exposes the master side as a [`BackendHandle`].
 
+use parking_lot::Mutex;
 use std::os::unix::io::RawFd;
-use std::sync::Mutex;
 
 /// The host terminal's `termios` captured when raw mode was enabled, so it can
 /// be restored exactly on exit.
@@ -12,7 +12,11 @@ static ORIGINAL_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
 pub struct UnixBackend;
 
 impl crate::backend::Backend for UnixBackend {
-    fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
+    fn spawn_shell(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         // Honor the user's `$SHELL`, falling back to /bin/bash. Resolved in the
         // parent (before fork) so the allocation never happens on the child's
         // post-fork, pre-exec path, where only async-signal-safe work is sound.
@@ -81,7 +85,10 @@ impl crate::backend::Backend for UnixBackend {
 
             // Parent: close the slave, keep the master.
             libc::close(slave_fd);
-            Ok(Box::new(UnixHandle { fd: master_fd, child: Some(pid) }))
+            Ok(Box::new(UnixHandle {
+                fd: master_fd,
+                child: Some(pid),
+            }))
         }
     }
 
@@ -93,7 +100,7 @@ impl crate::backend::Backend for UnixBackend {
                     return Err(std::io::Error::last_os_error());
                 }
                 // Stash the original so it can be restored verbatim on exit.
-                *ORIGINAL_TERMIOS.lock().unwrap() = Some(termios);
+                *ORIGINAL_TERMIOS.lock() = Some(termios);
 
                 // Full raw mode: this clears ISIG (so Ctrl-C/Z/\ are forwarded
                 // as bytes to the child instead of signalling us), IXON, ICRNL,
@@ -106,7 +113,7 @@ impl crate::backend::Backend for UnixBackend {
                 if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-            } else if let Some(orig) = ORIGINAL_TERMIOS.lock().unwrap().take()
+            } else if let Some(orig) = ORIGINAL_TERMIOS.lock().take()
                 && libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig) == -1
             {
                 return Err(std::io::Error::last_os_error());
@@ -138,9 +145,7 @@ struct UnixHandle {
 impl crate::backend::BackendHandle for UnixHandle {
     fn read(&mut self) -> Result<Vec<u8>, std::io::Error> {
         let mut buf = vec![0u8; 4096];
-        let n = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             // The shell closing the slave surfaces as EIO on the master; treat
@@ -187,7 +192,10 @@ impl crate::backend::BackendHandle for UnixHandle {
         if dup_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Box::new(UnixHandle { fd: dup_fd, child: None }))
+        Ok(Box::new(UnixHandle {
+            fd: dup_fd,
+            child: None,
+        }))
     }
 
     fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error> {
@@ -202,6 +210,10 @@ impl crate::backend::BackendHandle for UnixHandle {
         }
         Ok(())
     }
+
+    fn pty_fd(&self) -> RawFd {
+        self.fd
+    }
 }
 
 impl Drop for UnixHandle {
@@ -211,9 +223,8 @@ impl Drop for UnixHandle {
             // that traps/ignores HUP must not wedge us in a blocking waitpid.
             if let Some(pid) = self.child.take() {
                 let mut status = 0;
-                let reaped = |status: &mut libc::c_int| {
-                    libc::waitpid(pid, status, libc::WNOHANG) == pid
-                };
+                let reaped =
+                    |status: &mut libc::c_int| libc::waitpid(pid, status, libc::WNOHANG) == pid;
                 libc::kill(pid, libc::SIGHUP);
                 let mut done = false;
                 for _ in 0..25 {

@@ -1,4 +1,3 @@
-
 pub trait Backend {
     /// Spawn the child shell on a new PTY sized to `cols`×`rows`.
     fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn BackendHandle>, std::io::Error>;
@@ -8,13 +7,24 @@ pub trait Backend {
 }
 
 pub trait BackendHandle: Send {
-    /// Read whatever bytes are currently available from the child.
+    /// Read whatever bytes are currently available from the child (blocking).
     ///
     /// An `Ok` value containing an empty slice signals end-of-file: the child
-    /// has exited and its side of the PTY is closed.
+    /// has exited and its side of the PTY is closed. Used by the threaded
+    /// runtime; the tokio runtime drives the raw [`pty_fd`](Self::pty_fd)
+    /// through its reactor instead.
+    #[cfg_attr(
+        any(not(feature = "threaded"), all(feature = "tokio-runtime", unix)),
+        allow(dead_code)
+    )]
     fn read(&mut self) -> Result<Vec<u8>, std::io::Error>;
 
-    /// Write `data` to the child's input.
+    /// Write `data` to the child's input (blocking). Used by the threaded
+    /// runtime; the tokio runtime writes the raw [`pty_fd`](Self::pty_fd).
+    #[cfg_attr(
+        any(not(feature = "threaded"), all(feature = "tokio-runtime", unix)),
+        allow(dead_code)
+    )]
     fn write(&mut self, data: &[u8]) -> Result<(), std::io::Error>;
 
     /// Produce an independent handle referring to the same child, so the
@@ -27,6 +37,14 @@ pub trait BackendHandle: Send {
     /// Inform the child of a new window size (`cols`×`rows`), so it can reflow
     /// and so applications receive `SIGWINCH`.
     fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error>;
+
+    /// The PTY master descriptor backing this handle, for runtimes that drive
+    /// it through a readiness reactor (the tokio runtime's `AsyncFd`). The fd
+    /// stays owned by the handle — the caller registers it without closing it.
+    /// Unix-only; the Windows ConPTY handle has no equivalent pollable fd.
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
+    fn pty_fd(&self) -> std::os::unix::io::RawFd;
 }
 
 // Each backend only compiles on its own platform — the Unix one leans on

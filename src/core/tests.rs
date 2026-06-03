@@ -2,6 +2,8 @@ use super::cell::*;
 use super::color::*;
 use super::grid::*;
 use super::parser::*;
+use super::sixel::{SixelImage, decode};
+use super::{base64, inflate, png};
 
 fn parse(input: &[u8], cols: usize, rows: usize) -> Grid {
     let mut g = Grid::new(cols, rows);
@@ -13,6 +15,27 @@ fn parse(input: &[u8], cols: usize, rows: usize) -> Grid {
 fn row_text(g: &Grid, y: usize) -> String {
     let base = y * g.cols;
     g.cells[base..base + g.cols].iter().map(|c| c.ch).collect()
+}
+
+/// The full glyph text at `(x, y)`: base scalar plus any interned grapheme
+/// continuation. Mirrors the renderer's reconstruction.
+fn glyph(g: &Grid, x: usize, y: usize) -> String {
+    let cell = g.cells[y * g.cols + x];
+    let mut s = String::new();
+    s.push(cell.ch);
+    if cell.cluster != 0 {
+        s.push_str(&g.clusters[(cell.cluster - 1) as usize]);
+    }
+    s
+}
+
+/// A decoded Sixel image's pixel at `(x, y)`, `None` if transparent/out of range.
+fn spix(img: &SixelImage, x: usize, y: usize) -> Option<u32> {
+    if x < img.width && y < img.height {
+        img.pixels[y * img.width + x]
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -217,7 +240,7 @@ fn scroll_region_limits_scrolling_and_dirtying() {
     g.cursor = (0, 3);
     p.advance(&mut g, b"\n");
     assert_eq!(row_text(&g, 2).trim_end(), "BBBB"); // row 3 shifted up to row 2
-    assert_eq!(row_text(&g, 3).trim_end(), "");      // region bottom blanked
+    assert_eq!(row_text(&g, 3).trim_end(), ""); // region bottom blanked
     // Only region rows are dirty.
     assert_eq!(g.dirty, vec![false, false, true, true, false]);
 }
@@ -406,6 +429,67 @@ fn charset_designation_is_consumed() {
     assert_eq!(g.cells[0].ch, 'Z');
     assert_eq!(g.cursor, (1, 0));
 }
+#[test]
+fn dec_line_drawing_g0_translates_letters_to_box_glyphs() {
+    // ESC ( 0 designates DEC Special Graphics into G0 (active by default), so
+    // `lqk` becomes the top of a box: ┌─┐. ESC ( B restores ASCII.
+    let g = parse(b"\x1b(0lqk\x1b(Bx", 80, 24);
+    assert_eq!(g.cells[0].ch, '┌');
+    assert_eq!(g.cells[1].ch, '─');
+    assert_eq!(g.cells[2].ch, '┐');
+    assert_eq!(g.cells[3].ch, 'x'); // back to ASCII — not translated
+}
+
+#[test]
+fn so_si_toggle_g1_line_drawing() {
+    // The ncurses pattern: designate G1 = line-drawing (ESC ) 0), then SO/SI
+    // (^N/^O) shift GL between G1 and G0 around a run of glyphs.
+    let g = parse(b"\x1b)0a\x0eqx\x0fb", 80, 24);
+    assert_eq!(g.cells[0].ch, 'a'); // GL still G0 (ASCII)
+    assert_eq!(g.cells[1].ch, '─'); // SO -> G1, 'q' -> horizontal line
+    assert_eq!(g.cells[2].ch, '│'); // 'x' -> vertical line
+    assert_eq!(g.cells[3].ch, 'b'); // SI -> back to G0 (ASCII)
+}
+
+#[test]
+fn dec_graphics_passes_digits_and_space_through() {
+    // Only 0x60..=0x7e differ; digits, space, and punctuation are unchanged.
+    let g = parse(b"\x1b(0 1!", 80, 24);
+    assert_eq!(g.cells[0].ch, ' ');
+    assert_eq!(g.cells[1].ch, '1');
+    assert_eq!(g.cells[2].ch, '!');
+}
+
+#[test]
+fn dec_graphics_rep_repeats_translated_glyph() {
+    // REP after a line-drawing glyph repeats the translated glyph, not the byte.
+    let g = parse(b"\x1b(0q\x1b[2b", 80, 24); // '─' then repeat x2 -> "───"
+    assert_eq!(g.cells[0].ch, '─');
+    assert_eq!(g.cells[1].ch, '─');
+    assert_eq!(g.cells[2].ch, '─');
+    assert_eq!(g.cursor, (3, 0));
+}
+
+#[test]
+fn ris_resets_charset_to_ascii() {
+    // A line-drawing charset left active must not survive a full reset.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b(0"); // G0 = line-drawing
+    p.advance(&mut g, b"\x1bc"); // RIS
+    p.advance(&mut g, b"q"); // would be '─' if charset persisted
+    assert_eq!(g.cells[0].ch, 'q');
+}
+
+#[test]
+fn decstr_resets_charset_to_ascii() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b(0"); // G0 = line-drawing
+    p.advance(&mut g, b"\x1b[!p"); // DECSTR soft reset
+    p.advance(&mut g, b"q");
+    assert_eq!(g.cells[0].ch, 'q');
+}
 
 #[test]
 fn char_width_classifies_common_cases() {
@@ -485,20 +569,21 @@ fn combining_mark_attaches_to_preceding_glyph() {
     // 'a' + U+0301 (combining acute) + 'b'.
     let g = parse("a\u{0301}b".as_bytes(), 80, 24);
     assert_eq!(g.cells[0].ch, 'a');
-    assert_eq!(g.cells[0].combining[0], '\u{0301}'); // mark composed onto 'a'
+    assert_eq!(glyph(&g, 0, 0), "a\u{0301}"); // mark composed onto 'a'
     assert_eq!(g.cells[1].ch, 'b'); // mark consumed no cell
     assert_eq!(g.cursor, (2, 0));
 }
 
 #[test]
-fn multiple_combining_marks_and_overflow() {
+fn multiple_combining_marks_are_all_kept() {
     let mut g = Grid::new(80, 24);
     g.put_char('e', Pen::default());
-    // Two marks fill both slots; a third is dropped (bounded).
+    // Three combining marks all attach to 'e' — UAX #29 clusters are unbounded
+    // now, so none is dropped (the old fixed 2-slot cap is gone).
     g.put_char('\u{0301}', Pen::default());
     g.put_char('\u{0323}', Pen::default());
     g.put_char('\u{0308}', Pen::default());
-    assert_eq!(g.cells[0].combining, ['\u{0301}', '\u{0323}']);
+    assert_eq!(glyph(&g, 0, 0), "e\u{0301}\u{0323}\u{0308}");
     assert_eq!(g.cursor, (1, 0));
 }
 
@@ -514,8 +599,35 @@ fn combining_mark_at_line_start_is_dropped() {
 fn combining_mark_attaches_to_wide_glyph_head() {
     let g = parse("世\u{0301}".as_bytes(), 80, 24);
     assert_eq!(g.cells[0].ch, '世');
-    assert_eq!(g.cells[0].combining[0], '\u{0301}'); // on the head, not the trailer
+    assert_eq!(glyph(&g, 0, 0), "世\u{0301}"); // on the head, not the trailer
     assert_ne!(g.cells[1].flags & WIDE_TRAILER, 0);
+}
+
+#[test]
+fn zwj_emoji_sequence_collapses_to_one_glyph() {
+    // 👨 + ZWJ + 💻 (man technologist) is one grapheme occupying two columns,
+    // not three separate emoji spanning six.
+    let g = parse("👨\u{200d}💻".as_bytes(), 80, 24);
+    assert_eq!(glyph(&g, 0, 0), "👨\u{200d}💻");
+    assert_ne!(g.cells[1].flags & WIDE_TRAILER, 0);
+    assert_eq!(g.cursor, (2, 0));
+}
+
+#[test]
+fn emoji_skin_tone_modifier_joins_base_glyph() {
+    // 👍 + medium skin tone is one grapheme; the modifier doesn't get its own cell.
+    let g = parse("👍\u{1f3fd}".as_bytes(), 80, 24);
+    assert_eq!(glyph(&g, 0, 0), "👍\u{1f3fd}");
+    assert_eq!(g.cursor, (2, 0));
+}
+
+#[test]
+fn distinct_wide_glyphs_stay_separate() {
+    // Boundary detection must not over-merge: 世 and 界 are separate graphemes.
+    let g = parse("世界".as_bytes(), 80, 24);
+    assert_eq!(g.cells[0].ch, '世');
+    assert_eq!(g.cells[2].ch, '界');
+    assert_eq!(g.cursor, (4, 0));
 }
 
 #[test]
@@ -653,6 +765,24 @@ fn da2_query_is_answered() {
     // The `>` marker must not be confused with a DEC private mode and must
     // not disturb the alt screen.
     assert!(g.cells[0].ch == ' ');
+}
+
+#[test]
+fn xtversion_query_reports_name_and_version() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[>q");
+    let expected = concat!("\x1bP>|rusty_term(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes();
+    assert_eq!(p.take_responses(), expected);
+    assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
+}
+
+#[test]
+fn da3_query_is_answered() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[=c");
+    assert_eq!(p.take_responses(), b"\x1bP!|00000000\x1b\\");
 }
 
 #[test]
@@ -849,7 +979,10 @@ fn osc_8_stamps_link_on_covered_cells() {
     let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
     assert_ne!(g.cells[0].link, 0);
     assert_eq!(g.cells[0].link, g.cells[1].link); // A and B share the link
-    assert_eq!(g.links[(g.cells[0].link - 1) as usize], "http://example.com");
+    assert_eq!(
+        g.links[(g.cells[0].link - 1) as usize],
+        "http://example.com"
+    );
     assert_eq!(g.cells[2].link, 0); // C is after the close
 }
 
@@ -870,6 +1003,171 @@ fn osc_8_interns_duplicate_uri_once() {
     );
     assert_eq!(g.cells[0].link, g.cells[2].link); // same interned id
     assert_eq!(g.links.len(), 1); // URI stored once
+}
+
+#[test]
+fn osc_4_sets_palette_index_recoloring_later_text() {
+    // Redefine palette index 1 (normally dim red) to pure blue, then print with
+    // SGR 31 (which resolves through index 1).
+    let g = parse(b"\x1b]4;1;rgb:00/00/ff\x1b\\\x1b[31mX", 80, 24);
+    assert_eq!(g.cells[0].fg, 0x0000FF);
+}
+
+#[test]
+fn osc_4_query_replies_with_current_value() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]4;1;?\x07"); // query index 1 (default 0x800000)
+    assert_eq!(p.take_responses(), b"\x1b]4;1;rgb:8080/0000/0000\x1b\\");
+}
+
+#[test]
+fn osc_104_resets_palette() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]4;1;rgb:00/00/ff\x1b\\"); // change index 1
+    p.advance(&mut g, b"\x1b]104;1\x1b\\"); // reset index 1
+    p.advance(&mut g, b"\x1b[31mX");
+    assert_eq!(g.cells[0].fg, 0x800000); // back to the default dim red
+}
+
+#[test]
+fn osc_11_sets_default_bg_and_colors_erases() {
+    // Set the default background to blue, then clear the screen: the cleared
+    // cells must carry the new background, not the static black default.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]11;rgb:00/00/ff\x1b\\");
+    p.advance(&mut g, b"\x1b[2J"); // ED 2 — clear all
+    assert_eq!(g.cells[0].bg, 0x0000FF);
+    // And SGR 49 (default bg) now resolves to blue for new text too.
+    p.advance(&mut g, b"\x1b[49mX");
+    assert_eq!(g.cells[0].bg, 0x0000FF);
+}
+
+#[test]
+fn osc_10_sets_default_fg_for_reset_pen() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]10;rgb:0a/0b/0c\x1b\\");
+    p.advance(&mut g, b"X"); // default pen -> default fg
+    assert_eq!(g.cells[0].fg, 0x0A0B0C);
+}
+
+#[test]
+fn osc_11_query_replies_and_110_resets() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]11;rgb:00/00/ff\x1b\\");
+    p.advance(&mut g, b"\x1b]11;?\x07");
+    assert_eq!(p.take_responses(), b"\x1b]11;rgb:0000/0000/ffff\x1b\\");
+    // OSC 111 resets the default background to black.
+    p.advance(&mut g, b"\x1b]111\x1b\\");
+    p.advance(&mut g, b"\x1b[2J");
+    assert_eq!(g.cells[0].bg, 0x000000);
+}
+
+#[test]
+fn osc_color_resets_on_ris() {
+    // A default background set via OSC 11 must not survive a full reset.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]11;rgb:00/00/ff\x1b\\");
+    p.advance(&mut g, b"\x1bc"); // RIS
+    p.advance(&mut g, b"\x1b[2J");
+    assert_eq!(g.cells[0].bg, 0x000000);
+}
+
+#[test]
+fn osc_1_icon_name_is_forwarded_to_host_not_printed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]1;myicon\x07X");
+    assert_eq!(g.cells[0].ch, 'X'); // not leaked to the screen
+    assert_eq!(g.title, ""); // icon name is not the window title
+    assert_eq!(g.take_host_out(), b"\x1b]1;myicon\x07"); // forwarded verbatim
+}
+
+#[test]
+fn color_spec_parses_rgb_and_hash_forms() {
+    assert_eq!(parse_color_spec("rgb:ff/00/00"), Some(0xFF0000));
+    assert_eq!(parse_color_spec("rgb:ffff/0000/0000"), Some(0xFF0000)); // 16-bit
+    assert_eq!(parse_color_spec("#00ff00"), Some(0x00FF00));
+    assert_eq!(parse_color_spec("#0f0"), Some(0x00FF00)); // short form scales up
+    assert_eq!(parse_color_spec("red"), None); // named colors unsupported
+    assert_eq!(parse_color_spec("rgb:zz/00/00"), None); // non-hex
+}
+
+#[test]
+fn color_spec_formats_as_16bit_rgb() {
+    assert_eq!(format_color_spec(0xFF8000), "rgb:ffff/8080/0000");
+}
+
+#[test]
+fn osc_133_prompt_navigation() {
+    // Three shell prompts, each scrolling the prior line into history (the
+    // P1/P2/P3 pattern). Marks are logical line indices stable across scrolls.
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;A\x07P1\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07P2\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07P3\r\n");
+    assert_eq!(g.view_offset, 0); // live view; P3 is on the live screen
+    // Jump up to the previous prompt — P2, now the most recent history line.
+    assert!(g.scroll_to_prev_prompt());
+    assert_eq!(g.view_offset, 1);
+    let top: String = g.snapshot_viewport().rows[0]
+        .1
+        .iter()
+        .map(|c| c.ch)
+        .collect();
+    assert_eq!(top.trim_end(), "P2");
+    // And up again to the oldest, P1.
+    assert!(g.scroll_to_prev_prompt());
+    assert_eq!(g.view_offset, 2);
+    // Nothing above the oldest prompt.
+    assert!(!g.scroll_to_prev_prompt());
+    // Walk back down: P2, then snap to the live bottom (P3 lives on screen).
+    assert!(g.scroll_to_next_prompt());
+    assert_eq!(g.view_offset, 1);
+    assert!(g.scroll_to_next_prompt());
+    assert_eq!(g.view_offset, 0);
+}
+
+#[test]
+fn osc_133_oldest_mark_evicts_from_history() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;A\x07old\r\n"); // marks the oldest line
+    // Overflow the scrollback so the oldest line — and its mark — is evicted.
+    for _ in 0..(SCROLLBACK_MAX + 10) {
+        p.advance(&mut g, b"y\r\n");
+    }
+    p.advance(&mut g, b"\x1b]133;A\x07new\r\n"); // a fresh prompt...
+    p.advance(&mut g, b"z\r\n"); // ...scrolled into history so it's above the view
+    // The "new" mark survived eviction (its index was decremented) and is navigable...
+    assert!(g.scroll_to_prev_prompt());
+    // ...and "old" is gone: nothing older remains above it.
+    assert!(!g.scroll_to_prev_prompt());
+}
+
+#[test]
+fn osc_133_not_recorded_on_alt_screen() {
+    let mut g = Grid::new(4, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1049h"); // enter alt screen (no history)
+    p.advance(&mut g, b"\x1b]133;A\x07");
+    assert!(!g.scroll_to_prev_prompt()); // marks aren't recorded there
+}
+
+#[test]
+fn osc_133_marks_cleared_on_ris() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;A\x07P1\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07P2\r\n"); // one prompt now in history
+    p.advance(&mut g, b"\x1bc"); // RIS clears scrollback and marks
+    assert!(!g.scroll_to_prev_prompt());
 }
 
 #[test]
@@ -1291,6 +1589,44 @@ fn sgr_mouse_and_bracketed_paste_are_relayed() {
     p.advance(&mut g, b"\x1b[?2004h"); // bracketed paste
     assert_eq!(g.take_host_out(), b"\x1b[?2004h");
 }
+#[test]
+fn kitty_keyboard_protocol_is_relayed_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Push flags (`CSI > flags u`).
+    p.advance(&mut g, b"\x1b[>1u");
+    assert_eq!(g.take_host_out(), b"\x1b[>1u");
+    assert_eq!(g.cells[0].ch, ' '); // not printed
+    assert!(p.take_responses().is_empty()); // host answers, not us
+    // Set (`= flags ; mode u`), pop (`< n u`), and query (`? u`).
+    p.advance(&mut g, b"\x1b[=5;1u");
+    assert_eq!(g.take_host_out(), b"\x1b[=5;1u");
+    p.advance(&mut g, b"\x1b[<2u");
+    assert_eq!(g.take_host_out(), b"\x1b[<2u");
+    p.advance(&mut g, b"\x1b[?u");
+    assert_eq!(g.take_host_out(), b"\x1b[?u");
+}
+
+#[test]
+fn modify_other_keys_is_relayed_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[>4;2m"); // XTMODKEYS: modifyOtherKeys = 2
+    assert_eq!(g.take_host_out(), b"\x1b[>4;2m");
+    p.advance(&mut g, b"\x1b[>4m"); // reset
+    assert_eq!(g.take_host_out(), b"\x1b[>4m");
+}
+
+#[test]
+fn da2_and_xtversion_answer_locally_not_relayed() {
+    // `CSI > c` / `CSI > q` are queries we answer ourselves — they must reply on
+    // the child channel and NOT be relayed to the host as keyboard sequences.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[>c");
+    assert_eq!(p.take_responses(), b"\x1b[>0;1;0c");
+    assert!(g.take_host_out().is_empty());
+}
 
 #[test]
 fn focus_reporting_mode_is_relayed() {
@@ -1408,11 +1744,56 @@ fn decaln_fills_screen_with_e() {
 
 #[test]
 fn esc_hash_non_8_is_consumed_not_printed() {
-    // ESC # 3 (double-height top half) is consumed; the '#' and '3' must not
-    // leak, and the following 'X' still renders.
+    // ESC # 3 (DECDHL top half) sets the line size but must not leak the '#'/'3';
+    // the following 'X' still renders.
     let g = parse(b"\x1b#3X", 4, 2);
     assert_eq!(g.cells[0].ch, 'X');
     assert_eq!(g.cursor, (1, 0));
+}
+
+#[test]
+fn decdwl_decdhl_decswl_set_line_size() {
+    assert_eq!(
+        parse(b"\x1b#6", 8, 2).snapshot_dirty().line_attrs[0],
+        LineAttr::DoubleWidth
+    );
+    assert_eq!(
+        parse(b"\x1b#3", 8, 2).snapshot_dirty().line_attrs[0],
+        LineAttr::DoubleTop
+    );
+    assert_eq!(
+        parse(b"\x1b#4", 8, 2).snapshot_dirty().line_attrs[0],
+        LineAttr::DoubleBottom
+    );
+    // ESC # 5 (DECSWL) resets the line to single width.
+    assert_eq!(
+        parse(b"\x1b#6\x1b#5", 8, 2).snapshot_dirty().line_attrs[0],
+        LineAttr::Single
+    );
+}
+
+#[test]
+fn line_attr_follows_content_when_scrolling() {
+    // A double-width line must keep its size as the screen scrolls it upward.
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"AAAA\r\n"); // row 0
+    p.advance(&mut g, b"\x1b#6BBBB\r\n"); // row 1, double-width
+    p.advance(&mut g, b"CCCC\r\n"); // scrolls row 0 off; BBBB rises to row 0
+    let attrs = g.snapshot_dirty().line_attrs;
+    assert_eq!(attrs[0], LineAttr::DoubleWidth); // followed BBBB up to row 0
+    assert_eq!(attrs[1], LineAttr::Single);
+}
+
+#[test]
+fn line_attrs_reset_on_ris_and_decaln() {
+    let mut g = Grid::new(8, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b#6");
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.snapshot_dirty().line_attrs[0], LineAttr::Single);
+    p.advance(&mut g, b"\x1b#6\x1b#8"); // double-width, then DECALN
+    assert_eq!(g.snapshot_dirty().line_attrs[0], LineAttr::Single);
 }
 
 #[test]
@@ -1586,4 +1967,322 @@ fn cud_below_region_ceilings_at_screen_bottom() {
     g.cursor = (0, 21); // below the region bottom margin
     p.advance(&mut g, b"\x1b[100B");
     assert_eq!(g.cursor.1, 23); // ceilings at the last row, not the margin
+}
+
+#[test]
+fn sixel_decodes_single_column_all_pixels() {
+    // Define register 0 = full red (RGB 100;0;0), select it, then `~` (all six
+    // band bits set) paints one column, six rows tall.
+    let img = decode(b"#0;2;100;0;0~");
+    assert_eq!((img.width, img.height), (1, 6));
+    assert!((0..6).all(|y| spix(&img, 0, y) == Some(0xFF0000)));
+}
+
+#[test]
+fn sixel_repeat_paints_multiple_columns() {
+    // `!3~` repeats the all-bits byte three times: 3 columns × 6 rows green.
+    let img = decode(b"#0;2;0;100;0!3~");
+    assert_eq!((img.width, img.height), (3, 6));
+    assert!((0..3).all(|x| spix(&img, x, 0) == Some(0x00FF00)));
+}
+
+#[test]
+fn sixel_band_advance_stacks_rows() {
+    // `-` starts the next band: two stacked columns -> 12 rows of blue.
+    let img = decode(b"#0;2;0;0;100~-~");
+    assert_eq!((img.width, img.height), (1, 12));
+    assert_eq!(spix(&img, 0, 0), Some(0x0000FF));
+    assert_eq!(spix(&img, 0, 11), Some(0x0000FF));
+}
+
+#[test]
+fn sixel_partial_bits_set_only_some_rows() {
+    // `@` = 0x40 -> value 1 -> only bit 0 (top row) is painted.
+    let img = decode(b"#0;2;100;100;100@");
+    assert_eq!((img.width, img.height), (1, 1));
+    assert_eq!(spix(&img, 0, 0), Some(0xFFFFFF));
+}
+
+#[test]
+fn sixel_transparent_advance_leaves_gaps() {
+    // `!2?` advances two columns without painting (value 0); `~` then paints col 2.
+    let img = decode(b"#0;2;100;0;0!2?~");
+    assert_eq!(img.width, 3);
+    assert_eq!(spix(&img, 0, 0), None);
+    assert_eq!(spix(&img, 1, 0), None);
+    assert_eq!(spix(&img, 2, 0), Some(0xFF0000));
+}
+
+#[test]
+fn sixel_default_palette_select_without_define() {
+    // `#1` selects register 1 of the VT340 default palette (RGB 20;20;80).
+    let img = decode(b"#1~");
+    assert_eq!(spix(&img, 0, 0), Some(0x3333CC));
+}
+
+#[test]
+fn sixel_empty_payload_is_empty_image() {
+    let img = decode(b"");
+    assert_eq!((img.width, img.height), (0, 0));
+}
+
+#[test]
+fn render_sixel_writes_halfblock_cells() {
+    // A 1×2 image (top red, bottom green) becomes one upper-half-block cell:
+    // fg = top pixel, bg = bottom pixel.
+    let img = SixelImage {
+        width: 1,
+        height: 2,
+        pixels: vec![Some(0xFF0000), Some(0x00FF00)],
+    };
+    let mut g = Grid::new(80, 24);
+    g.render_sixel(&img);
+    assert_eq!(g.cells[0].ch, '\u{2580}'); // ▀
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    assert_eq!(g.cells[0].bg, 0x00FF00);
+    assert_eq!(g.cursor, (0, 1)); // sixel scrolling: column 0 of the row below
+}
+
+#[test]
+fn render_sixel_transparent_lower_half_uses_default_bg() {
+    // Only a top pixel: upper half block, fg = pixel, bg = default background.
+    let img = SixelImage {
+        width: 1,
+        height: 1,
+        pixels: vec![Some(0xFF0000)],
+    };
+    let mut g = Grid::new(80, 24);
+    g.render_sixel(&img);
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    assert_eq!(g.cells[0].bg, DEFAULT_BG);
+}
+
+#[test]
+fn render_sixel_shrinks_to_fit_width() {
+    // A 4-wide image into a 2-column grid downsamples to 2 cells (cols 0 and 2
+    // of the source), preserving aspect (height collapses to one cell row).
+    let row = vec![
+        Some(0xFF0000),
+        Some(0xFF0000),
+        Some(0x00FF00),
+        Some(0x00FF00),
+    ];
+    let mut pixels = row.clone();
+    pixels.extend(row); // 4×2
+    let img = SixelImage {
+        width: 4,
+        height: 2,
+        pixels,
+    };
+    let mut g = Grid::new(2, 24);
+    g.render_sixel(&img);
+    assert_eq!(g.cells[0].fg, 0xFF0000); // sampled source col 0
+    assert_eq!(g.cells[1].fg, 0x00FF00); // sampled source col 2
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+}
+
+#[test]
+fn render_sixel_taller_than_screen_scrolls() {
+    // A 1×8 image (4 cell rows) into a 2-row grid scrolls the top rows into
+    // history without panicking; the visible rows still show the image.
+    let img = SixelImage {
+        width: 1,
+        height: 8,
+        pixels: vec![Some(0xFF0000); 8],
+    };
+    let mut g = Grid::new(2, 2);
+    g.render_sixel(&img);
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    assert!(!g.scrollback.is_empty()); // rows scrolled into history
+    assert_eq!(g.cursor, (0, 1));
+}
+
+#[test]
+fn dcs_sixel_renders_into_grid() {
+    // DCS `q` + define-red + all-bits column + ST. The image (1×6 red) renders
+    // as upper-half blocks; the sixel data never leaks as text.
+    let g = parse(b"\x1bPq#0;2;100;0;0~\x1b\\", 80, 24);
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    assert_eq!(g.cells[0].bg, 0xFF0000); // 6 rows -> top and bottom both red
+    assert_eq!(g.cursor, (0, 3)); // 6px = 3 cell rows, cursor below
+}
+
+#[test]
+fn dcs_sixel_skips_leading_params() {
+    // `DCS 0;1;0 q <data>`: the `q` final byte follows the numeric params.
+    let g = parse(b"\x1bP0;1;0q#1~\x1b\\", 80, 24);
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0x3333CC); // default palette register 1
+}
+
+#[test]
+fn dcs_non_sixel_is_ignored_not_leaked() {
+    // A DECRQSS-style DCS (`$q…`) is not a Sixel: it's consumed and discarded,
+    // and the following `X` prints normally at the origin.
+    let g = parse(b"\x1bP$qm\x1b\\X", 80, 24);
+    assert_eq!(g.cells[0].ch, 'X');
+    assert!(g.cells.iter().all(|c| c.ch != '\u{2580}')); // nothing rendered
+}
+
+#[test]
+fn dcs_sixel_split_across_chunks() {
+    // The DCS may arrive in pieces; the parser buffers across `advance` calls.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1bPq#0;2;0;100;0"); // introducer + partial data
+    p.advance(&mut g, b"~\x1b\\"); // rest of data + ST
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0x00FF00);
+}
+
+#[test]
+fn base64_decodes_standard_and_padding() {
+    assert_eq!(base64::decode(b"TWFu").unwrap(), b"Man");
+    assert_eq!(base64::decode(b"SGVsbG8=").unwrap(), b"Hello");
+    assert_eq!(base64::decode(b"SGVsbG8h").unwrap(), b"Hello!");
+    assert_eq!(base64::decode(b"").unwrap(), b"");
+    // Whitespace (line wrapping) is ignored; invalid bytes are rejected.
+    assert_eq!(base64::decode(b"SGVs\nbG8=").unwrap(), b"Hello");
+    assert!(base64::decode(b"@@@@").is_none());
+}
+
+#[test]
+fn inflate_zlib_short_string() {
+    let z1 = [
+        0x78, 0xda, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x08, 0xcf, 0x2f, 0xca, 0x49, 0x51,
+        0x04, 0x00, 0x1f, 0x9e, 0x04, 0x6a,
+    ];
+    assert_eq!(
+        inflate::zlib_decompress(&z1, 1 << 20).unwrap(),
+        b"Hello, World!"
+    );
+}
+
+#[test]
+fn inflate_zlib_repetitive_back_references() {
+    // Repetitive data exercises LZ77 back-references and dynamic Huffman.
+    let z2 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x4a, 0x4e, 0x84, 0x21, 0x05, 0x03, 0x43, 0x23, 0x63, 0x13, 0x53,
+        0x33, 0x73, 0x0b, 0x4b, 0x85, 0xc4, 0x51, 0xf1, 0x61, 0x21, 0x0e, 0x00, 0xa0, 0x46, 0x89,
+        0xe5,
+    ];
+    let expected = b"abcabcabcabc 0123456789 ".repeat(20);
+    assert_eq!(inflate::zlib_decompress(&z2, 1 << 20).unwrap(), expected);
+}
+
+#[test]
+fn inflate_raw_deflate_and_stored_block() {
+    let r3 = [
+        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x08, 0xcf, 0x2f, 0xca, 0x49, 0x51, 0x04, 0x00,
+    ];
+    assert_eq!(inflate::inflate(&r3, 1 << 20).unwrap(), b"Hello, World!");
+    // A stored (uncompressed) block.
+    let r4 = [
+        0x01, 0x09, 0x00, 0xf6, 0xff, 0x52, 0x41, 0x57, 0x53, 0x54, 0x4f, 0x52, 0x45, 0x44,
+    ];
+    assert_eq!(inflate::inflate(&r4, 1 << 20).unwrap(), b"RAWSTORED");
+}
+
+#[test]
+fn inflate_rejects_garbage_and_respects_cap() {
+    assert!(inflate::zlib_decompress(&[0x00, 0x01, 0x02], 1024).is_none());
+    // Output cap: decompressing the repetitive stream with a tiny cap truncates.
+    let z2 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x4a, 0x4e, 0x84, 0x21, 0x05, 0x03, 0x43, 0x23, 0x63, 0x13, 0x53,
+        0x33, 0x73, 0x0b, 0x4b, 0x85, 0xc4, 0x51, 0xf1, 0x61, 0x21, 0x0e, 0x00, 0xa0, 0x46, 0x89,
+        0xe5,
+    ];
+    assert!(inflate::zlib_decompress(&z2, 16).unwrap().len() <= 64);
+}
+
+#[test]
+fn png_decodes_rgba_filter0() {
+    let data: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
+        0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x13, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x0c, 0x81, 0x34, 0x08, 0x30, 0x00, 0x00, 0x48, 0xc9, 0x08, 0xf8,
+        0xc5, 0x34, 0xfd, 0x05, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+        0x82,
+    ];
+    let img = png::decode(data).unwrap();
+    assert_eq!((img.width, img.height), (2, 2));
+    assert_eq!(&img.rgba[0..4], &[255, 0, 0, 255]); // red
+    assert_eq!(&img.rgba[4..8], &[0, 255, 0, 255]); // green
+    assert_eq!(&img.rgba[8..12], &[0, 0, 255, 255]); // blue
+    assert_eq!(&img.rgba[12..16], &[255, 255, 255, 0]); // transparent white
+}
+
+#[test]
+fn png_reverses_sub_and_paeth_filters() {
+    // 3×2 RGB encoded with Sub on row 0 and Paeth on row 1.
+    let data: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0x12,
+        0x16, 0xf1, 0x4d, 0x00, 0x00, 0x00, 0x13, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xe4,
+        0x12, 0x91, 0x83, 0x00, 0x96, 0xa8, 0xa8, 0x28, 0x08, 0x0b, 0x00, 0x18, 0xd8, 0x02, 0xb8,
+        0x8d, 0x21, 0x18, 0x45, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+        0x82,
+    ];
+    let img = png::decode(data).unwrap();
+    assert_eq!((img.width, img.height), (3, 2));
+    assert_eq!(&img.rgba[0..4], &[10, 20, 30, 255]); // row 0, pixel 0
+    assert_eq!(&img.rgba[8..12], &[70, 80, 90, 255]); // row 0, pixel 2
+    assert_eq!(&img.rgba[12..16], &[100, 110, 120, 255]); // row 1, pixel 0
+    assert_eq!(&img.rgba[20..24], &[160, 170, 180, 255]); // row 1, pixel 2
+}
+
+#[test]
+fn png_rejects_non_png() {
+    assert!(png::decode(b"not a png").is_none());
+}
+
+#[test]
+fn kitty_raw_rgba_renders() {
+    // f=32 (RGBA), 1×1 red, transmit+display. `/wAA/w==` = [ff,00,00,ff].
+    let g = parse(b"\x1b_Gf=32,s=1,v=1,a=T;/wAA/w==\x1b\\", 80, 24);
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    assert_eq!(g.cursor, (0, 1));
+}
+
+#[test]
+fn kitty_query_is_answered_ok() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b_Gi=99,a=q;\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1b_Gi=99;OK\x1b\\");
+    assert_eq!(g.cells[0].ch, ' '); // a query renders nothing
+}
+
+#[test]
+fn kitty_png_renders() {
+    let cmd = b"\x1b_Gf=100,a=T;iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR42mP4z8DwHwyBNAgwAABIyQj4xTT9BQAAAABJRU5ErkJggg==\x1b\\";
+    let g = parse(cmd, 80, 24);
+    // 2×2: row0 red,green; row1 blue,transparent -> one half-block cell row.
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000); // top-left red
+    assert_eq!(g.cells[0].bg, 0x0000FF); // bottom-left blue
+    assert_eq!(g.cells[1].fg, 0x00FF00); // top-right green
+}
+
+#[test]
+fn kitty_chunked_transmission_accumulates() {
+    // The base64 payload split across two APC chunks (`m=1` then `m=0`).
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=T,m=1;/wAA\x1b\\");
+    p.advance(&mut g, b"\x1b_Gm=0;/w==\x1b\\");
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+}
+
+#[test]
+fn kitty_non_graphics_apc_ignored() {
+    // An APC not starting with `G` is consumed, not decoded; `X` then prints.
+    let g = parse(b"\x1b_Zhello\x1b\\X", 80, 24);
+    assert_eq!(g.cells[0].ch, 'X');
 }
