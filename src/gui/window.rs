@@ -8,20 +8,22 @@
 //!
 //! Note: this drives a live window and so cannot be exercised in a headless
 //! environment — the render, input-encoding, and font layers it composes are
-//! unit-tested independently. Mouse reporting, clipboard (OSC 52), and DECCKM
-//! application-cursor tracking are not yet wired (documented gaps, not stubs).
+//! unit-tested independently. Mouse drag-selection, clipboard copy/paste
+//! (Ctrl+Shift+C / Ctrl+Shift+V), the block cursor, and a Windows child-exit
+//! watcher are wired here; mouse *reporting* to the child and DECCKM
+//! application-cursor tracking remain documented gaps.
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
-use crate::core::{AnsiParser, Grid};
+use crate::core::{AnsiParser, Grid, Selection};
 use super::font::{self, FontCache, GlyphSource};
 use super::render::{CpuRenderer, Renderer};
 
@@ -61,7 +63,19 @@ pub fn run(backend: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
     let read_handle = handle.try_clone()?;
     let reply_handle = handle.try_clone()?;
     let reader_grid = Arc::clone(&grid);
-    std::thread::spawn(move || reader_loop(read_handle, reply_handle, reader_grid, proxy));
+    let reader_proxy = proxy.clone();
+    std::thread::spawn(move || reader_loop(read_handle, reply_handle, reader_grid, reader_proxy));
+
+    // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
+    // teardown, not when the shell exits, so read-EOF can't close the window;
+    // block on the child process handle instead. `None` where read-EOF already
+    // signals exit (Unix), keeping this a no-op there.
+    if let Some(wait) = handle.exit_token() {
+        std::thread::spawn(move || {
+            wait();
+            let _ = proxy.send_event(UserEvent::Exit);
+        });
+    }
 
     let mut app = App {
         grid,
@@ -74,6 +88,10 @@ pub fn run(backend: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
         mods: ModifiersState::empty(),
         cols: INIT_COLS,
         rows: INIT_ROWS,
+        clipboard: arboard::Clipboard::new().ok(),
+        mouse_pos: (0.0, 0.0),
+        selecting: false,
+        sel_anchor: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -123,6 +141,14 @@ struct App {
     mods: ModifiersState,
     cols: u16,
     rows: u16,
+    /// System clipboard for copy/paste; `None` if unavailable (e.g. headless).
+    clipboard: Option<arboard::Clipboard>,
+    /// Last pointer position in physical pixels, for hit-testing selection.
+    mouse_pos: (f64, f64),
+    /// Whether the left button is held (a drag-selection is in progress).
+    selecting: bool,
+    /// Cell where the current drag-selection began.
+    sel_anchor: Option<(usize, usize)>,
 }
 
 impl App {
@@ -133,7 +159,10 @@ impl App {
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
             self.rows = rows;
-            self.grid.lock().resize(cols as usize, rows as usize);
+            let mut g = self.grid.lock();
+            g.resize(cols as usize, rows as usize);
+            g.selection = None; // viewport changed; old selection coords are stale
+            drop(g);
             let _ = self.writer.set_winsize(cols, rows);
         }
     }
@@ -166,6 +195,32 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Map a physical pixel position to a clamped `(col, row)` cell.
+    fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
+        let col = (px.max(0.0) as usize / self.cell_w).min((self.cols as usize).saturating_sub(1));
+        let row = (py.max(0.0) as usize / self.cell_h).min((self.rows as usize).saturating_sub(1));
+        (col, row)
+    }
+
+    /// Copy the current selection to the system clipboard (Ctrl+Shift+C).
+    fn copy_selection(&mut self) {
+        let Some(cb) = self.clipboard.as_mut() else { return };
+        if let Some(text) = self.grid.lock().selected_text() {
+            let _ = cb.set_text(text);
+        }
+    }
+
+    /// Paste the system clipboard into the child (Ctrl+Shift+V).
+    fn paste(&mut self) {
+        let Some(cb) = self.clipboard.as_mut() else { return };
+        let Ok(text) = cb.get_text() else { return };
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.grid.lock().bracketed_paste;
+        let _ = self.writer.write(&encode_paste(&text, bracketed));
     }
 }
 
@@ -207,12 +262,47 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false)
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                // Clipboard shortcuts are intercepted before native encoding.
+                if self.mods.control_key()
+                    && self.mods.shift_key()
+                    && let PhysicalKey::Code(code) = event.physical_key
                 {
+                    match code {
+                        KeyCode::KeyC => return self.copy_selection(),
+                        KeyCode::KeyV => return self.paste(),
+                        _ => {}
+                    }
+                }
+                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
                     let _ = self.writer.write(&bytes);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x, position.y);
+                if self.selecting
+                    && let Some(anchor) = self.sel_anchor
+                {
+                    let head = self.cell_at(position.x, position.y);
+                    self.grid.lock().selection = Some(Selection { anchor, head });
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed => {
+                    self.sel_anchor = Some(self.cell_at(self.mouse_pos.0, self.mouse_pos.1));
+                    self.selecting = true;
+                    self.grid.lock().selection = None; // cleared until the drag moves
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                ElementState::Released => self.selecting = false,
+            },
             _ => {}
         }
     }
@@ -226,5 +316,48 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Exit => event_loop.exit(),
         }
+    }
+}
+
+/// Encode clipboard `text` for the child: normalize line endings to CR, and
+/// when `bracketed` wrap it in `ESC[200~`/`ESC[201~`, stripping any embedded
+/// end marker first so the payload can't close the bracket early (a
+/// paste-injection guard).
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let mut out = Vec::with_capacity(text.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        text.into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_paste;
+
+    #[test]
+    fn paste_normalizes_newlines_to_cr() {
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc");
+    }
+
+    #[test]
+    fn unbracketed_paste_is_raw_after_newline_fix() {
+        assert_eq!(encode_paste("hello", false), b"hello");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_and_strips_end_marker() {
+        // An embedded end marker must not close the bracket early.
+        assert_eq!(encode_paste("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_plain_text() {
+        assert_eq!(encode_paste("ls", true), b"\x1b[200~ls\x1b[201~");
     }
 }

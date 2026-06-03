@@ -25,14 +25,21 @@ pub(crate) fn render(
         return;
     }
 
+    // Block cursor + drag-selection are drawn by inverting a cell's fg/bg. The
+    // cursor shows only on the live view, not while scrolled into history.
+    let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
+    let inverted = |col: usize, row: usize| cursor == Some((col, row)) || grid.is_selected(col, row);
+
     // Pass 1: backgrounds. A wide glyph's bitmap may spill into its trailer
     // cell, so fill every cell (including trailers) before drawing glyphs.
     for (i, cell) in grid.cells.iter().enumerate() {
-        let (x0, y0) = ((i % grid.cols) * cw, (i / grid.cols) * ch);
+        let (col, row) = (i % grid.cols, i / grid.cols);
+        let bg = if inverted(col, row) { cell.fg } else { cell.bg };
+        let (x0, y0) = (col * cw, row * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
-                buf[base + x] = cell.bg;
+                buf[base + x] = bg;
             }
         }
     }
@@ -47,9 +54,10 @@ pub(crate) fn render(
             continue;
         }
         let (col, row) = (i % grid.cols, i / grid.cols);
+        let fg = if inverted(col, row) { cell.bg } else { cell.fg };
         let pen_x = (col * cw) as i32 + glyph.left;
         let pen_y = (row * ch) as i32 + baseline + glyph.top;
-        blit(buf, width, height, &glyph, pen_x, pen_y, cell.fg);
+        blit(buf, width, height, &glyph, pen_x, pen_y, fg);
     }
 }
 
@@ -166,5 +174,59 @@ mod tests {
         render(&g, &mut fc, &mut buf, w, h);
         // Glyphs were drawn: at least some pixels differ from the black bg.
         assert!(buf.iter().any(|&px| px != 0x000000), "expected rasterized glyph pixels");
+    }
+
+    #[test]
+    fn cursor_inverts_its_cell() {
+        // Red fg on blue bg, a space (no glyph) so only the block shows.
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m ");
+        g.cursor = (0, 0);
+        g.cursor_visible = true;
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &mut MockFont, &mut buf, 4, 8);
+        // Inverted: the cell is painted in the fg color (red), not the blue bg.
+        assert!(buf.iter().all(|&px| px == 0xFF0000), "cursor cell is a red block");
+    }
+
+    #[test]
+    fn hidden_cursor_is_not_drawn() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m ");
+        g.cursor = (0, 0);
+        g.cursor_visible = false;
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &mut MockFont, &mut buf, 4, 8);
+        assert!(buf.iter().all(|&px| px == 0x0000FF), "no cursor: plain blue bg");
+    }
+
+    #[test]
+    fn cursor_hidden_while_scrolled_back() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m ");
+        g.cursor = (0, 0);
+        g.cursor_visible = true;
+        g.view_offset = 1; // browsing history — live cursor must not draw
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &mut MockFont, &mut buf, 4, 8);
+        assert!(buf.iter().all(|&px| px == 0x0000FF), "scrolled back: no cursor");
+    }
+
+    #[test]
+    fn selection_inverts_cells() {
+        let mut g = Grid::new(2, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m  ");
+        g.cursor_visible = false; // isolate selection from the cursor
+        g.selection = Some(crate::core::Selection { anchor: (0, 0), head: (0, 0) });
+        let (w, h) = (8usize, 8usize); // 2 cols * 4px
+        let mut buf = vec![0u32; w * h];
+        render(&g, &mut MockFont, &mut buf, w, h);
+        // Col 0 inverted (red block), col 1 untouched (blue bg).
+        assert_eq!(buf[0], 0xFF0000, "selected cell inverted");
+        assert_eq!(buf[4], 0x0000FF, "unselected cell unchanged");
     }
 }

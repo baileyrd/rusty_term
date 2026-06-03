@@ -83,6 +83,18 @@ cargo run --features l13
 | `SHELL` / `COMSPEC` | The child program to spawn (falls back to `bash` / `cmd`). |
 | `TERM`, `COLORTERM` | Set by `rusty_term` for the child before spawn — not read from your environment. |
 
+#### Window backend controls (`--gui`)
+
+| Input | Action |
+|-------|--------|
+| Left-drag | Select text (highlighted by inversion). |
+| Ctrl+Shift+C | Copy the selection to the system clipboard. |
+| Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
+
+The window draws a block cursor and closes when the shell exits. Mouse
+*reporting* to applications (so TUI apps see clicks), OSC 52 programmatic
+clipboard, and IME are not yet wired.
+
 ## Shell integration (OSC 133)
 
 `rusty_term` recognizes OSC 133 semantic prompt marks and uses them for

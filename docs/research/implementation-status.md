@@ -130,7 +130,11 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] All input-generating modes relayed to the host: mouse 1000/1002/1003/1005/1006/1015/1016, focus 1004, paste 2004, DECCKM 1 (`is_host_input_mode`), **Kitty keyboard (`CSI >/</=/? … u`) and xterm modifyOtherKeys / XTMODKEYS (`CSI > … m`)** (`handle_private_csi`)
 - [x] Native **key** encoding in the `gui` window backend — winit key → terminal
   bytes, incl. DECCKM application-cursor + modifier params (`src/gui/input.rs`, #10)
-- [ ] Native **mouse** encoding in the window backend (not yet wired; documented gap)
+- [x] Windowed UX (`gui`): **block cursor**, **left-drag text selection**, and
+  **clipboard copy/paste** (Ctrl+Shift+C / Ctrl+Shift+V, bracketed-paste aware),
+  plus a Windows child-exit watcher (`src/gui/window.rs`, #10)
+- [ ] Native **mouse reporting** to the child in the window (SGR/1006 etc. not yet
+  emitted; selection is local-only); DECCKM application-cursor not tracked in `gui`
 
 ### L10 Identification — [x] (XTGETTCAP out)
 - [x] DA1 (`CSI c` → `?1;2c`), DA2 (`CSI > c`), DA3 (`CSI = c`)
@@ -211,8 +215,11 @@ DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
       (#26) that the resize first surfaced. The headless CI box still can't run
       it (lavapipe/dzn segfault on submit), so `gpu_renders_to_texture` stays
       `#[ignore]`d there.
-    - **Documented gaps (not stubs):** mouse reporting, clipboard/OSC 52, IME,
-      DECCKM tracking in the window, in-window scrollback/cursor, and host resize
-      propagation on Windows (no `SIGWINCH` equivalent wired). Text is now
-      pixel-resolution; inline images still render at cell resolution
-      (half-blocks) as in TUI mode.
+    - **Now wired in the window:** block cursor, left-drag text selection with
+      clipboard copy/paste (Ctrl+Shift+C / Ctrl+Shift+V, bracketed-paste aware,
+      injection-guarded), and a child-exit watcher so the window closes when the
+      shell quits (the Windows ConPTY output pipe only EOFs at teardown).
+    - **Documented gaps (not stubs):** mouse *reporting* to the child (selection is
+      local-only), OSC 52 programmatic clipboard, IME, DECCKM tracking in the
+      window, in-window scrollback, and host resize propagation on Windows. Text is
+      pixel-resolution; inline images still render at cell resolution (half-blocks).

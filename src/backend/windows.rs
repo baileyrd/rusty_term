@@ -7,8 +7,9 @@
 //!
 //! This module is only compiled on Windows (gated in `backend/mod.rs`).
 //!
-//! NOTE: this path has been type-checked (via a cross-target `cargo check`) but
-//! not run — it needs a real Windows host to exercise.
+//! NOTE: run and verified on Windows 11 (build 26200) — shell spawn, child
+//! `TERM`/`COLORTERM`, bidirectional relay, and OSC title capture all work.
+//! Host resize propagation is a known gap (no `SIGWINCH` equivalent is wired).
 
 use crate::backend::{Backend, BackendHandle};
 use parking_lot::Mutex;
@@ -315,6 +316,40 @@ impl BackendHandle for WindowsHandle {
             return Err(std::io::Error::from_raw_os_error(hr));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "gui")]
+    fn exit_token(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        // Only the owning handle holds the child process handle.
+        if self.process.is_null() {
+            return None;
+        }
+        // Duplicate it so a watcher thread can wait without owning the child
+        // (the owner still reaps/terminates it on drop).
+        let dup = unsafe {
+            let proc = GetCurrentProcess();
+            let mut dup: HANDLE = std::ptr::null_mut();
+            if DuplicateHandle(proc, self.process, proc, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS) == 0
+            {
+                return None;
+            }
+            dup
+        };
+        // HANDLE isn't `Send`; wrap it so the watcher thread can own it. A
+        // `self`-consuming method forces the closure to capture the whole
+        // wrapper (not the bare field, which disjoint captures would pick).
+        struct Waitable(HANDLE);
+        unsafe impl Send for Waitable {}
+        impl Waitable {
+            fn wait(self) {
+                unsafe {
+                    WaitForSingleObject(self.0, u32::MAX); // u32::MAX == INFINITE
+                    CloseHandle(self.0);
+                }
+            }
+        }
+        let waitable = Waitable(dup);
+        Some(Box::new(move || waitable.wait()))
     }
 }
 
