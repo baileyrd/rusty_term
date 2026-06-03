@@ -2286,3 +2286,146 @@ fn kitty_non_graphics_apc_ignored() {
     let g = parse(b"\x1b_Zhello\x1b\\X", 80, 24);
     assert_eq!(g.cells[0].ch, 'X');
 }
+
+#[cfg(feature = "l13")]
+mod l13 {
+    use super::*;
+
+    /// Drive one channel OSC (`OSC 5379 ; <protocol> ; <json> ST`) and return
+    /// the reply the terminal queued for the child, as a string.
+    fn channel_roundtrip(grid: &mut Grid, protocol: &str, json: &str) -> String {
+        let mut p = AnsiParser::new();
+        let msg = format!("\x1b]5379;{protocol};{json}\x1b\\");
+        p.advance(grid, msg.as_bytes());
+        String::from_utf8(p.take_responses()).unwrap()
+    }
+
+    #[test]
+    fn channel_initialize_advertises_protocols() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "channel",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        );
+        assert!(resp.starts_with("\x1b]5379;channel;"));
+        assert!(resp.ends_with("\x1b\\"));
+        assert!(resp.contains("\"protocols\""));
+        assert!(resp.contains("\"mcp\"") && resp.contains("\"lsp\"") && resp.contains("\"acp\""));
+        assert!(resp.contains("\"rusty_term\""));
+        assert!(resp.contains("\"id\":1"));
+    }
+
+    #[test]
+    fn mcp_tools_list_includes_terminal_tools() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        );
+        for tool in ["get_screen", "get_scrollback", "get_cwd", "get_title", "get_dimensions"] {
+            assert!(resp.contains(tool), "tools/list missing {tool}");
+        }
+    }
+
+    #[test]
+    fn mcp_get_screen_returns_current_text() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"hello channel"); // put text on the screen
+        let _ = p.take_responses();
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_screen"}}"#,
+        );
+        assert!(resp.contains("hello channel"), "screen text not returned: {resp}");
+        assert!(resp.contains("\"content\""));
+    }
+
+    #[test]
+    fn mcp_get_dimensions_and_title() {
+        let mut g = Grid::new(80, 24);
+        g.title = "my window".into();
+        let dims = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_dimensions"}}"#,
+        );
+        assert!(dims.contains("80x24"), "{dims}");
+        let title = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_title"}}"#,
+        );
+        assert!(title.contains("my window"));
+    }
+
+    #[test]
+    fn lsp_initialize_negotiates() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "lsp",
+            r#"{"jsonrpc":"2.0","id":6,"method":"initialize","params":{"capabilities":{}}}"#,
+        );
+        assert!(resp.contains("\"capabilities\""));
+        assert!(resp.contains("\"rusty_term\""));
+    }
+
+    #[test]
+    fn acp_initialize_negotiates() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "acp",
+            r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":1}}"#,
+        );
+        assert!(resp.contains("\"protocolVersion\":1"));
+        assert!(resp.contains("\"agentCapabilities\""));
+        assert!(resp.contains("\"authMethods\""));
+    }
+
+    #[test]
+    fn unknown_method_returns_jsonrpc_error() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":8,"method":"nonexistent"}"#,
+        );
+        assert!(resp.contains("\"error\""));
+        assert!(resp.contains("-32601")); // METHOD_NOT_FOUND
+    }
+
+    #[test]
+    fn unknown_protocol_returns_error() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "bogus",
+            r#"{"jsonrpc":"2.0","id":9,"method":"initialize"}"#,
+        );
+        assert!(resp.contains("\"error\"") && resp.contains("-32601"));
+    }
+
+    #[test]
+    fn malformed_json_is_dropped_no_reply() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(&mut g, "mcp", "{not valid json");
+        assert!(resp.is_empty(), "malformed request should produce no reply");
+    }
+
+    #[test]
+    fn notification_produces_no_reply() {
+        // No `id` -> a JSON-RPC notification; the channel must not respond.
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        );
+        assert!(resp.is_empty());
+    }
+}

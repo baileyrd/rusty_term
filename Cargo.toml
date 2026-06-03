@@ -14,6 +14,11 @@ threaded = []
 # the PTY master fd). Takes precedence over `threaded` when enabled, so build it
 # with just `--features tokio-runtime`.
 tokio-runtime = ["dep:tokio"]
+# L13 structured side-channel: a private-OSC JSON-RPC transport that hosts the
+# adjacent protocols (MCP, plus LSP/ACP negotiation). Pulls the local rusty_lsp
+# crate for its JSON-RPC 2.0 model + LSP types, and serde_json for payloads.
+# Opt-in so the default terminal stays lean.
+l13 = ["dep:rusty_lsp", "dep:serde_json"]
 
 [dependencies]
 libc = "0.2.186"
@@ -28,6 +33,8 @@ tokio = { version = "1", optional = true, default-features = false, features = [
     "sync",
     "macros",
 ] }
+rusty_lsp = { path = "../rusty_lsp", optional = true }
+serde_json = { version = "1", optional = true }
 
 # ConPTY backend: Windows-only, so the Linux/macOS build never pulls it in.
 [target.'cfg(windows)'.dependencies]
