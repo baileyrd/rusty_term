@@ -125,7 +125,11 @@ impl GpuCore {
             &wgpu::DeviceDescriptor {
                 label: Some("rusty_term"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // Use the adapter's real capabilities, not `downlevel_defaults()`
+                // (whose `max_texture_dimension_2d` is 2048) — a native window is
+                // routinely wider than 2048px, and the surface is a texture, so a
+                // low cap makes `Surface::configure` reject normal window sizes.
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
@@ -409,6 +413,12 @@ impl Renderer for GpuRenderer {
         if width == 0 || height == 0 {
             return;
         }
+        // wgpu rejects a surface whose width or height exceeds the device's max
+        // 2D texture size (the surface is texture-backed), so clamp and shadow.
+        // A window dragged past that limit renders cropped instead of panicking.
+        let max = self.core.device.limits().max_texture_dimension_2d;
+        let width = width.min(max);
+        let height = height.min(max);
         if self.configured != (width, height) {
             self.surface.configure(
                 &self.core.device,
