@@ -38,6 +38,17 @@ pub trait BackendHandle: Send {
     /// and so applications receive `SIGWINCH`.
     fn set_winsize(&mut self, cols: u16, rows: u16) -> Result<(), std::io::Error>;
 
+    /// A blocking closure that returns once the child has exited, for front-ends
+    /// that can't rely on read-EOF to detect it. `None` when read-EOF already
+    /// signals exit (the Unix PTY) or this handle doesn't own the child; `Some`
+    /// only on the owning Windows ConPTY handle (whose output pipe EOFs at
+    /// teardown, not on child exit). The windowed backend runs it on a watcher
+    /// thread to close the window when the shell quits.
+    #[cfg(feature = "gui")]
+    fn exit_token(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
+
     /// The PTY master descriptor backing this handle, for runtimes that drive
     /// it through a readiness reactor (the tokio runtime's `AsyncFd`). The fd
     /// stays owned by the handle — the caller registers it without closing it.

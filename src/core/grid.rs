@@ -30,6 +30,19 @@ const LINK_MAX: usize = 4096;
 /// glyph still renders) rather than growing the table without bound.
 const CLUSTER_MAX: usize = 8192;
 
+/// A text selection in viewport cell coordinates (`(col, row)`), set by the
+/// windowed front-end during a mouse drag and read by the renderer (to invert
+/// the highlighted cells) and by [`Grid::selected_text`] (clipboard copy).
+/// `anchor` is where the drag began, `head` where it is now; the pair is
+/// normalized into row-major order on read, so either drag direction works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    /// Cell where the drag started.
+    pub anchor: (usize, usize),
+    /// Cell under the pointer now.
+    pub head: (usize, usize),
+}
+
 /// The authoritative screen buffer: a row-major grid of [`Cell`]s plus a
 /// per-row damage (`dirty`) tracker and a cursor position.
 pub struct Grid {
@@ -71,6 +84,11 @@ pub struct Grid {
     /// `0` is the live view (bottom); the renderer composites history above the
     /// live grid when this is non-zero.
     pub view_offset: usize,
+    /// Active text selection (windowed front-end only), in viewport cell
+    /// coordinates; `None` when nothing is selected. Pure view state, like
+    /// [`Grid::view_offset`] — the TUI renderer ignores it (the host owns
+    /// selection there).
+    pub selection: Option<Selection>,
     /// Bytes destined for the *host* terminal (not the grid): OSC 52 clipboard
     /// requests forwarded verbatim. The renderer drains these via
     /// [`Grid::take_host_out`] each frame and writes them to its stdout.
@@ -94,6 +112,10 @@ pub struct Grid {
     /// renderer shows/hides the host cursor accordingly — independent of the
     /// separate hide it applies while browsing scrollback.
     pub cursor_visible: bool,
+    /// Whether bracketed paste (DEC `?2004`) is enabled by the child. In TUI
+    /// mode it is also relayed to the host; the windowed front-end reads it to
+    /// decide whether to wrap pasted text in `ESC[200~` / `ESC[201~`.
+    pub bracketed_paste: bool,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -212,12 +234,14 @@ impl Grid {
             cwd: String::new(),
             scrollback: VecDeque::new(),
             view_offset: 0,
+            selection: None,
             host_out: Vec::new(),
             links: Vec::new(),
             clusters: Vec::new(),
             current_link: 0,
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
+            bracketed_paste: false,
             autowrap: true,
             origin_mode: false,
             insert_mode: false,
@@ -552,6 +576,59 @@ impl Grid {
             s.push_str(suffix);
         }
         s
+    }
+
+    /// Normalize the active selection into an inclusive `(start, end)` pair of
+    /// `(col, row)` cells in row-major order, clamped to the grid. `None` when
+    /// there is no selection.
+    #[cfg(any(test, feature = "gui"))]
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let sel = self.selection?;
+        let clamp = |(c, r): (usize, usize)| {
+            (c.min(self.cols.saturating_sub(1)), r.min(self.rows.saturating_sub(1)))
+        };
+        let a = clamp(sel.anchor);
+        let b = clamp(sel.head);
+        // Row-major linear order, so a backward drag still yields start <= end.
+        if (a.1, a.0) <= (b.1, b.0) { Some((a, b)) } else { Some((b, a)) }
+    }
+
+    /// Whether the cell at `(col, row)` lies within the active selection
+    /// (stream/linear order — full intermediate rows are included). Read by the
+    /// windowed renderer to invert highlighted cells.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn is_selected(&self, col: usize, row: usize) -> bool {
+        let Some((start, end)) = self.selection_bounds() else {
+            return false;
+        };
+        let lin = |c: usize, r: usize| r * self.cols + c;
+        (lin(start.0, start.1)..=lin(end.0, end.1)).contains(&lin(col, row))
+    }
+
+    /// The selected text, or `None` when nothing is selected. Lines join with
+    /// `\n`; per-line trailing blanks are trimmed, wide-glyph trailers skipped,
+    /// and grapheme continuations preserved.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_bounds()?;
+        let mut out = String::new();
+        for row in start.1..=end.1 {
+            let c0 = if row == start.1 { start.0 } else { 0 };
+            let c1 = if row == end.1 { end.0 } else { self.cols - 1 };
+            let mut line = String::new();
+            for col in c0..=c1 {
+                let cell = self.cells[row * self.cols + col];
+                if cell.flags & WIDE_TRAILER != 0 {
+                    continue;
+                }
+                line.push_str(&self.glyph_text(col, row));
+            }
+            if row != start.1 {
+                out.push('\n');
+            }
+            out.push_str(line.trim_end());
+        }
+        Some(out)
     }
 
     /// Append `ch` to the grapheme continuation of the cell at `(x, y)`,
@@ -982,6 +1059,8 @@ impl Grid {
         self.view_offset = 0;
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
+        self.bracketed_paste = false;
+        self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
@@ -998,6 +1077,8 @@ impl Grid {
         self.scroll_bottom = self.rows.saturating_sub(1);
         self.saved_cursor = (0, 0);
         self.cursor_visible = true;
+        self.bracketed_paste = false;
+        self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;

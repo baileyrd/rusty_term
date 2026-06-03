@@ -2429,3 +2429,71 @@ mod l13 {
         assert!(resp.is_empty());
     }
 }
+
+#[test]
+fn selection_extracts_single_line() {
+    let mut g = parse(b"hello world", 20, 2);
+    g.selection = Some(Selection { anchor: (0, 0), head: (4, 0) });
+    assert_eq!(g.selected_text().as_deref(), Some("hello"));
+}
+
+#[test]
+fn selection_spans_rows_and_joins_with_newline() {
+    let mut g = parse(b"abc\r\ndef", 10, 3);
+    g.selection = Some(Selection { anchor: (0, 0), head: (2, 1) });
+    assert_eq!(g.selected_text().as_deref(), Some("abc\ndef"));
+}
+
+#[test]
+fn selection_backward_drag_normalizes() {
+    let mut g = parse(b"hello world", 20, 2);
+    g.selection = Some(Selection { anchor: (4, 0), head: (0, 0) });
+    assert_eq!(g.selected_text().as_deref(), Some("hello"));
+}
+
+#[test]
+fn selection_trims_trailing_blanks_per_line() {
+    let mut g = parse(b"hi", 10, 1);
+    g.selection = Some(Selection { anchor: (0, 0), head: (9, 0) });
+    assert_eq!(g.selected_text().as_deref(), Some("hi"));
+}
+
+#[test]
+fn is_selected_includes_full_intermediate_rows() {
+    let mut g = parse(b"", 10, 3);
+    g.selection = Some(Selection { anchor: (5, 0), head: (1, 2) });
+    assert!(g.is_selected(0, 1), "whole intermediate row is selected");
+    assert!(g.is_selected(9, 1));
+    assert!(!g.is_selected(4, 0), "before the start col on the start row");
+    assert!(!g.is_selected(2, 2), "after the end col on the end row");
+    assert!(g.is_selected(1, 2), "the end cell is inclusive");
+}
+
+#[test]
+fn no_selection_yields_none() {
+    let g = parse(b"text", 10, 1);
+    assert_eq!(g.selected_text(), None);
+    assert!(!g.is_selected(0, 0));
+}
+
+#[test]
+fn bracketed_paste_tracks_mode_2004() {
+    let mut g = Grid::new(10, 2);
+    let mut p = AnsiParser::new();
+    assert!(!g.bracketed_paste);
+    p.advance(&mut g, b"\x1b[?2004h");
+    assert!(g.bracketed_paste, "?2004h enables bracketed paste");
+    p.advance(&mut g, b"\x1b[?2004l");
+    assert!(!g.bracketed_paste, "?2004l disables it");
+}
+
+#[test]
+fn ris_clears_bracketed_paste_and_selection() {
+    let mut g = Grid::new(10, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?2004h");
+    g.selection = Some(Selection { anchor: (0, 0), head: (3, 0) });
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert!(!g.bracketed_paste);
+    assert_eq!(g.selection, None);
+}

@@ -323,18 +323,24 @@ impl GpuCore {
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
+        // Block cursor + drag-selection invert a cell's fg/bg (no shader change).
+        // The cursor shows only on the live view, not while scrolled into history.
+        let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
         let mut instances = Vec::with_capacity(grid.cells.len());
         for (i, cell) in grid.cells.iter().enumerate() {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
+            let (col, row) = (i % grid.cols, i / grid.cols);
+            let inv = cursor == Some((col, row)) || grid.is_selected(col, row);
+            let (fg, bg) = if inv { (cell.bg, cell.fg) } else { (cell.fg, cell.bg) };
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {
-                col: (i % grid.cols) as u32,
-                row: (i / grid.cols) as u32,
+                col: col as u32,
+                row: row as u32,
                 slot,
-                fg: cell.fg,
-                bg: cell.bg,
+                fg,
+                bg,
             });
         }
         let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

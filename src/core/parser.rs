@@ -602,6 +602,11 @@ impl AnsiParser {
                 g.host_out.extend_from_slice(b"\x1b[?");
                 g.host_out.extend_from_slice(param.to_string().as_bytes());
                 g.host_out.push(if set { b'h' } else { b'l' });
+                if param == 2004 {
+                    // Also record it for the windowed front-end, which has no
+                    // host to relay to and wraps pasted text itself.
+                    g.bracketed_paste = set;
+                }
             } else if param == 25 {
                 // DECTCEM — text cursor enable. The renderer reads this to show
                 // or hide the host cursor; not relayed (we own the host cursor).
