@@ -1,5 +1,7 @@
 mod backend;
 mod core;
+#[cfg(feature = "gui")]
+mod gui;
 mod input;
 mod render;
 mod runtime;
@@ -21,6 +23,13 @@ fn main() -> Result<(), std::io::Error> {
     let backend: Box<dyn Backend> = Box::new(UnixBackend);
     #[cfg(windows)]
     let backend: Box<dyn Backend> = Box::new(WindowsBackend);
+
+    // `--gui` launches the native window backend (the tcore-app fork) instead of
+    // rendering into the host terminal. Requires the `gui` feature.
+    #[cfg(feature = "gui")]
+    if std::env::args().any(|a| a == "--gui") {
+        return gui::run(backend.as_ref()).map_err(|e| std::io::Error::other(e.to_string()));
+    }
 
     // Start at the host terminal's actual size, falling back to 80x24.
     let (init_cols, init_rows) = backend.terminal_size().unwrap_or((80, 24));
