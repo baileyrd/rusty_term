@@ -78,12 +78,13 @@ cargo run --features l13
 | `--gui` | `gui`       | Launch the native window backend instead of TUI/passthrough mode. |
 | `--gpu` | `gui-gpu`   | Use the `wgpu` GPU renderer in the window (CPU fallback on failure). |
 | `--config <path>` | — | Read the configuration file from `<path>` (see below). |
+| `--list-shells` | — | Print the shells detected on this machine and exit. |
 
 | Variable          | Effect |
 |-------------------|--------|
 | `RUSTY_TERM_CONFIG` | Path to the configuration file (when `--config` is not given). |
 | `RUSTY_TERM_FONT` | Path to a monospace font for the window backend. If unset, a list of common system locations is searched. |
-| `SHELL` / `COMSPEC` | The child program to spawn (falls back to `bash` / `cmd`). |
+| `SHELL` / `COMSPEC` | The child program to spawn when no `shell` is configured. On Windows, when `COMSPEC` is unset or the stock `cmd.exe`, rusty_term auto-detects a better default (`pwsh` > `powershell` > `cmd`); a custom `COMSPEC` is honored as-is. On Unix `$SHELL` always wins (falls back to `bash`). |
 | `TERM`, `COLORTERM` | Set by `rusty_term` for the child before spawn — not read from your environment. |
 
 ### Configuration file

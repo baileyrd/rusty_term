@@ -6,6 +6,7 @@ mod gui;
 mod input;
 mod render;
 mod runtime;
+mod shells;
 mod term;
 
 use std::sync::Arc;
@@ -27,9 +28,34 @@ fn main() -> Result<(), std::io::Error> {
     // drawing and harmless behind a detached gui window — and never abort:
     // the terminal always starts, with defaults filling any gap.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (config, warnings) = Config::load(&args);
+
+    // `--list-shells`: print what's installed and exit. Runs before config
+    // loading so a broken config can't get in the way of the diagnostic.
+    if args.iter().any(|a| a == "--list-shells") {
+        shells::print_detected();
+        return Ok(());
+    }
+
+    let (mut config, warnings) = Config::load(&args);
     for w in &warnings {
         eprintln!("rusty_term: {w}");
+    }
+
+    // No shell configured: ask the detector for a better default than the
+    // backend's last resort. On Windows that upgrades cmd.exe to PowerShell
+    // when one is installed; on Unix it stays `None` ($SHELL already wins).
+    // An explicitly set $COMSPEC is honored over the probe — someone who set
+    // it chose their shell, same as $SHELL on Unix.
+    if config.shell.is_none() {
+        #[cfg(windows)]
+        let env_choice = std::env::var("COMSPEC")
+            .map(|c| !c.to_ascii_lowercase().ends_with("cmd.exe"))
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let env_choice = false;
+        if !env_choice {
+            config.shell = shells::detect_default();
+        }
     }
 
     #[cfg(unix)]
