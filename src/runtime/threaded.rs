@@ -251,6 +251,16 @@ pub fn run(
             };
             if changed {
                 let _ = resizer.set_winsize(cols, rows);
+                // Tell a subscribed structured client the size changed (the child
+                // also gets SIGWINCH from set_winsize). Best-effort: a dropped
+                // frame on a full input queue is harmless.
+                #[cfg(feature = "l13")]
+                {
+                    let notif = grid.lock().resize_notification();
+                    if let Some(bytes) = notif {
+                        let _ = resizer.write(&bytes);
+                    }
+                }
                 let mut out = std::io::stdout();
                 let _ = out.write_all(b"\x1b[2J");
                 let _ = out.flush();

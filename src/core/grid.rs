@@ -77,9 +77,10 @@ pub struct Grid {
     /// the same directory"); empty until reported.
     pub cwd: String,
     /// Lines that have scrolled off the top of the primary screen, oldest at the
-    /// front. Bounded by [`SCROLLBACK_MAX`]. Each line is stored at the width it
-    /// had when evicted and padded/truncated to the live width when viewed.
-    pub(crate) scrollback: VecDeque<Vec<Cell>>,
+    /// front. Bounded by [`SCROLLBACK_MAX`]. Each [`Line`] carries the cells plus
+    /// its soft-wrap bit, so a resize can rejoin wrapped runs and re-wrap them to
+    /// the new width. Rewrapped to the live width on every resize.
+    pub(crate) scrollback: VecDeque<Line>,
     /// How many lines the viewport is scrolled up into [`Grid::scrollback`].
     /// `0` is the live view (bottom); the renderer composites history above the
     /// live grid when this is non-zero.
@@ -137,10 +138,41 @@ pub struct Grid {
     /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
     /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
     prompt_marks: Vec<usize>,
+    /// Structured side-channel (L13) session state: the resource subscriptions a
+    /// connected client has registered for change notifications. Carried here
+    /// because it must outlive any single channel OSC and ride alongside the grid
+    /// state whose changes it reports.
+    #[cfg(feature = "l13")]
+    pub(crate) channel: super::channel::ChannelState,
+    /// Optional status-line overlay set via the L13 `render` protocol; composited
+    /// over the bottom row by every renderer. `None` (no allocation) when unset.
+    status_line: Option<StatusLine>,
+    /// Exit code of the last finished command, reported via OSC 133;D. Surfaced
+    /// to a structured client as the `terminal://exit` resource; `None` until a
+    /// command finishes (or when the shell omits the code).
+    #[cfg(feature = "l13")]
+    last_exit: Option<i32>,
+    /// Absolute logical line (`scrollback.len() + cursor row`) where the running
+    /// command's output began (OSC 133;C), or `None` outside a command. Decays
+    /// with scrollback eviction and is remapped across a resize (it rides the
+    /// reflow like a prompt mark), so a mid-command resize keeps the capture.
+    #[cfg(feature = "l13")]
+    command_start: Option<usize>,
+    /// Text of the last finished command's output, captured at OSC 133;D and
+    /// surfaced as the `terminal://command` resource.
+    #[cfg(feature = "l13")]
+    last_command_output: Option<String>,
     /// Per-row line size attributes (DECDWL/DECDHL); `len() == rows`. The
     /// renderer relays each to the host so double-width/height lines display
     /// correctly, and they shift with the rows they label as the screen scrolls.
     line_attrs: Vec<LineAttr>,
+    /// Per-row soft-wrap flags; `len() == rows`. `wrapped[y]` is set when DECAWM
+    /// autowrap overflowed row `y` into row `y + 1`, marking the two as one
+    /// logical line. Travels with the row through scrolls (alongside
+    /// [`Grid::line_attrs`]) and into [`Grid::scrollback`], and is the signal the
+    /// reflow uses to rejoin wrapped runs on resize. A *hard* line break (LF,
+    /// NEL, IND) leaves it clear.
+    wrapped: Vec<bool>,
 }
 
 /// Build the default tab-stop table for a `cols`-wide grid: a stop at every
@@ -200,11 +232,24 @@ struct SavedScreen {
     mode: AltMode,
     /// Line size attributes of the stashed screen, swapped back on exit.
     line_attrs: Vec<LineAttr>,
+    /// Soft-wrap flags of the stashed screen, swapped back on exit. Parallel to
+    /// [`SavedScreen::line_attrs`].
+    wrapped: Vec<bool>,
 }
 
-/// Reflow `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows` buffer,
-/// preserving the top-left overlap and blank-filling any new area.
-fn reflow(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows: usize) -> Vec<Cell> {
+/// One stored line of scrollback history: the cells as they left the screen plus
+/// the soft-wrap bit that says whether the next stored line is a continuation of
+/// the same logical line (set by DECAWM autowrap, clear on a hard line break).
+pub(crate) struct Line {
+    pub cells: Vec<Cell>,
+    pub wrapped: bool,
+}
+
+/// Clip/extend `old` (sized `old_cols`×`old_rows`) into a fresh `cols`×`rows`
+/// buffer, preserving the top-left overlap and blank-filling any new area. Used
+/// for the *alternate* screen, whose full-screen apps repaint on resize — there
+/// is no logical-line history there to rejoin, so a plain clip is correct.
+fn reflow_clip(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows: usize) -> Vec<Cell> {
     let mut new = vec![Cell::blank(); cols * rows];
     let copy_rows = rows.min(old_rows);
     let copy_cols = cols.min(old_cols);
@@ -214,6 +259,315 @@ fn reflow(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows: usi
         new[dst..dst + copy_cols].copy_from_slice(&old[src..src + copy_cols]);
     }
     new
+}
+
+/// A cell that contributes nothing to a logical line's content — a plain space
+/// in default rendition with no link or grapheme tail. Trailing runs of these
+/// are trimmed when rejoining wrapped rows so re-wrapping doesn't preserve dead
+/// padding. `flags == 0` excludes both [`WIDE_TRAILER`] and any SGR attribute,
+/// so a colored/attributed blank is *kept* (its background is content).
+fn is_padding(c: &Cell) -> bool {
+    c.ch == ' ' && c.cluster == 0 && c.link == 0 && c.flags == 0
+}
+
+/// The product of a wrap-aware reflow: the rebuilt history, the new on-screen
+/// buffer with its per-row metadata, the relocated cursor, and the remapped
+/// prompt marks.
+struct Reflowed {
+    scrollback: VecDeque<Line>,
+    cells: Vec<Cell>,
+    wrapped: Vec<bool>,
+    line_attrs: Vec<LineAttr>,
+    cursor: (usize, usize),
+    prompt_marks: Vec<usize>,
+    /// Remapped command-capture anchor; only consumed under the `l13` feature.
+    #[cfg_attr(not(feature = "l13"), allow(dead_code))]
+    command_start: Option<usize>,
+}
+
+/// Re-wrap the combined history `scrollback ++ screen` into `new_cols`×`new_rows`.
+///
+/// The buffer is a sequence of physical rows; consecutive rows joined by the
+/// soft-wrap bit form one *logical line*. We flatten those runs back into
+/// logical lines (dropping the one-column filler a wide glyph leaves when it
+/// wraps, and trimming trailing padding), re-wrap each to the new width without
+/// splitting a double-width glyph across the margin, then re-window the result so
+/// the cursor's line stays on screen. The cursor and the OSC-133 prompt marks
+/// (physical-row indices into the old `scrollback ++ screen`) are carried through
+/// by tracking, respectively, the cursor's offset within its logical line and a
+/// physical-row → logical-line → new-physical-row mapping.
+#[allow(clippy::too_many_arguments)]
+fn reflow_history(
+    scrollback: &VecDeque<Line>,
+    screen: &[Cell],
+    screen_wrapped: &[bool],
+    screen_attrs: &[LineAttr],
+    old_cols: usize,
+    old_rows: usize,
+    cursor: (usize, usize),
+    prompt_marks: &[usize],
+    command_start: Option<usize>,
+    new_cols: usize,
+    new_rows: usize,
+    blank: Cell,
+) -> Reflowed {
+    let hist = scrollback.len();
+    let old_total = hist + old_rows;
+    let cursor_phys = hist + cursor.1.min(old_rows.saturating_sub(1));
+    // Borrow physical row `i` as (cells, wrapped, line attr). Scrollback lines
+    // have no size attribute (a double-width line is meaningless once scrolled
+    // off) and may be narrower than `old_cols`; both are handled by the joiner.
+    let phys = |i: usize| -> (&[Cell], bool, LineAttr) {
+        if i < hist {
+            (&scrollback[i].cells, scrollback[i].wrapped, LineAttr::Single)
+        } else {
+            let y = i - hist;
+            (
+                &screen[y * old_cols..y * old_cols + old_cols],
+                screen_wrapped[y],
+                screen_attrs[y],
+            )
+        }
+    };
+
+    // --- Phase 1: flatten physical rows into logical lines. ---
+    let mut logical: Vec<Vec<Cell>> = Vec::new();
+    let mut logical_attr: Vec<LineAttr> = Vec::new();
+    let mut phys_to_logical: Vec<usize> = Vec::with_capacity(old_total);
+    let mut cur: Vec<Cell> = Vec::new();
+    let mut cur_attr = LineAttr::Single;
+    let mut cur_started = false;
+    let mut cursor_logical = 0usize;
+    let mut cursor_off = 0usize;
+    for i in 0..old_total {
+        let (cells, wrapped, attr) = phys(i);
+        let li = logical.len(); // index this physical row's logical line will get
+        phys_to_logical.push(li);
+        if !cur_started {
+            cur_attr = attr;
+            cur_started = true;
+        }
+        if i == cursor_phys {
+            cursor_logical = li;
+            cursor_off = cur.len() + cursor.0.min(old_cols);
+        }
+        // Append this row's content. A wrapped row that ends in one padding cell
+        // because a wide glyph didn't fit drops that filler — detected precisely
+        // by the next row beginning with a width-2 glyph.
+        let mut take = cells.len();
+        if wrapped && take > 0 && is_padding(&cells[take - 1]) {
+            let next_wide = i + 1 < old_total && {
+                let (nc, _, _) = phys(i + 1);
+                !nc.is_empty() && char_width(nc[0].ch) == 2
+            };
+            if next_wide {
+                take -= 1;
+            }
+        }
+        cur.extend_from_slice(&cells[..take]);
+        if wrapped {
+            continue; // logical line continues on the next physical row
+        }
+        // Hard break: close the logical line, trimming trailing padding but never
+        // past the cursor's column on the cursor's own line.
+        let min_keep = if li == cursor_logical { cursor_off } else { 0 };
+        let mut end = cur.len();
+        while end > min_keep && is_padding(&cur[end - 1]) {
+            end -= 1;
+        }
+        cur.truncate(end);
+        logical.push(std::mem::take(&mut cur));
+        logical_attr.push(cur_attr);
+        cur_started = false;
+    }
+    if cur_started {
+        // A trailing wrapped run with no closing hard break (shouldn't normally
+        // happen, since a wrap always creates the next row): keep it anyway.
+        let min_keep = if logical.len() == cursor_logical { cursor_off } else { 0 };
+        let mut end = cur.len();
+        while end > min_keep && is_padding(&cur[end - 1]) {
+            end -= 1;
+        }
+        cur.truncate(end);
+        logical.push(cur);
+        logical_attr.push(cur_attr);
+    }
+
+    // Drop blank logical lines trailing *below* the cursor: those are the screen's
+    // empty tail (padding under the last output), not history. Lines at or above
+    // the cursor — including intentional mid-content blank lines — are kept, so a
+    // resize doesn't sweep real content into scrollback just to fill the window.
+    while logical.len() > cursor_logical + 1 && logical.last().is_some_and(|l| l.is_empty()) {
+        logical.pop();
+        logical_attr.pop();
+    }
+
+    // --- Phase 2: re-wrap each logical line to the new width. ---
+    let mut out_cells: Vec<Vec<Cell>> = Vec::new();
+    let mut out_wrapped: Vec<bool> = Vec::new();
+    let mut out_attr: Vec<LineAttr> = Vec::new();
+    let mut logical_first_row: Vec<usize> = vec![0; logical.len()];
+    let mut ncur = (0usize, 0usize);
+    let mut cursor_set = false;
+    for (li, line) in logical.iter().enumerate() {
+        logical_first_row[li] = out_cells.len();
+        let attr = logical_attr[li];
+        if line.is_empty() {
+            if li == cursor_logical && !cursor_set {
+                ncur = (out_cells.len(), 0);
+                cursor_set = true;
+            }
+            out_cells.push(vec![blank; new_cols]);
+            out_wrapped.push(false);
+            out_attr.push(attr);
+            continue;
+        }
+        let mut i = 0;
+        let mut seg_start = 0;
+        while i < line.len() {
+            let mut take = new_cols.min(line.len() - i);
+            // Don't cut a double-width glyph from its trailer: if the cell just
+            // past the segment is a trailer, push its head to the next row.
+            if i + take < line.len() && line[i + take].flags & WIDE_TRAILER != 0 && take > 1 {
+                take -= 1;
+            }
+            if take == 0 {
+                take = 1; // degenerate new_cols == 1 vs a wide glyph: force progress
+            }
+            let mut row = vec![blank; new_cols];
+            let n = take.min(new_cols);
+            row[..n].copy_from_slice(&line[i..i + n]);
+            seg_start = i;
+            if li == cursor_logical && !cursor_set && cursor_off >= i && cursor_off < i + take {
+                ncur = (out_cells.len(), (cursor_off - i).min(new_cols - 1));
+                cursor_set = true;
+            }
+            let more = i + take < line.len();
+            out_cells.push(row);
+            out_wrapped.push(more);
+            out_attr.push(attr);
+            i += take;
+        }
+        if li == cursor_logical && !cursor_set {
+            // Cursor sat at or past the last cell of its (trimmed) line.
+            let col = (cursor_off - seg_start).min(new_cols - 1);
+            ncur = (out_cells.len() - 1, col);
+            cursor_set = true;
+        }
+    }
+    let total = out_cells.len();
+    if !cursor_set {
+        ncur = (total.saturating_sub(1), 0);
+    }
+
+    // --- Phase 3: re-window into screen + scrollback, keeping the cursor visible. ---
+    let mut screen_top = total.saturating_sub(new_rows);
+    if ncur.0 < screen_top {
+        screen_top = ncur.0; // cursor would be above the window: pull the window up
+    }
+    let dropped = screen_top.saturating_sub(SCROLLBACK_MAX);
+    let mut new_scrollback: VecDeque<Line> = VecDeque::new();
+    let mut cells = vec![blank; new_cols * new_rows];
+    let mut wrapped = vec![false; new_rows];
+    let mut line_attrs = vec![LineAttr::Single; new_rows];
+    for (r, row) in out_cells.into_iter().enumerate() {
+        if r < dropped {
+            continue; // oldest history beyond the scrollback cap
+        }
+        if r < screen_top {
+            new_scrollback.push_back(Line {
+                cells: row,
+                wrapped: out_wrapped[r],
+            });
+        } else if r < screen_top + new_rows {
+            let y = r - screen_top;
+            cells[y * new_cols..(y + 1) * new_cols].copy_from_slice(&row);
+            wrapped[y] = out_wrapped[r];
+            line_attrs[y] = out_attr[r];
+        }
+        // r >= screen_top + new_rows: below the cursor's window, dropped.
+    }
+    let cy = ncur.0.saturating_sub(screen_top).min(new_rows - 1);
+    let cx = ncur.1.min(new_cols - 1);
+
+    // --- Phase 4: remap line indices (old physical row → logical → new row). ---
+    // A physical row maps to the first new row of its logical line, minus the
+    // scrollback dropped off the front; a row past the kept logical lines (a
+    // dropped trailing blank) or below the cap has no image.
+    let remap = |m: usize| -> Option<usize> {
+        if m < phys_to_logical.len() && phys_to_logical[m] < logical_first_row.len() {
+            let outrow = logical_first_row[phys_to_logical[m]];
+            (outrow >= dropped).then(|| outrow - dropped)
+        } else {
+            None
+        }
+    };
+    let mut new_marks: Vec<usize> = prompt_marks.iter().filter_map(|&m| remap(m)).collect();
+    new_marks.sort_unstable();
+    new_marks.dedup();
+    if new_marks.len() > PROMPT_MARKS_MAX {
+        new_marks.drain(0..new_marks.len() - PROMPT_MARKS_MAX);
+    }
+    let new_command_start = command_start.and_then(remap);
+
+    Reflowed {
+        scrollback: new_scrollback,
+        cells,
+        wrapped,
+        line_attrs,
+        cursor: (cx, cy),
+        prompt_marks: new_marks,
+        command_start: new_command_start,
+    }
+}
+
+/// A terminal-owned status-line overlay (L13 `render` protocol): one row of
+/// pre-rendered cells the renderer composites over the bottom of the live
+/// screen, independent of the child's output stream. Kept pre-rendered so the
+/// hot render path just borrows the slice; re-laid from `text`/`fg`/`bg` on a
+/// resize.
+pub(crate) struct StatusLine {
+    text: String,
+    fg: u32,
+    bg: u32,
+    cells: Vec<Cell>,
+}
+
+impl StatusLine {
+    /// Lay `text` out into exactly `cols` cells in `fg`/`bg`: advance wide glyphs
+    /// by two columns with a flagged trailer, drop zero-width scalars, stop at the
+    /// margin, and pad the tail with blanks in `bg`.
+    fn lay_out(text: &str, fg: u32, bg: u32, cols: usize) -> Vec<Cell> {
+        let blank = Cell { ch: ' ', cluster: 0, fg, bg, flags: 0, link: 0 };
+        let mut cells = vec![blank; cols];
+        let mut x = 0;
+        for ch in text.chars() {
+            let w = char_width(ch);
+            if w == 0 {
+                continue;
+            }
+            if x + w > cols {
+                break;
+            }
+            cells[x] = Cell { ch, cluster: 0, fg, bg, flags: 0, link: 0 };
+            if w == 2 {
+                cells[x + 1] = Cell { ch: ' ', cluster: 0, fg, bg, flags: WIDE_TRAILER, link: 0 };
+            }
+            x += w;
+        }
+        cells
+    }
+
+    #[cfg(feature = "l13")]
+    fn new(text: String, fg: u32, bg: u32, cols: usize) -> Self {
+        let cells = Self::lay_out(&text, fg, bg, cols);
+        StatusLine { text, fg, bg, cells }
+    }
+
+    /// Re-lay the existing text/colors at a new width (after a resize).
+    fn relayout(&mut self, cols: usize) {
+        self.cells = Self::lay_out(&self.text, self.fg, self.bg, cols);
+    }
 }
 
 impl Grid {
@@ -248,7 +602,17 @@ impl Grid {
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
             line_attrs: vec![LineAttr::Single; rows],
+            wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
+            #[cfg(feature = "l13")]
+            channel: super::channel::ChannelState::default(),
+            status_line: None,
+            #[cfg(feature = "l13")]
+            last_exit: None,
+            #[cfg(feature = "l13")]
+            command_start: None,
+            #[cfg(feature = "l13")]
+            last_command_output: None,
         }
     }
 
@@ -427,10 +791,17 @@ impl Grid {
         // full-screen scroll on the primary buffer: partial-region scrolls
         // (TUI apps using DECSTBM) and the alternate screen don't form history.
         if top == 0 && bottom == self.rows - 1 && self.primary.is_none() {
-            self.scrollback.push_back(self.cells[0..self.cols].to_vec());
+            self.scrollback.push_back(Line {
+                cells: self.cells[0..self.cols].to_vec(),
+                wrapped: self.wrapped[top],
+            });
             if self.scrollback.len() > SCROLLBACK_MAX {
                 self.scrollback.pop_front();
                 self.evict_prompt_mark();
+                #[cfg(feature = "l13")]
+                if let Some(s) = &mut self.command_start {
+                    *s = s.saturating_sub(1);
+                }
             }
             // If the user is browsing history, advance the offset in step with
             // the incoming line so the viewed region stays put under new output.
@@ -448,7 +819,7 @@ impl Grid {
         for c in &mut self.cells[last..last + self.cols] {
             *c = blank;
         }
-        self.shift_line_attrs(top + 1, top, bottom - top, bottom..bottom + 1);
+        self.shift_line_meta(top + 1, top, bottom - top, bottom..bottom + 1);
         for d in &mut self.dirty[top..=bottom] {
             *d = true;
         }
@@ -496,6 +867,11 @@ impl Grid {
         let w = char_width(ch); // >= 1 here (zero-width non-continuations dropped above)
         if self.cursor.0 + w > self.cols {
             if self.autowrap {
+                // Mark this row as soft-wrapped before leaving it, so the reflow
+                // and scrollback know it and its successor are one logical line.
+                if self.cursor.1 < self.wrapped.len() {
+                    self.wrapped[self.cursor.1] = true;
+                }
                 self.carriage_return();
                 self.newline();
             } else {
@@ -677,6 +1053,11 @@ impl Grid {
         for c in &mut self.cells[base + from..base + to] {
             *c = blank;
         }
+        // Erasing through the right margin ends the line here: it no longer
+        // wraps into the row below (EL, the tail of ED, ECH at the margin).
+        if to >= self.cols {
+            self.wrapped[y] = false;
+        }
         self.dirty[y] = true;
     }
 
@@ -684,6 +1065,7 @@ impl Grid {
     pub(crate) fn clear_all(&mut self) {
         let blank = self.erase_cell();
         self.cells.fill(blank);
+        self.wrapped.iter_mut().for_each(|w| *w = false);
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
     }
@@ -705,36 +1087,108 @@ impl Grid {
         self.default_bg = bg;
     }
 
-    /// Resize the grid to `cols`×`rows`, preserving the top-left overlap of the
-    /// existing content. The cursor (and saved cursor) are clamped into the new
-    /// bounds and every row is marked dirty so the next frame repaints fully.
+    /// Resize the grid to `cols`×`rows`.
+    ///
+    /// On the primary screen this is a **wrap-aware reflow**: soft-wrapped runs
+    /// across scrollback + the live screen are rejoined into logical lines and
+    /// re-wrapped to the new width, so narrowing rewraps long lines (pushing the
+    /// overflow into history) and widening pulls wrapped continuations — and
+    /// lines back out of scrollback — instead of truncating. The cursor, prompt
+    /// marks, and per-row line-size attributes ride through the reflow. The saved
+    /// (DECSC) cursor is clamped. Every row is marked dirty for a full repaint.
+    ///
+    /// On the alternate screen the live buffer is merely clipped/extended (its
+    /// full-screen app repaints on resize); the *stashed* primary is reflowed so
+    /// it is correct when the app exits the alt screen.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
         }
+        let (old_cols, old_rows) = (self.cols, self.rows);
         let clamp = |(x, y): (usize, usize)| (x.min(cols - 1), y.min(rows - 1));
-        let new_cells = reflow(&self.cells, self.cols, self.rows, cols, rows);
-        // Keep the stashed primary screen the same size as the live buffer so
-        // it can be restored without a size mismatch.
-        if let Some(saved) = &mut self.primary {
-            saved.cells = reflow(&saved.cells, self.cols, self.rows, cols, rows);
-            saved.line_attrs = vec![LineAttr::Single; rows];
-            saved.cursor = clamp(saved.cursor);
-            saved.saved_cursor = clamp(saved.saved_cursor);
-        }
-        // Preserve tab stops within the surviving width; default new columns.
+        let blank = self.erase_cell();
+        // Preserve tab stops within the surviving width; default the new columns.
         let mut stops = default_tab_stops(cols);
-        let keep = cols.min(self.cols);
+        let keep = cols.min(old_cols);
         stops[..keep].copy_from_slice(&self.tab_stops[..keep]);
         self.tab_stops = stops;
-        self.cells = new_cells;
+
+        // The in-flight command-capture anchor (l13) rides the reflow like a
+        // prompt mark, so a mid-command resize preserves the capture.
+        #[cfg(feature = "l13")]
+        let cmd_start = self.command_start;
+        #[cfg(not(feature = "l13"))]
+        let cmd_start: Option<usize> = None;
+        if self.primary.is_none() {
+            let r = reflow_history(
+                &self.scrollback,
+                &self.cells,
+                &self.wrapped,
+                &self.line_attrs,
+                old_cols,
+                old_rows,
+                self.cursor,
+                &self.prompt_marks,
+                cmd_start,
+                cols,
+                rows,
+                blank,
+            );
+            self.scrollback = r.scrollback;
+            self.cells = r.cells;
+            self.wrapped = r.wrapped;
+            self.line_attrs = r.line_attrs;
+            self.cursor = r.cursor;
+            self.prompt_marks = r.prompt_marks;
+            #[cfg(feature = "l13")]
+            {
+                self.command_start = r.command_start;
+            }
+            self.saved_cursor = clamp(self.saved_cursor);
+        } else {
+            let primary = self.primary.take().expect("primary present");
+            let r = reflow_history(
+                &self.scrollback,
+                &primary.cells,
+                &primary.wrapped,
+                &primary.line_attrs,
+                old_cols,
+                old_rows,
+                primary.cursor,
+                &self.prompt_marks,
+                cmd_start,
+                cols,
+                rows,
+                blank,
+            );
+            self.scrollback = r.scrollback;
+            self.prompt_marks = r.prompt_marks;
+            #[cfg(feature = "l13")]
+            {
+                self.command_start = r.command_start;
+            }
+            self.primary = Some(SavedScreen {
+                cells: r.cells,
+                cursor: r.cursor,
+                saved_cursor: clamp(primary.saved_cursor),
+                mode: primary.mode,
+                line_attrs: r.line_attrs,
+                wrapped: r.wrapped,
+            });
+            self.cells = reflow_clip(&self.cells, old_cols, old_rows, cols, rows);
+            self.line_attrs = vec![LineAttr::Single; rows];
+            self.wrapped = vec![false; rows];
+            self.cursor = clamp(self.cursor);
+            self.saved_cursor = clamp(self.saved_cursor);
+        }
+
         self.cols = cols;
         self.rows = rows;
-        self.line_attrs = vec![LineAttr::Single; rows];
         self.dirty = vec![true; rows];
-        self.cursor = clamp(self.cursor);
-        self.saved_cursor = clamp(self.saved_cursor);
-        self.prompt_marks.clear();
+        self.view_offset = 0;
+        if let Some(s) = &mut self.status_line {
+            s.relayout(cols);
+        }
         self.reset_scroll_region();
     }
 
@@ -752,6 +1206,7 @@ impl Grid {
             saved_cursor: self.saved_cursor,
             mode,
             line_attrs: std::mem::replace(&mut self.line_attrs, vec![LineAttr::Single; self.rows]),
+            wrapped: std::mem::replace(&mut self.wrapped, vec![false; self.rows]),
         });
         if mode == AltMode::Dec1049 {
             self.cursor = (0, 0);
@@ -770,6 +1225,7 @@ impl Grid {
         if let Some(saved) = self.primary.take() {
             self.cells = saved.cells;
             self.line_attrs = saved.line_attrs;
+            self.wrapped = saved.wrapped;
             if saved.mode == AltMode::Dec1049 {
                 self.cursor = (
                     saved.cursor.0.min(self.cols.saturating_sub(1)),
@@ -865,7 +1321,7 @@ impl Grid {
         for c in &mut self.cells[cy * cols..blank_end] {
             *c = blank;
         }
-        self.shift_line_attrs(cy, cy + n, count / cols, cy..cy + n);
+        self.shift_line_meta(cy, cy + n, count / cols, cy..cy + n);
         for d in &mut self.dirty[cy..=self.scroll_bottom] {
             *d = true;
         }
@@ -895,12 +1351,10 @@ impl Grid {
         for c in &mut self.cells[first_blank..region_end] {
             *c = blank;
         }
-        self.shift_line_attrs(
-            cy + n,
-            cy,
-            count / cols,
-            (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1),
-        );
+        self.shift_line_meta(cy + n,
+        cy,
+        count / cols,
+        (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1),);
         for d in &mut self.dirty[cy..=self.scroll_bottom] {
             *d = true;
         }
@@ -942,7 +1396,7 @@ impl Grid {
         for c in &mut self.cells[top * cols..blank_end] {
             *c = blank;
         }
-        self.shift_line_attrs(top, top + n, count / cols, top..top + n);
+        self.shift_line_meta(top, top + n, count / cols, top..top + n);
         for d in &mut self.dirty[top..=bottom] {
             *d = true;
         }
@@ -967,10 +1421,11 @@ impl Grid {
         }
     }
 
-    /// Mirror a region scroll on the line-attribute table: move `count` rows
-    /// from `src_row` to begin at `dst_row`, then reset the rows in `blank` to
-    /// single width. Keeps line size glued to its content as the screen scrolls.
-    fn shift_line_attrs(
+    /// Mirror a region scroll on the per-row metadata tables (line size + soft
+    /// wrap): move `count` rows from `src_row` to begin at `dst_row`, then reset
+    /// the rows in `blank` to single-width / unwrapped. Keeps both glued to the
+    /// content rows they label as the screen scrolls.
+    fn shift_line_meta(
         &mut self,
         src_row: usize,
         dst_row: usize,
@@ -980,9 +1435,13 @@ impl Grid {
         if count > 0 {
             self.line_attrs
                 .copy_within(src_row..src_row + count, dst_row);
+            self.wrapped.copy_within(src_row..src_row + count, dst_row);
         }
-        for a in &mut self.line_attrs[blank] {
+        for a in &mut self.line_attrs[blank.clone()] {
             *a = LineAttr::Single;
+        }
+        for w in &mut self.wrapped[blank] {
+            *w = false;
         }
     }
 
@@ -1053,6 +1512,7 @@ impl Grid {
         self.cells = vec![Cell::blank(); self.cols * self.rows];
         self.dirty = vec![true; self.rows];
         self.line_attrs = vec![LineAttr::Single; self.rows];
+        self.wrapped = vec![false; self.rows];
         self.cursor = (0, 0);
         self.saved_cursor = (0, 0);
         self.scroll_top = 0;
@@ -1102,6 +1562,7 @@ impl Grid {
         for a in &mut self.line_attrs {
             *a = LineAttr::Single;
         }
+        self.wrapped.iter_mut().for_each(|w| *w = false);
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
     }
@@ -1109,6 +1570,105 @@ impl Grid {
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.
     pub fn clear_dirty(&mut self) {
         self.dirty.iter_mut().for_each(|d| *d = false);
+    }
+
+    /// Overlay a status line at the bottom of the screen (L13 `render/set_status`),
+    /// laid out at the current width; `fg`/`bg` default to the grid's defaults.
+    /// Marks the bottom row dirty so the next frame composites it.
+    #[cfg(feature = "l13")]
+    pub(crate) fn set_status_line(&mut self, text: String, fg: Option<u32>, bg: Option<u32>) {
+        let fg = fg.unwrap_or(self.default_fg);
+        let bg = bg.unwrap_or(self.default_bg);
+        self.status_line = Some(StatusLine::new(text, fg, bg, self.cols));
+        if let Some(d) = self.dirty.last_mut() {
+            *d = true;
+        }
+    }
+
+    /// Remove the status-line overlay (L13 `render/clear_status`), repainting the
+    /// bottom row it covered.
+    #[cfg(feature = "l13")]
+    pub(crate) fn clear_status_line(&mut self) {
+        if self.status_line.take().is_some()
+            && let Some(d) = self.dirty.last_mut()
+        {
+            *d = true;
+        }
+    }
+
+    /// The status-line overlay cells (length `cols`) to composite over the bottom
+    /// row, or `None` when no overlay is set or the alternate screen is active
+    /// (its full-screen app owns the whole grid).
+    pub(crate) fn status_row(&self) -> Option<&[Cell]> {
+        if self.primary.is_some() {
+            return None;
+        }
+        self.status_line.as_ref().map(|s| s.cells.as_slice())
+    }
+
+    /// Begin capturing a command's output (OSC 133;C): anchor the output start at
+    /// the current cursor line, captured at the matching `D`.
+    #[cfg(feature = "l13")]
+    pub(crate) fn command_output_begin(&mut self) {
+        self.command_start = Some(self.scrollback.len() + self.cursor.1);
+    }
+
+    /// A command finished (OSC 133;D): record its exit status and, if its output
+    /// start was marked (C), capture the text from there to the cursor as the
+    /// `terminal://command` resource.
+    #[cfg(feature = "l13")]
+    pub(crate) fn command_finished(&mut self, exit: Option<i32>) {
+        self.last_exit = exit;
+        if let Some(start) = self.command_start.take() {
+            self.last_command_output = Some(self.capture_command_output(start));
+        }
+    }
+
+    /// Join the cell rows in the absolute line range `[start, cursor line)` into
+    /// text, one row per line, trailing blanks trimmed per row.
+    #[cfg(feature = "l13")]
+    fn capture_command_output(&self, start: usize) -> String {
+        let history = self.scrollback.len();
+        let end = history + self.cursor.1;
+        let start = start.min(end);
+        let mut out = String::new();
+        for i in start..end {
+            if i != start {
+                out.push('\n');
+            }
+            let cells = if i < history {
+                &self.scrollback[i].cells[..]
+            } else {
+                let s = (i - history) * self.cols;
+                &self.cells[s..s + self.cols]
+            };
+            out.push_str(&row_text(cells, &self.clusters));
+        }
+        out
+    }
+
+    /// The exit code of the last finished command, or `None` if none has
+    /// finished (or the shell reported no code).
+    #[cfg(feature = "l13")]
+    pub(crate) fn last_command_exit(&self) -> Option<i32> {
+        self.last_exit
+    }
+
+    /// The output text of the last finished command (OSC 133;C..D), if captured.
+    #[cfg(feature = "l13")]
+    pub(crate) fn last_command_output(&self) -> Option<&str> {
+        self.last_command_output.as_deref()
+    }
+
+    /// Build the `terminal://dimensions` change notification if a client is
+    /// subscribed, for the runtime driver to write to the child after a resize
+    /// (which happens outside the parser's `advance`, so it has no `responses` in
+    /// hand). Returns `None` when nobody is subscribed — no wasted frame.
+    #[cfg(feature = "l13")]
+    pub(crate) fn resize_notification(&self) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        super::channel::notify_resource_changed(self, super::channel::RES_DIMENSIONS, &mut buf);
+        (!buf.is_empty()).then_some(buf)
     }
 
     /// Snapshot only the rows currently marked dirty, cloning their cells into
@@ -1121,7 +1681,11 @@ impl Grid {
             .filter(|&(_, d)| *d)
             .map(|(y, _)| {
                 let start = y * self.cols;
-                (y, self.cells[start..start + self.cols].to_vec())
+                let cells = match (y + 1 == self.rows).then(|| self.status_row()).flatten() {
+                    Some(s) => s.to_vec(),
+                    None => self.cells[start..start + self.cols].to_vec(),
+                };
+                (y, cells)
             })
             .collect();
         DirtyFrame {
@@ -1244,9 +1808,16 @@ impl Grid {
         let mut rows = Vec::with_capacity(self.rows);
         let mut attrs = Vec::with_capacity(self.rows);
         for y in 0..self.rows {
-            let cells = if y < off {
+            let status = if y + 1 == self.rows {
+                self.status_row()
+            } else {
+                None
+            };
+            let cells = if let Some(s) = status {
+                s.to_vec()
+            } else if y < off {
                 // Top `off` viewport rows show the tail of history.
-                let line = &self.scrollback[history - off + y];
+                let line = &self.scrollback[history - off + y].cells;
                 let mut row = vec![Cell::blank(); self.cols];
                 let n = line.len().min(self.cols);
                 row[..n].copy_from_slice(&line[..n]);
@@ -1258,8 +1829,8 @@ impl Grid {
                 self.cells[start..start + self.cols].to_vec()
             };
             rows.push((y, cells));
-            attrs.push(if y < off {
-                LineAttr::Single // history lines are always single width
+            attrs.push(if status.is_some() || y < off {
+                LineAttr::Single // history + status-overlay rows are single width
             } else {
                 self.line_attrs[y - off]
             });
@@ -1320,4 +1891,24 @@ pub struct DirtyFrame {
     /// Per-row line size attributes (DECDWL/DECDHL), indexed by each row's `y`
     /// in [`rows`](Self::rows). Cloned so the renderer can relay them to the host.
     pub line_attrs: Vec<LineAttr>,
+}
+
+/// Reconstruct a row of cells as text: base glyph plus any interned grapheme
+/// continuation, skipping wide-glyph trailers, with trailing blanks trimmed.
+/// Shared by the MCP screen/scrollback/command readers.
+#[cfg(feature = "l13")]
+pub(crate) fn row_text(cells: &[Cell], clusters: &[String]) -> String {
+    let mut s = String::new();
+    for cell in cells {
+        if cell.flags & WIDE_TRAILER != 0 {
+            continue;
+        }
+        s.push(cell.ch);
+        if cell.cluster != 0
+            && let Some(suffix) = clusters.get((cell.cluster - 1) as usize)
+        {
+            s.push_str(suffix);
+        }
+    }
+    s.trim_end().to_string()
 }

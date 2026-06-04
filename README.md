@@ -127,8 +127,23 @@ The `l13` feature adds a full-duplex JSON-RPC 2.0 transport over a private OSC
 (`OSC 5379 ; <protocol> ; <json> ST`). One message per OSC, replies written to
 the child's stdin; terminals that don't understand the OSC ignore it. It hosts:
 
-- an **MCP** server exposing the terminal to agents (`get_screen`,
-  `get_scrollback`, `get_cwd`, `get_title`, `get_dimensions`);
+- a **`channel`** meta-protocol for **version negotiation** (`initialize` agrees
+  a version with the client and advertises per-protocol capabilities) and
+  **schema discovery** (`describe` returns the machine-readable contract);
+- an **MCP** server exposing the terminal to agents both as **tools**
+  (`get_screen`, `get_scrollback`, `get_cwd`, `get_title`, `get_dimensions`,
+  `get_cursor`) and as **resources** (`resources/list` + `resources/read` over
+  `terminal://screen`, `terminal://scrollback`, `terminal://cursor`,
+  `terminal://exit`, `terminal://command`, …), with live **change
+  notifications** — `resources/subscribe` pushes `notifications/resources/updated`
+  when a subscribed resource changes (cwd, title, terminal size on resize, and
+  the captured output text of each finished command). Completing the OSC 133
+  lifecycle, finishing a
+  command (OSC 133;C…D) emits a typed `notifications/command_finished` carrying
+  the **exit code** in the push itself — no follow-up read;
+- a **`render`** protocol for terminal-owned UI the renderer composites
+  independent of the child's output stream — `set_status` / `clear_status` drive
+  a status-line overlay across the bottom row, honored by all three render paths;
 - **LSP** and **ACP** `initialize` negotiation endpoints.
 
 It reuses the JSON-RPC model and LSP types from the sibling `rusty_lsp` crate,

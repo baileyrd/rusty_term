@@ -137,12 +137,15 @@ and a real terminal like xterm clamps all of them.)*
 
 ### LOW / fidelity gaps (by design, but worth knowing)
 
-- **Resize does not reflow text.** `reflow()` only preserves the top-left
-  overlap (`grid.rs:205-217`); narrowing **truncates** long lines instead of
-  rewrapping, and growing height does not re-pull lines from scrollback. Resize
-  also **clears all prompt marks** and **resets `line_attrs` to Single**
-  (`grid.rs:737,733`), so OSC-133 prompt navigation and double-width/height
-  lines are lost across a resize.
+- **Resize is wrap-aware** *(reflowed 2026-06-03)*. `reflow_history()` rejoins
+  soft-wrapped runs across scrollback + screen into logical lines (tracked by a
+  per-row `wrapped` bit set on DECAWM autowrap) and re-wraps them to the new
+  width, carrying the cursor, OSC-133 prompt marks, and per-row `line_attrs`
+  through the reflow without splitting a double-width glyph across the margin.
+  Narrowing pushes the overflow into scrollback; widening pulls continuations
+  (and history lines) back. The alternate screen is still clipped/extended, since
+  its full-screen apps repaint on resize. (Earlier this was a top-left clip that
+  truncated long lines and dropped prompt marks + line attrs.)
 - **GPU glyph atlas caps at 1024 distinct glyphs** (`SLOTS_PER_ROW^2`,
   `gpu.rs:22,282`); the 1025th+ glyph silently renders as blank (slot 0). Fine
   for ASCII+symbols; a heavy-CJK session would show gaps. Graceful, not a crash.
@@ -197,8 +200,8 @@ docs, and a strong behavior-focused test suite. The one substantive weakness —
 a family of **unclamped repeat counts in untrusted-input paths** (Sixel `!`, SU,
 REP) that let a tiny malicious byte sequence hang the whole emulator under the
 grid lock — has been **fixed and regression-tested** (section 4). The remaining
-items are intentional fidelity simplifications (no reflow, cell-resolution
-images, 1024-glyph atlas) appropriate to a passthrough terminal.
+items are intentional fidelity simplifications (cell-resolution images,
+1024-glyph atlas) appropriate to a passthrough terminal.
 
 ### Follow-ups
 
@@ -208,4 +211,4 @@ images, 1024-glyph atlas) appropriate to a passthrough terminal.
 4. ~~Add adversarial tests covering the pathological repeat counts.~~ **Done.**
 5. ~~Refresh the stale `backend/windows.rs` header comment.~~ **Done.**
 6. *(Open)* Coverage-guided fuzzing of `inflate`/`png`/`base64`/`kitty` decoders.
-7. *(Open)* Wrap-aware reflow on resize; preserve prompt marks and line attrs.
+7. ~~Wrap-aware reflow on resize; preserve prompt marks and line attrs.~~ **Done.**

@@ -30,11 +30,17 @@ pub(crate) fn render(
     let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
     let inverted = |col: usize, row: usize| cursor == Some((col, row)) || grid.is_selected(col, row);
 
+    // The status-line overlay (L13), when present, replaces the bottom row.
+    let status = grid.status_row();
+    let last_row = grid.rows.saturating_sub(1);
+
     // Pass 1: backgrounds. A wide glyph's bitmap may spill into its trailer
     // cell, so fill every cell (including trailers) before drawing glyphs.
     for (i, cell) in grid.cells.iter().enumerate() {
         let (col, row) = (i % grid.cols, i / grid.cols);
-        let bg = if inverted(col, row) { cell.fg } else { cell.bg };
+        let on_status = status.is_some() && row == last_row;
+        let cell = if on_status { status.unwrap()[col] } else { *cell };
+        let bg = if !on_status && inverted(col, row) { cell.fg } else { cell.bg };
         let (x0, y0) = (col * cw, row * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
@@ -46,6 +52,9 @@ pub(crate) fn render(
 
     // Pass 2: glyphs.
     for (i, cell) in grid.cells.iter().enumerate() {
+        let (col, row) = (i % grid.cols, i / grid.cols);
+        let on_status = status.is_some() && row == last_row;
+        let cell = if on_status { status.unwrap()[col] } else { *cell };
         if cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0) {
             continue;
         }
@@ -53,8 +62,7 @@ pub(crate) fn render(
         if glyph.width == 0 {
             continue;
         }
-        let (col, row) = (i % grid.cols, i / grid.cols);
-        let fg = if inverted(col, row) { cell.bg } else { cell.fg };
+        let fg = if !on_status && inverted(col, row) { cell.bg } else { cell.fg };
         let pen_x = (col * cw) as i32 + glyph.left;
         let pen_y = (row * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
@@ -149,6 +157,22 @@ mod tests {
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &mut MockFont, &mut buf, 4, 8);
         assert!(buf.iter().all(|&px| px == 0x008000));
+    }
+
+    #[cfg(feature = "l13")]
+    #[test]
+    fn status_line_overlays_bottom_cell_row() {
+        let mut g = Grid::new(2, 2);
+        // Distinct status bg (0x123456) so the overlay is detectable; white fg.
+        g.set_status_line("X".into(), Some(0xFFFFFF), Some(0x123456));
+        let (cw, chh) = (4usize, 8usize);
+        let (w, h) = (cw * 2, chh * 2);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &mut MockFont, &mut buf, w, h);
+        // Bottom cell-row, second cell (no glyph there) is pure status bg.
+        assert_eq!(buf[chh * w + cw + 1], 0x123456, "bottom row is the status overlay");
+        // A non-cursor top-row cell (col 1) is untouched: default black background.
+        assert_eq!(buf[cw], 0x000000, "top row not overlaid");
     }
 
     #[test]

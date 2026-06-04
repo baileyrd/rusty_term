@@ -35,8 +35,12 @@ pub(crate) fn dispatch(
     match code {
         // 0 sets icon name *and* window title; 2 sets the window title.
         "0" | "2" => {
-            if let Some(text) = text {
+            if let Some(text) = text
+                && g.title != text
+            {
                 g.title = text.to_string();
+                #[cfg(feature = "l13")]
+                super::channel::notify_resource_changed(g, super::channel::RES_TITLE, responses);
             }
         }
         // 1 sets the icon name only. We have no icon-name surface, so forward it
@@ -48,8 +52,12 @@ pub(crate) fn dispatch(
         }
         // 7 reports the working directory (usually a file:// URI).
         "7" => {
-            if let Some(text) = text {
+            if let Some(text) = text
+                && g.cwd != text
+            {
                 g.cwd = text.to_string();
+                #[cfg(feature = "l13")]
+                super::channel::notify_resource_changed(g, super::channel::RES_CWD, responses);
             }
         }
         // 8 sets/clears the active hyperlink: `8 ; params ; URI`. An empty URI
@@ -112,13 +120,26 @@ pub(crate) fn dispatch(
         "112" => palette.reset_cursor(),
         // 133 (shell integration / FinalTerm): A=prompt start, B=prompt end,
         // C=command output start, D[;exit]=command end. We record prompt starts
-        // for prompt-to-prompt scrollback navigation; the rest is accepted and
-        // ignored. (Emitters live in extra/shell-integration/.)
+        // for prompt-to-prompt scrollback navigation and, under `l13`, surface
+        // the command-end exit code as the `terminal://exit` resource (pushing a
+        // change notification to any subscriber). (Emitters live in
+        // extra/shell-integration/.)
         "133" => {
-            if let Some(text) = text
-                && text.split(';').next() == Some("A")
-            {
-                g.mark_prompt();
+            if let Some(text) = text {
+                let mut parts = text.split(';');
+                match parts.next() {
+                    Some("A") => g.mark_prompt(),
+                    #[cfg(feature = "l13")]
+                    Some("C") => g.command_output_begin(),
+                    #[cfg(feature = "l13")]
+                    Some("D") => {
+                        let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
+                        g.command_finished(exit);
+                        super::channel::notify_command_finished(g, exit, responses);
+                        super::channel::notify_resource_changed(g, super::channel::RES_COMMAND, responses);
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}

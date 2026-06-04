@@ -326,13 +326,18 @@ impl GpuCore {
         // Block cursor + drag-selection invert a cell's fg/bg (no shader change).
         // The cursor shows only on the live view, not while scrolled into history.
         let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
+        let status = grid.status_row();
+        let last_row = grid.rows.saturating_sub(1);
         let mut instances = Vec::with_capacity(grid.cells.len());
         for (i, cell) in grid.cells.iter().enumerate() {
+            let (col, row) = (i % grid.cols, i / grid.cols);
+            // The status-line overlay (L13), when present, replaces the bottom row.
+            let on_status = status.is_some() && row == last_row;
+            let cell = if on_status { status.unwrap()[col] } else { *cell };
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let (col, row) = (i % grid.cols, i / grid.cols);
-            let inv = cursor == Some((col, row)) || grid.is_selected(col, row);
+            let inv = !on_status && (cursor == Some((col, row)) || grid.is_selected(col, row));
             let (fg, bg) = if inv { (cell.bg, cell.fg) } else { (cell.fg, cell.bg) };
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {

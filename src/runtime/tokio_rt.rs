@@ -325,6 +325,17 @@ async fn run_async(
                     };
                     if changed {
                         let _ = resizer.set_winsize(cols, rows);
+                        // Tell a subscribed structured client the size changed
+                        // (the child also gets SIGWINCH). The master fd is
+                        // non-blocking; a best-effort write is fine for a small
+                        // frame and never blocks the reactor.
+                        #[cfg(feature = "l13")]
+                        {
+                            let notif = grid.lock().resize_notification();
+                            if let Some(bytes) = notif {
+                                let _ = resizer.write(&bytes);
+                            }
+                        }
                         let mut out = std::io::stdout();
                         let _ = out.write_all(b"\x1b[2J");
                         let _ = out.flush();

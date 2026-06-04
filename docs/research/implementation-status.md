@@ -50,6 +50,18 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 > crash on submit). Remaining `[ ]` items are now
 > only small leftovers (iTerm2, XTGETTCAP, OSC notifications, bidi, DAP/Jupyter,
 > in-window mouse/clipboard/IME, …).
+>
+> **Update 2026-06-03 (later)** — Resize is now a **wrap-aware reflow**
+> (`Grid::resize` → `reflow_history`, `src/core/grid.rs`): a per-row soft-wrap
+> bit (set on DECAWM autowrap, carried through scrolls and into scrollback) lets
+> a resize rejoin wrapped runs across scrollback + screen into logical lines and
+> re-wrap them to the new width — narrowing pushes overflow into history, widening
+> pulls continuations (and history lines) back — carrying the cursor, OSC-133
+> prompt marks, and per-row line-size attributes through, and never splitting a
+> double-width glyph across the margin. The alternate screen is still
+> clipped/extended (its apps repaint on resize). This closes the last
+> daily-use fidelity gap; the previous top-left clip truncated long lines and
+> dropped prompt marks + line attrs. Suite: **238** core tests (255 with `gui`).
 
 ## Appendix C — Minimum Viable Modern Terminal
 
@@ -148,8 +160,10 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 
 ### L13 Adjacent protocols — [x] (channel + MCP complete; LSP/ACP negotiable)
 - [x] Structured side-channel: full-duplex JSON-RPC 2.0 over a private OSC (`OSC 5379 ; <protocol> ; <json> ST`), one message per OSC, replies written to the child's stdin via the response channel; unaware terminals ignore the OSC (graceful degradation). Feature-gated `l13`, runtime-agnostic. (`src/core/channel.rs`, parser routing in `finish_osc`)
-- [x] Capability negotiation: `channel`/`initialize` advertises the supported protocols + terminal info
-- [x] **MCP** server exposing the terminal to agents — `initialize`, `tools/list`, `tools/call` with `get_screen` / `get_scrollback` / `get_cwd` / `get_title` / `get_dimensions` (the complete exemplar)
+- [x] Versioned negotiation + schema discovery: `channel/initialize` negotiates a channel version (`min(client, ours)`, erroring with the supported range below the floor), intersects the client's requested protocol set, and advertises a per-protocol capability map; `channel/describe` returns the machine-readable schema (version range + per-protocol method lists) so a client discovers the contract programmatically
+- [x] **MCP** server exposing the terminal to agents — `initialize`, `tools/list`, `tools/call` (`get_screen` / `get_scrollback` / `get_cwd` / `get_title` / `get_dimensions` / `get_cursor`) **and** `resources/list` / `resources/read` over `terminal://{screen,scrollback,cwd,title,dimensions,cursor,exit,command}` URIs (advertises `tools` + `resources` capabilities)
+- [x] **MCP push notifications + command lifecycle** — `resources/subscribe` / `resources/unsubscribe` register a client's interest; a real state change at the source emits a push on the child channel. Wired for the **full OSC 133 command lifecycle**: `A`=prompt start drives scrollback nav, `C`=output start anchors a capture, `D[;exit]`=command end. State changes that map to a resource (`terminal://cwd` via OSC 7, `terminal://title` via OSC 0/2, `terminal://command` = captured output text) push generic `notifications/resources/updated {uri}`; **command completion** pushes a typed `notifications/command_finished { exit }` to `terminal://exit` subscribers, carrying the exit code (or `null`) in the push itself so the client needs no follow-up read. **Resize** pushes `notifications/resources/updated {terminal://dimensions}`: the resize path runs in the runtime driver *outside* `advance` (no `responses` in hand), so `Grid::resize_notification()` builds the frame and the driver writes it to the child via the PTY handle (both the threaded and tokio runtimes), best-effort. The output-capture anchor decays with scrollback eviction and is **remapped across a resize** (rides the reflow like a prompt mark), keeping the capture even when the output rewraps. Notifications fire only on an actual change. High-churn resources (screen/scrollback/cursor) are deliberately poll-only and reject subscription. State on the `Grid` (`channel`, `last_exit`, `command_start`, `last_command_output`); shared `row_text` extractor. (`src/core/channel.rs`, `src/core/grid.rs`, hooks in `src/core/osc.rs`, `src/runtime/{threaded,tokio_rt}.rs`)
+- [x] **`render` protocol — structured render primitive** (the "terminal meets GUI toolkit" frontier): `set_status` / `clear_status` drive a terminal-owned status-line overlay composited over the bottom row, independent of the child's text stream. Pre-rendered cells stored on the `Grid` (`Grid::status_line`), re-laid out on resize, wide-glyph aware; honored by **all three** render paths — the `DirtyFrame` snapshot (passthrough renderer) and the direct-cell `cpu`/`gpu` GUI renderers — and suppressed on the alternate screen. (`src/core/grid.rs` `StatusLine`, `src/core/channel.rs`, `src/gui/cpu.rs`, `src/gui/gpu.rs`)
 - [x] **LSP** and **ACP** negotiable endpoints — `initialize` handshakes implemented (LSP via `rusty_lsp`'s `InitializeResult`/`ServerCapabilities`; ACP per the v1 schema); deeper methods return `method not found` until a language/agent backend is registered
 - [x] Built on `rusty_lsp` (JSON-RPC 2.0 `Message` model + LSP types), no reinvented RPC
 - [ ] DAP / Jupyter bridges; full LSP/ACP backends (need a language server / agent behind them)

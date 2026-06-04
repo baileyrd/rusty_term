@@ -205,19 +205,121 @@ fn alt_screen_survives_resize() {
 }
 
 #[test]
-fn resize_preserves_content_and_clamps_cursor() {
+fn resize_keeps_short_line_and_repaints() {
     let mut g = parse(b"hello", 80, 24);
-    g.cursor = (40, 20);
     g.resize(10, 5);
-    assert_eq!(g.cols, 10);
-    assert_eq!(g.rows, 5);
-    assert_eq!(&row_text(&g, 0)[..5], "hello"); // top-left content kept
-    assert_eq!(g.cursor, (9, 4)); // clamped into new bounds
+    assert_eq!((g.cols, g.rows), (10, 5));
+    assert_eq!(&row_text(&g, 0)[..5], "hello"); // short line rides with its row
+    assert_eq!(g.cursor, (5, 0)); // cursor stays just past its (unwrapped) line
     assert!(g.dirty.iter().all(|&d| d)); // full repaint queued
-    // Growing back keeps the surviving content and blanks new area.
+    // Growing back keeps the surviving content and blanks the new area.
     g.resize(80, 24);
     assert_eq!(&row_text(&g, 0)[..5], "hello");
     assert_eq!(g.cells[79].ch, ' ');
+}
+
+#[test]
+fn resize_narrow_rewraps_a_wrapped_line() {
+    // 15 cells auto-wrap 10|5 at width 10; narrowing to 5 re-wraps to 5|5|5
+    // rather than truncating the overflow.
+    let mut g = Grid::new(10, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"ABCDEFGHIJKLMNO");
+    assert_eq!(row_text(&g, 0), "ABCDEFGHIJ");
+    assert_eq!(row_text(&g, 1).trim_end(), "KLMNO");
+    g.resize(5, 4);
+    assert_eq!(row_text(&g, 0), "ABCDE");
+    assert_eq!(row_text(&g, 1), "FGHIJ");
+    assert_eq!(row_text(&g, 2), "KLMNO");
+    assert_eq!(g.cursor, (4, 2)); // cursor follows to the end of the rewrapped run
+}
+
+#[test]
+fn resize_widen_rejoins_a_wrapped_line() {
+    // 10 cells wrapped 5|5 at width 5; widening to 10 rejoins them on one row.
+    let mut g = Grid::new(5, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"ABCDEFGHIJ");
+    assert_eq!(row_text(&g, 0), "ABCDE");
+    assert_eq!(row_text(&g, 1), "FGHIJ");
+    g.resize(10, 4);
+    assert_eq!(row_text(&g, 0), "ABCDEFGHIJ");
+    assert_eq!(row_text(&g, 1).trim_end(), ""); // continuation pulled up
+    assert_eq!(g.cursor, (9, 0));
+}
+
+#[test]
+fn resize_roundtrip_preserves_wrapped_text() {
+    // A 30-cell logical line survives narrow→wide unchanged: the soft-wrap bit,
+    // not the physical row split, defines the line.
+    let mut g = Grid::new(20, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"the quick brown fox jumps over");
+    g.resize(7, 5); // shred into 7-wide rows, some pushed into scrollback
+    g.resize(20, 5); // and pull them all back
+    assert_eq!(row_text(&g, 0), "the quick brown fox ");
+    assert_eq!(row_text(&g, 1).trim_end(), "jumps over");
+    assert_eq!(g.cursor, (10, 1));
+}
+
+#[test]
+fn resize_does_not_rejoin_hard_breaks() {
+    // Two lines separated by a hard CR/LF stay distinct logical lines: a resize
+    // must not glue them into "helloworld".
+    let mut g = Grid::new(10, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"hello\r\nworld");
+    g.resize(3, 4);
+    assert_eq!(row_text(&g, 0), "hel");
+    assert_eq!(row_text(&g, 1).trim_end(), "lo");
+    assert_eq!(row_text(&g, 2), "wor");
+    assert_eq!(row_text(&g, 3).trim_end(), "ld");
+    assert_eq!(g.cursor, (2, 3));
+}
+
+#[test]
+fn resize_does_not_split_a_wide_glyph() {
+    // a世界你 = widths 1+2+2+2 = 7. Narrowing to 4 must keep each CJK head glued
+    // to its trailer, pushing a glyph that won't fit down to the next row.
+    let mut g = Grid::new(6, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, "a世界你".as_bytes());
+    g.resize(4, 3);
+    assert_eq!(g.cells[0].ch, 'a');
+    assert_eq!(g.cells[1].ch, '世');
+    assert_eq!(g.cells[2].flags & WIDE_TRAILER, WIDE_TRAILER);
+    assert_eq!(g.cells[3].ch, ' '); // 界 didn't fit in col 3 -> pushed down, no split
+    assert_eq!(g.cells[4].ch, '界'); // row 1, col 0
+    assert_eq!(g.cells[6].ch, '你'); // row 1, col 2
+}
+
+#[test]
+fn resize_preserves_double_width_attr() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b#6HI"); // DECDWL on row 0
+    assert_eq!(g.snapshot_dirty().line_attrs[0], LineAttr::DoubleWidth);
+    g.resize(8, 3);
+    // The line-size attribute rides the logical line through the reflow
+    // (previously a resize reset every row to Single).
+    assert_eq!(g.snapshot_dirty().line_attrs[0], LineAttr::DoubleWidth);
+}
+
+#[test]
+fn resize_preserves_prompt_marks() {
+    // Four OSC-133 prompts, the oldest scrolled into history; a resize must carry
+    // the marks through instead of clearing them (the pre-fix behavior).
+    let mut g = Grid::new(8, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;A\x07one\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07two\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07three\r\n");
+    p.advance(&mut g, b"\x1b]133;A\x07four\r\n");
+    assert!(g.scrollback.len() >= 2);
+    assert!(g.scroll_to_prev_prompt()); // navigable before resize
+    g.reset_view();
+    g.resize(4, 3); // narrows + rebuilds the buffer
+    assert!(g.scroll_to_prev_prompt()); // a prompt mark survived into history
 }
 
 #[test]
@@ -871,7 +973,7 @@ fn full_screen_scroll_captures_into_scrollback() {
     assert_eq!(g.scrollback.len(), 0);
     p.advance(&mut g, b"\r\nCCCC"); // scrolls AAAA off the top
     assert_eq!(g.scrollback.len(), 1);
-    let line: String = g.scrollback[0].iter().map(|c| c.ch).collect();
+    let line: String = g.scrollback[0].cells.iter().map(|c| c.ch).collect();
     assert_eq!(line, "AAAA");
     // Live grid now shows BBBB / CCCC.
     assert_eq!(row_text(&g, 0), "BBBB");
@@ -1331,7 +1433,7 @@ fn ind_at_bottom_scrolls_and_captures_scrollback() {
     assert_eq!(row_text(&g, 0), "BBBB");
     assert_eq!(row_text(&g, 1), "    ");
     assert_eq!(g.scrollback.len(), 1);
-    let line: String = g.scrollback[0].iter().map(|c| c.ch).collect();
+    let line: String = g.scrollback[0].cells.iter().map(|c| c.ch).collect();
     assert_eq!(line, "AAAA");
 }
 
@@ -2427,6 +2529,394 @@ mod l13 {
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         );
         assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn channel_initialize_negotiates_version_down() {
+        let mut g = Grid::new(80, 24);
+        // A client claiming a far-future version is negotiated down to ours.
+        let resp = channel_roundtrip(
+            &mut g,
+            "channel",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"version":99}}"#,
+        );
+        assert!(resp.contains("\"version\":1"), "did not downgrade: {resp}");
+        assert!(resp.contains("\"capabilities\""));
+        assert!(resp.contains("\"resources\":true"));
+    }
+
+    #[test]
+    fn channel_initialize_rejects_version_below_floor() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "channel",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"version":0}}"#,
+        );
+        assert!(resp.contains("\"error\""), "version 0 must be rejected: {resp}");
+        assert!(resp.contains("\"supported\""));
+    }
+
+    #[test]
+    fn channel_initialize_intersects_requested_protocols() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "channel",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocols":["mcp","bogus"]}}"#,
+        );
+        // Only the supported intersection comes back — "mcp" yes, "bogus"/"lsp" no.
+        assert!(resp.contains("\"protocols\":[\"mcp\"]"), "{resp}");
+    }
+
+    #[test]
+    fn channel_describe_returns_versioned_schema() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "channel",
+            r#"{"jsonrpc":"2.0","id":2,"method":"describe"}"#,
+        );
+        assert!(resp.contains("\"min\":1") && resp.contains("\"max\":1"), "{resp}");
+        assert!(resp.contains("resources/read"), "schema lists MCP resource methods: {resp}");
+        assert!(resp.contains("\"acp\""));
+    }
+
+    #[test]
+    fn mcp_resources_list_and_read() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"resource body");
+        let _ = p.take_responses();
+        let list = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
+        );
+        for uri in ["terminal://screen", "terminal://cursor", "terminal://dimensions"] {
+            assert!(list.contains(uri), "resource {uri} missing from list: {list}");
+        }
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"terminal://screen"}}"#,
+        );
+        assert!(read.contains("resource body"), "screen resource text missing: {read}");
+        assert!(read.contains("\"contents\""));
+    }
+
+    #[test]
+    fn mcp_resource_read_unknown_uri_errors() {
+        let mut g = Grid::new(80, 24);
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"terminal://nope"}}"#,
+        );
+        assert!(resp.contains("\"error\""), "unknown resource must error: {resp}");
+    }
+
+    #[test]
+    fn mcp_get_cursor_tool_reports_position() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[4;6H"); // CUP row 4, col 6 (1-based) -> cursor (5, 3)
+        let _ = p.take_responses();
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_cursor"}}"#,
+        );
+        assert!(resp.contains("5,3"), "cursor position not reported as COL,ROW: {resp}");
+    }
+
+    #[test]
+    fn subscribe_pushes_resource_updated_on_cwd_change() {
+        let mut g = Grid::new(80, 24);
+        let sub = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://cwd"}}"#,
+        );
+        assert!(sub.contains("\"result\""), "subscribe should succeed: {sub}");
+        // A cwd change (OSC 7) now pushes a notification on the child channel.
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]7;file:///tmp/x\x07");
+        let push = String::from_utf8(p.take_responses()).unwrap();
+        assert!(push.contains("notifications/resources/updated"), "no push: {push}");
+        assert!(push.contains("terminal://cwd"), "{push}");
+        assert!(!push.contains("\"id\""), "a notification carries no id: {push}");
+    }
+
+    #[test]
+    fn cwd_change_without_subscription_is_silent() {
+        let mut g = Grid::new(80, 24);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]7;file:///tmp/x\x07");
+        assert!(p.take_responses().is_empty(), "no notification without subscribe");
+    }
+
+    #[test]
+    fn unsubscribe_stops_resource_updates() {
+        let mut g = Grid::new(80, 24);
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://title"}}"#,
+        );
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/unsubscribe","params":{"uri":"terminal://title"}}"#,
+        );
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]2;new title\x07");
+        assert!(p.take_responses().is_empty(), "unsubscribed: must not notify");
+    }
+
+    #[test]
+    fn subscribe_to_high_churn_resource_errors() {
+        let mut g = Grid::new(80, 24);
+        // The screen changes on nearly every byte; it is polled, not pushed.
+        let resp = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://screen"}}"#,
+        );
+        assert!(resp.contains("\"error\""), "screen is not subscribable: {resp}");
+    }
+
+    #[test]
+    fn resource_update_fires_only_on_real_change() {
+        let mut g = Grid::new(80, 24);
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://title"}}"#,
+        );
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]2;same\x07"); // "" -> "same": a real change
+        assert!(
+            String::from_utf8(p.take_responses()).unwrap().contains("terminal://title"),
+            "first title set must notify"
+        );
+        let mut p2 = AnsiParser::new();
+        p2.advance(&mut g, b"\x1b]2;same\x07"); // "same" -> "same": no change
+        assert!(p2.take_responses().is_empty(), "a no-op title set must not notify");
+    }
+
+    #[test]
+    fn render_set_status_overlays_bottom_row() {
+        let mut g = Grid::new(10, 3);
+        let ok = channel_roundtrip(
+            &mut g,
+            "render",
+            r#"{"jsonrpc":"2.0","id":1,"method":"set_status","params":{"text":"READY"}}"#,
+        );
+        assert!(ok.contains("\"result\""), "set_status should succeed: {ok}");
+        // The bottom row of a snapshot now shows the overlay text, not grid content.
+        let frame = g.snapshot_dirty();
+        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 2).expect("bottom row dirty");
+        let text: String = bottom.iter().map(|c| c.ch).collect();
+        assert!(text.starts_with("READY"), "overlay text missing: {text:?}");
+        // Clearing restores the underlying (blank) row.
+        let _ = channel_roundtrip(
+            &mut g,
+            "render",
+            r#"{"jsonrpc":"2.0","id":2,"method":"clear_status"}"#,
+        );
+        let frame = g.snapshot_dirty();
+        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 2).expect("bottom row dirty");
+        let text: String = bottom.iter().map(|c| c.ch).collect();
+        assert!(!text.contains("READY"), "overlay not cleared: {text:?}");
+    }
+
+    #[test]
+    fn render_status_survives_resize() {
+        let mut g = Grid::new(10, 3);
+        let _ = channel_roundtrip(
+            &mut g,
+            "render",
+            r#"{"jsonrpc":"2.0","id":1,"method":"set_status","params":{"text":"hi"}}"#,
+        );
+        g.resize(4, 4); // overlay re-lays out to the new width
+        let frame = g.snapshot_dirty();
+        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 3).expect("new bottom row");
+        assert_eq!(bottom.len(), 4, "overlay re-laid to new width");
+        let text: String = bottom.iter().map(|c| c.ch).collect();
+        assert!(text.starts_with("hi"), "overlay lost across resize: {text:?}");
+    }
+
+    #[test]
+    fn render_set_status_requires_text() {
+        let mut g = Grid::new(10, 3);
+        let resp = channel_roundtrip(
+            &mut g,
+            "render",
+            r#"{"jsonrpc":"2.0","id":1,"method":"set_status","params":{}}"#,
+        );
+        assert!(resp.contains("\"error\""), "missing text must error: {resp}");
+    }
+
+    #[test]
+    fn osc_133_d_pushes_typed_command_finished() {
+        let mut g = Grid::new(20, 4);
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://exit"}}"#,
+        );
+        // A command finishes with exit 0 (OSC 133;D;0).
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]133;D;0\x07");
+        let push = String::from_utf8(p.take_responses()).unwrap();
+        assert!(push.contains("notifications/command_finished"), "no typed push: {push}");
+        assert!(push.contains("\"exit\":0"), "exit code not carried in the push: {push}");
+        // The resource now reads the exit code.
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
+        );
+        assert!(read.contains("\"text\":\"0\""), "exit code not reported: {read}");
+    }
+
+    #[test]
+    fn osc_133_d_parses_nonzero_exit_code() {
+        let mut g = Grid::new(20, 4);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]133;D;130\x07");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
+        );
+        assert!(read.contains("\"text\":\"130\""), "nonzero exit not parsed: {read}");
+    }
+
+    #[test]
+    fn osc_133_d_without_code_notifies_with_empty_exit() {
+        let mut g = Grid::new(20, 4);
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://exit"}}"#,
+        );
+        // D with no exit code still signals a finished command.
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]133;D\x07");
+        let push = String::from_utf8(p.take_responses()).unwrap();
+        assert!(push.contains("notifications/command_finished"), "must push on finish: {push}");
+        assert!(push.contains("\"exit\":null"), "a missing code should push null: {push}");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
+        );
+        assert!(read.contains("\"text\":\"\""), "missing code should read empty: {read}");
+    }
+
+    #[test]
+    fn osc_133_captures_command_output() {
+        let mut g = Grid::new(20, 5);
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://command"}}"#,
+        );
+        // Prompt, command line, output-start, output, command-end.
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]133;A\x07$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        let push = String::from_utf8(p.take_responses()).unwrap();
+        assert!(push.contains("terminal://command"), "command finish must push: {push}");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
+        );
+        assert!(read.contains("\"text\":\"hi\""), "captured output wrong: {read}");
+    }
+
+    #[test]
+    fn osc_133_captures_multiline_output() {
+        let mut g = Grid::new(20, 6);
+        let mut p = AnsiParser::new();
+        p.advance(
+            &mut g,
+            b"\x1b]133;A\x07$ ls\r\n\x1b]133;C\x07a.txt\r\nb.txt\r\n\x1b]133;D;0\x07",
+        );
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
+        );
+        // Output rows joined by a newline (escaped in JSON).
+        assert!(read.contains("a.txt\\nb.txt"), "multi-line capture wrong: {read}");
+    }
+
+    #[test]
+    fn osc_133_d_without_c_captures_no_output() {
+        let mut g = Grid::new(20, 5);
+        let mut p = AnsiParser::new();
+        // Empty command line: prompt then finish, no output-start marker.
+        p.advance(&mut g, b"\x1b]133;A\x07$ \r\n\x1b]133;D;0\x07");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
+        );
+        assert!(read.contains("\"text\":\"\""), "no C means no captured output: {read}");
+    }
+
+    #[test]
+    fn resize_preserves_in_flight_command_capture() {
+        let mut g = Grid::new(20, 5);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b]133;A\x07$ x\r\n\x1b]133;C\x07partial\r\n");
+        g.resize(10, 5); // mid-command resize: the anchor rides the reflow
+        p.advance(&mut g, b"\x1b]133;D;0\x07");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
+        );
+        assert!(read.contains("\"text\":\"partial\""), "resize must keep the capture: {read}");
+    }
+
+    #[test]
+    fn resize_rewraps_captured_command_output() {
+        let mut g = Grid::new(10, 5);
+        let mut p = AnsiParser::new();
+        // Output is one row at width 10; narrowing to 4 rewraps it to two rows,
+        // and the capture must follow the rewrap.
+        p.advance(&mut g, b"\x1b]133;A\x07$ x\r\n\x1b]133;C\x07ABCDEFGH\r\n");
+        g.resize(4, 6);
+        p.advance(&mut g, b"\x1b]133;D;0\x07");
+        let read = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
+        );
+        assert!(read.contains("ABCD\\nEFGH"), "capture must reflect the rewrap: {read}");
+    }
+
+    #[test]
+    fn resize_notifies_dimensions_subscriber() {
+        let mut g = Grid::new(80, 24);
+        // No subscriber: the driver gets nothing to send.
+        assert!(g.resize_notification().is_none(), "unsubscribed: no frame");
+        // After subscribing, a resize yields a dimensions update for the driver
+        // to write to the child (the resize path runs outside `advance`).
+        let _ = channel_roundtrip(
+            &mut g,
+            "mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://dimensions"}}"#,
+        );
+        g.resize(100, 30);
+        let frame = g.resize_notification().expect("subscribed: a frame");
+        let s = String::from_utf8(frame).unwrap();
+        assert!(s.contains("notifications/resources/updated"), "{s}");
+        assert!(s.contains("terminal://dimensions"), "{s}");
     }
 }
 
