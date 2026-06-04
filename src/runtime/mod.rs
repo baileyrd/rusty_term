@@ -18,8 +18,10 @@ mod tokio_rt;
 pub use tokio_rt::run;
 
 /// The signature every runtime's `run` must satisfy: take ownership of the
-/// backend and the shared grid, plus the host's initial size, and drive the
-/// terminal until the child exits or input ends. Documented here as the
-/// contract; the active runtime provides the concrete `run`.
+/// backend, the shared grid, the host's initial size, and the startup
+/// configuration, and drive the terminal until the child exits or input ends.
+/// Documented here as the contract; the active runtime provides the concrete
+/// `run`.
 #[allow(dead_code)]
-type RunFn = fn(Box<dyn Backend>, Arc<Mutex<Grid>>, u16, u16) -> std::io::Result<()>;
+type RunFn =
+    fn(Box<dyn Backend>, Arc<Mutex<Grid>>, u16, u16, crate::config::Config) -> std::io::Result<()>;

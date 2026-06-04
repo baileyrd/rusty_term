@@ -40,7 +40,12 @@ pub struct WindowsBackend;
 static ORIGINAL_MODES: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 impl Backend for WindowsBackend {
-    fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn BackendHandle>, std::io::Error> {
+    fn spawn_shell(
+        &self,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+    ) -> Result<Box<dyn BackendHandle>, std::io::Error> {
         use std::os::windows::ffi::OsStrExt;
 
         unsafe {
@@ -105,9 +110,13 @@ impl Backend for WindowsBackend {
                 return Err(e);
             }
 
-            // Honor %COMSPEC%, default cmd.exe. CreateProcessW needs a mutable,
-            // null-terminated wide command line.
-            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            // The configured shell wins; else honor %COMSPEC%, default cmd.exe.
+            // CreateProcessW needs a mutable, null-terminated wide command line.
+            let shell = shell
+                .map(str::to_owned)
+                .or_else(|| std::env::var("COMSPEC").ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "cmd.exe".to_string());
             let mut cmdline: Vec<u16> = std::ffi::OsStr::new(&shell)
                 .encode_wide()
                 .chain(std::iter::once(0))

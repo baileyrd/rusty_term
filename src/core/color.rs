@@ -6,6 +6,35 @@
 
 use super::cell::{DEFAULT_BG, DEFAULT_FG};
 
+/// Startup color theme: the default foreground/background/cursor plus the
+/// 16-color ANSI palette, as configured by the user. The "built-in values"
+/// every reset path (RIS, DECSTR, OSC 104/110/111/112) restores — so a
+/// configured theme survives a `reset`, exactly as the hardware defaults
+/// would. Indexed colors 16-255 always come from the fixed xterm cube/ramp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    /// Default foreground (SGR 39).
+    pub fg: u32,
+    /// Default background (SGR 49) — also the erase-fill color.
+    pub bg: u32,
+    /// Cursor color (OSC 12 round-trips).
+    pub cursor: u32,
+    /// ANSI palette indices 0-15 (normal + bright).
+    pub palette16: [u32; 16],
+}
+
+impl Default for Theme {
+    /// The classic built-ins: white on black, xterm 16-color palette.
+    fn default() -> Self {
+        Theme {
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            cursor: DEFAULT_FG,
+            palette16: PALETTE_16,
+        }
+    }
+}
+
 /// Standard 16-color ANSI palette (indices 0-7 normal, 8-15 bright), in
 /// `0xRRGGBB` form. Roughly matches the classic xterm palette. The seed for the
 /// low 16 entries of a fresh [`Palette`].
@@ -30,6 +59,8 @@ pub(crate) struct Palette {
     /// Cursor color (OSC 12). Stored for query round-trips; the renderer owns
     /// the host cursor, so it is not painted yet.
     pub(crate) cursor: u32,
+    /// The configured startup theme: what every reset restores.
+    seed: Theme,
 }
 
 impl Default for Palette {
@@ -42,22 +73,30 @@ impl Palette {
     /// A palette seeded with the built-in xterm 256-color table and default
     /// colors.
     pub(crate) fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    /// A palette seeded from `theme`: its fg/bg/cursor and 16-color palette,
+    /// with indices 16-255 from the fixed xterm table. The theme is retained
+    /// as the target of every subsequent reset.
+    pub(crate) fn with_theme(theme: Theme) -> Self {
         let mut colors = [0u32; 256];
         for (i, slot) in colors.iter_mut().enumerate() {
-            *slot = xterm_256_to_rgb(i);
+            *slot = theme_index(&theme, i);
         }
         Palette {
             colors,
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
-            cursor: DEFAULT_FG,
+            fg: theme.fg,
+            bg: theme.bg,
+            cursor: theme.cursor,
+            seed: theme,
         }
     }
 
     /// Reset the indexed table *and* the default colors to the built-in values
     /// (RIS / DECSTR).
     pub(crate) fn reset(&mut self) {
-        *self = Palette::new();
+        *self = Palette::with_theme(self.seed);
     }
 
     /// Reset every indexed color (or, if `indices` is non-empty, only those) to
@@ -65,12 +104,12 @@ impl Palette {
     pub(crate) fn reset_colors(&mut self, indices: &[usize]) {
         if indices.is_empty() {
             for (i, slot) in self.colors.iter_mut().enumerate() {
-                *slot = xterm_256_to_rgb(i);
+                *slot = theme_index(&self.seed, i);
             }
         } else {
             for &n in indices {
                 if n < self.colors.len() {
-                    self.colors[n] = xterm_256_to_rgb(n);
+                    self.colors[n] = theme_index(&self.seed, n);
                 }
             }
         }
@@ -78,17 +117,17 @@ impl Palette {
 
     /// Reset only the default foreground to its built-in value (OSC 110).
     pub(crate) fn reset_fg(&mut self) {
-        self.fg = DEFAULT_FG;
+        self.fg = self.seed.fg;
     }
 
     /// Reset only the default background to its built-in value (OSC 111).
     pub(crate) fn reset_bg(&mut self) {
-        self.bg = DEFAULT_BG;
+        self.bg = self.seed.bg;
     }
 
     /// Reset only the cursor color to its built-in value (OSC 112).
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = DEFAULT_FG;
+        self.cursor = self.seed.cursor;
     }
 
     /// The `0xRRGGBB` of palette index `n`. Indices ≥ 256 (never produced by
@@ -124,6 +163,15 @@ impl Palette {
             }
             _ => None,
         }
+    }
+}
+
+/// The "built-in" value of palette index `n` under `theme`: 0-15 come from the
+/// theme's ANSI palette, 16-255 from the fixed xterm cube/ramp.
+fn theme_index(theme: &Theme, n: usize) -> u32 {
+    match n {
+        0..=15 => theme.palette16[n],
+        _ => xterm_256_to_rgb(n),
     }
 }
 

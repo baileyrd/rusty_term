@@ -466,7 +466,7 @@ mod tests {
     /// `gpu_renders_to_texture`.
     #[test]
     fn gpu_core_builds() {
-        let Some(bytes) = super::super::font::load_default_font() else {
+        let Some(bytes) = super::super::font::load_default_font(None) else {
             eprintln!("no system font; skipping GPU core test");
             return;
         };
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     #[ignore = "render+readback needs a working GPU adapter; lavapipe/dzn crash headless"]
     fn gpu_renders_to_texture() {
-        let mut font = FontCache::new(super::super::font::load_default_font().unwrap(), 16.0).unwrap();
+        let mut font = FontCache::new(super::super::font::load_default_font(None).unwrap(), 16.0).unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut core = GpuCore::new(&instance, None, &mut font).expect("adapter");
 

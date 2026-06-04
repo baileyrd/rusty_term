@@ -3022,3 +3022,92 @@ fn su_huge_count_clears_region_without_flooding_scrollback() {
     assert_eq!(row_text(&g, 1).trim_end(), "");
     assert_eq!(g.scrollback.len(), 2, "only the region's rows reach scrollback");
 }
+
+// --- Configured theme (startup config) ---
+
+/// A distinctive test theme: dark-grey bg, off-white fg, red cursor, and a
+/// remapped ANSI red (index 1).
+fn test_theme() -> Theme {
+    let mut t = Theme::default();
+    t.fg = 0xd8d8d8;
+    t.bg = 0x1d1f21;
+    t.cursor = 0xff0000;
+    t.palette16[1] = 0xcc6666;
+    t
+}
+
+#[test]
+fn themed_parser_writes_text_in_theme_colors() {
+    let mut g = Grid::new(8, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    p.advance(&mut g, b"hi\x1b[31mr");
+    let c = g.cells[0];
+    assert_eq!(c.fg, 0xd8d8d8, "plain text uses the themed default fg");
+    assert_eq!(c.bg, 0x1d1f21, "plain text uses the themed default bg");
+    let r = g.cells[2];
+    assert_eq!(r.fg, 0xcc6666, "SGR 31 resolves through the themed palette");
+}
+
+#[test]
+fn themed_grid_erases_in_theme_background() {
+    let mut g = Grid::new(4, 2);
+    g.apply_theme(&test_theme());
+    // Untouched (startup) cells already carry the themed colors...
+    assert_eq!(g.cells[0].bg, 0x1d1f21);
+    // ...and so do cells cleared after output (ED 2).
+    let mut p = AnsiParser::with_theme(test_theme());
+    p.advance(&mut g, b"xx\x1b[2J");
+    assert_eq!(g.cells[0].bg, 0x1d1f21, "ED fills with the themed bg");
+}
+
+#[test]
+fn ris_restores_theme_not_builtin() {
+    let mut g = Grid::new(4, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    // The child sets its own colors (OSC 10/11), then fully resets.
+    p.advance(&mut g, b"\x1b]10;#ffffff\x07\x1b]11;#000000\x07\x1b\x63x");
+    let c = g.cells[0];
+    assert_eq!(c.fg, 0xd8d8d8, "RIS returns to the configured fg, not white");
+    assert_eq!(c.bg, 0x1d1f21, "RIS returns to the configured bg, not black");
+}
+
+#[test]
+fn osc_110_111_reset_to_theme() {
+    let mut g = Grid::new(4, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    p.advance(&mut g, b"\x1b]10;#123456\x07\x1b]110\x07\x1b]111\x07x");
+    let c = g.cells[0];
+    assert_eq!(c.fg, 0xd8d8d8, "OSC 110 restores the themed fg");
+    assert_eq!(c.bg, 0x1d1f21, "OSC 111 restores the themed bg");
+}
+
+#[test]
+fn osc_104_resets_palette_to_theme() {
+    let mut g = Grid::new(8, 2);
+    let mut p = AnsiParser::with_theme(test_theme());
+    // Remap index 1 via OSC 4, then reset it via OSC 104;1 — it must return to
+    // the *themed* red, not the stock xterm 0x800000.
+    p.advance(&mut g, b"\x1b]4;1;#0000ff\x07\x1b]104;1\x07\x1b[31mx");
+    assert_eq!(g.cells[0].fg, 0xcc6666, "OSC 104 restores the themed index 1");
+}
+
+#[test]
+fn custom_scrollback_cap_is_enforced() {
+    let mut g = Grid::new(4, 2);
+    g.set_scrollback_max(3);
+    let mut p = AnsiParser::new();
+    for i in 0..10 {
+        p.advance(&mut g, format!("l{i}\r\n").as_bytes());
+    }
+    assert_eq!(g.scrollback.len(), 3, "cap honored during scrolling");
+    // Shrinking the cap trims an overfull buffer immediately.
+    g.set_scrollback_max(1);
+    assert_eq!(g.scrollback.len(), 1);
+    // Zero disables history.
+    g.set_scrollback_max(0);
+    p.advance(&mut g, b"more\r\nlines\r\n");
+    assert_eq!(g.scrollback.len(), 0, "zero cap keeps history empty");
+}

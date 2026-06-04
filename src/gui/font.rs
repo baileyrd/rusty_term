@@ -116,9 +116,15 @@ fn rasterize(font: &FontVec, scale: PxScale, ch: char) -> Glyph {
     }
 }
 
-/// Load a monospace font: `$RUSTY_TERM_FONT` if set and readable, else the first
-/// hit from a list of common system locations. `None` if nothing is found.
-pub(crate) fn load_default_font() -> Option<Vec<u8>> {
+/// Load a monospace font: the configured path (the `font` config key) if set
+/// and readable, else `$RUSTY_TERM_FONT`, else the first hit from a list of
+/// common system locations. `None` if nothing is found.
+pub(crate) fn load_default_font(configured: Option<&std::path::Path>) -> Option<Vec<u8>> {
+    if let Some(path) = configured
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        return Some(bytes);
+    }
     if let Some(path) = std::env::var_os("RUSTY_TERM_FONT")
         && let Ok(bytes) = std::fs::read(&path)
     {
@@ -145,7 +151,7 @@ mod tests {
     fn real_font_metrics_and_glyphs() {
         // Uses a system font if one is present; skips cleanly otherwise so the
         // suite stays green on hosts without the candidate fonts.
-        let Some(bytes) = load_default_font() else {
+        let Some(bytes) = load_default_font(None) else {
             eprintln!("no system monospace font found; skipping font integration test");
             return;
         };

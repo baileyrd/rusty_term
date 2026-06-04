@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn real_font_fills_a_frame() {
-        let Some(bytes) = super::super::font::load_default_font() else {
+        let Some(bytes) = super::super::font::load_default_font(None) else {
             eprintln!("no system font; skipping real-font render");
             return;
         };

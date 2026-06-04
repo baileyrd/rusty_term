@@ -15,7 +15,7 @@ use super::cell::{
 use super::channel;
 use super::charset::Charset;
 use super::color::Palette;
-use super::grid::{Grid, LineAttr, SCROLLBACK_MAX, alt_mode};
+use super::grid::{Grid, LineAttr, alt_mode};
 use super::kitty;
 use super::osc;
 use super::sixel;
@@ -140,9 +140,22 @@ impl Default for AnsiParser {
 impl AnsiParser {
     /// Create a parser in the ground state with default colors.
     pub fn new() -> Self {
+        Self::with_theme(super::color::Theme::default())
+    }
+
+    /// Create a parser in the ground state whose palette — and every later
+    /// reset of it — is seeded from `theme`. The initial pen uses the theme's
+    /// default colors, so text drawn before any SGR lands in the right colors.
+    pub fn with_theme(theme: super::color::Theme) -> Self {
+        let palette = Palette::with_theme(theme);
+        let pen = Pen {
+            fg: palette.fg,
+            bg: palette.bg,
+            attrs: 0,
+        };
         Self {
             state: ParserState::Ground,
-            pen: Pen::default(),
+            pen,
             param_buffer: String::new(),
             csi_private: false,
             csi_marker: 0,
@@ -158,7 +171,7 @@ impl AnsiParser {
             charsets: [Charset::Ascii; 4],
             gl: 0,
             charset_slot: 0,
-            palette: Palette::new(),
+            palette,
         }
     }
 
@@ -238,9 +251,12 @@ impl AnsiParser {
                     }
                     // RIS — reset to initial state (full reset).
                     b'c' => {
-                        g.reset();
                         self.palette.reset();
-                        self.pen = Pen::default();
+                        self.reset_sgr();
+                        // Sync the themed defaults *before* the grid refills
+                        // its cells, so the blank screen lands in theme colors.
+                        g.set_default_colors(self.palette.fg, self.palette.bg);
+                        g.reset();
                         self.charsets = [Charset::Ascii; 4];
                         self.gl = 0;
                         self.last_char = None;
@@ -668,7 +684,7 @@ impl AnsiParser {
                 // an unclamped value (parsed up to `usize`) would spin under the
                 // held grid lock and hang the terminal on hostile input.
                 if let Some(ch) = self.last_char {
-                    let cap = g.rows.saturating_add(SCROLLBACK_MAX).saturating_mul(g.cols);
+                    let cap = g.rows.saturating_add(g.scrollback_max).saturating_mul(g.cols);
                     for _ in 0..count.min(cap) {
                         g.put_char(ch, self.pen);
                     }
@@ -745,9 +761,10 @@ impl AnsiParser {
             }
             b'p' if self.csi_intermediate == b'!' => {
                 // DECSTR — soft terminal reset (`CSI ! p`).
-                g.soft_reset();
                 self.palette.reset();
-                self.pen = Pen::default();
+                self.reset_sgr();
+                g.set_default_colors(self.palette.fg, self.palette.bg);
+                g.soft_reset();
                 self.last_char = None;
                 self.charsets = [Charset::Ascii; 4];
                 self.gl = 0;
