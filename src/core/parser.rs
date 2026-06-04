@@ -255,7 +255,7 @@ impl AnsiParser {
                         self.reset_sgr();
                         // Sync the themed defaults *before* the grid refills
                         // its cells, so the blank screen lands in theme colors.
-                        g.set_default_colors(self.palette.fg, self.palette.bg);
+                        g.set_default_colors(self.palette.fg, self.palette.bg, self.palette.cursor);
                         g.reset();
                         self.charsets = [Charset::Ascii; 4];
                         self.gl = 0;
@@ -763,7 +763,7 @@ impl AnsiParser {
                 // DECSTR — soft terminal reset (`CSI ! p`).
                 self.palette.reset();
                 self.reset_sgr();
-                g.set_default_colors(self.palette.fg, self.palette.bg);
+                g.set_default_colors(self.palette.fg, self.palette.bg, self.palette.cursor);
                 g.soft_reset();
                 self.last_char = None;
                 self.charsets = [Charset::Ascii; 4];

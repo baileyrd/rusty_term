@@ -25,10 +25,14 @@ pub(crate) fn render(
         return;
     }
 
-    // Block cursor + drag-selection are drawn by inverting a cell's fg/bg. The
-    // cursor shows only on the live view, not while scrolled into history.
+    // The block cursor paints the cell in the cursor color (OSC 12 / the
+    // `cursor` config key) with the glyph in the cell's background, so it
+    // reads like an inversion but honors the configured color. It shows only
+    // on the live view, not while scrolled into history. Drag-selection still
+    // inverts the cell's own fg/bg.
     let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
-    let inverted = |col: usize, row: usize| cursor == Some((col, row)) || grid.is_selected(col, row);
+    let at_cursor = |col: usize, row: usize| cursor == Some((col, row));
+    let inverted = |col: usize, row: usize| grid.is_selected(col, row);
 
     // The status-line overlay (L13), when present, replaces the bottom row.
     let status = grid.status_row();
@@ -40,7 +44,13 @@ pub(crate) fn render(
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
         let cell = if on_status { status.unwrap()[col] } else { *cell };
-        let bg = if !on_status && inverted(col, row) { cell.fg } else { cell.bg };
+        let bg = if !on_status && at_cursor(col, row) {
+            grid.cursor_color
+        } else if !on_status && inverted(col, row) {
+            cell.fg
+        } else {
+            cell.bg
+        };
         let (x0, y0) = (col * cw, row * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
@@ -62,7 +72,11 @@ pub(crate) fn render(
         if glyph.width == 0 {
             continue;
         }
-        let fg = if !on_status && inverted(col, row) { cell.bg } else { cell.fg };
+        let fg = if !on_status && (at_cursor(col, row) || inverted(col, row)) {
+            cell.bg
+        } else {
+            cell.fg
+        };
         let pen_x = (col * cw) as i32 + glyph.left;
         let pen_y = (row * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
@@ -201,17 +215,44 @@ mod tests {
     }
 
     #[test]
-    fn cursor_inverts_its_cell() {
+    fn cursor_paints_in_cursor_color() {
         // Red fg on blue bg, a space (no glyph) so only the block shows.
         let mut g = Grid::new(1, 1);
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m ");
         g.cursor = (0, 0);
         g.cursor_visible = true;
+        // Default cursor color (white): the cell is a white block.
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &mut MockFont, &mut buf, 4, 8);
-        // Inverted: the cell is painted in the fg color (red), not the blue bg.
-        assert!(buf.iter().all(|&px| px == 0xFF0000), "cursor cell is a red block");
+        assert!(
+            buf.iter().all(|&px| px == 0xFFFFFF),
+            "default cursor is a white block"
+        );
+        // A configured/OSC-12 cursor color paints the block in that color.
+        g.cursor_color = 0x00FF00;
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &mut MockFont, &mut buf, 4, 8);
+        assert!(
+            buf.iter().all(|&px| px == 0x00FF00),
+            "cursor block honors cursor_color"
+        );
+    }
+
+    #[test]
+    fn osc12_recolors_the_cursor_block() {
+        // The child sets the cursor color at runtime; the renderer follows.
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m \x1b]12;#ff8800\x07");
+        g.cursor = (0, 0);
+        g.cursor_visible = true;
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &mut MockFont, &mut buf, 4, 8);
+        assert!(
+            buf.iter().all(|&px| px == 0xFF8800),
+            "OSC 12 color reaches the block cursor"
+        );
     }
 
     #[test]

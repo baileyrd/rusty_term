@@ -138,6 +138,10 @@ pub struct Grid {
     /// theme set via OSC 11 colors cleared regions, not just freshly written text.
     default_fg: u32,
     default_bg: u32,
+    /// Cursor color (OSC 12 / the `cursor` config key), mirrored from the
+    /// parser's palette like the defaults above. The windowed renderers paint
+    /// the block cursor in it; the TUI host owns its own cursor.
+    pub cursor_color: u32,
     /// Logical line indices (counting from the oldest retained scrollback line)
     /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
     /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
@@ -607,6 +611,7 @@ impl Grid {
             insert_mode: false,
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
+            cursor_color: DEFAULT_FG,
             line_attrs: vec![LineAttr::Single; rows],
             wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
@@ -1086,11 +1091,20 @@ impl Grid {
         c
     }
 
-    /// Update the default foreground/background colors (OSC 10/11). Mirrors the
-    /// parser's palette so subsequent erases fill with the new background.
-    pub(crate) fn set_default_colors(&mut self, fg: u32, bg: u32) {
+    /// Update the default foreground/background/cursor colors (OSC 10/11/12).
+    /// Mirrors the parser's palette so subsequent erases fill with the new
+    /// background and the windowed cursor paints in the new cursor color.
+    pub(crate) fn set_default_colors(&mut self, fg: u32, bg: u32, cursor: u32) {
         self.default_fg = fg;
         self.default_bg = bg;
+        if self.cursor_color != cursor {
+            self.cursor_color = cursor;
+            // Repaint the cursor cell's row so a pure OSC 12 change shows.
+            let row = self.cursor.1;
+            if let Some(d) = self.dirty.get_mut(row) {
+                *d = true;
+            }
+        }
     }
 
     /// Override the scrollback line cap (the `scrollback` config key). `0`
@@ -1113,7 +1127,7 @@ impl Grid {
     /// before any child output is parsed — the screen is all blank cells, so
     /// refilling is exact, not lossy.
     pub fn apply_theme(&mut self, theme: &super::Theme) {
-        self.set_default_colors(theme.fg, theme.bg);
+        self.set_default_colors(theme.fg, theme.bg, theme.cursor);
         self.cells = vec![self.erase_cell(); self.cols * self.rows];
         self.dirty = vec![true; self.rows];
     }

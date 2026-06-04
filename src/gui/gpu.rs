@@ -323,8 +323,10 @@ impl GpuCore {
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        // Block cursor + drag-selection invert a cell's fg/bg (no shader change).
-        // The cursor shows only on the live view, not while scrolled into history.
+        // The block cursor paints the cell in the cursor color (OSC 12 / the
+        // `cursor` config key) with the glyph in the cell's bg; drag-selection
+        // inverts the cell's own fg/bg (no shader change either way). The
+        // cursor shows only on the live view, not while scrolled into history.
         let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
         let status = grid.status_row();
         let last_row = grid.rows.saturating_sub(1);
@@ -337,8 +339,13 @@ impl GpuCore {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let inv = !on_status && (cursor == Some((col, row)) || grid.is_selected(col, row));
-            let (fg, bg) = if inv { (cell.bg, cell.fg) } else { (cell.fg, cell.bg) };
+            let (fg, bg) = if !on_status && cursor == Some((col, row)) {
+                (cell.bg, grid.cursor_color)
+            } else if !on_status && grid.is_selected(col, row) {
+                (cell.bg, cell.fg)
+            } else {
+                (cell.fg, cell.bg)
+            };
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {
                 col: col as u32,

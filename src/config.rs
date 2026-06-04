@@ -211,6 +211,11 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("", "scrollback") => {
             cfg.scrollback = Some(expect_int(key, value)?.clamp(0, 10_000_000) as usize)
         }
+        ("", "theme") => {
+            let name = expect_str(key, value)?;
+            cfg.theme = preset(&name)
+                .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESET_NAMES))?;
+        }
         ("window", "cols") => cfg.cols = Some(expect_dim(key, value)?),
         ("window", "rows") => cfg.rows = Some(expect_dim(key, value)?),
         ("window", "font") => cfg.font = Some(PathBuf::from(expect_str(key, value)?)),
@@ -280,6 +285,77 @@ fn expect_color(key: &str, v: Value) -> Result<u32, String> {
         return Ok(rgb);
     }
     Err(format!("{key}: `{s}` is not #RRGGBB"))
+}
+
+/// The preset names, for the unknown-theme warning.
+const PRESET_NAMES: &str =
+    "default, gruvbox-dark, dracula, solarized-dark, solarized-light, nord, one-dark";
+
+/// A built-in theme preset by (case/sep-insensitive) name, or `None`. Colors
+/// are the published palettes of each scheme. `theme = "name"` seeds the whole
+/// [`Theme`]; explicit `[colors]` keys still override individual entries when
+/// they appear after it in the file.
+fn preset(name: &str) -> Option<Theme> {
+    let key = name.to_ascii_lowercase().replace(['-', '_', ' '], "");
+    let t = |fg, bg, cursor, palette16| Theme { fg, bg, cursor, palette16 };
+    Some(match key.as_str() {
+        "default" => Theme::default(),
+        "gruvboxdark" | "gruvbox" => t(
+            0xebdbb2,
+            0x282828,
+            0xebdbb2,
+            [
+                0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
+                0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+            ],
+        ),
+        "dracula" => t(
+            0xf8f8f2,
+            0x282a36,
+            0xf8f8f2,
+            [
+                0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2,
+                0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5, 0xd6acff, 0xff92df, 0xa4ffff, 0xffffff,
+            ],
+        ),
+        "solarizeddark" | "solarized" => t(
+            0x839496,
+            0x002b36,
+            0x839496,
+            [
+                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+            ],
+        ),
+        "solarizedlight" => t(
+            0x657b83,
+            0xfdf6e3,
+            0x657b83,
+            [
+                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+            ],
+        ),
+        "nord" => t(
+            0xd8dee9,
+            0x2e3440,
+            0xd8dee9,
+            [
+                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+                0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+            ],
+        ),
+        "onedark" | "one" => t(
+            0xabb2bf,
+            0x282c34,
+            0x528bff,
+            [
+                0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
+                0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
+            ],
+        ),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -390,5 +466,36 @@ color15 = "ffffff"
         let (cfg, warns) = Config::load(&args);
         assert_eq!(cfg, Config::default());
         assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn theme_preset_seeds_colors() {
+        let (cfg, warns) = parse("theme = \"gruvbox-dark\"\n");
+        assert!(warns.is_empty());
+        assert_eq!(cfg.theme.bg, 0x282828);
+        assert_eq!(cfg.theme.fg, 0xebdbb2);
+        assert_eq!(cfg.theme.palette16[1], 0xcc241d, "gruvbox red");
+        // Name normalization: case and separators don't matter.
+        assert_eq!(preset("Gruvbox_Dark"), preset("gruvbox-dark"));
+        assert_eq!(preset("SOLARIZED LIGHT"), preset("solarized-light"));
+        assert!(preset("not-a-theme").is_none());
+    }
+
+    #[test]
+    fn explicit_colors_override_preset() {
+        // [colors] after `theme = ...` overrides individual entries.
+        let (cfg, warns) = parse("theme = \"dracula\"\n[colors]\nbackground = \"#000000\"\n");
+        assert!(warns.is_empty());
+        assert_eq!(cfg.theme.bg, 0x000000, "explicit bg wins");
+        assert_eq!(cfg.theme.fg, 0xf8f8f2, "dracula fg kept");
+        assert_eq!(cfg.theme.palette16[4], 0xbd93f9, "dracula purple kept");
+    }
+
+    #[test]
+    fn unknown_theme_warns_and_keeps_defaults() {
+        let (cfg, warns) = parse("theme = \"vaporwave\"\n");
+        assert_eq!(cfg.theme, Theme::default());
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("unknown theme"));
     }
 }

@@ -99,6 +99,8 @@ backslash escapes, integers, floats) parsed without any dependency:
 ```toml
 shell = "/usr/bin/fish"  # child to spawn; default $SHELL / %COMSPEC%
 scrollback = 5000        # history line cap; default 10000, 0 disables
+theme = "gruvbox-dark"   # preset: default, gruvbox-dark, dracula,
+                         # solarized-dark, solarized-light, nord, one-dark
 ```
 
 On Windows, `shell` accepts a bare name resolved through the standard search
@@ -125,9 +127,12 @@ color1 = "#cc6666"
 
 The `[colors]` theme is what every reset path (`RIS`, `DECSTR`, OSC
 104/110/111/112) restores, so a configured look survives a `reset` exactly
-the way the hardware defaults would. Indexed colors 16–255 always come from
-the fixed xterm cube/ramp. In TUI mode `cols`/`rows` are ignored (the host
-terminal owns its size), and `font`/`font-size` apply only to `--gui`.
+the way the hardware defaults would. A `theme = "name"` preset seeds all the
+colors at once; `[colors]` keys placed after it override individual entries.
+The windowed block cursor is painted in the `cursor` color (and follows
+OSC 12 at runtime). Indexed colors 16–255 always come from the fixed xterm
+cube/ramp. In TUI mode `cols`/`rows` are ignored (the host terminal owns its
+size), and `font`/`font-size` apply only to `--gui`.
 
 #### Window backend controls (`--gui`)
 

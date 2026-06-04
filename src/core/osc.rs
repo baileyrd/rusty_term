@@ -107,7 +107,7 @@ pub(crate) fn dispatch(
             if pen.fg == old {
                 pen.fg = palette.fg;
             }
-            g.set_default_colors(palette.fg, palette.bg);
+            g.set_default_colors(palette.fg, palette.bg, palette.cursor);
         }
         "111" => {
             let old = palette.bg;
@@ -115,9 +115,12 @@ pub(crate) fn dispatch(
             if pen.bg == old {
                 pen.bg = palette.bg;
             }
-            g.set_default_colors(palette.fg, palette.bg);
+            g.set_default_colors(palette.fg, palette.bg, palette.cursor);
         }
-        "112" => palette.reset_cursor(),
+        "112" => {
+            palette.reset_cursor();
+            g.set_default_colors(palette.fg, palette.bg, palette.cursor);
+        }
         // 133 (shell integration / FinalTerm): A=prompt start, B=prompt end,
         // C=command output start, D[;exit]=command end. We record prompt starts
         // for prompt-to-prompt scrollback navigation and, under `l13`, surface
@@ -226,5 +229,5 @@ fn set_dynamic_colors(
         }
         role += 1;
     }
-    g.set_default_colors(palette.fg, palette.bg);
+    g.set_default_colors(palette.fg, palette.bg, palette.cursor);
 }
