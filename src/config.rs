@@ -288,8 +288,9 @@ fn expect_color(key: &str, v: Value) -> Result<u32, String> {
 }
 
 /// The preset names, for the unknown-theme warning.
-const PRESET_NAMES: &str =
-    "default, gruvbox-dark, dracula, solarized-dark, solarized-light, nord, one-dark";
+const PRESET_NAMES: &str = "default, gruvbox-dark, dracula, solarized-dark, solarized-light, \
+     nord, one-dark, catppuccin-mocha, catppuccin-latte, tokyo-night, tokyo-night-storm, \
+     monokai, rose-pine, github-dark, kanagawa";
 
 /// A built-in theme preset by (case/sep-insensitive) name, or `None`. Colors
 /// are the published palettes of each scheme. `theme = "name"` seeds the whole
@@ -352,6 +353,78 @@ fn preset(name: &str) -> Option<Theme> {
             [
                 0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
                 0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
+            ],
+        ),
+        "catppuccinmocha" | "catppuccin" => t(
+            0xcdd6f4,
+            0x1e1e2e,
+            0xf5e0dc,
+            [
+                0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de,
+                0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+            ],
+        ),
+        "catppuccinlatte" => t(
+            0x4c4f69,
+            0xeff1f5,
+            0xdc8a78,
+            [
+                0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xacb0be,
+                0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xbcc0cc,
+            ],
+        ),
+        "tokyonight" => t(
+            0xc0caf5,
+            0x1a1b26,
+            0xc0caf5,
+            [
+                0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
+                0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
+            ],
+        ),
+        "tokyonightstorm" => t(
+            0xc0caf5,
+            0x24283b,
+            0xc0caf5,
+            [
+                0x1d202f, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
+                0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
+            ],
+        ),
+        "monokai" => t(
+            0xf8f8f2,
+            0x272822,
+            0xf8f8f2,
+            [
+                0x272822, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf8f8f2,
+                0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
+            ],
+        ),
+        "rosepine" => t(
+            0xe0def4,
+            0x191724,
+            0xe0def4,
+            [
+                0x26233a, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xebbcba, 0xe0def4,
+                0x6e6a86, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xebbcba, 0xe0def4,
+            ],
+        ),
+        "githubdark" | "github" => t(
+            0xc9d1d9,
+            0x0d1117,
+            0x58a6ff,
+            [
+                0x484f58, 0xff7b72, 0x3fb950, 0xd29922, 0x58a6ff, 0xbc8cff, 0x39c5cf, 0xb1bac4,
+                0x6e7681, 0xffa198, 0x56d364, 0xe3b341, 0x79c0ff, 0xd2a8ff, 0x56d4dd, 0xf0f6fc,
+            ],
+        ),
+        "kanagawa" | "kanagawawave" => t(
+            0xdcd7ba,
+            0x1f1f28,
+            0xc8c093,
+            [
+                0x090618, 0xc34043, 0x76946a, 0xc0a36e, 0x7e9cd8, 0x957fb8, 0x6a9589, 0xc8c093,
+                0x727169, 0xe82424, 0x98bb6c, 0xe6c384, 0x7fb4ca, 0x938aa9, 0x7aa89f, 0xdcd7ba,
             ],
         ),
         _ => return None,
@@ -479,6 +552,50 @@ color15 = "ffffff"
         assert_eq!(preset("Gruvbox_Dark"), preset("gruvbox-dark"));
         assert_eq!(preset("SOLARIZED LIGHT"), preset("solarized-light"));
         assert!(preset("not-a-theme").is_none());
+    }
+
+    #[test]
+    fn every_preset_resolves_with_signature_colors() {
+        // (name, bg, fg, one signature ANSI slot) per preset — guards against
+        // a palette row being pasted under the wrong name.
+        let expect: &[(&str, u32, u32, usize, u32)] = &[
+            ("default", 0x000000, 0xFFFFFF, 1, 0x800000),
+            ("gruvbox-dark", 0x282828, 0xebdbb2, 2, 0x98971a),
+            ("dracula", 0x282a36, 0xf8f8f2, 5, 0xff79c6),
+            ("solarized-dark", 0x002b36, 0x839496, 4, 0x268bd2),
+            ("solarized-light", 0xfdf6e3, 0x657b83, 4, 0x268bd2),
+            ("nord", 0x2e3440, 0xd8dee9, 6, 0x88c0d0),
+            ("one-dark", 0x282c34, 0xabb2bf, 1, 0xe06c75),
+            ("catppuccin-mocha", 0x1e1e2e, 0xcdd6f4, 4, 0x89b4fa),
+            ("catppuccin-latte", 0xeff1f5, 0x4c4f69, 1, 0xd20f39),
+            ("tokyo-night", 0x1a1b26, 0xc0caf5, 4, 0x7aa2f7),
+            ("tokyo-night-storm", 0x24283b, 0xc0caf5, 4, 0x7aa2f7),
+            ("monokai", 0x272822, 0xf8f8f2, 1, 0xf92672),
+            ("rose-pine", 0x191724, 0xe0def4, 1, 0xeb6f92),
+            ("github-dark", 0x0d1117, 0xc9d1d9, 2, 0x3fb950),
+            ("kanagawa", 0x1f1f28, 0xdcd7ba, 5, 0x957fb8),
+        ];
+        for &(name, bg, fg, slot, color) in expect {
+            let theme = preset(name).unwrap_or_else(|| panic!("preset `{name}` missing"));
+            assert_eq!(theme.bg, bg, "{name} bg");
+            assert_eq!(theme.fg, fg, "{name} fg");
+            assert_eq!(theme.palette16[slot], color, "{name} palette16[{slot}]");
+        }
+        // Every name advertised in the warning text must actually resolve.
+        for name in PRESET_NAMES.split(',') {
+            let name = name.trim();
+            assert!(preset(name).is_some(), "advertised preset `{name}` missing");
+        }
+    }
+
+    #[test]
+    fn preset_aliases_resolve() {
+        assert_eq!(preset("catppuccin"), preset("catppuccin-mocha"));
+        assert_eq!(preset("github"), preset("github-dark"));
+        assert_eq!(preset("kanagawa-wave"), preset("kanagawa"));
+        assert_eq!(preset("gruvbox"), preset("gruvbox-dark"));
+        assert_eq!(preset("solarized"), preset("solarized-dark"));
+        assert_eq!(preset("one"), preset("one-dark"));
     }
 
     #[test]
