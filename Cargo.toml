@@ -5,15 +5,9 @@ edition = "2024"
 default-run = "rusty_term"
 
 [features]
-default = ["threaded"]
-# Threaded runtime: one OS thread each for parse, input pump, and render,
-# coordinated by a condvar (no async dependencies). The default.
-threaded = []
-# Tokio runtime: a single async reactor drives the PTY master, host stdin, the
-# SIGWINCH stream, and render coalescing. Unix-only (uses tokio's `AsyncFd` on
-# the PTY master fd). Takes precedence over `threaded` when enabled, so build it
-# with just `--features tokio-runtime`.
-tokio-runtime = ["dep:tokio"]
+default = []
+# The runtime is always tokio (a single async reactor on every platform); see
+# `src/runtime`. It is a hard dependency rather than a feature.
 # L13 structured side-channel: a private-OSC JSON-RPC transport that hosts the
 # adjacent protocols (MCP, plus LSP/ACP negotiation). Pulls the local rusty_lsp
 # crate for its JSON-RPC 2.0 model + LSP types, and serde_json for payloads.
@@ -31,7 +25,7 @@ libc = "0.2.186"
 parking_lot = "0.12"
 unicode-width = "0.2"
 unicode-segmentation = "1"
-tokio = { version = "1", optional = true, default-features = false, features = [
+tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "net",
     "signal",

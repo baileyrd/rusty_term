@@ -318,7 +318,6 @@ impl BackendHandle for WindowsHandle {
         Ok(())
     }
 
-    #[cfg(feature = "gui")]
     fn exit_token(&self) -> Option<Box<dyn FnOnce() + Send>> {
         // Only the owning handle holds the child process handle.
         if self.process.is_null() {

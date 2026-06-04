@@ -1,10 +1,11 @@
-//! Tokio runtime (Unix-only): a single async reactor replaces the three OS
-//! threads of the [`threaded`](super::threaded) runtime.
+//! Tokio runtime: a single async reactor drives the terminal on every platform.
 //!
-//! The PTY master and a fresh `/dev/tty` open are registered with the reactor
-//! via [`AsyncFd`]; `SIGWINCH` arrives as a [`tokio::signal`] stream; and a
-//! [`Notify`] coalesces repaints. Two spawned tasks (parser, input pump) feed
-//! the grid and the child, while the render loop lives in the top-level future.
+//! On **Unix** the PTY master and a fresh `/dev/tty` open are registered with
+//! the reactor via [`AsyncFd`]; `SIGWINCH` arrives as a [`tokio::signal`] stream.
+//! On **Windows** ConPTY's pipes are synchronous (no pollable fd), so blocking
+//! reader / writer / stdin threads bridge into tokio channels and a timer polls
+//! the console size for resizes. Both paths share [`run`] and the
+//! [`Notify`]-driven render loop.
 //!
 //! Locking note: the grid uses a `parking_lot::Mutex` (sync), and a guard is
 //! **never** held across an `.await` — every critical section locks, mutates or
@@ -12,13 +13,10 @@
 //! here, not `tokio::sync::Mutex`.
 
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use tokio::io::unix::AsyncFd;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 
 use crate::backend::Backend;
@@ -26,11 +24,25 @@ use crate::core::{AnsiParser, Grid};
 use crate::input::{Scroll, split_input};
 use crate::render::{FRAME_BUDGET, RawModeGuard, RenderState, render_once, restore_host_modes};
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(windows)]
+use std::time::Duration;
+
 /// A PTY master descriptor registered with the reactor that does **not** close
 /// the fd on drop — ownership stays with the `BackendHandle` that produced it,
 /// which closes it. `AsyncFd<FdRef>` only deregisters from the reactor on drop.
+#[cfg(unix)]
 struct FdRef(RawFd);
 
+#[cfg(unix)]
 impl AsRawFd for FdRef {
     fn as_raw_fd(&self) -> RawFd {
         self.0
@@ -40,6 +52,7 @@ impl AsRawFd for FdRef {
 /// Put `fd`'s open file description into non-blocking mode, as `AsyncFd`
 /// requires. Dups (from `try_clone`) share the description, so one call covers
 /// every clone of the master.
+#[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: fcntl on a valid fd; no memory operands.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -58,6 +71,7 @@ fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
 /// `O_NONBLOCK` we need for `AsyncFd` never leaks onto the shared stdout (fds
 /// 0/1/2 usually share one description). Raw mode set on stdin still applies —
 /// it is a property of the tty *device*, not of any one fd.
+#[cfg(unix)]
 fn open_tty_nonblocking() -> std::io::Result<OwnedFd> {
     // SAFETY: opening a path; the returned fd is owned and wrapped immediately.
     let fd = unsafe {
@@ -76,6 +90,7 @@ fn open_tty_nonblocking() -> std::io::Result<OwnedFd> {
 /// Read whatever is available from a non-blocking fd. `Ok(empty)` signals EOF
 /// (a zero-length read, or `EIO` on a PTY master after the slave closed);
 /// `EAGAIN` surfaces as `WouldBlock` so the caller's `AsyncFd` guard re-arms.
+#[cfg(unix)]
 fn read_nonblocking(fd: RawFd) -> std::io::Result<Vec<u8>> {
     let mut buf = [0u8; 4096];
     // SAFETY: writing into a stack buffer of the given length.
@@ -92,6 +107,7 @@ fn read_nonblocking(fd: RawFd) -> std::io::Result<Vec<u8>> {
 }
 
 /// Issue one `write`, retrying `EINTR`. `EAGAIN` surfaces as `WouldBlock`.
+#[cfg(unix)]
 fn write_some(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
     loop {
         // SAFETY: reading `data.len()` bytes from a valid slice.
@@ -110,6 +126,7 @@ fn write_some(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
 /// Write every byte of `data` to the PTY master, awaiting writability between
 /// short writes. The slave's input queue is finite, so partial writes are
 /// normal.
+#[cfg(unix)]
 async fn write_all(afd: &AsyncFd<FdRef>, data: &[u8]) -> std::io::Result<()> {
     let mut written = 0;
     while written < data.len() {
@@ -138,6 +155,7 @@ pub fn run(
     rt.block_on(run_async(backend, grid, init_cols, init_rows))
 }
 
+#[cfg(unix)]
 async fn run_async(
     backend: Box<dyn Backend>,
     grid: Arc<Mutex<Grid>>,
@@ -351,6 +369,217 @@ async fn run_async(
     // scope) reaps the child; `_raw_guard` restores cooked mode on return.
     parser_task.abort();
     input_task.abort();
+    restore_host_modes();
+    Ok(())
+}
+
+/// Windows ConPTY driver: the pipes are synchronous (no readiness-pollable fd),
+/// so dedicated blocking threads bridge PTY output, PTY input, and host stdin
+/// into tokio channels, while the async render loop coalesces repaints and polls
+/// the console size for resizes (there is no `SIGWINCH`).
+#[cfg(windows)]
+async fn run_async(
+    backend: Box<dyn Backend>,
+    grid: Arc<Mutex<Grid>>,
+    init_cols: u16,
+    init_rows: u16,
+) -> std::io::Result<()> {
+    let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
+
+    // `reader` owns the ConPTY + child and reaps it on drop; independent dups
+    // feed the read, write, and resize paths.
+    let reader = backend.spawn_shell(init_cols, init_rows)?;
+    let read_handle = reader.try_clone()?;
+    let write_handle = reader.try_clone()?;
+    let mut resizer = reader.try_clone()?;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let frame = Arc::new(Notify::new());
+
+    // ConPTY's output pipe does NOT EOF when the child exits — it EOFs when the
+    // pseudoconsole is torn down, which only happens once *we* drop `reader`.
+    // Relying on read-EOF alone would deadlock: we'd wait forever for an EOF
+    // that only our own teardown produces. So a watcher thread blocks on the
+    // child process handle and stops the event loop when the shell exits.
+    if let Some(wait_for_exit) = reader.exit_token() {
+        let running = Arc::clone(&running);
+        let frame = Arc::clone(&frame);
+        std::thread::spawn(move || {
+            wait_for_exit();
+            running.store(false, Ordering::Relaxed);
+            frame.notify_one();
+        });
+    }
+
+    {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J");
+        let _ = out.flush();
+    }
+
+    // PTY output: a blocking `ReadFile` thread feeds the async side.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        let running = Arc::clone(&running);
+        std::thread::spawn(move || {
+            let mut read_handle = read_handle;
+            loop {
+                match read_handle.read() {
+                    Ok(data) if !data.is_empty() => {
+                        if out_tx.send(data).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break, // empty read == EOF, or a hard error
+                }
+            }
+            running.store(false, Ordering::Relaxed);
+            // Dropping `out_tx` closes the channel so the render loop sees EOF.
+        });
+    }
+
+    // PTY input: the async side queues bytes; a blocking `WriteFile` thread
+    // drains them so reply/keystroke writes never block the reactor.
+    let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        let mut in_rx = in_rx;
+        std::thread::spawn(move || {
+            let mut write_handle = write_handle;
+            while let Some(data) = in_rx.blocking_recv() {
+                if write_handle.write(&data).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Host stdin: a blocking read thread (Shift+PageUp/Down browse scrollback;
+    // everything else forwards to the child).
+    {
+        let grid = Arc::clone(&grid);
+        let running = Arc::clone(&running);
+        let frame = Arc::clone(&frame);
+        let in_tx = in_tx.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let mut buf = [0u8; 1024];
+            loop {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let (forward, scrolls) = split_input(&buf[..n]);
+                        if !scrolls.is_empty() {
+                            let mut moved = false;
+                            {
+                                let mut g = grid.lock();
+                                let page = g.rows.saturating_sub(1).max(1);
+                                for s in &scrolls {
+                                    moved |= match s {
+                                        Scroll::Up => g.scroll_view_up(page),
+                                        Scroll::Down => g.scroll_view_down(page),
+                                        Scroll::PrevPrompt => g.scroll_to_prev_prompt(),
+                                        Scroll::NextPrompt => g.scroll_to_next_prompt(),
+                                    };
+                                }
+                            }
+                            if moved {
+                                frame.notify_one();
+                            }
+                        }
+                        if !forward.is_empty() {
+                            let snapped = grid.lock().reset_view();
+                            if snapped {
+                                frame.notify_one();
+                            }
+                            if in_tx.send(forward.to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            running.store(false, Ordering::Relaxed);
+            frame.notify_one();
+        });
+    }
+
+    // Render loop: parse incoming output, coalesce repaints, and poll for resize.
+    let mut parser = AnsiParser::new();
+    let mut render_state = RenderState::new();
+    let mut resize_poll = tokio::time::interval(Duration::from_millis(150));
+    let notified = frame.notified();
+    tokio::pin!(notified);
+
+    loop {
+        tokio::select! {
+            data = out_rx.recv() => {
+                match data {
+                    Some(data) => {
+                        let responses = {
+                            let mut g = grid.lock();
+                            parser.advance(&mut g, &data);
+                            g.epoch += 1;
+                            parser.take_responses()
+                        };
+                        frame.notify_one();
+                        if !responses.is_empty() {
+                            let _ = in_tx.send(responses);
+                        }
+                    }
+                    None => break, // PTY EOF: the shell exited
+                }
+            }
+            _ = &mut notified => {
+                notified.set(frame.notified());
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                let since = render_state.last_frame.elapsed();
+                if since < FRAME_BUDGET {
+                    tokio::time::sleep(FRAME_BUDGET - since).await;
+                }
+                render_once(&grid, &mut render_state);
+            }
+            _ = resize_poll.tick() => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                // No SIGWINCH on Windows: poll the console size and act on change.
+                if let Some((cols, rows)) = backend.terminal_size() {
+                    let changed = {
+                        let mut g = grid.lock();
+                        let changed = g.cols != cols as usize || g.rows != rows as usize;
+                        if changed {
+                            g.resize(cols as usize, rows as usize);
+                        }
+                        changed
+                    };
+                    if changed {
+                        let _ = resizer.set_winsize(cols, rows);
+                        // Notify a subscribed structured client; routed through the
+                        // write bridge so it serializes with other child writes.
+                        #[cfg(feature = "l13")]
+                        {
+                            let notif = grid.lock().resize_notification();
+                            if let Some(bytes) = notif {
+                                let _ = in_tx.send(bytes);
+                            }
+                        }
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(b"\x1b[2J");
+                        let _ = out.flush();
+                        frame.notify_one();
+                    }
+                }
+            }
+        }
+    }
+
     restore_host_modes();
     Ok(())
 }

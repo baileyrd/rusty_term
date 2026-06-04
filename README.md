@@ -34,7 +34,7 @@ and the narrative design synthesis in
 Requires a recent stable Rust (edition 2024).
 
 ```sh
-# Default: threaded runtime, TUI/passthrough mode.
+# TUI/passthrough mode (default).
 cargo run
 
 # Run the test suite.
@@ -50,16 +50,17 @@ relays it through the parser into the host terminal. Before spawning, it sets
 
 | Feature        | Default | What it adds |
 |----------------|:-------:|--------------|
-| `threaded`     |   yes   | Threaded runtime: one OS thread each for parse / input / render, coordinated by a condvar. No async deps. |
-| `tokio-runtime`|         | Single async reactor (`AsyncFd` → mio → epoll) driving the PTY master, host stdin, SIGWINCH, and render coalescing. **Unix-only**; takes precedence over `threaded`, so build with just `--features tokio-runtime`. |
 | `gui`          |         | Native window backend: a `winit` window with a `softbuffer` CPU renderer and `ab_glyph` glyph rasterization. |
 | `gui-gpu`      |         | Adds a `wgpu` GPU renderer (glyph atlas + instanced quads) alongside the CPU one. Implies `gui`. |
 | `l13`          |         | L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP plus LSP/ACP negotiation. Requires a sibling `rusty_lsp` checkout (see below). |
 
-```sh
-# Async (tokio) runtime instead of the threaded default.
-cargo run --features tokio-runtime
+The runtime is always **tokio** — a single async reactor. On Unix it registers
+the PTY master + `/dev/tty` with the reactor (`AsyncFd` → mio → epoll) and takes
+`SIGWINCH` from a signal stream; on Windows, where ConPTY's pipes aren't
+pollable, blocking reader/writer/stdin threads bridge into tokio channels and a
+timer polls the console size for resizes.
 
+```sh
 # Native window, CPU renderer.
 cargo run --features gui -- --gui
 
@@ -157,9 +158,8 @@ src/
   backend/           OS interface: PTY spawn, raw mode, resize
     unix.rs            openpty + fork/exec (libc)
     windows.rs         ConPTY (windows-sys)
-  runtime/           the I/O loops
-    threaded.rs        threaded runtime (default)
-    tokio_rt.rs        tokio runtime (feature `tokio-runtime`)
+  runtime/           the tokio I/O loop
+    tokio_rt.rs        async reactor: Unix AsyncFd / Windows ConPTY bridge
   core/              parser + grid + protocol surface
     parser.rs          VT/ANSI state machine
     grid.rs            cells, scrollback, reflow, image rendering
