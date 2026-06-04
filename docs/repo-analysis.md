@@ -27,7 +27,7 @@ Two independent axes, both cleanly abstracted behind traits/features:
 
 | Axis | Options | Seam |
 |------|---------|------|
-| **Runtime** | `threaded` (3 OS threads + condvar) / `tokio-runtime` (single `AsyncFd`/epoll reactor, Unix-only) | `runtime::run(Box<dyn Backend>, Arc<Mutex<Grid>>, ...)` — `main` is agnostic (`runtime/mod.rs:43`) |
+| **Runtime** | tokio, single async reactor on every platform: Unix registers the PTY master + `/dev/tty` (`AsyncFd`/epoll) with a SIGWINCH stream; Windows bridges ConPTY's blocking pipes through threads into tokio channels and polls the console size for resizes | `runtime::run(Box<dyn Backend>, Arc<Mutex<Grid>>, ...)` — `main` is agnostic (`runtime/mod.rs`) |
 | **OS backend** | `UnixBackend` (openpty+fork) / `WindowsBackend` (ConPTY) | `Backend` + `BackendHandle` traits (`backend/mod.rs`) |
 | **Front-end** | TUI relay / native window | shared `core::Grid` |
 
@@ -53,7 +53,7 @@ Worth singling out:
   mouse/paste modes on shutdown.
 - **~60 Hz frame coalescing:** producers signal damage; the renderer holds off
   to `FRAME_BUDGET` (16ms) so a `cat bigfile` flood repaints smoothly rather
-  than per-read (`threaded.rs:226-234`, `render.rs:22`).
+  than per-read (`tokio_rt.rs`, `render.rs:22`).
 
 ## 3. Code quality
 
@@ -177,15 +177,15 @@ as features.
 
 ## 6. Test coverage
 
-**257 `#[test]` functions** (226 in `core/tests.rs`), plus per-module suites in
-`cpu.rs` (8), `input.rs` / `gui/input.rs` / `gui/window.rs` / `term.rs` (4-5
-each), `threaded.rs` (FrameSignal), `gpu.rs`, `font.rs`. Coverage skews correctly
-toward behavior that can break: cursor/scroll-region edge cases, charset
-toggling, grapheme clustering, double-width lines, alt-screen cursor semantics,
-key-encoding tables, paste-injection guarding (`encode_paste` strips embedded
-`ESC[201~`, `window.rs:326-337`), the `FrameSignal` condvar, and headless GPU
-pipeline/atlas creation. The live window and real-Vulkan submit cannot run
-headless and are documented as such.
+**~285 `#[test]` functions** (most in `core/tests.rs`), plus per-module suites in
+`cpu.rs`, `input.rs` / `gui/input.rs` / `gui/window.rs` / `term.rs`, `gpu.rs`,
+`font.rs`. Coverage skews correctly toward behavior that can break:
+cursor/scroll-region edge cases, wrap-aware reflow, charset toggling, grapheme
+clustering, double-width lines, alt-screen cursor semantics, key-encoding tables,
+paste-injection guarding (`encode_paste` strips embedded `ESC[201~`,
+`window.rs`), the L13 channel surface, and headless GPU pipeline/atlas creation.
+The live window and real-Vulkan submit cannot run headless and are documented as
+such.
 
 **Gap (now closed for the repeat-count class):** the three pathological
 Sixel/REP/SU repeat counts are now covered by adversarial tests (see section 4).

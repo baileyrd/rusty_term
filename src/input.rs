@@ -3,8 +3,8 @@
 //! Raw bytes arriving on the host terminal's stdin are mostly forwarded
 //! verbatim to the child, except the scrollback-browse keys (Shift+PageUp /
 //! Shift+PageDown), which are intercepted here and never reach the child. The
-//! split is pure (no I/O, no grid), so both the threaded and tokio runtimes
-//! apply identical semantics and a single unit test pins the behaviour.
+//! split is pure (no I/O, no grid), so the runtime applies identical semantics
+//! and a single unit test pins the behaviour.
 
 /// Shift+PageUp — browse one page up into scrollback (`CSI 5 ; 2 ~`).
 pub(crate) const SCROLL_UP_KEY: &[u8] = b"\x1b[5;2~";

@@ -92,12 +92,11 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] Host controlling-tty raw mode (`cfmakeraw` + `VMIN=1/VTIME=0`) with exact save/restore (`src/backend/unix.rs:88`); raw is the only correct setting for an emulator's own tty, so there are no useful "finer" knobs
 - [x] PTY slave gets the kernel's sane cooked defaults (`openpty(.., NULL, &ws)`); the real line discipline (echo/canonical/`ISIG`/`ONLCR`) is the kernel's `N_TTY`, reconfigured by the child — correctly out of the emulator's scope
 
-### L04 I/O — [x] (epoll via tokio; io_uring/IOCP absent)
-- [x] Threaded runtime: parser/input/render threads + condvar (`src/runtime/threaded.rs`)
-- [x] Tokio runtime: `AsyncFd`→mio→epoll, Unix-only (`src/runtime/tokio_rt.rs`)
-- [x] SIGWINCH-driven reflow in both runtimes; ~60Hz frame coalescing
+### L04 I/O — [x] (epoll via tokio on Unix; ConPTY thread-bridge on Windows; io_uring/IOCP-native absent)
+- [x] Tokio runtime — the single runtime on every platform (`src/runtime/tokio_rt.rs`). Unix registers the PTY master + `/dev/tty` with the reactor (`AsyncFd`→mio→epoll); Windows bridges ConPTY's synchronous pipes through blocking reader/writer/stdin threads into tokio channels.
+- [x] Resize-driven reflow: `SIGWINCH` signal stream on Unix, console-size poll on Windows; ~60Hz frame coalescing
 - [ ] io_uring
-- [ ] Windows IOCP (uses blocking `ReadFile` on threads)
+- [ ] Windows IOCP-native async (currently blocking `ReadFile`/`WriteFile` on bridge threads)
 
 ### L05 Encoding — [x] (bidi/normalization out)
 - [x] UTF-8 incremental decode with split-chunk resilience

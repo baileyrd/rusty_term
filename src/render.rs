@@ -2,8 +2,8 @@
 //! terminal, the one-shot `render_once` snapshot-and-paint step, the host
 //! raw-mode guard, and the host-input-mode reset performed on exit.
 //!
-//! Keeping the paint path here means the threaded and tokio runtimes differ
-//! only in *how they wake* (condvar vs reactor), never in *what they draw*.
+//! Keeping the paint path here means the runtime's wake mechanism (`AsyncFd` on
+//! Unix, channel + poll bridge on Windows) never changes *what* gets drawn.
 
 use std::io::Write;
 use std::time::{Duration, Instant};

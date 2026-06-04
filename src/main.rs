@@ -50,7 +50,7 @@ fn main() -> Result<(), std::io::Error> {
         std::env::set_var("COLORTERM", "truecolor");
     }
 
-    // Hand off to the selected runtime (threaded by default, tokio behind the
-    // `tokio-runtime` feature). Both drive the same grid and backend.
+    // Hand off to the tokio runtime — a single async reactor driving the grid
+    // and backend (Unix via AsyncFd, Windows by bridging ConPTY's blocking pipes).
     runtime::run(backend, grid, init_cols, init_rows)
 }
