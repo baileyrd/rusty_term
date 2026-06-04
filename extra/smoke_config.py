@@ -95,6 +95,37 @@ def main():
         failures.append("bad-config-exit")
         print("FAIL  bad config: did not exit cleanly")
 
+    # --- 3. Alternative shells: bare names + a quoted path with spaces ---
+    # Bare names resolve through the CreateProcessW search path; the full-path
+    # case proves the auto-quoting of unquoted paths containing spaces.
+    pwsh7 = r"C:\Program Files\PowerShell\7\pwsh.exe"
+    cases = [
+        ("powershell", "powershell", "PS C:", 20, None),
+        ("pwsh", "pwsh", "PowerShell 7", 20, None),
+        # WSL's prompt rendering varies by distro/profile, so prove the
+        # round-trip with a computed marker instead of waiting on a prompt.
+        ("wsl", "wsl", "WSL-MARKER-2", 25, "echo WSL-MARKER-$((1+1))\n"),
+    ]
+    if os.path.isfile(pwsh7):
+        cases.append(("pwsh-fullpath", pwsh7.replace("\\", "\\\\"), "PowerShell 7", 20, None))
+    for label, shell_value, needle, timeout, write in cases:
+        cfg = os.path.join(tempfile.gettempdir(), f"rusty_{label}_config.toml")
+        with open(cfg, "w") as f:
+            f.write(f'shell = "{shell_value}"\n')
+        proc = PtyProcess.spawn(f"{BIN} --config {cfg}", dimensions=(30, 100))
+        out = Output(proc)
+        if write:
+            time.sleep(6)
+            proc.write(write)
+        if out.wait_for(needle, timeout):
+            print(f"PASS  shell={label}: spawned and rendered ({needle!r} seen)")
+        else:
+            failures.append(f"shell-{label}")
+            print(f"FAIL  shell={label}: {needle!r} not seen; tail %r" % out.text()[-200:])
+        if not end(proc):
+            failures.append(f"shell-{label}-exit")
+            print(f"FAIL  shell={label}: did not exit cleanly")
+
     print()
     if failures:
         print("RESULT: FAIL (%s)" % ", ".join(failures))

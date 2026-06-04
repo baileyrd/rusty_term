@@ -99,6 +99,15 @@ backslash escapes, integers, floats) parsed without any dependency:
 ```toml
 shell = "/usr/bin/fish"  # child to spawn; default $SHELL / %COMSPEC%
 scrollback = 5000        # history line cap; default 10000, 0 disables
+```
+
+On Windows, `shell` accepts a bare name resolved through the standard search
+path — `"powershell"`, `"pwsh"`, `"wsl"`, `"cmd"` all work — as well as a full
+path (quoted automatically if it contains spaces) and trailing arguments
+(`"wsl -d Ubuntu"`, `"cmd /K clink inject"`):
+
+```toml
+shell = "pwsh"           # or "wsl", "powershell", "C:\\tools\\nu.exe", ...
 
 [window]                 # windowed (--gui) front-end only
 cols = 120               # initial size in cells; default 80x24

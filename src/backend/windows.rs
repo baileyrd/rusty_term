@@ -111,12 +111,26 @@ impl Backend for WindowsBackend {
             }
 
             // The configured shell wins; else honor %COMSPEC%, default cmd.exe.
-            // CreateProcessW needs a mutable, null-terminated wide command line.
+            // Bare names (`powershell`, `pwsh`, `wsl`) resolve through the
+            // standard CreateProcessW search path, and arguments pass through
+            // (`wsl -d Ubuntu`, `cmd /K ...`). An unquoted path containing
+            // spaces is ambiguous to CreateProcessW (it would try
+            // `C:\Program.exe` first), so when the whole string names an
+            // existing file we quote it.
             let shell = shell
                 .map(str::to_owned)
                 .or_else(|| std::env::var("COMSPEC").ok())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "cmd.exe".to_string());
+            let shell = if shell.contains(' ')
+                && !shell.starts_with('"')
+                && std::path::Path::new(&shell).is_file()
+            {
+                format!("\"{shell}\"")
+            } else {
+                shell
+            };
+            // CreateProcessW needs a mutable, null-terminated wide command line.
             let mut cmdline: Vec<u16> = std::ffi::OsStr::new(&shell)
                 .encode_wide()
                 .chain(std::iter::once(0))
