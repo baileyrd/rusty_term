@@ -101,7 +101,10 @@ backslash escapes, integers, floats) parsed without any dependency:
 shell = "/usr/bin/fish"  # child to spawn; default $SHELL / %COMSPEC%
 scrollback = 5000        # history line cap; default 10000, 0 disables
 theme = "gruvbox-dark"   # preset: default, gruvbox-dark, dracula,
-                         # solarized-dark, solarized-light, nord, one-dark
+                         # solarized-dark, solarized-light, nord, one-dark,
+                         # catppuccin-mocha, catppuccin-latte, tokyo-night,
+                         # tokyo-night-storm, monokai, rose-pine,
+                         # github-dark, kanagawa
 ```
 
 On Windows, `shell` accepts a bare name resolved through the standard search
