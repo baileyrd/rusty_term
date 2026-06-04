@@ -23,10 +23,12 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
+use crate::config::Config;
 use crate::core::{AnsiParser, Grid, Selection};
 use super::font::{self, FontCache, GlyphSource};
 use super::render::{CpuRenderer, Renderer};
 
+/// Built-in defaults, overridable via the config file (`[window]` section).
 const FONT_PX: f32 = 18.0;
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
@@ -41,19 +43,28 @@ enum UserEvent {
 
 /// Launch the windowed terminal. Blocks until the window closes or the child
 /// exits. Returns an error if the window/PTY/font can't be set up.
-pub fn run(backend: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // The child renders through us now, so advertise a real terminal identity.
     unsafe {
         std::env::set_var("TERM", "xterm-256color");
         std::env::set_var("COLORTERM", "truecolor");
     }
 
-    let font_bytes = font::load_default_font().ok_or("no monospace font found")?;
-    let font = FontCache::new(font_bytes, FONT_PX).ok_or("font failed to parse")?;
+    let font_bytes =
+        font::load_default_font(config.font.as_deref()).ok_or("no monospace font found")?;
+    let font_px = config.font_size.unwrap_or(FONT_PX);
+    let font = FontCache::new(font_bytes, font_px).ok_or("font failed to parse")?;
     let (cell_w, cell_h) = font.cell_size();
 
-    let handle = backend.spawn_shell(INIT_COLS, INIT_ROWS)?;
-    let grid = Arc::new(Mutex::new(Grid::new(INIT_COLS as usize, INIT_ROWS as usize)));
+    let init_cols = config.cols.unwrap_or(INIT_COLS);
+    let init_rows = config.rows.unwrap_or(INIT_ROWS);
+    let handle = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+    let mut g = Grid::new(init_cols as usize, init_rows as usize);
+    if let Some(max) = config.scrollback {
+        g.set_scrollback_max(max);
+    }
+    g.apply_theme(&config.theme);
+    let grid = Arc::new(Mutex::new(g));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -64,7 +75,10 @@ pub fn run(backend: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
     let reply_handle = handle.try_clone()?;
     let reader_grid = Arc::clone(&grid);
     let reader_proxy = proxy.clone();
-    std::thread::spawn(move || reader_loop(read_handle, reply_handle, reader_grid, reader_proxy));
+    let reader_theme = config.theme;
+    std::thread::spawn(move || {
+        reader_loop(read_handle, reply_handle, reader_grid, reader_proxy, reader_theme)
+    });
 
     // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
     // teardown, not when the shell exits, so read-EOF can't close the window;
@@ -86,8 +100,8 @@ pub fn run(backend: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
         window: None,
         renderer: None,
         mods: ModifiersState::empty(),
-        cols: INIT_COLS,
-        rows: INIT_ROWS,
+        cols: init_cols,
+        rows: init_rows,
         clipboard: arboard::Clipboard::new().ok(),
         mouse_pos: (0.0, 0.0),
         selecting: false,
@@ -104,8 +118,9 @@ fn reader_loop(
     mut replies: Box<dyn BackendHandle>,
     grid: Arc<Mutex<Grid>>,
     proxy: EventLoopProxy<UserEvent>,
+    theme: crate::core::Theme,
 ) {
-    let mut parser = AnsiParser::new();
+    let mut parser = AnsiParser::with_theme(theme);
     loop {
         match reader.read() {
             Ok(data) if data.is_empty() => break, // EOF: child exited

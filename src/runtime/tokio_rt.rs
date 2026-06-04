@@ -147,12 +147,13 @@ pub fn run(
     grid: Arc<Mutex<Grid>>,
     init_cols: u16,
     init_rows: u16,
+    config: crate::config::Config,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    rt.block_on(run_async(backend, grid, init_cols, init_rows))
+    rt.block_on(run_async(backend, grid, init_cols, init_rows, config))
 }
 
 #[cfg(unix)]
@@ -161,6 +162,7 @@ async fn run_async(
     grid: Arc<Mutex<Grid>>,
     init_cols: u16,
     init_rows: u16,
+    config: crate::config::Config,
 ) -> std::io::Result<()> {
     // Raw mode for the host terminal; restored on drop (any exit path).
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
@@ -168,7 +170,7 @@ async fn run_async(
     // `reader` owns the master fd + child and reaps it on drop; keeping it in
     // this top-level future means the child is reaped on every exit path.
     // Independent dups feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows)?;
+    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
@@ -193,6 +195,7 @@ async fn run_async(
         let grid = Arc::clone(&grid);
         let running = Arc::clone(&running);
         let frame = Arc::clone(&frame);
+        let theme = config.theme;
         tokio::spawn(async move {
             // Keep the read dup alive for the task; `master` deregisters before
             // it (declared after, dropped first) so the fd is still open then.
@@ -201,7 +204,7 @@ async fn run_async(
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let mut parser = AnsiParser::new();
+            let mut parser = AnsiParser::with_theme(theme);
             loop {
                 let mut guard = match master.readable().await {
                     Ok(g) => g,
@@ -383,12 +386,13 @@ async fn run_async(
     grid: Arc<Mutex<Grid>>,
     init_cols: u16,
     init_rows: u16,
+    config: crate::config::Config,
 ) -> std::io::Result<()> {
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
     // `reader` owns the ConPTY + child and reaps it on drop; independent dups
     // feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows)?;
+    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
@@ -509,7 +513,7 @@ async fn run_async(
     }
 
     // Render loop: parse incoming output, coalesce repaints, and poll for resize.
-    let mut parser = AnsiParser::new();
+    let mut parser = AnsiParser::with_theme(config.theme);
     let mut render_state = RenderState::new();
     let mut resize_poll = tokio::time::interval(Duration::from_millis(150));
     let notified = frame.notified();

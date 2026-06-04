@@ -12,8 +12,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::sixel::SixelImage;
 
-/// Maximum number of lines retained in the scrollback history. Older lines are
-/// evicted from the front once this is exceeded.
+/// Default maximum number of lines retained in the scrollback history. Older
+/// lines are dropped as new ones arrive. Overridable per-grid via
+/// [`Grid::set_scrollback_max`] (the `scrollback` config key).
 pub const SCROLLBACK_MAX: usize = 10_000;
 
 /// Maximum number of prompt marks (OSC 133;A) retained for navigation. Older
@@ -81,6 +82,9 @@ pub struct Grid {
     /// its soft-wrap bit, so a resize can rejoin wrapped runs and re-wrap them to
     /// the new width. Rewrapped to the live width on every resize.
     pub(crate) scrollback: VecDeque<Line>,
+    /// The live scrollback cap: [`SCROLLBACK_MAX`] unless overridden by the
+    /// `scrollback` config key via [`Grid::set_scrollback_max`].
+    pub(crate) scrollback_max: usize,
     /// How many lines the viewport is scrolled up into [`Grid::scrollback`].
     /// `0` is the live view (bottom); the renderer composites history above the
     /// live grid when this is non-zero.
@@ -134,6 +138,10 @@ pub struct Grid {
     /// theme set via OSC 11 colors cleared regions, not just freshly written text.
     default_fg: u32,
     default_bg: u32,
+    /// Cursor color (OSC 12 / the `cursor` config key), mirrored from the
+    /// parser's palette like the defaults above. The windowed renderers paint
+    /// the block cursor in it; the TUI host owns its own cursor.
+    pub cursor_color: u32,
     /// Logical line indices (counting from the oldest retained scrollback line)
     /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
     /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
@@ -310,6 +318,7 @@ fn reflow_history(
     new_cols: usize,
     new_rows: usize,
     blank: Cell,
+    scrollback_max: usize,
 ) -> Reflowed {
     let hist = scrollback.len();
     let old_total = hist + old_rows;
@@ -465,7 +474,7 @@ fn reflow_history(
     if ncur.0 < screen_top {
         screen_top = ncur.0; // cursor would be above the window: pull the window up
     }
-    let dropped = screen_top.saturating_sub(SCROLLBACK_MAX);
+    let dropped = screen_top.saturating_sub(scrollback_max);
     let mut new_scrollback: VecDeque<Line> = VecDeque::new();
     let mut cells = vec![blank; new_cols * new_rows];
     let mut wrapped = vec![false; new_rows];
@@ -587,6 +596,7 @@ impl Grid {
             title: String::new(),
             cwd: String::new(),
             scrollback: VecDeque::new(),
+            scrollback_max: SCROLLBACK_MAX,
             view_offset: 0,
             selection: None,
             host_out: Vec::new(),
@@ -601,6 +611,7 @@ impl Grid {
             insert_mode: false,
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
+            cursor_color: DEFAULT_FG,
             line_attrs: vec![LineAttr::Single; rows],
             wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
@@ -795,7 +806,7 @@ impl Grid {
                 cells: self.cells[0..self.cols].to_vec(),
                 wrapped: self.wrapped[top],
             });
-            if self.scrollback.len() > SCROLLBACK_MAX {
+            if self.scrollback.len() > self.scrollback_max {
                 self.scrollback.pop_front();
                 self.evict_prompt_mark();
                 #[cfg(feature = "l13")]
@@ -1080,11 +1091,45 @@ impl Grid {
         c
     }
 
-    /// Update the default foreground/background colors (OSC 10/11). Mirrors the
-    /// parser's palette so subsequent erases fill with the new background.
-    pub(crate) fn set_default_colors(&mut self, fg: u32, bg: u32) {
+    /// Update the default foreground/background/cursor colors (OSC 10/11/12).
+    /// Mirrors the parser's palette so subsequent erases fill with the new
+    /// background and the windowed cursor paints in the new cursor color.
+    pub(crate) fn set_default_colors(&mut self, fg: u32, bg: u32, cursor: u32) {
         self.default_fg = fg;
         self.default_bg = bg;
+        if self.cursor_color != cursor {
+            self.cursor_color = cursor;
+            // Repaint the cursor cell's row so a pure OSC 12 change shows.
+            let row = self.cursor.1;
+            if let Some(d) = self.dirty.get_mut(row) {
+                *d = true;
+            }
+        }
+    }
+
+    /// Override the scrollback line cap (the `scrollback` config key). `0`
+    /// disables history. An already-overfull buffer is trimmed immediately.
+    pub fn set_scrollback_max(&mut self, max: usize) {
+        self.scrollback_max = max;
+        while self.scrollback.len() > max {
+            self.scrollback.pop_front();
+            self.evict_prompt_mark();
+            #[cfg(feature = "l13")]
+            if let Some(s) = &mut self.command_start {
+                *s = s.saturating_sub(1);
+            }
+        }
+        self.view_offset = self.view_offset.min(self.scrollback.len());
+    }
+
+    /// Seed the grid's default colors from the configured startup theme and
+    /// repaint the (still pristine) screen in them. Called once at startup,
+    /// before any child output is parsed — the screen is all blank cells, so
+    /// refilling is exact, not lossy.
+    pub fn apply_theme(&mut self, theme: &super::Theme) {
+        self.set_default_colors(theme.fg, theme.bg, theme.cursor);
+        self.cells = vec![self.erase_cell(); self.cols * self.rows];
+        self.dirty = vec![true; self.rows];
     }
 
     /// Resize the grid to `cols`×`rows`.
@@ -1133,6 +1178,7 @@ impl Grid {
                 cols,
                 rows,
                 blank,
+                self.scrollback_max,
             );
             self.scrollback = r.scrollback;
             self.cells = r.cells;
@@ -1160,6 +1206,7 @@ impl Grid {
                 cols,
                 rows,
                 blank,
+                self.scrollback_max,
             );
             self.scrollback = r.scrollback;
             self.prompt_marks = r.prompt_marks;
@@ -1506,10 +1553,12 @@ impl Grid {
     /// screen, home cursor, full-screen scroll region, default tab stops,
     /// cleared scrollback, cursor visible, autowrap on. The window title and cwd
     /// are intentionally left alone (a hardware reset doesn't relabel the tab).
-    /// The parser separately resets its pen.
+    /// The parser separately resets its pen and re-syncs the default colors
+    /// (via [`Grid::set_default_colors`]) *before* calling this, so the blank
+    /// fill below lands in the configured theme's colors.
     pub(crate) fn reset(&mut self) {
         self.primary = None; // leave the alternate screen if active
-        self.cells = vec![Cell::blank(); self.cols * self.rows];
+        self.cells = vec![self.erase_cell(); self.cols * self.rows];
         self.dirty = vec![true; self.rows];
         self.line_attrs = vec![LineAttr::Single; self.rows];
         self.wrapped = vec![false; self.rows];
@@ -1527,8 +1576,8 @@ impl Grid {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
-        self.default_fg = DEFAULT_FG;
-        self.default_bg = DEFAULT_BG;
+        // default_fg/bg are intentionally untouched: the parser re-syncs them
+        // from its (theme-seeded) palette right after — see RIS handling.
         self.current_link = 0;
     }
 
@@ -1545,8 +1594,8 @@ impl Grid {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
-        self.default_fg = DEFAULT_FG;
-        self.default_bg = DEFAULT_BG;
+        // default_fg/bg are intentionally untouched: the parser re-syncs them
+        // from its (theme-seeded) palette right after — see DECSTR handling.
         self.current_link = 0;
         for a in &mut self.line_attrs {
             *a = LineAttr::Single;

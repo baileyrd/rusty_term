@@ -33,6 +33,7 @@ pub use cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
     ATTR_STRIKE, ATTR_UNDERLINE, WIDE_TRAILER,
 };
+pub use color::Theme;
 pub use grid::{DirtyFrame, Grid, LineAttr};
 #[cfg(feature = "gui")]
 pub use grid::Selection;

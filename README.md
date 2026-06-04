@@ -77,12 +77,62 @@ cargo run --features l13
 |---------|-------------|--------|
 | `--gui` | `gui`       | Launch the native window backend instead of TUI/passthrough mode. |
 | `--gpu` | `gui-gpu`   | Use the `wgpu` GPU renderer in the window (CPU fallback on failure). |
+| `--config <path>` | — | Read the configuration file from `<path>` (see below). |
 
 | Variable          | Effect |
 |-------------------|--------|
+| `RUSTY_TERM_CONFIG` | Path to the configuration file (when `--config` is not given). |
 | `RUSTY_TERM_FONT` | Path to a monospace font for the window backend. If unset, a list of common system locations is searched. |
 | `SHELL` / `COMSPEC` | The child program to spawn (falls back to `bash` / `cmd`). |
 | `TERM`, `COLORTERM` | Set by `rusty_term` for the child before spawn — not read from your environment. |
+
+### Configuration file
+
+Looked up as `--config <path>` > `$RUSTY_TERM_CONFIG` > the platform default:
+`$XDG_CONFIG_HOME/rusty_term/config.toml` (Unix, `~/.config` when unset) or
+`%APPDATA%/rusty_term/config.toml` (Windows). A missing file means built-in
+defaults; a malformed line or unknown key prints a warning to stderr and is
+skipped — the config can never stop the terminal from starting. The syntax is
+a TOML subset (`key = value`, `[section]`, `#` comments, quoted strings with
+backslash escapes, integers, floats) parsed without any dependency:
+
+```toml
+shell = "/usr/bin/fish"  # child to spawn; default $SHELL / %COMSPEC%
+scrollback = 5000        # history line cap; default 10000, 0 disables
+theme = "gruvbox-dark"   # preset: default, gruvbox-dark, dracula,
+                         # solarized-dark, solarized-light, nord, one-dark
+```
+
+On Windows, `shell` accepts a bare name resolved through the standard search
+path — `"powershell"`, `"pwsh"`, `"wsl"`, `"cmd"` all work — as well as a full
+path (quoted automatically if it contains spaces) and trailing arguments
+(`"wsl -d Ubuntu"`, `"cmd /K clink inject"`):
+
+```toml
+shell = "pwsh"           # or "wsl", "powershell", "C:\\tools\\nu.exe", ...
+
+[window]                 # windowed (--gui) front-end only
+cols = 120               # initial size in cells; default 80x24
+rows = 40
+font = "/path/to/mono.ttf"  # else $RUSTY_TERM_FONT, else system search
+font-size = 16           # pixels; default 18
+
+[colors]                 # startup theme; resets (RIS/OSC 1xx) restore it
+foreground = "#d8d8d8"
+background = "#1d1f21"
+cursor = "#aeafad"
+color0 = "#282a2e"       # ANSI palette, color0..color15
+color1 = "#cc6666"
+```
+
+The `[colors]` theme is what every reset path (`RIS`, `DECSTR`, OSC
+104/110/111/112) restores, so a configured look survives a `reset` exactly
+the way the hardware defaults would. A `theme = "name"` preset seeds all the
+colors at once; `[colors]` keys placed after it override individual entries.
+The windowed block cursor is painted in the `cursor` color (and follows
+OSC 12 at runtime). Indexed colors 16–255 always come from the fixed xterm
+cube/ramp. In TUI mode `cols`/`rows` are ignored (the host terminal owns its
+size), and `font`/`font-size` apply only to `--gui`.
 
 #### Window backend controls (`--gui`)
 

@@ -1,6 +1,13 @@
 pub trait Backend {
-    /// Spawn the child shell on a new PTY sized to `cols`×`rows`.
-    fn spawn_shell(&self, cols: u16, rows: u16) -> Result<Box<dyn BackendHandle>, std::io::Error>;
+    /// Spawn the child shell on a new PTY sized to `cols`×`rows`. `shell`
+    /// overrides the platform default (`$SHELL` / `%COMSPEC%`) when `Some` —
+    /// the `shell` config key.
+    fn spawn_shell(
+        &self,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+    ) -> Result<Box<dyn BackendHandle>, std::io::Error>;
     fn set_raw_mode(&self, enabled: bool) -> Result<(), std::io::Error>;
     /// Best-effort query of the controlling terminal's size as `(cols, rows)`.
     fn terminal_size(&self) -> Option<(u16, u16)>;
