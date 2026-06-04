@@ -182,6 +182,22 @@ impl AnsiParser {
         std::mem::take(&mut self.responses)
     }
 
+    /// Live theme switch (config reload). Returns the previous seed theme so
+    /// the caller can remap the grid with [`Grid::retheme`].
+    ///
+    /// The live palette's dynamic state rides through: entries still at their
+    /// old built-in value follow the new theme, while colors the child set
+    /// itself (OSC 4/10/11/12) are kept — the child's choices outrank ours,
+    /// exactly as they would have had the new theme been set at startup. The
+    /// pen is remapped the same way, so text typed next stays coherent.
+    pub fn retheme(&mut self, new: super::color::Theme) -> super::color::Theme {
+        let old = self.palette.seed();
+        self.pen.fg = super::color::remap(self.pen.fg, &old, &new);
+        self.pen.bg = super::color::remap(self.pen.bg, &old, &new);
+        self.palette.retheme(&old, &new);
+        old
+    }
+
     /// Feed a chunk of bytes, applying their effects to `g`. Parser state
     /// persists across calls, so escape sequences may straddle chunk boundaries.
     pub fn advance(&mut self, g: &mut Grid, bytes: &[u8]) {

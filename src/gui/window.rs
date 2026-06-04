@@ -39,6 +39,8 @@ enum UserEvent {
     Redraw,
     /// The child exited; close the window.
     Exit,
+    /// The config file changed on disk; reload and apply what can change live.
+    ConfigChanged,
 }
 
 /// Launch the windowed terminal. Blocks until the window closes or the child
@@ -65,6 +67,10 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
     }
     g.apply_theme(&config.theme);
     let grid = Arc::new(Mutex::new(g));
+    // The parser is shared between the reader thread (PTY bytes) and the
+    // winit loop (live config reload retheming it); contention is nil — the
+    // loop only takes it on a config save.
+    let parser = Arc::new(Mutex::new(AnsiParser::with_theme(config.theme)));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -75,10 +81,20 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
     let reply_handle = handle.try_clone()?;
     let reader_grid = Arc::clone(&grid);
     let reader_proxy = proxy.clone();
-    let reader_theme = config.theme;
+    let reader_parser = Arc::clone(&parser);
     std::thread::spawn(move || {
-        reader_loop(read_handle, reply_handle, reader_grid, reader_proxy, reader_theme)
+        reader_loop(read_handle, reply_handle, reader_grid, reader_proxy, reader_parser)
     });
+
+    // Config live reload: watch the file and wake the loop on changes.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config_path = crate::config::Config::file_path(&args);
+    if let Some(path) = config_path.clone() {
+        let watch_proxy = proxy.clone();
+        crate::config::watch(path, move || {
+            let _ = watch_proxy.send_event(UserEvent::ConfigChanged);
+        });
+    }
 
     // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
     // teardown, not when the shell exits, so read-EOF can't close the window;
@@ -93,6 +109,8 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
 
     let mut app = App {
         grid,
+        parser,
+        config_path,
         writer: handle,
         font,
         cell_w: cell_w.max(1),
@@ -118,15 +136,15 @@ fn reader_loop(
     mut replies: Box<dyn BackendHandle>,
     grid: Arc<Mutex<Grid>>,
     proxy: EventLoopProxy<UserEvent>,
-    theme: crate::core::Theme,
+    parser: Arc<Mutex<AnsiParser>>,
 ) {
-    let mut parser = AnsiParser::with_theme(theme);
     loop {
         match reader.read() {
             Ok(data) if data.is_empty() => break, // EOF: child exited
             Ok(data) => {
                 let response = {
                     let mut g = grid.lock();
+                    let mut parser = parser.lock();
                     parser.advance(&mut g, &data);
                     // host_out (clipboard/title relay) has no host here; dropped.
                     let _ = g.take_host_out();
@@ -147,6 +165,10 @@ fn reader_loop(
 
 struct App {
     grid: Arc<Mutex<Grid>>,
+    /// Shared with the reader thread; the loop takes it only on config reload.
+    parser: Arc<Mutex<AnsiParser>>,
+    /// The config file in effect, for the open shortcut + reload re-reads.
+    config_path: Option<std::path::PathBuf>,
     writer: Box<dyn BackendHandle>,
     font: FontCache,
     cell_w: usize,
@@ -237,6 +259,39 @@ impl App {
         let bracketed = self.grid.lock().bracketed_paste;
         let _ = self.writer.write(&encode_paste(&text, bracketed));
     }
+
+    /// Open the config file in the user's editor (Ctrl+Shift+,), creating it
+    /// from the commented template first if needed. The live-reload watcher
+    /// then applies any save the user makes.
+    fn open_config(&self) {
+        let Some(path) = &self.config_path else { return };
+        if let Err(e) = crate::config::open_in_editor(path) {
+            eprintln!("rusty_term: open config {}: {e}", path.display());
+        }
+    }
+
+    /// Re-read the config file and apply what can change live: theme (parser
+    /// palette + grid recolor) and scrollback cap. Shell, font, and window
+    /// size are launch-time choices — a saved change to those takes effect on
+    /// the next start. Parse warnings go to stderr, same as at startup.
+    fn reload_config(&mut self) {
+        let Some(path) = self.config_path.clone() else { return };
+        let args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
+        let (new, warnings) = crate::config::Config::load(&args);
+        for w in &warnings {
+            eprintln!("rusty_term: {w}");
+        }
+        let mut g = self.grid.lock();
+        let old = self.parser.lock().retheme(new.theme);
+        if old != new.theme {
+            g.retheme(&old, &new.theme);
+        }
+        g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
+        drop(g);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -288,6 +343,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match code {
                         KeyCode::KeyC => return self.copy_selection(),
                         KeyCode::KeyV => return self.paste(),
+                        KeyCode::Comma => return self.open_config(),
                         _ => {}
                     }
                 }
@@ -330,6 +386,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Exit => event_loop.exit(),
+            UserEvent::ConfigChanged => self.reload_config(),
         }
     }
 }

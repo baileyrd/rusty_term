@@ -138,6 +138,17 @@ OSC 12 at runtime). Indexed colors 16–255 always come from the fixed xterm
 cube/ramp. In TUI mode `cols`/`rows` are ignored (the host terminal owns its
 size), and `font`/`font-size` apply only to `--gui`.
 
+#### Live reload
+
+The config file is watched while rusty_term runs: saving it applies **theme**
+and **scrollback** changes immediately — existing screen content, scrollback,
+and even the stashed primary screen are recolored, while truecolor output and
+colors the child set itself (OSC 4/10/11/12) are left alone. `shell`, `font`,
+and `[window]` size are launch-time choices and take effect on the next start.
+In the window backend, **Ctrl+Shift+,** opens the config file in your editor
+(`$VISUAL`/`$EDITOR`, else the system opener), creating it from a commented
+template on first use — edit, save, watch it apply.
+
 #### Window backend controls (`--gui`)
 
 | Input | Action |
@@ -145,6 +156,7 @@ size), and `font`/`font-size` apply only to `--gui`.
 | Left-drag | Select text (highlighted by inversion). |
 | Ctrl+Shift+C | Copy the selection to the system clipboard. |
 | Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
+| Ctrl+Shift+, | Open the config file in your editor (created from a template on first use). |
 
 The window draws a block cursor and closes when the shell exits. Mouse
 *reporting* to applications (so TUI apps see clicks), OSC 52 programmatic

@@ -3111,3 +3111,67 @@ fn custom_scrollback_cap_is_enforced() {
     p.advance(&mut g, b"more\r\nlines\r\n");
     assert_eq!(g.scrollback.len(), 0, "zero cap keeps history empty");
 }
+
+// --- Live retheme (config reload) ---
+
+#[test]
+fn retheme_recolors_existing_content() {
+    let mut g = Grid::new(8, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    p.advance(&mut g, b"hi\x1b[31mr");
+    // Switch to a different theme: defaults and ANSI red follow.
+    let mut new = Theme::default();
+    new.fg = 0x111111;
+    new.bg = 0x222222;
+    new.palette16[1] = 0x333333;
+    let old = p.retheme(new);
+    assert_eq!(old, test_theme(), "retheme returns the previous seed");
+    g.retheme(&old, &new);
+    assert_eq!(g.cells[0].fg, 0x111111, "plain text recolored to new fg");
+    assert_eq!(g.cells[0].bg, 0x222222, "bg recolored");
+    assert_eq!(g.cells[2].fg, 0x333333, "ANSI red remapped to new red");
+    // New output uses the new theme immediately.
+    p.advance(&mut g, b"\x1b[0mx");
+    assert_eq!(g.cells[3].fg, 0x111111);
+}
+
+#[test]
+fn retheme_preserves_truecolor_and_child_overrides() {
+    let mut g = Grid::new(8, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    // Truecolor text + a child-overridden palette slot (OSC 4;2).
+    p.advance(&mut g, b"\x1b[38;2;1;2;3mt\x1b]4;2;#abcdef\x07\x1b[32mg");
+    let mut new = Theme::default();
+    new.palette16[2] = 0x444444;
+    let old = p.retheme(new);
+    g.retheme(&old, &new);
+    assert_eq!(g.cells[0].fg, 0x010203, "truecolor passes through retheme");
+    // The child's own OSC 4 green is kept (not stomped to the new theme's).
+    p.advance(&mut g, b"\x1b[32mG");
+    assert_eq!(g.cells[2].fg, 0xabcdef, "child palette override survives");
+    // And a reset returns to the *new* theme, not the old one.
+    p.advance(&mut g, b"\x1b]104;2\x07\x1b[32mz");
+    assert_eq!(g.cells[3].fg, 0x444444, "reset lands on the new theme");
+}
+
+#[test]
+fn retheme_recolors_scrollback() {
+    let mut g = Grid::new(4, 2);
+    g.apply_theme(&test_theme());
+    let mut p = AnsiParser::with_theme(test_theme());
+    for i in 0..5 {
+        p.advance(&mut g, format!("l{i}\r\n").as_bytes());
+    }
+    assert!(!g.scrollback.is_empty());
+    let mut new = Theme::default();
+    new.fg = 0x999999;
+    let old = p.retheme(new);
+    g.retheme(&old, &new);
+    for line in &g.scrollback {
+        for cell in &line.cells {
+            assert_ne!(cell.fg, 0xd8d8d8, "old themed fg gone from history");
+        }
+    }
+}

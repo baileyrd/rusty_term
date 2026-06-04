@@ -66,6 +66,43 @@ impl Config {
             Err(_) => (Config::default(), Vec::new()), // default path absent: fine
         }
     }
+
+    /// The config file this invocation reads or would read: the explicit path
+    /// (CLI/env) if given, else the platform default location — returned even
+    /// when the file doesn't exist yet, so callers can watch for its creation
+    /// or create it (`Ctrl+Shift+,`). `None` only when no config root exists
+    /// (e.g. `%APPDATA%`/`$HOME` unset).
+    pub fn file_path(args: &[String]) -> Option<PathBuf> {
+        if let Some((p, _)) = resolve_path(args) {
+            return Some(p);
+        }
+        Some(default_config_dir()?.join("rusty_term").join("config.toml"))
+    }
+
+    /// A commented starter config, written when the open-config shortcut
+    /// targets a file that doesn't exist yet.
+    pub fn template() -> &'static str {
+        r##"# rusty_term configuration. Saving this file applies theme and
+# scrollback changes to running instances immediately; shell, font,
+# and window size apply on the next launch.
+
+# shell = "pwsh"           # or "wsl", "powershell", a full path, ...
+# scrollback = 10000       # history line cap; 0 disables
+# theme = "gruvbox-dark"   # see README for the preset list
+
+# [window]                 # windowed (--gui) front-end only
+# cols = 120
+# rows = 40
+# font = "C:\\Windows\\Fonts\\CascadiaMono.ttf"
+# font-size = 18
+
+# [colors]                 # override individual colors (after any preset)
+# foreground = "#d8d8d8"
+# background = "#1d1f21"
+# cursor     = "#aeafad"
+# color0     = "#282a2e"   # ANSI palette, color0..color15
+"##
+    }
 }
 
 /// The config file to read, if any, and whether the user *named* it (CLI/env)
@@ -106,6 +143,68 @@ fn default_config_dir() -> Option<PathBuf> {
         }
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
     }
+}
+
+/// Open the config file in the user's editor (the `Ctrl+Shift+,` shortcut),
+/// creating it with the commented [`Config::template`] first if it doesn't
+/// exist. Detached — the editor is not a child we wait on. `$VISUAL`/`$EDITOR`
+/// win when set; else the platform opener (`start`/`open`/`xdg-open`) routes
+/// to the user's associated editor.
+pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, Config::template())?;
+    }
+    if let Some(editor) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) {
+        return std::process::Command::new(editor).arg(path).spawn().map(drop);
+    }
+    #[cfg(windows)]
+    {
+        // `start` is a cmd builtin; the empty quoted arg is its title slot.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+            .map(drop)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn().map(drop)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn().map(drop)
+    }
+}
+
+/// Watch `path` for changes from a daemon thread, invoking `on_change` after
+/// each observed modification. A simple 500ms mtime/length poll — editors
+/// vary wildly in how they save (rename-over, truncate+write, atomic temp
+/// file), and polling sees through all of them, needs no platform API, and a
+/// half-second latency is imperceptible next to a manual save. Also fires
+/// when the file first appears.
+pub fn watch(path: PathBuf, on_change: impl Fn() + Send + 'static) {
+    fn stamp(p: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let m = std::fs::metadata(p).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    }
+    std::thread::spawn(move || {
+        let mut last = stamp(&path);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = stamp(&path);
+            if now != last {
+                // Half-written saves settle within a poll tick; a second
+                // change event after the settle is harmless (idempotent apply).
+                if now.is_some() {
+                    on_change();
+                }
+                last = now;
+            }
+        }
+    });
 }
 
 /// One parsed `key = value` payload.

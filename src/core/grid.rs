@@ -1132,6 +1132,36 @@ impl Grid {
         self.dirty = vec![true; self.rows];
     }
 
+    /// Live theme switch (config reload): remap every color that resolves to
+    /// an `old`-theme entry — across the live screen, scrollback, and the
+    /// stashed primary screen — to its `new`-theme counterpart, and adopt the
+    /// new defaults. Truecolor/256-cube colors pass through untouched (we
+    /// can't know they meant "the theme's red"). Full repaint requested.
+    pub fn retheme(&mut self, old: &super::Theme, new: &super::Theme) {
+        let map = |c: &mut u32| *c = super::color::remap(*c, old, new);
+        for cell in &mut self.cells {
+            map(&mut cell.fg);
+            map(&mut cell.bg);
+        }
+        for line in &mut self.scrollback {
+            for cell in &mut line.cells {
+                map(&mut cell.fg);
+                map(&mut cell.bg);
+            }
+        }
+        if let Some(primary) = &mut self.primary {
+            for cell in &mut primary.cells {
+                map(&mut cell.fg);
+                map(&mut cell.bg);
+            }
+        }
+        map(&mut self.default_fg);
+        map(&mut self.default_bg);
+        self.cursor_color = super::color::remap(self.cursor_color, old, new);
+        self.dirty = vec![true; self.rows];
+        self.epoch += 1;
+    }
+
     /// Resize the grid to `cols`×`rows`.
     ///
     /// On the primary screen this is a **wrap-aware reflow**: soft-wrapped runs

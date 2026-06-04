@@ -156,6 +156,33 @@ pub fn run(
     rt.block_on(run_async(backend, grid, init_cols, init_rows, config))
 }
 
+/// Live config reload for the TUI: watch the config file and, on each save,
+/// re-read it and apply what can change live — theme (parser palette + grid
+/// recolor) and the scrollback cap. Shell/font/window-size remain launch-time
+/// choices. Wakes the render loop through `frame` for a repaint; reload
+/// warnings go to stderr like startup ones (cosmetic in raw mode, but real).
+fn watch_config(parser: Arc<Mutex<AnsiParser>>, grid: Arc<Mutex<Grid>>, frame: Arc<Notify>) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(path) = crate::config::Config::file_path(&args) else {
+        return;
+    };
+    let reload_args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
+    crate::config::watch(path, move || {
+        let (new, warnings) = crate::config::Config::load(&reload_args);
+        for w in &warnings {
+            eprintln!("rusty_term: {w}");
+        }
+        let mut g = grid.lock();
+        let old = parser.lock().retheme(new.theme);
+        if old != new.theme {
+            g.retheme(&old, &new.theme);
+        }
+        g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
+        drop(g);
+        frame.notify_one();
+    });
+}
+
 #[cfg(unix)]
 async fn run_async(
     backend: Box<dyn Backend>,
@@ -190,12 +217,17 @@ async fn run_async(
         let _ = out.flush();
     }
 
+    // Shared parser: the parser task feeds it; the config watcher thread takes
+    // it briefly on a config save to retheme (see `watch_config`).
+    let parser = Arc::new(Mutex::new(AnsiParser::with_theme(config.theme)));
+    watch_config(Arc::clone(&parser), Arc::clone(&grid), Arc::clone(&frame));
+
     // --- Parser task: PTY master -> Grid (+ DA/DSR replies) ---
     let parser_task = {
         let grid = Arc::clone(&grid);
         let running = Arc::clone(&running);
         let frame = Arc::clone(&frame);
-        let theme = config.theme;
+        let parser = Arc::clone(&parser);
         tokio::spawn(async move {
             // Keep the read dup alive for the task; `master` deregisters before
             // it (declared after, dropped first) so the fd is still open then.
@@ -204,7 +236,6 @@ async fn run_async(
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let mut parser = AnsiParser::with_theme(theme);
             loop {
                 let mut guard = match master.readable().await {
                     Ok(g) => g,
@@ -214,6 +245,7 @@ async fn run_async(
                     Ok(Ok(data)) if !data.is_empty() => {
                         let responses = {
                             let mut g = grid.lock();
+                            let mut parser = parser.lock();
                             parser.advance(&mut g, &data);
                             g.epoch += 1;
                             parser.take_responses()
@@ -513,7 +545,10 @@ async fn run_async(
     }
 
     // Render loop: parse incoming output, coalesce repaints, and poll for resize.
-    let mut parser = AnsiParser::with_theme(config.theme);
+    // The parser is shared with the config watcher thread, which takes it
+    // briefly on a config save to retheme (see `watch_config`).
+    let parser = Arc::new(Mutex::new(AnsiParser::with_theme(config.theme)));
+    watch_config(Arc::clone(&parser), Arc::clone(&grid), Arc::clone(&frame));
     let mut render_state = RenderState::new();
     let mut resize_poll = tokio::time::interval(Duration::from_millis(150));
     let notified = frame.notified();
@@ -526,6 +561,7 @@ async fn run_async(
                     Some(data) => {
                         let responses = {
                             let mut g = grid.lock();
+                            let mut parser = parser.lock();
                             parser.advance(&mut g, &data);
                             g.epoch += 1;
                             parser.take_responses()
