@@ -9,14 +9,17 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::core::Grid;
+use crate::core::{Cell, Grid};
 
 use super::cpu;
 use super::font::FontCache;
 
 /// A present target: paint one frame of `grid` at the given pixel size.
+/// `chrome` is the window's own top bar (tabs + caption buttons) as one row of
+/// pre-laid cells; when non-empty it occupies the first cell row and the grid
+/// is painted one row below. Empty means no chrome (headless tests).
 pub(crate) trait Renderer {
-    fn render(&mut self, grid: &Grid, font: &mut FontCache, width: u32, height: u32);
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32);
 }
 
 /// CPU compositor presented through `softbuffer`.
@@ -35,7 +38,7 @@ impl CpuRenderer {
 }
 
 impl Renderer for CpuRenderer {
-    fn render(&mut self, grid: &Grid, font: &mut FontCache, width: u32, height: u32) {
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32) {
         let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
@@ -45,7 +48,7 @@ impl Renderer for CpuRenderer {
         let Ok(mut buffer) = self.surface.buffer_mut() else {
             return;
         };
-        cpu::render(grid, font, &mut buffer, width as usize, height as usize);
+        cpu::render(grid, chrome, font, &mut buffer, width as usize, height as usize);
         let _ = buffer.present();
     }
 }

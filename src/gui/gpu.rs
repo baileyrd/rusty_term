@@ -13,7 +13,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::core::{Grid, WIDE_TRAILER};
+use crate::core::{Cell, Grid, WIDE_TRAILER};
 
 use super::font::{FontCache, GlyphSource};
 use super::render::Renderer;
@@ -307,12 +307,15 @@ impl GpuCore {
     }
 
     /// Render `grid` into `view` (a surface frame or an offscreen texture).
+    /// A non-empty `chrome` row is drawn as cell row 0 with the grid shifted
+    /// one row down (see [`Renderer::render`]).
     pub(crate) fn render(
         &mut self,
         view: &wgpu::TextureView,
         width: u32,
         height: u32,
         grid: &Grid,
+        chrome: &[Cell],
         font: &mut FontCache,
     ) {
         let uniforms = Uniforms {
@@ -330,7 +333,15 @@ impl GpuCore {
         let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
         let status = grid.status_row();
         let last_row = grid.rows.saturating_sub(1);
-        let mut instances = Vec::with_capacity(grid.cells.len());
+        let row_off = if chrome.is_empty() { 0 } else { 1 };
+        let mut instances = Vec::with_capacity(grid.cells.len() + chrome.len());
+        for (col, cell) in chrome.iter().enumerate() {
+            if cell.flags & WIDE_TRAILER != 0 {
+                continue;
+            }
+            let slot = self.ensure_slot(cell.ch, font);
+            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg });
+        }
         for (i, cell) in grid.cells.iter().enumerate() {
             let (col, row) = (i % grid.cols, i / grid.cols);
             // The status-line overlay (L13), when present, replaces the bottom row.
@@ -349,7 +360,7 @@ impl GpuCore {
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {
                 col: col as u32,
-                row: row as u32,
+                row: (row + row_off) as u32,
                 slot,
                 fg,
                 bg,
@@ -427,7 +438,7 @@ impl GpuRenderer {
 }
 
 impl Renderer for GpuRenderer {
-    fn render(&mut self, grid: &Grid, font: &mut FontCache, width: u32, height: u32) {
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
@@ -457,7 +468,7 @@ impl Renderer for GpuRenderer {
             return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render(&view, width, height, grid, font);
+        self.core.render(&view, width, height, grid, chrome, font);
         frame.present();
     }
 }
@@ -514,7 +525,7 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        core.render(&view, w, h, &grid, &mut font);
+        core.render(&view, w, h, &grid, &[], &mut font);
 
         let bytes_per_row = (w * 4).next_multiple_of(256);
         let readback = core.device.create_buffer(&wgpu::BufferDescriptor {

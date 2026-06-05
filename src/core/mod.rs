@@ -36,6 +36,8 @@ pub use cell::{
 pub use color::Theme;
 pub use grid::{DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 #[cfg(feature = "gui")]
+pub use cell::{Cell, char_width};
+#[cfg(feature = "gui")]
 pub use grid::Selection;
 pub use parser::AnsiParser;
 
