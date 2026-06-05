@@ -24,7 +24,7 @@ use winit::window::{Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
 use crate::config::Config;
-use crate::core::{AnsiParser, Grid, Selection};
+use crate::core::{AnsiParser, Grid, Selection, Theme};
 use super::font::{self, FontCache, GlyphSource};
 use super::render::{CpuRenderer, Renderer};
 
@@ -120,6 +120,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         mods: ModifiersState::empty(),
         cols: init_cols,
         rows: init_rows,
+        theme: config.theme,
         clipboard: arboard::Clipboard::new().ok(),
         mouse_pos: (0.0, 0.0),
         selecting: false,
@@ -178,6 +179,8 @@ struct App {
     mods: ModifiersState,
     cols: u16,
     rows: u16,
+    /// The theme in effect, mirrored onto the window chrome (title bar/border).
+    theme: Theme,
     /// System clipboard for copy/paste; `None` if unavailable (e.g. headless).
     clipboard: Option<arboard::Clipboard>,
     /// Last pointer position in physical pixels, for hit-testing selection.
@@ -271,7 +274,7 @@ impl App {
     }
 
     /// Re-read the config file and apply what can change live: theme (parser
-    /// palette + grid recolor) and scrollback cap. Shell, font, and window
+    /// palette + grid recolor + window chrome) and scrollback cap. Shell, font, and window
     /// size are launch-time choices — a saved change to those takes effect on
     /// the next start. Parse warnings go to stderr, same as at startup.
     fn reload_config(&mut self) {
@@ -288,9 +291,31 @@ impl App {
         }
         g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
         drop(g);
+        self.theme = new.theme;
         if let Some(window) = &self.window {
+            apply_chrome(window, &self.theme);
             window.request_redraw();
         }
+    }
+}
+
+/// Paint the native window chrome — title bar background, caption text, and
+/// border — with the theme's colors, so the frame reads as part of the
+/// terminal instead of stock system chrome. Windows 11 only (DWM ignores the
+/// attributes on Windows 10); a no-op on other platforms, where the system
+/// titlebar theme is not per-window paintable through winit.
+fn apply_chrome(window: &Window, theme: &Theme) {
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::{Color, WindowExtWindows};
+        let c = |rgb: u32| Color::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+        window.set_title_background_color(Some(c(theme.bg)));
+        window.set_border_color(Some(c(theme.bg)));
+        window.set_title_text_color(c(theme.fg));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, theme);
     }
 }
 
@@ -309,6 +334,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let window = Arc::new(window);
+        apply_chrome(&window, &self.theme);
         self.window = Some(window.clone());
         match self.make_renderer(window.clone()) {
             Some(r) => self.renderer = Some(r),
