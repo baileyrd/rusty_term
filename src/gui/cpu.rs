@@ -4,7 +4,7 @@
 //! later hands the buffer to `softbuffer` for presentation. Pixels are
 //! `0x00RRGGBB` (the format `softbuffer` expects).
 
-use crate::core::{Grid, WIDE_TRAILER};
+use crate::core::{Cell, Grid, WIDE_TRAILER};
 
 use super::font::{Glyph, GlyphSource};
 
@@ -12,8 +12,13 @@ use super::font::{Glyph, GlyphSource};
 /// `len() == width * height`). Each cell is filled with its background, then its
 /// glyph is blended on top in the foreground color. Geometry comes from the
 /// font's cell size; cells past the buffer edge are clipped.
+///
+/// A non-empty `chrome` row (the window's own tab/caption bar) is painted as
+/// the first cell row and pushes the grid one row down; empty paints the grid
+/// at the top, unchanged.
 pub(crate) fn render(
     grid: &Grid,
+    chrome: &[Cell],
     font: &mut dyn GlyphSource,
     buf: &mut [u32],
     width: usize,
@@ -23,6 +28,30 @@ pub(crate) fn render(
     let baseline = font.baseline();
     if cw == 0 || ch == 0 {
         return;
+    }
+    let row_off = if chrome.is_empty() { 0 } else { 1 };
+
+    // Chrome bar: same bg-then-glyph compositing, fixed at pixel row 0.
+    for (col, cell) in chrome.iter().enumerate() {
+        let (x0, y0) = (col * cw, 0);
+        for y in y0..(y0 + ch).min(height) {
+            let base = y * width;
+            for x in x0..(x0 + cw).min(width) {
+                buf[base + x] = cell.bg;
+            }
+        }
+    }
+    for (col, cell) in chrome.iter().enumerate() {
+        if cell.flags & WIDE_TRAILER != 0 || cell.ch == ' ' {
+            continue;
+        }
+        let glyph = font.glyph(cell.ch);
+        if glyph.width == 0 {
+            continue;
+        }
+        let pen_x = (col * cw) as i32 + glyph.left;
+        let pen_y = baseline + glyph.top;
+        blit(buf, width, height, &glyph, pen_x, pen_y, cell.fg);
     }
 
     // The block cursor paints the cell in the cursor color (OSC 12 / the
@@ -51,7 +80,7 @@ pub(crate) fn render(
         } else {
             cell.bg
         };
-        let (x0, y0) = (col * cw, row * ch);
+        let (x0, y0) = (col * cw, (row + row_off) * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
@@ -78,7 +107,7 @@ pub(crate) fn render(
             cell.fg
         };
         let pen_x = (col * cw) as i32 + glyph.left;
-        let pen_y = (row * ch) as i32 + baseline + glyph.top;
+        let pen_y = ((row + row_off) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
     }
 }
@@ -152,7 +181,7 @@ mod tests {
         p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mX");
         let (w, h) = (4usize, 8usize);
         let mut buf = vec![0u32; w * h];
-        render(&g, &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h);
         // The 2×2 block at the top-left is the red foreground...
         assert_eq!(buf[0], 0xFF0000);
         assert_eq!(buf[1], 0xFF0000);
@@ -164,12 +193,33 @@ mod tests {
     }
 
     #[test]
+    fn chrome_row_paints_first_and_offsets_grid() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m "); // grid: blue bg space
+        g.cursor_visible = false;
+        // One chrome cell: 'X' in white on a red bar.
+        let mut bar = crate::core::Cell::blank();
+        bar.ch = 'X';
+        bar.fg = 0xFFFFFF;
+        bar.bg = 0xFF0000;
+        let (w, h) = (4usize, 16usize); // one column, two cell rows
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[bar], &mut MockFont, &mut buf, w, h);
+        // Row 0 carries the chrome: red bg with the white 2×2 glyph at top-left.
+        assert_eq!(buf[0], 0xFFFFFF, "chrome glyph at top");
+        assert_eq!(buf[3], 0xFF0000, "chrome bar background");
+        // The grid's blue cell starts one cell row down.
+        assert_eq!(buf[8 * w], 0x0000FF, "grid offset below the chrome row");
+    }
+
+    #[test]
     fn blank_cell_is_pure_background() {
         let mut g = Grid::new(1, 1);
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b[48;2;0;128;0m "); // a space painted with green bg
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(buf.iter().all(|&px| px == 0x008000));
     }
 
@@ -182,7 +232,7 @@ mod tests {
         let (cw, chh) = (4usize, 8usize);
         let (w, h) = (cw * 2, chh * 2);
         let mut buf = vec![0u32; w * h];
-        render(&g, &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h);
         // Bottom cell-row, second cell (no glyph there) is pure status bg.
         assert_eq!(buf[chh * w + cw + 1], 0x123456, "bottom row is the status overlay");
         // A non-cursor top-row cell (col 1) is untouched: default black background.
@@ -209,7 +259,7 @@ mod tests {
         p.advance(&mut g, b"\x1b[48;2;0;0;0mabc");
         let (w, h) = (cw * 3, chh);
         let mut buf = vec![0u32; w * h];
-        render(&g, &mut fc, &mut buf, w, h);
+        render(&g, &[], &mut fc, &mut buf, w, h);
         // Glyphs were drawn: at least some pixels differ from the black bg.
         assert!(buf.iter().any(|&px| px != 0x000000), "expected rasterized glyph pixels");
     }
@@ -224,7 +274,7 @@ mod tests {
         g.cursor_visible = true;
         // Default cursor color (white): the cell is a white block.
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(
             buf.iter().all(|&px| px == 0xFFFFFF),
             "default cursor is a white block"
@@ -232,7 +282,7 @@ mod tests {
         // A configured/OSC-12 cursor color paints the block in that color.
         g.cursor_color = 0x00FF00;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(
             buf.iter().all(|&px| px == 0x00FF00),
             "cursor block honors cursor_color"
@@ -248,7 +298,7 @@ mod tests {
         g.cursor = (0, 0);
         g.cursor_visible = true;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(
             buf.iter().all(|&px| px == 0xFF8800),
             "OSC 12 color reaches the block cursor"
@@ -263,7 +313,7 @@ mod tests {
         g.cursor = (0, 0);
         g.cursor_visible = false;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "no cursor: plain blue bg");
     }
 
@@ -276,7 +326,7 @@ mod tests {
         g.cursor_visible = true;
         g.view_offset = 1; // browsing history — live cursor must not draw
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "scrolled back: no cursor");
     }
 
@@ -289,7 +339,7 @@ mod tests {
         g.selection = Some(crate::core::Selection { anchor: (0, 0), head: (0, 0) });
         let (w, h) = (8usize, 8usize); // 2 cols * 4px
         let mut buf = vec![0u32; w * h];
-        render(&g, &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h);
         // Col 0 inverted (red block), col 1 untouched (blue bg).
         assert_eq!(buf[0], 0xFF0000, "selected cell inverted");
         assert_eq!(buf[4], 0x0000FF, "unselected cell unchanged");

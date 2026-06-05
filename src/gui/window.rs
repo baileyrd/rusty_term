@@ -1,10 +1,17 @@
 //! The windowed front-end: a `winit` event loop driving a real OS window, with
 //! `softbuffer` CPU presentation.
 //!
-//! A reader thread pumps the PTY through the parser into the shared [`Grid`] and
-//! wakes the loop to repaint; window key events are encoded natively (see
-//! [`super::input`]) and written to the PTY; window resizes are translated to a
-//! new cell grid + `TIOCSWINSZ`.
+//! The window is borderless (`decorations(false)`) and draws its own chrome: a
+//! one-cell-row bar across the top holding the session tabs, a `+` new-tab
+//! button, and the minimize/maximize/close caption buttons, all laid out as
+//! ordinary cells so both renderers composite it for free. Dragging the bar
+//! moves the window, double-click toggles maximize, and a thin band at the
+//! window edges drag-resizes (the native frame is gone).
+//!
+//! Each tab owns a PTY session: its own grid, parser, writer, and a reader
+//! thread pumping PTY output into the grid and waking the loop to repaint.
+//! Key events are encoded natively (see [`super::input`]) and written to the
+//! *active* tab's PTY; window resizes re-grid every tab + `TIOCSWINSZ`.
 //!
 //! Note: this drives a live window and so cannot be exercised in a headless
 //! environment — the render, input-encoding, and font layers it composes are
@@ -14,17 +21,18 @@
 //! application-cursor tracking remain documented gaps.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
 use crate::config::Config;
-use crate::core::{AnsiParser, Grid, Selection, Theme};
+use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use super::font::{self, FontCache, GlyphSource};
 use super::render::{CpuRenderer, Renderer};
 
@@ -32,19 +40,53 @@ use super::render::{CpuRenderer, Renderer};
 const FONT_PX: f32 = 18.0;
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
+/// Pixel band at the window edges acting as a resize handle (the native frame
+/// is gone with decorations off).
+const RESIZE_BORDER: f64 = 6.0;
+/// Cell budget for one tab's label in the chrome bar.
+const TAB_CELLS: usize = 20;
+/// Two clicks on the drag strip within this window toggle maximize.
+const DOUBLE_CLICK_MS: u128 = 400;
 
-/// Wakeups sent from the PTY reader thread into the winit loop.
+/// Wakeups sent from per-tab PTY reader threads into the winit loop, tagged
+/// with the tab id they concern.
 enum UserEvent {
-    /// New output was parsed into the grid; repaint.
-    Redraw,
-    /// The child exited; close the window.
-    Exit,
+    /// New output was parsed into the tab's grid; repaint if it's the active one.
+    Redraw(u64),
+    /// The tab's child exited; close that tab (the last one closes the window).
+    Exit(u64),
     /// The config file changed on disk; reload and apply what can change live.
     ConfigChanged,
 }
 
-/// Launch the windowed terminal. Blocks until the window closes or the child
-/// exits. Returns an error if the window/PTY/font can't be set up.
+/// What a click on a given chrome-bar cell does.
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    /// Activate tab `i`.
+    Tab(usize),
+    /// Spawn a new tab.
+    NewTab,
+    Minimize,
+    Maximize,
+    Close,
+    /// Empty bar: drag moves the window, double-click toggles maximize.
+    Drag,
+}
+
+/// One terminal session under a tab: its screen state and PTY plumbing. The
+/// owning PTY handle lives here, so dropping a `Tab` tears the session down
+/// (its reader thread then EOFs and its exit event becomes a no-op).
+struct Tab {
+    id: u64,
+    grid: Arc<Mutex<Grid>>,
+    /// Shared with the tab's reader thread; the loop takes it only on config
+    /// reload.
+    parser: Arc<Mutex<AnsiParser>>,
+    writer: Box<dyn BackendHandle>,
+}
+
+/// Launch the windowed terminal. Blocks until the window closes or the last
+/// tab's child exits. Returns an error if the window/PTY/font can't be set up.
 pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // The child renders through us now, so advertise a real terminal identity.
     unsafe {
@@ -58,33 +100,8 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
     let font = FontCache::new(font_bytes, font_px).ok_or("font failed to parse")?;
     let (cell_w, cell_h) = font.cell_size();
 
-    let init_cols = config.cols.unwrap_or(INIT_COLS);
-    let init_rows = config.rows.unwrap_or(INIT_ROWS);
-    let handle = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
-    let mut g = Grid::new(init_cols as usize, init_rows as usize);
-    if let Some(max) = config.scrollback {
-        g.set_scrollback_max(max);
-    }
-    g.apply_theme(&config.theme);
-    let grid = Arc::new(Mutex::new(g));
-    // The parser is shared between the reader thread (PTY bytes) and the
-    // winit loop (live config reload retheming it); contention is nil — the
-    // loop only takes it on a config save.
-    let parser = Arc::new(Mutex::new(AnsiParser::with_theme(config.theme)));
-
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-
-    // Reader thread: PTY -> parser -> grid, writing replies back and waking the
-    // loop. Uses independent handle clones so it shares no lock with the loop.
-    let read_handle = handle.try_clone()?;
-    let reply_handle = handle.try_clone()?;
-    let reader_grid = Arc::clone(&grid);
-    let reader_proxy = proxy.clone();
-    let reader_parser = Arc::clone(&parser);
-    std::thread::spawn(move || {
-        reader_loop(read_handle, reply_handle, reader_grid, reader_proxy, reader_parser)
-    });
 
     // Config live reload: watch the file and wake the loop on changes.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -96,43 +113,40 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         });
     }
 
-    // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
-    // teardown, not when the shell exits, so read-EOF can't close the window;
-    // block on the child process handle instead. `None` where read-EOF already
-    // signals exit (Unix), keeping this a no-op there.
-    if let Some(wait) = handle.exit_token() {
-        std::thread::spawn(move || {
-            wait();
-            let _ = proxy.send_event(UserEvent::Exit);
-        });
-    }
-
     let mut app = App {
-        grid,
-        parser,
+        backend,
+        config: config.clone(),
         config_path,
-        writer: handle,
+        tabs: Vec::new(),
+        active: 0,
+        next_id: 0,
+        proxy,
         font,
         cell_w: cell_w.max(1),
         cell_h: cell_h.max(1),
         window: None,
         renderer: None,
         mods: ModifiersState::empty(),
-        cols: init_cols,
-        rows: init_rows,
+        cols: config.cols.unwrap_or(INIT_COLS),
+        rows: config.rows.unwrap_or(INIT_ROWS),
         theme: config.theme,
         clipboard: arboard::Clipboard::new().ok(),
         mouse_pos: (0.0, 0.0),
         selecting: false,
         sel_anchor: None,
+        hits: Vec::new(),
+        last_strip_click: None,
     };
+    app.spawn_tab()?; // the first shell; more come from Ctrl+Shift+T / the + button
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-/// PTY reader loop (own thread): parse output into the grid, send replies
-/// (DA/DSR/structured-channel) back to the child, and wake the window.
+/// PTY reader loop (own thread, one per tab): parse output into the tab's
+/// grid, send replies (DA/DSR/structured-channel) back to the child, and wake
+/// the window with the tab's id.
 fn reader_loop(
+    id: u64,
     mut reader: Box<dyn BackendHandle>,
     mut replies: Box<dyn BackendHandle>,
     grid: Arc<Mutex<Grid>>,
@@ -154,68 +168,200 @@ fn reader_loop(
                 if !response.is_empty() {
                     let _ = replies.write(&response);
                 }
-                if proxy.send_event(UserEvent::Redraw).is_err() {
+                if proxy.send_event(UserEvent::Redraw(id)).is_err() {
                     break; // loop gone
                 }
             }
             Err(_) => break,
         }
     }
-    let _ = proxy.send_event(UserEvent::Exit);
+    let _ = proxy.send_event(UserEvent::Exit(id));
 }
 
-struct App {
-    grid: Arc<Mutex<Grid>>,
-    /// Shared with the reader thread; the loop takes it only on config reload.
-    parser: Arc<Mutex<AnsiParser>>,
+struct App<'a> {
+    /// Spawns the shell behind each new tab.
+    backend: &'a dyn Backend,
+    /// The effective config; refreshed on live reload so new tabs follow it.
+    config: Config,
     /// The config file in effect, for the open shortcut + reload re-reads.
     config_path: Option<std::path::PathBuf>,
-    writer: Box<dyn BackendHandle>,
+    tabs: Vec<Tab>,
+    /// Index into `tabs` of the session being shown and fed input.
+    active: usize,
+    /// Monotonic id source for tabs (ids outlive indices across closes).
+    next_id: u64,
+    proxy: EventLoopProxy<UserEvent>,
     font: FontCache,
     cell_w: usize,
     cell_h: usize,
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
     mods: ModifiersState,
+    /// Grid size in cells (the chrome bar adds one extra screen row on top).
     cols: u16,
     rows: u16,
-    /// The theme in effect, mirrored onto the window chrome (title bar/border).
+    /// The theme in effect, painting the chrome bar and any new tab's grid.
     theme: Theme,
     /// System clipboard for copy/paste; `None` if unavailable (e.g. headless).
     clipboard: Option<arboard::Clipboard>,
-    /// Last pointer position in physical pixels, for hit-testing selection.
+    /// Last pointer position in physical pixels, for hit-testing.
     mouse_pos: (f64, f64),
     /// Whether the left button is held (a drag-selection is in progress).
     selecting: bool,
     /// Cell where the current drag-selection began.
     sel_anchor: Option<(usize, usize)>,
+    /// Per-cell click actions for the chrome bar, rebuilt with each layout.
+    hits: Vec<Hit>,
+    /// Time of the last single click on the drag strip (double-click detect).
+    last_strip_click: Option<Instant>,
 }
 
-impl App {
-    /// Recompute the cell grid from the window's pixel size and inform the child.
-    fn apply_size(&mut self, px_w: u32, px_h: u32) {
-        let cols = ((px_w as usize / self.cell_w).max(1)) as u16;
-        let rows = ((px_h as usize / self.cell_h).max(1)) as u16;
-        if (cols, rows) != (self.cols, self.rows) {
-            self.cols = cols;
-            self.rows = rows;
-            let mut g = self.grid.lock();
-            g.resize(cols as usize, rows as usize);
-            g.selection = None; // viewport changed; old selection coords are stale
-            drop(g);
-            let _ = self.writer.set_winsize(cols, rows);
+impl App<'_> {
+    /// Spawn a shell in a new tab sized to the current grid, wire its reader
+    /// and exit watcher, and make it the active tab.
+    fn spawn_tab(&mut self) -> Result<(), std::io::Error> {
+        let handle = self.backend.spawn_shell(self.cols, self.rows, self.config.shell.as_deref())?;
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut g = Grid::new(self.cols as usize, self.rows as usize);
+        if let Some(max) = self.config.scrollback {
+            g.set_scrollback_max(max);
+        }
+        g.apply_theme(&self.theme);
+        let grid = Arc::new(Mutex::new(g));
+        let parser = Arc::new(Mutex::new(AnsiParser::with_theme(self.theme)));
+
+        // Reader thread: PTY -> parser -> grid, writing replies back and waking
+        // the loop. Uses independent handle clones so it shares no lock with us.
+        let read_handle = handle.try_clone()?;
+        let reply_handle = handle.try_clone()?;
+        let reader_grid = Arc::clone(&grid);
+        let reader_parser = Arc::clone(&parser);
+        let reader_proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            reader_loop(id, read_handle, reply_handle, reader_grid, reader_proxy, reader_parser)
+        });
+
+        // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
+        // teardown, not when the shell exits, so read-EOF can't close the tab;
+        // block on the child process handle instead. `None` where read-EOF
+        // already signals exit (Unix), keeping this a no-op there.
+        if let Some(wait) = handle.exit_token() {
+            let exit_proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                wait();
+                let _ = exit_proxy.send_event(UserEvent::Exit(id));
+            });
+        }
+
+        self.tabs.push(Tab { id, grid, parser, writer: handle });
+        self.active = self.tabs.len() - 1;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        Ok(())
+    }
+
+    /// Close the tab with `id` (idempotent: a stale exit event for an
+    /// already-closed tab is a no-op). Closing the last tab exits the app.
+    fn close_tab(&mut self, id: u64, event_loop: &ActiveEventLoop) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.tabs.remove(idx); // drops the owning handle: PTY + child torn down
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if idx < self.active {
+            self.active -= 1; // indices above the removed tab shifted down
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
-    /// Paint the current grid through the active renderer.
+    /// Recompute the cell grid from the window's pixel size (minus the chrome
+    /// row) and inform every tab's child.
+    fn apply_size(&mut self, px_w: u32, px_h: u32) {
+        let cols = ((px_w as usize / self.cell_w).max(1)) as u16;
+        let rows = (((px_h as usize / self.cell_h).saturating_sub(1)).max(1)) as u16;
+        if (cols, rows) != (self.cols, self.rows) {
+            self.cols = cols;
+            self.rows = rows;
+            for tab in &mut self.tabs {
+                let mut g = tab.grid.lock();
+                g.resize(cols as usize, rows as usize);
+                g.selection = None; // viewport changed; old selection coords are stale
+                drop(g);
+                let _ = tab.writer.set_winsize(cols, rows);
+            }
+        }
+    }
+
+    /// Paint the chrome bar + the active tab's grid through the renderer.
     fn redraw(&mut self) {
+        let chrome = self.chrome_row();
         let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
             return;
         };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         let size = window.inner_size();
-        let g = self.grid.lock();
+        let g = tab.grid.lock();
         window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
-        renderer.render(&g, &mut self.font, size.width, size.height);
+        renderer.render(&g, &chrome, &mut self.font, size.width, size.height);
+    }
+
+    /// Lay out the chrome bar for the current tabs/size: tab labels and the
+    /// `+` on the left, the caption buttons (─ □ ×) right-aligned, drag strip
+    /// between. Rebuilds the per-cell hit map as it goes.
+    fn chrome_row(&mut self) -> Vec<Cell> {
+        let cols = self.cols as usize;
+        let bar_bg = mix(self.theme.bg, self.theme.fg, 30);
+        let dim_fg = mix(self.theme.fg, self.theme.bg, 110);
+        let mut row: Vec<Cell> = vec![Cell::blank(); cols];
+        for c in &mut row {
+            c.fg = self.theme.fg;
+            c.bg = bar_bg;
+        }
+        let mut hits = vec![Hit::Drag; cols];
+
+        // Caption buttons get the last 12 cells (4 each); tabs + the `+` fill
+        // the left, never running into them.
+        let btn0 = cols.saturating_sub(12);
+        let tab_limit = btn0.saturating_sub(4);
+
+        let mut col = 0usize;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let is_active = i == self.active;
+            // The active tab adopts the terminal background, visually merging
+            // with the grid below; inactive ones sit dimmed on the bar.
+            let (fg, bg) = if is_active { (self.theme.fg, self.theme.bg) } else { (dim_fg, bar_bg) };
+            let title = {
+                let g = tab.grid.lock();
+                if g.title.is_empty() { format!("shell {}", i + 1) } else { g.title.clone() }
+            };
+            let label: String = format!(" {title} ").chars().take(TAB_CELLS).collect();
+            let end = (col + TAB_CELLS).min(tab_limit);
+            put_text(&mut row, &mut hits, &mut col, end, &label, fg, bg, Hit::Tab(i));
+            if col < tab_limit {
+                col += 1; // one bar-colored cell as a tab separator
+            }
+        }
+        put_text(&mut row, &mut hits, &mut col, btn0, " + ", self.theme.fg, bar_bg, Hit::NewTab);
+
+        let mut bcol = btn0;
+        put_text(&mut row, &mut hits, &mut bcol, btn0 + 4, "  ─ ", self.theme.fg, bar_bg, Hit::Minimize);
+        put_text(&mut row, &mut hits, &mut bcol, btn0 + 8, "  □ ", self.theme.fg, bar_bg, Hit::Maximize);
+        put_text(&mut row, &mut hits, &mut bcol, cols, "  × ", self.theme.fg, bar_bg, Hit::Close);
+
+        self.hits = hits;
+        row
     }
 
     /// Build the configured renderer for `window`: the GPU one when `--gpu` is
@@ -237,30 +383,122 @@ impl App {
         }
     }
 
-    /// Map a physical pixel position to a clamped `(col, row)` cell.
+    /// Map a physical pixel position to a clamped `(col, row)` *grid* cell
+    /// (the chrome bar occupies the screen row above grid row 0).
     fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
         let col = (px.max(0.0) as usize / self.cell_w).min((self.cols as usize).saturating_sub(1));
-        let row = (py.max(0.0) as usize / self.cell_h).min((self.rows as usize).saturating_sub(1));
+        let row = (py.max(0.0) as usize / self.cell_h)
+            .saturating_sub(1)
+            .min((self.rows as usize).saturating_sub(1));
         (col, row)
     }
 
-    /// Copy the current selection to the system clipboard (Ctrl+Shift+C).
+    /// The resize direction for a pointer near the window edge, `None` away
+    /// from the edges or while maximized (a maximized window doesn't resize).
+    fn resize_zone(&self, x: f64, y: f64) -> Option<ResizeDirection> {
+        let window = self.window.as_ref()?;
+        if window.is_maximized() {
+            return None;
+        }
+        let size = window.inner_size();
+        let (w, h) = (size.width as f64, size.height as f64);
+        let (l, r) = (x < RESIZE_BORDER, x > w - RESIZE_BORDER);
+        let (t, b) = (y < RESIZE_BORDER, y > h - RESIZE_BORDER);
+        Some(match (l, r, t, b) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, ..) => ResizeDirection::West,
+            (_, true, ..) => ResizeDirection::East,
+            (_, _, true, _) => ResizeDirection::North,
+            (_, _, _, true) => ResizeDirection::South,
+            _ => return None,
+        })
+    }
+
+    /// Left button pressed: edge band starts a drag-resize, the chrome bar
+    /// dispatches its hit action, anywhere else anchors a drag-selection.
+    fn on_left_press(&mut self, event_loop: &ActiveEventLoop) {
+        let (x, y) = self.mouse_pos;
+        if let Some(dir) = self.resize_zone(x, y) {
+            if let Some(window) = &self.window {
+                let _ = window.drag_resize_window(dir);
+            }
+            return;
+        }
+        if (y.max(0.0) as usize) < self.cell_h {
+            return self.on_bar_click(x, event_loop);
+        }
+        self.sel_anchor = Some(self.cell_at(x, y));
+        self.selecting = true;
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.grid.lock().selection = None; // cleared until the drag moves
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Dispatch a click on the chrome bar through the hit map.
+    fn on_bar_click(&mut self, x: f64, event_loop: &ActiveEventLoop) {
+        if self.hits.is_empty() {
+            return; // no frame laid out yet
+        }
+        let col = (x.max(0.0) as usize / self.cell_w).min(self.hits.len() - 1);
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        match self.hits[col] {
+            Hit::Tab(i) => {
+                if i < self.tabs.len() && i != self.active {
+                    self.active = i;
+                    window.request_redraw();
+                }
+            }
+            Hit::NewTab => {
+                if let Err(e) = self.spawn_tab() {
+                    eprintln!("rusty_term: new tab: {e}");
+                }
+            }
+            Hit::Minimize => window.set_minimized(true),
+            Hit::Maximize => window.set_maximized(!window.is_maximized()),
+            Hit::Close => event_loop.exit(),
+            Hit::Drag => {
+                let now = Instant::now();
+                if self
+                    .last_strip_click
+                    .take()
+                    .is_some_and(|last| now.duration_since(last).as_millis() <= DOUBLE_CLICK_MS)
+                {
+                    window.set_maximized(!window.is_maximized());
+                } else {
+                    self.last_strip_click = Some(now);
+                    let _ = window.drag_window();
+                }
+            }
+        }
+    }
+
+    /// Copy the active tab's selection to the system clipboard (Ctrl+Shift+C).
     fn copy_selection(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
-        if let Some(text) = self.grid.lock().selected_text() {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        if let Some(text) = tab.grid.lock().selected_text() {
             let _ = cb.set_text(text);
         }
     }
 
-    /// Paste the system clipboard into the child (Ctrl+Shift+V).
+    /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
         let Ok(text) = cb.get_text() else { return };
         if text.is_empty() {
             return;
         }
-        let bracketed = self.grid.lock().bracketed_paste;
-        let _ = self.writer.write(&encode_paste(&text, bracketed));
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let bracketed = tab.grid.lock().bracketed_paste;
+        let _ = tab.writer.write(&encode_paste(&text, bracketed));
     }
 
     /// Open the config file in the user's editor (Ctrl+Shift+,), creating it
@@ -273,10 +511,11 @@ impl App {
         }
     }
 
-    /// Re-read the config file and apply what can change live: theme (parser
-    /// palette + grid recolor + window chrome) and scrollback cap. Shell, font, and window
-    /// size are launch-time choices — a saved change to those takes effect on
-    /// the next start. Parse warnings go to stderr, same as at startup.
+    /// Re-read the config file and apply what can change live: theme (every
+    /// tab's parser palette + grid recolor, the chrome bar, the window border)
+    /// and scrollback cap. Shell changes apply to tabs opened afterwards;
+    /// font and window size are launch-time choices. Parse warnings go to
+    /// stderr, same as at startup.
     fn reload_config(&mut self) {
         let Some(path) = self.config_path.clone() else { return };
         let args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
@@ -284,14 +523,16 @@ impl App {
         for w in &warnings {
             eprintln!("rusty_term: {w}");
         }
-        let mut g = self.grid.lock();
-        let old = self.parser.lock().retheme(new.theme);
-        if old != new.theme {
-            g.retheme(&old, &new.theme);
+        for tab in &self.tabs {
+            let mut g = tab.grid.lock();
+            let old = tab.parser.lock().retheme(new.theme);
+            if old != new.theme {
+                g.retheme(&old, &new.theme);
+            }
+            g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
         }
-        g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
-        drop(g);
         self.theme = new.theme;
+        self.config = new;
         if let Some(window) = &self.window {
             apply_chrome(window, &self.theme);
             window.request_redraw();
@@ -299,19 +540,68 @@ impl App {
     }
 }
 
-/// Paint the native window chrome — title bar background, caption text, and
-/// border — with the theme's colors, so the frame reads as part of the
-/// terminal instead of stock system chrome. Windows 11 only (DWM ignores the
-/// attributes on Windows 10); a no-op on other platforms, where the system
-/// titlebar theme is not per-window paintable through winit.
+/// Write `text` into the chrome `row` from `*col` up to (not including)
+/// `limit`, advancing wide glyphs by two cells with a flagged trailer and
+/// stopping at the boundary. Every written cell adopts `fg`/`bg` and `hit`.
+#[allow(clippy::too_many_arguments)]
+fn put_text(
+    row: &mut [Cell],
+    hits: &mut [Hit],
+    col: &mut usize,
+    limit: usize,
+    text: &str,
+    fg: u32,
+    bg: u32,
+    hit: Hit,
+) {
+    let limit = limit.min(row.len());
+    for ch in text.chars() {
+        if *col >= limit {
+            break;
+        }
+        let w = char_width(ch);
+        if w == 0 {
+            continue; // zero-width scalars don't occupy a cell
+        }
+        if w == 2 && *col + 1 >= limit {
+            break; // a wide glyph's trailer wouldn't fit
+        }
+        row[*col].ch = ch;
+        row[*col].fg = fg;
+        row[*col].bg = bg;
+        hits[*col] = hit;
+        *col += 1;
+        if w == 2 {
+            row[*col].ch = ' ';
+            row[*col].fg = fg;
+            row[*col].bg = bg;
+            row[*col].flags = WIDE_TRAILER;
+            hits[*col] = hit;
+            *col += 1;
+        }
+    }
+}
+
+/// Per-channel mix of `t/255` of `b` into `a` (`0xRRGGBB`) — used to derive
+/// the chrome bar's bg and dimmed text from the theme without new config keys.
+fn mix(a: u32, b: u32, t: u32) -> u32 {
+    let chan = |s: u32| {
+        let av = (a >> s) & 0xff;
+        let bv = (b >> s) & 0xff;
+        ((av * (255 - t) + bv * t) / 255) << s
+    };
+    chan(16) | chan(8) | chan(0)
+}
+
+/// Paint the window border with the theme background so the frame reads as
+/// part of the terminal (the title bar itself is ours now). Windows 11 only
+/// (DWM ignores the attribute on 10); a no-op on other platforms.
 fn apply_chrome(window: &Window, theme: &Theme) {
     #[cfg(target_os = "windows")]
     {
         use winit::platform::windows::{Color, WindowExtWindows};
         let c = |rgb: u32| Color::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
-        window.set_title_background_color(Some(c(theme.bg)));
         window.set_border_color(Some(c(theme.bg)));
-        window.set_title_text_color(c(theme.fg));
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -319,16 +609,25 @@ fn apply_chrome(window: &Window, theme: &Theme) {
     }
 }
 
-impl ApplicationHandler<UserEvent> for App {
+impl ApplicationHandler<UserEvent> for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
         let width = (self.cols as usize * self.cell_w) as u32;
-        let height = (self.rows as usize * self.cell_h) as u32;
+        // One extra cell row on top for the chrome bar.
+        let height = ((self.rows as usize + 1) * self.cell_h) as u32;
         let attrs = Window::default_attributes()
             .with_title("rusty_term")
+            .with_decorations(false)
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
+        // Keep the DWM drop shadow so the borderless window still reads as
+        // raised above the desktop.
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_undecorated_shadow(true)
+        };
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
             return;
@@ -361,7 +660,24 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                // Clipboard shortcuts are intercepted before native encoding.
+                // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs, never reaching the child.
+                if self.mods.control_key()
+                    && let PhysicalKey::Code(KeyCode::Tab) = event.physical_key
+                {
+                    let n = self.tabs.len();
+                    if n > 1 {
+                        self.active = if self.mods.shift_key() {
+                            (self.active + n - 1) % n
+                        } else {
+                            (self.active + 1) % n
+                        };
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Terminal-owned shortcuts are intercepted before native encoding.
                 if self.mods.control_key()
                     && self.mods.shift_key()
                     && let PhysicalKey::Code(code) = event.physical_key
@@ -370,34 +686,58 @@ impl ApplicationHandler<UserEvent> for App {
                         KeyCode::KeyC => return self.copy_selection(),
                         KeyCode::KeyV => return self.paste(),
                         KeyCode::Comma => return self.open_config(),
+                        KeyCode::KeyT => {
+                            if let Err(e) = self.spawn_tab() {
+                                eprintln!("rusty_term: new tab: {e}");
+                            }
+                            return;
+                        }
+                        KeyCode::KeyW => {
+                            if let Some(tab) = self.tabs.get(self.active) {
+                                let id = tab.id;
+                                self.close_tab(id, event_loop);
+                            }
+                            return;
+                        }
                         _ => {}
                     }
                 }
-                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
-                    let _ = self.writer.write(&bytes);
+                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false)
+                    && let Some(tab) = self.tabs.get_mut(self.active)
+                {
+                    let _ = tab.writer.write(&bytes);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
+                // The edge band shows a resize cursor; everywhere else default.
+                let icon = match self.resize_zone(position.x, position.y) {
+                    Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
+                        CursorIcon::NwseResize
+                    }
+                    Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => {
+                        CursorIcon::NeswResize
+                    }
+                    Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
+                    Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+                    None => CursorIcon::Default,
+                };
+                if let Some(window) = &self.window {
+                    window.set_cursor(icon);
+                }
                 if self.selecting
                     && let Some(anchor) = self.sel_anchor
+                    && let Some(tab) = self.tabs.get(self.active)
                 {
                     let head = self.cell_at(position.x, position.y);
-                    self.grid.lock().selection = Some(Selection { anchor, head });
+                    tab.grid.lock().selection = Some(Selection { anchor, head });
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    self.sel_anchor = Some(self.cell_at(self.mouse_pos.0, self.mouse_pos.1));
-                    self.selecting = true;
-                    self.grid.lock().selection = None; // cleared until the drag moves
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
+                ElementState::Pressed => self.on_left_press(event_loop),
                 ElementState::Released => self.selecting = false,
             },
             _ => {}
@@ -406,12 +746,16 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Redraw => {
-                if let Some(window) = &self.window {
+            UserEvent::Redraw(id) => {
+                // Output on a background tab doesn't repaint; its bar label
+                // refreshes with the next frame the active tab causes.
+                if self.tabs.get(self.active).is_some_and(|t| t.id == id)
+                    && let Some(window) = &self.window
+                {
                     window.request_redraw();
                 }
             }
-            UserEvent::Exit => event_loop.exit(),
+            UserEvent::Exit(id) => self.close_tab(id, event_loop),
             UserEvent::ConfigChanged => self.reload_config(),
         }
     }
@@ -436,7 +780,8 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_paste;
+    use super::{Hit, encode_paste, mix, put_text};
+    use crate::core::Cell;
 
     #[test]
     fn paste_normalizes_newlines_to_cr() {
@@ -457,5 +802,51 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_plain_text() {
         assert_eq!(encode_paste("ls", true), b"\x1b[200~ls\x1b[201~");
+    }
+
+    #[test]
+    fn put_text_writes_cells_and_hits_up_to_limit() {
+        let mut row = vec![Cell::blank(); 8];
+        let mut hits = vec![Hit::Drag; 8];
+        let mut col = 1;
+        put_text(&mut row, &mut hits, &mut col, 4, "abcdef", 0x111111, 0x222222, Hit::NewTab);
+        assert_eq!(col, 4, "stops at the limit");
+        assert_eq!(row[1].ch, 'a');
+        assert_eq!(row[3].ch, 'c');
+        assert_eq!(row[4].ch, ' ', "cell past the limit untouched");
+        assert_eq!(row[1].fg, 0x111111);
+        assert!(hits[1] == Hit::NewTab && hits[3] == Hit::NewTab);
+        assert!(hits[4] == Hit::Drag);
+    }
+
+    #[test]
+    fn put_text_gives_wide_glyphs_a_trailer() {
+        use crate::core::WIDE_TRAILER;
+        let mut row = vec![Cell::blank(); 8];
+        let mut hits = vec![Hit::Drag; 8];
+        let mut col = 0;
+        put_text(&mut row, &mut hits, &mut col, 8, "你x", 0xAAAAAA, 0x0, Hit::Close);
+        assert_eq!(col, 3, "wide glyph advances two cells");
+        assert_eq!(row[0].ch, '你');
+        assert_ne!(row[1].flags & WIDE_TRAILER, 0, "trailer flagged");
+        assert_eq!(row[2].ch, 'x');
+    }
+
+    #[test]
+    fn put_text_breaks_when_wide_trailer_does_not_fit() {
+        let mut row = vec![Cell::blank(); 4];
+        let mut hits = vec![Hit::Drag; 4];
+        let mut col = 0;
+        put_text(&mut row, &mut hits, &mut col, 2, "a你", 0x0, 0x0, Hit::Close);
+        assert_eq!(col, 1, "wide head would straddle the limit; stops");
+        assert_eq!(row[1].ch, ' ');
+    }
+
+    #[test]
+    fn mix_blends_toward_second_color() {
+        assert_eq!(mix(0x000000, 0xFFFFFF, 0), 0x000000);
+        assert_eq!(mix(0x000000, 0xFFFFFF, 255), 0xFFFFFF);
+        let mid = mix(0x000000, 0xFFFFFF, 128);
+        assert!((0x7F..=0x81).contains(&(mid & 0xff)), "roughly half: {mid:#x}");
     }
 }

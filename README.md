@@ -151,16 +151,25 @@ template on first use — edit, save, watch it apply.
 
 #### Window backend controls (`--gui`)
 
+The window is borderless and draws its own chrome: a one-row bar across the
+top with the session **tabs**, a `+` new-tab button, and minimize/maximize/
+close. Each tab is its own shell session. Drag the empty bar to move the
+window (double-click it to toggle maximize), and drag the thin band at the
+window edges to resize.
+
 | Input | Action |
 |-------|--------|
 | Left-drag | Select text (highlighted by inversion). |
 | Ctrl+Shift+C | Copy the selection to the system clipboard. |
 | Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
 | Ctrl+Shift+, | Open the config file in your editor (created from a template on first use). |
+| Ctrl+Shift+T / `+` | Open a new tab (uses the configured shell). |
+| Ctrl+Shift+W | Close the current tab (the last one closes the window). |
+| Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs. |
 
-The window draws a block cursor and closes when the shell exits. Mouse
-*reporting* to applications (so TUI apps see clicks), OSC 52 programmatic
-clipboard, and IME are not yet wired.
+The window draws a block cursor; a tab closes when its shell exits, and the
+window closes with the last tab. Mouse *reporting* to applications (so TUI
+apps see clicks), OSC 52 programmatic clipboard, and IME are not yet wired.
 
 ## Shell integration (OSC 133)
 
