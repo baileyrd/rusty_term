@@ -130,6 +130,32 @@ impl Palette {
         self.cursor = self.seed.cursor;
     }
 
+    /// The configured startup theme this palette reseeds from on every reset.
+    pub(crate) fn seed(&self) -> Theme {
+        self.seed
+    }
+
+    /// Live theme switch: adopt `new` as the seed and migrate the dynamic
+    /// state. Entries still at their `old` built-in value follow the new
+    /// theme; entries the child changed (OSC 4/10/11/12) are preserved.
+    pub(crate) fn retheme(&mut self, old: &Theme, new: &Theme) {
+        for i in 0..16 {
+            if self.colors[i] == old.palette16[i] {
+                self.colors[i] = new.palette16[i];
+            }
+        }
+        if self.fg == old.fg {
+            self.fg = new.fg;
+        }
+        if self.bg == old.bg {
+            self.bg = new.bg;
+        }
+        if self.cursor == old.cursor {
+            self.cursor = new.cursor;
+        }
+        self.seed = *new;
+    }
+
     /// The `0xRRGGBB` of palette index `n`. Indices ≥ 256 (never produced by
     /// our SGR paths) fall back to the default foreground.
     pub(crate) fn index(&self, n: usize) -> u32 {
@@ -173,6 +199,30 @@ fn theme_index(theme: &Theme, n: usize) -> u32 {
         0..=15 => theme.palette16[n],
         _ => xterm_256_to_rgb(n),
     }
+}
+
+/// Remap a resolved color from `old`'s theme to `new`'s: a color that exactly
+/// matches the old default fg/bg/cursor or one of the old 16 ANSI entries
+/// becomes the new theme's counterpart; anything else (truecolor, 256-cube)
+/// passes through. Cells store resolved RGB rather than palette indices, so
+/// this exact-match mapping is how a live config reload recolors content that
+/// is already on screen. First match wins when old entries collide.
+pub(crate) fn remap(c: u32, old: &Theme, new: &Theme) -> u32 {
+    if c == old.fg {
+        return new.fg;
+    }
+    if c == old.bg {
+        return new.bg;
+    }
+    if c == old.cursor {
+        return new.cursor;
+    }
+    for i in 0..16 {
+        if c == old.palette16[i] {
+            return new.palette16[i];
+        }
+    }
+    c
 }
 
 /// Convert an xterm 256-color index to `0xRRGGBB`.

@@ -34,7 +34,7 @@ pub use cell::{
     ATTR_STRIKE, ATTR_UNDERLINE, WIDE_TRAILER,
 };
 pub use color::Theme;
-pub use grid::{DirtyFrame, Grid, LineAttr};
+pub use grid::{DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 #[cfg(feature = "gui")]
 pub use grid::Selection;
 pub use parser::AnsiParser;
