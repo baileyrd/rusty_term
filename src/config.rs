@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use crate::core::{CursorShape, Theme};
+use crate::keymap::{Keymap, parse_action, parse_chord};
 
 /// Parsed configuration with everything optional; `None` / the [`Theme`]
 /// defaults mean "keep the built-in behavior".
@@ -44,6 +45,9 @@ pub struct Config {
     pub cursor_style: Option<CursorShape>,
     /// Whether the cursor blinks by default (windowed front-end).
     pub cursor_blink: Option<bool>,
+    /// Keybindings for terminal-owned shortcuts (windowed front-end); the
+    /// `[keys]` section overrides individual actions on top of the defaults.
+    pub keys: Keymap,
 }
 
 impl Config {
@@ -358,6 +362,11 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
         ("", "cursor_blink") => cfg.cursor_blink = Some(expect_bool(key, value)?),
+        ("keys", k) => {
+            let action =
+                parse_action(k).ok_or_else(|| format!("unknown [keys] action `{k}`"))?;
+            cfg.keys.set(action, parse_chord(&expect_str(key, value)?)?);
+        }
         ("", k) => return Err(format!("unknown key `{k}`")),
         (s, k) => return Err(format!("unknown key `{k}` in [{s}]")),
     }
@@ -649,6 +658,28 @@ color15 = "ffffff"
         assert_eq!(cfg2.cursor_style, None);
         assert_eq!(cfg2.cursor_blink, None);
         assert_eq!(warns.len(), 2);
+    }
+
+    #[test]
+    fn keys_section_rebinds_actions() {
+        use crate::keymap::{Action, Chord, Key};
+        let (cfg, warns) = parse("[keys]\ncopy = \"Ctrl+Alt+C\"\nnew_tab = \"Ctrl+Shift+N\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.keys.action(Chord::new(true, false, true, Key::Char('c'))), Some(Action::Copy));
+        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('n'))), Some(Action::NewTab));
+        // The rebound action vacated its default chord.
+        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('c'))), None);
+        // Untouched defaults still resolve.
+        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('v'))), Some(Action::Paste));
+    }
+
+    #[test]
+    fn keys_section_warns_on_bad_action_or_chord() {
+        use crate::keymap::{Action, Chord, Key};
+        let (cfg, warns) = parse("[keys]\nbogus = \"Ctrl+C\"\ncopy = \"Ctrl+Nope\"\n");
+        assert_eq!(warns.len(), 2); // unknown action + malformed chord
+        // Both lines were rejected, so the defaults are intact.
+        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('c'))), Some(Action::Copy));
     }
 
     #[test]

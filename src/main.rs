@@ -4,6 +4,7 @@ mod core;
 #[cfg(feature = "gui")]
 mod gui;
 mod input;
+mod keymap;
 mod render;
 mod runtime;
 mod shells;

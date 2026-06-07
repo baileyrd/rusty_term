@@ -33,6 +33,7 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 use crate::backend::{Backend, BackendHandle};
 use crate::config::Config;
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
+use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseEvent, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
 use super::render::{CpuRenderer, Renderer};
@@ -548,6 +549,48 @@ impl App<'_> {
         }
     }
 
+    /// Dispatch a terminal-owned [`Action`] resolved from the keymap.
+    fn run_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste(),
+            Action::NewTab => {
+                if let Err(e) = self.spawn_tab() {
+                    eprintln!("rusty_term: new tab: {e}");
+                }
+            }
+            Action::CloseTab => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    let id = tab.id;
+                    self.close_tab(id, event_loop);
+                }
+            }
+            Action::NextTab => self.cycle_tab(true),
+            Action::PrevTab => self.cycle_tab(false),
+            Action::OpenConfig => self.open_config(),
+            Action::ScrollPageUp => self.scroll_key(false, true),
+            Action::ScrollPageDown => self.scroll_key(false, false),
+            Action::ScrollPromptUp => self.scroll_key(true, true),
+            Action::ScrollPromptDown => self.scroll_key(true, false),
+        }
+    }
+
+    /// Switch to the next (`forward`) or previous tab, wrapping; a no-op with one
+    /// tab. Repaints since the active grid changed.
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        if n > 1 {
+            self.active = if forward {
+                (self.active + 1) % n
+            } else {
+                (self.active + n - 1) % n
+            };
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
@@ -820,56 +863,21 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs, never reaching the child.
-                if self.mods.control_key()
-                    && let PhysicalKey::Code(KeyCode::Tab) = event.physical_key
+                // Terminal-owned shortcuts (configurable via the `[keys]` config
+                // section) are looked up before native encoding, so a bound chord
+                // never reaches the child.
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && let Some(key) = chord_key(code)
                 {
-                    let n = self.tabs.len();
-                    if n > 1 {
-                        self.active = if self.mods.shift_key() {
-                            (self.active + n - 1) % n
-                        } else {
-                            (self.active + 1) % n
-                        };
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
-                    }
-                    return;
-                }
-                // Scrollback browsing: Shift+PageUp/Down page through history,
-                // Ctrl+Shift+PageUp/Down jump prompt-to-prompt. Intercepted
-                // before native encoding so they never reach the child.
-                if self.mods.shift_key()
-                    && let PhysicalKey::Code(code @ (KeyCode::PageUp | KeyCode::PageDown)) =
-                        event.physical_key
-                {
-                    self.scroll_key(self.mods.control_key(), code == KeyCode::PageUp);
-                    return;
-                }
-                // Terminal-owned shortcuts are intercepted before native encoding.
-                if self.mods.control_key()
-                    && self.mods.shift_key()
-                    && let PhysicalKey::Code(code) = event.physical_key
-                {
-                    match code {
-                        KeyCode::KeyC => return self.copy_selection(),
-                        KeyCode::KeyV => return self.paste(),
-                        KeyCode::Comma => return self.open_config(),
-                        KeyCode::KeyT => {
-                            if let Err(e) = self.spawn_tab() {
-                                eprintln!("rusty_term: new tab: {e}");
-                            }
-                            return;
-                        }
-                        KeyCode::KeyW => {
-                            if let Some(tab) = self.tabs.get(self.active) {
-                                let id = tab.id;
-                                self.close_tab(id, event_loop);
-                            }
-                            return;
-                        }
-                        _ => {}
+                    let chord = Chord::new(
+                        self.mods.control_key(),
+                        self.mods.shift_key(),
+                        self.mods.alt_key(),
+                        key,
+                    );
+                    if let Some(action) = self.config.keys.action(chord) {
+                        self.run_action(action, event_loop);
+                        return;
                     }
                 }
                 if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
@@ -1044,6 +1052,57 @@ fn notify(title: &str, body: &str) {
         c
     };
     let _ = cmd.env("RT_TITLE", title).env("RT_BODY", body).spawn();
+}
+
+/// Map a winit physical key to a toolkit-free [`crate::keymap::Key`] for binding
+/// lookup, or `None` for keys that can't be bound (they fall through to native
+/// encoding). Letters and digits are position-based, matching most terminals.
+fn chord_key(code: KeyCode) -> Option<crate::keymap::Key> {
+    use crate::keymap::Key;
+    Some(match code {
+        KeyCode::Tab => Key::Tab,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Comma => Key::Char(','),
+        KeyCode::Period => Key::Char('.'),
+        KeyCode::KeyA => Key::Char('a'),
+        KeyCode::KeyB => Key::Char('b'),
+        KeyCode::KeyC => Key::Char('c'),
+        KeyCode::KeyD => Key::Char('d'),
+        KeyCode::KeyE => Key::Char('e'),
+        KeyCode::KeyF => Key::Char('f'),
+        KeyCode::KeyG => Key::Char('g'),
+        KeyCode::KeyH => Key::Char('h'),
+        KeyCode::KeyI => Key::Char('i'),
+        KeyCode::KeyJ => Key::Char('j'),
+        KeyCode::KeyK => Key::Char('k'),
+        KeyCode::KeyL => Key::Char('l'),
+        KeyCode::KeyM => Key::Char('m'),
+        KeyCode::KeyN => Key::Char('n'),
+        KeyCode::KeyO => Key::Char('o'),
+        KeyCode::KeyP => Key::Char('p'),
+        KeyCode::KeyQ => Key::Char('q'),
+        KeyCode::KeyR => Key::Char('r'),
+        KeyCode::KeyS => Key::Char('s'),
+        KeyCode::KeyT => Key::Char('t'),
+        KeyCode::KeyU => Key::Char('u'),
+        KeyCode::KeyV => Key::Char('v'),
+        KeyCode::KeyW => Key::Char('w'),
+        KeyCode::KeyX => Key::Char('x'),
+        KeyCode::KeyY => Key::Char('y'),
+        KeyCode::KeyZ => Key::Char('z'),
+        KeyCode::Digit0 => Key::Char('0'),
+        KeyCode::Digit1 => Key::Char('1'),
+        KeyCode::Digit2 => Key::Char('2'),
+        KeyCode::Digit3 => Key::Char('3'),
+        KeyCode::Digit4 => Key::Char('4'),
+        KeyCode::Digit5 => Key::Char('5'),
+        KeyCode::Digit6 => Key::Char('6'),
+        KeyCode::Digit7 => Key::Char('7'),
+        KeyCode::Digit8 => Key::Char('8'),
+        KeyCode::Digit9 => Key::Char('9'),
+        _ => return None,
+    })
 }
 
 /// Build the OSC 52 clipboard query reply for the child: `OSC 52 ; c ; <b64>`

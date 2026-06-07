@@ -2,7 +2,7 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 9,
+"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 7, 9,
 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
@@ -48,8 +48,8 @@ Support block/underline/bar + steady/blinking, configurable via settings.
 ## 7. User-configurable keybindings
 Move new-tab, copy, prompt-nav, etc out of compile-time constants into config file.
 
-- **Status:** not implemented
-- **Notes:** `src/config.rs::apply` accepts only `shell`/`scrollback`/`theme`/`[window]`/`[colors]`; there is no `[keys]` section. `src/gui/window.rs` still matches hard-coded `KeyCode`s (Comma/KeyV/KeyT/Tab/PageUp...).
+- **Status:** done (2026-06-07)
+- **Notes:** A new toolkit-free `src/keymap.rs` defines the terminal-owned `Action`s (copy/paste/new-tab/close-tab/next-tab/prev-tab/open-config/scroll page+prompt up/down), a `Chord` (ctrl/shift/alt + `Key`), and a `Keymap` whose `Default` holds the built-in bindings. The `[keys]` config section rebinds any action (`copy = "Ctrl+Alt+C"`, `next_tab = "Ctrl+Tab"`, …) via `parse_action`/`parse_chord`, validated with warnings on unknown action or malformed chord. `src/gui/window.rs` maps winit keys to `keymap::Key` (`chord_key`) and dispatches the resolved action through `run_action` instead of hard-coded `KeyCode` matches. Tests: `keymap::tests::*` (defaults, rebind, chord/action parsing) and `config::tests::{keys_section_rebinds_actions, keys_section_warns_on_bad_action_or_chord}`.
 
 ## 8. IME/composition events in winit backend
 Wire IME/composition events for CJK and dead-key input.
@@ -103,6 +103,6 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#7** config keymap, **#8** IME, **#3** search overlay, **#4** split panes,
-  **#11** font fallback/variants/ligatures, **#13** image framebuffer overlay,
+- **#8** IME, **#3** search overlay, **#4** split panes, **#11** font
+  fallback/variants/ligatures, **#13** image framebuffer overlay,
   **#14** iTerm2 + JPEG.
