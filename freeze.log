@@ -1,0 +1,6 @@
+   Compiling rusty_term v0.1.0 (C:\dev\rusty_term)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.18s
+     Running `target\debug\rusty_term.exe --gui`
+Loading personal and system profiles took 1223ms.
+Loading personal and system profiles took 898ms.
+Loading personal and system profiles took 908ms.
