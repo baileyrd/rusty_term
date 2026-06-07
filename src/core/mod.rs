@@ -38,7 +38,7 @@ pub use grid::{DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 #[cfg(feature = "gui")]
 pub use cell::{Cell, char_width};
 #[cfg(feature = "gui")]
-pub use grid::Selection;
+pub use grid::{MouseModes, Selection};
 pub use parser::AnsiParser;
 
 #[cfg(test)]

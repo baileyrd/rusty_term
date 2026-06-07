@@ -125,7 +125,7 @@ pub struct Grid {
     /// plus extended-format bits (`?1006`/`?1015`/`?1016`). The window backend
     /// uses this to route clicks/drags/scrolls back to the child as encoded
     /// input bytes instead of handling them locally.
-    pub(crate) mouse_modes: MouseModes,
+    pub mouse_modes: MouseModes,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -227,7 +227,7 @@ pub(crate) enum AltMode {
 /// consults this to decide whether a click/drag/scroll is forwarded to the
 /// child as an encoded input sequence or handled locally (selection, scroll).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) struct MouseModes {
+pub struct MouseModes {
     /// Base mode: click (`1000`), drag (`1002`), any-event (`1003`).
     pub base: usize,
     /// Extended encoding flags combined from `1005`/`1006`/`1015`/`1016`.
@@ -236,7 +236,7 @@ pub(crate) struct MouseModes {
 
 impl MouseModes {
     /// Whether any mouse reporting is active.
-    fn active(self) -> bool {
+    pub fn active(self) -> bool {
         self.base != 0
     }
 }
@@ -1626,6 +1626,7 @@ impl Grid {
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.mouse_modes = MouseModes::default();
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
@@ -1644,6 +1645,7 @@ impl Grid {
         self.saved_cursor = (0, 0);
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.mouse_modes = MouseModes::default();
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;

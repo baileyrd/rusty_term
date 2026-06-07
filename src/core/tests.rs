@@ -1692,6 +1692,44 @@ fn sgr_mouse_and_bracketed_paste_are_relayed() {
     assert_eq!(g.take_host_out(), b"\x1b[?2004h");
 }
 #[test]
+fn mouse_modes_tracked_for_window_backend() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.mouse_modes.active());
+    // Base tracking modes record into the grid *and* still relay to the host.
+    p.advance(&mut g, b"\x1b[?1000h");
+    assert_eq!(g.take_host_out(), b"\x1b[?1000h");
+    assert_eq!(g.mouse_modes.base, 1000);
+    assert!(g.mouse_modes.active());
+    // A higher tracking level supersedes the current base.
+    p.advance(&mut g, b"\x1b[?1003h");
+    assert_eq!(g.mouse_modes.base, 1003);
+    // Disabling a level that isn't the current one leaves tracking on.
+    p.advance(&mut g, b"\x1b[?1000l");
+    assert_eq!(g.mouse_modes.base, 1003);
+    // Disabling the active level turns reporting off.
+    p.advance(&mut g, b"\x1b[?1003l");
+    assert_eq!(g.mouse_modes.base, 0);
+    assert!(!g.mouse_modes.active());
+}
+
+#[test]
+fn sgr_extended_mouse_flag_tracked_and_reset_by_ris() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?1006h"); // SGR extended encoding -> bit 1
+    assert_eq!(g.take_host_out(), b"\x1b[?1006h");
+    assert_eq!(g.mouse_modes.extended & 2, 2);
+    p.advance(&mut g, b"\x1b[?1000h");
+    let _ = g.take_host_out();
+    assert!(g.mouse_modes.active());
+    // RIS clears mouse tracking entirely.
+    p.advance(&mut g, b"\x1bc");
+    assert_eq!(g.mouse_modes.base, 0);
+    assert_eq!(g.mouse_modes.extended, 0);
+    assert!(!g.mouse_modes.active());
+}
+#[test]
 fn kitty_keyboard_protocol_is_relayed_to_host() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();

@@ -634,10 +634,34 @@ impl AnsiParser {
                 g.host_out.extend_from_slice(b"\x1b[?");
                 g.host_out.extend_from_slice(param.to_string().as_bytes());
                 g.host_out.push(if set { b'h' } else { b'l' });
-                if param == 2004 {
-                    // Also record it for the windowed front-end, which has no
-                    // host to relay to and wraps pasted text itself.
-                    g.bracketed_paste = set;
+                // Also record state the windowed front-end needs: it has no
+                // host to relay to and must wrap pastes / encode mouse events
+                // itself. (TUI mode relays above and never reads these.)
+                match param {
+                    2004 => g.bracketed_paste = set,
+                    1000 | 1002 | 1003 => {
+                        g.mouse_modes.base = if set {
+                            param
+                        } else if g.mouse_modes.base == param {
+                            0
+                        } else {
+                            g.mouse_modes.base
+                        };
+                    }
+                    1005 | 1006 | 1015 | 1016 => {
+                        let bit: u8 = match param {
+                            1005 => 1,
+                            1006 => 2,
+                            1015 => 4,
+                            _ => 8, // 1016
+                        };
+                        if set {
+                            g.mouse_modes.extended |= bit;
+                        } else {
+                            g.mouse_modes.extended &= !bit;
+                        }
+                    }
+                    _ => {}
                 }
             } else if param == 25 {
                 // DECTCEM — text cursor enable. The renderer reads this to show

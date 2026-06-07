@@ -1,6 +1,6 @@
 //! Thin helper for SGR/1006 encoded mouse input generation.
 
-use crate::core::grid::MouseModes;
+use crate::core::MouseModes;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MousePoint {
@@ -97,5 +97,55 @@ impl SgrEncoder {
         out.push(b';');
         out.extend_from_slice(row.to_string().as_bytes());
         out.push(command);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::MouseModes;
+
+    fn enc(base: usize) -> SgrEncoder {
+        SgrEncoder::new(MouseModes { base, extended: 0 })
+    }
+
+    #[test]
+    fn press_encodes_sgr_at_one_based_coords() {
+        let mut out = Vec::new();
+        enc(1000).write(MouseEvent::new_point(0, 0).with_button(true), &mut out);
+        assert_eq!(out, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn release_uses_lowercase_m_and_button_3() {
+        let mut out = Vec::new();
+        enc(1000).write(MouseEvent::new_point(4, 2).with_button(false), &mut out);
+        assert_eq!(out, b"\x1b[<3;5;3m");
+    }
+
+    #[test]
+    fn modifiers_or_into_button_field() {
+        let mut out = Vec::new();
+        let e = MouseEvent::new_point(0, 0).with_button(true).with_modifiers(true, false, true);
+        enc(1002).write(e, &mut out);
+        // button 0 | shift(4) | ctrl(16) = 20
+        assert_eq!(out, b"\x1b[<20;1;1M");
+    }
+
+    #[test]
+    fn scroll_up_and_down_use_buttons_64_65() {
+        let mut up = Vec::new();
+        enc(1000).write(MouseEvent::new_point(0, 0).with_scroll(3), &mut up);
+        assert_eq!(up, b"\x1b[<64;1;1M");
+        let mut down = Vec::new();
+        enc(1000).write(MouseEvent::new_point(0, 0).with_scroll(-3), &mut down);
+        assert_eq!(down, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn inactive_modes_emit_nothing() {
+        let mut out = Vec::new();
+        enc(0).write(MouseEvent::new_point(0, 0).with_button(true), &mut out);
+        assert!(out.is_empty());
     }
 }

@@ -33,12 +33,8 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 use crate::backend::{Backend, BackendHandle};
 use crate::config::Config;
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
-use crate::core::grid::MouseModes;
+use crate::gui::mouse::{MouseEvent, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
-use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
-use crate::core::grid::MouseModes;
-use super::font::{self, FontCache, GlyphSource};
-use super::mouse::{MouseEvent, SgrEncoder};
 use super::render::{CpuRenderer, Renderer};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
@@ -508,6 +504,28 @@ impl App<'_> {
         let _ = tab.writer.write(&encode_paste(&text, bracketed));
     }
 
+    /// Encode a native mouse event as SGR/1006 and send it to the active tab's
+    /// child — but only when the child enabled mouse reporting (`?1000`/`?1002`/
+    /// `?1003`). `build` turns the cell under the pointer into the event. Returns
+    /// whether bytes were sent, so the wheel path can fall back to local
+    /// scrollback browsing when the child isn't tracking the mouse.
+    fn report_mouse(&mut self, build: impl FnOnce(usize, usize) -> MouseEvent) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else { return false };
+        let modes = tab.grid.lock().mouse_modes;
+        if !modes.active() {
+            return false;
+        }
+        let (col, row) = self.cell_at(self.mouse_pos.0, self.mouse_pos.1);
+        let mut out = Vec::new();
+        SgrEncoder::new(modes).write(build(col, row), &mut out);
+        if out.is_empty() {
+            return false;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else { return false };
+        let _ = tab.writer.write(&out);
+        true
+    }
+
     /// Browse the active tab's scrollback: move the viewport by `lines`
     /// (positive = up into history, negative = back toward the live bottom),
     /// clamped to the available history. Repaints if the view actually moved.
@@ -801,12 +819,21 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => self.on_left_press(event_loop),
+                ElementState::Pressed => {
+                    self.on_left_press(event_loop);
+                    let (sh, al, ct) =
+                        (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                    self.report_mouse(|c, r| {
+                        MouseEvent::new_point(c, r).with_button(true).with_modifiers(sh, al, ct)
+                    });
+                }
                 ElementState::Released => {
                     self.selecting = false;
-                    if self.mouse_modes.base == 1000 || self.mouse_modes.base == 1002 || self.mouse_modes.base == 1003 {
-                        self.send_mouse_release();
-                    }
+                    let (sh, al, ct) =
+                        (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                    self.report_mouse(|c, r| {
+                        MouseEvent::new_point(c, r).with_button(false).with_modifiers(sh, al, ct)
+                    });
                 }
             },
             // Wheel up browses into scrollback history, wheel down back toward
@@ -816,9 +843,17 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as isize * WHEEL_LINES,
                     MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h as f64).round() as isize,
                 };
-                if lines != 0 {
-                    self.scroll_active(lines);
+                if lines == 0 {
+                    return;
                 }
+                let (sh, al, ct) =
+                    (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                if self.report_mouse(|c, r| {
+                    MouseEvent::new_point(c, r).with_scroll(lines).with_modifiers(sh, al, ct)
+                }) {
+                    return;
+                }
+                self.scroll_active(lines);
             }
             _ => {}
         }
