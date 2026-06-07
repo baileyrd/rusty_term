@@ -1968,6 +1968,18 @@ impl Grid {
         }
     }
 
+    /// The OSC 8 hyperlink URI covering viewport `(col, row)`, if any. Mirrors
+    /// [`Grid::viewport_cell`] so links in scrolled-back history resolve too;
+    /// powers Ctrl+click in the windowed front-end.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn link_at(&self, col: usize, row: usize) -> Option<&str> {
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        let id = self.viewport_cell(col, row).link as usize;
+        self.links.get(id.checked_sub(1)?).map(String::as_str)
+    }
+
     /// Snapshot the entire visible viewport, compositing scrollback history
     /// above the live grid according to [`Grid::view_offset`]. Every row is
     /// included. History lines are padded/truncated to the current width.

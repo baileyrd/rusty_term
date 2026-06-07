@@ -537,6 +537,16 @@ impl App<'_> {
         true
     }
 
+    /// If an OSC 8 hyperlink covers the cell under the pointer, open it with the
+    /// OS handler. Returns whether a link was opened, so a Ctrl+click can
+    /// suppress the normal selection / mouse-report path.
+    fn open_link_under_pointer(&self) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else { return false };
+        let (col, row) = self.cell_at(self.mouse_pos.0, self.mouse_pos.1);
+        let url = tab.grid.lock().link_at(col, row).map(str::to_owned);
+        url.is_some_and(|u| open_url(&u))
+    }
+
     /// Browse the active tab's scrollback: move the viewport by `lines`
     /// (positive = up into history, negative = back toward the live bottom),
     /// clamped to the available history. Repaints if the view actually moved.
@@ -856,6 +866,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // Ctrl+click follows an OSC 8 hyperlink under the pointer,
+                    // suppressing selection and mouse reporting for that click.
+                    if self.mods.control_key() && self.open_link_under_pointer() {
+                        return;
+                    }
                     self.on_left_press(event_loop);
                     let (sh, al, ct) =
                         (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
@@ -929,9 +944,36 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// Open `url` with the OS default handler when its scheme is one we allow
+/// (see [`is_openable_url`]). Ctrl+click on an OSC 8 hyperlink routes here.
+/// Returns whether a handler was launched.
+fn open_url(url: &str) -> bool {
+    if !is_openable_url(url) {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
+    spawned.is_ok()
+}
+
+/// Whether `url`'s scheme is one we're willing to hand to the OS opener.
+/// Restricting it keeps arbitrary or custom-scheme URIs from terminal output
+/// from reaching the shell's URL handler. The scheme match is case-insensitive.
+fn is_openable_url(url: &str) -> bool {
+    const ALLOWED: [&str; 5] = ["http://", "https://", "ftp://", "file://", "mailto:"];
+    let b = url.as_bytes();
+    ALLOWED
+        .iter()
+        .any(|p| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Hit, encode_paste, mix, put_text};
+    use super::{Hit, encode_paste, is_openable_url, mix, put_text};
     use crate::core::Cell;
 
     #[test]
@@ -953,6 +995,18 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_plain_text() {
         assert_eq!(encode_paste("ls", true), b"\x1b[200~ls\x1b[201~");
+    }
+
+    #[test]
+    fn only_known_url_schemes_are_openable() {
+        assert!(is_openable_url("https://example.com"));
+        assert!(is_openable_url("HTTP://Example.COM")); // scheme is case-insensitive
+        assert!(is_openable_url("mailto:a@b.com"));
+        assert!(is_openable_url("file:///etc/hosts"));
+        assert!(!is_openable_url("javascript:alert(1)"));
+        assert!(!is_openable_url("data:text/html,x"));
+        assert!(!is_openable_url("https://")); // nothing after the scheme
+        assert!(!is_openable_url("notaurl"));
     }
 
     #[test]

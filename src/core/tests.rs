@@ -1161,6 +1161,18 @@ fn osc_8_stamps_link_on_covered_cells() {
 }
 
 #[test]
+fn link_at_resolves_covered_cells() {
+    let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
+    assert_eq!(g.link_at(0, 0), Some("http://example.com")); // A
+    assert_eq!(g.link_at(1, 0), Some("http://example.com")); // B
+    assert_eq!(g.link_at(2, 0), None); // C is after the close
+    assert_eq!(g.link_at(5, 0), None); // a blank, unlinked cell
+    // Out-of-bounds coordinates are safe.
+    assert_eq!(g.link_at(999, 0), None);
+    assert_eq!(g.link_at(0, 999), None);
+}
+
+#[test]
 fn osc_8_with_id_param_links_uri() {
     // The params field (here `id=foo`) is skipped; the URI still links.
     let g = parse(b"\x1b]8;id=foo;http://e.com\x1b\\Z", 80, 24);
