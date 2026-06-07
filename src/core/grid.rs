@@ -138,6 +138,11 @@ pub struct Grid {
     /// OSC to the host. Each entry is `(title, body)`; an empty title means the
     /// front-end picks a default. Bounded by [`Grid::push_notification`].
     pub notifications: Vec<(String, String)>,
+    /// The active IME composition (preedit) text, shown reverse-video at the
+    /// cursor by the windowed front-end; empty when not composing. Set by the
+    /// window backend on `WindowEvent::Ime`, not by the parser.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub ime_preedit: String,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -667,6 +672,7 @@ impl Grid {
             clipboard_set: None,
             clipboard_query: false,
             notifications: Vec::new(),
+            ime_preedit: String::new(),
             mouse_modes: MouseModes::default(),
             autowrap: true,
             origin_mode: false,

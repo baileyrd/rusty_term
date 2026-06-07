@@ -2,8 +2,8 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 7, 9,
-10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
+"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 7, 8,
+9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -54,8 +54,8 @@ Move new-tab, copy, prompt-nav, etc out of compile-time constants into config fi
 ## 8. IME/composition events in winit backend
 Wire IME/composition events for CJK and dead-key input.
 
-- **Status:** not implemented
-- **Notes:** No `WindowEvent::Ime` handling, no `set_ime_allowed`, and no preedit rendering in `src/gui/{window,input}.rs`.
+- **Status:** done (2026-06-07)
+- **Notes:** `resumed` calls `set_ime_allowed(true)`; `src/gui/window.rs` handles `WindowEvent::Ime` — `Preedit` stores the composition into `Grid::ime_preedit` and repositions the candidate popup at the cursor (`update_ime_area` → `set_ime_cursor_area`), `Commit` clears it and writes the committed text (CJK + dead keys) to the child, `Disabled` clears it. A composing guard skips native key encoding while a preedit is active so input isn't doubled. Both renderers draw the preedit reverse-video over the cells at the cursor (`src/gui/cpu.rs`, `src/gui/gpu.rs`, reading `Grid::ime_preedit` — no renderer signature change). Test: `gui::cpu::tests::ime_preedit_overlays_reverse_video_at_cursor`.
 
 ## 9. Desktop notifications via OSC 9/777
 Implement OSC 9 and OSC 777 notification support.
@@ -103,6 +103,6 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#8** IME, **#3** search overlay, **#4** split panes, **#11** font
+- **#3** search overlay, **#4** split panes, **#11** font
   fallback/variants/ligatures, **#13** image framebuffer overlay,
   **#14** iTerm2 + JPEG.

@@ -4,7 +4,7 @@
 //! later hands the buffer to `softbuffer` for presentation. Pixels are
 //! `0x00RRGGBB` (the format `softbuffer` expects).
 
-use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER};
+use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{Glyph, GlyphSource};
 
@@ -146,6 +146,36 @@ pub(crate) fn render(
                 }
             }
             CursorShape::Block => {}
+        }
+    }
+
+    // IME preedit (composition): reverse-video glyphs starting at the cursor, so
+    // the composing text is visible in place over the cells beneath it.
+    if !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
+        let crow = grid.cursor.1;
+        let mut col = grid.cursor.0;
+        let y0 = (crow + row_off) * ch;
+        for pch in grid.ime_preedit.chars() {
+            let w = char_width(pch).max(1);
+            if col + w > grid.cols {
+                break;
+            }
+            let base = grid.viewport_cell(col, crow);
+            let (fg, bg) = (base.bg, base.fg); // reverse video
+            let x0 = col * cw;
+            for y in y0..(y0 + ch).min(height) {
+                let b = y * width;
+                for x in x0..(x0 + w * cw).min(width) {
+                    buf[b + x] = bg;
+                }
+            }
+            let glyph = font.glyph(pch);
+            if glyph.width != 0 {
+                let pen_x = x0 as i32 + glyph.left;
+                let pen_y = y0 as i32 + baseline + glyph.top;
+                blit(buf, width, height, &glyph, pen_x, pen_y, fg);
+            }
+            col += w;
         }
     }
 }
@@ -380,6 +410,21 @@ mod tests {
         // cursor_on == false models the blink off-phase: nothing is drawn.
         render(&g, &[], &mut MockFont, &mut buf, 4, 8, false);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "off-phase draws no cursor");
+    }
+
+    #[test]
+    fn ime_preedit_overlays_reverse_video_at_cursor() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;0;255;0;48;2;0;0;255m "); // green-on-blue cell
+        g.cursor = (0, 0);
+        g.ime_preedit = "x".to_string();
+        let mut buf = vec![0u32; 4 * 8];
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
+        // Reverse video: the cell bg becomes its fg (green); the glyph its bg (blue).
+        // MockFont draws a 2x2 block top-left, so (3,0) is the reversed bg.
+        assert_eq!(buf[3], 0x00FF00, "preedit cell bg is the reversed fg");
+        assert_eq!(buf[0], 0x0000FF, "preedit glyph is the reversed bg");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER};
+use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{FontCache, GlyphSource};
 use super::render::Renderer;
@@ -390,6 +390,26 @@ impl GpuCore {
                 curs,
                 ccol,
             });
+        }
+        // IME preedit (composition): reverse-video glyphs at the cursor.
+        if !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
+            let crow = grid.cursor.1;
+            let mut col = grid.cursor.0;
+            for pch in grid.ime_preedit.chars() {
+                let w = char_width(pch).max(1);
+                if col + w > grid.cols {
+                    break;
+                }
+                let base = grid.viewport_cell(col, crow);
+                let row = (crow + row_off) as u32;
+                let slot = self.ensure_slot(pch, font);
+                instances.push(Instance { col: col as u32, row, slot, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                if w == 2 {
+                    let blank = self.ensure_slot(' ', font);
+                    instances.push(Instance { col: col as u32 + 1, row, slot: blank, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                }
+                col += w;
+            }
         }
         let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("instances"),

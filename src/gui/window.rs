@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
@@ -591,6 +591,22 @@ impl App<'_> {
         }
     }
 
+    /// Tell the IME where the text cursor is, so its candidate/composition popup
+    /// appears at the terminal cursor rather than the window origin.
+    fn update_ime_area(&self) {
+        let (Some(window), Some(tab)) = (&self.window, self.tabs.get(self.active)) else {
+            return;
+        };
+        let (col, row) = tab.grid.lock().cursor;
+        let x = (col * self.cell_w) as f64;
+        // +1 cell row for the chrome bar above the grid.
+        let y = ((row + 1) * self.cell_h) as f64;
+        window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(self.cell_w as u32, self.cell_h as u32),
+        );
+    }
+
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
@@ -838,6 +854,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         let window = Arc::new(window);
         apply_chrome(&window, &self.theme);
         self.window = Some(window.clone());
+        // Let the OS deliver IME composition events (CJK, dead keys).
+        window.set_ime_allowed(true);
         match self.make_renderer(window.clone()) {
             Some(r) => self.renderer = Some(r),
             None => {
@@ -880,6 +898,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         return;
                     }
                 }
+                // While the IME is composing, it owns key input; don't also
+                // encode it (the committed text arrives via `WindowEvent::Ime`).
+                if self.tabs.get(self.active).is_some_and(|t| !t.grid.lock().ime_preedit.is_empty()) {
+                    return;
+                }
                 if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         let _ = tab.writer.write(&bytes);
@@ -889,6 +912,33 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     self.snap_to_bottom();
                 }
             }
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Preedit(text, _) => {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        tab.grid.lock().ime_preedit = text;
+                    }
+                    self.update_ime_area();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                Ime::Commit(text) => {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.grid.lock().ime_preedit.clear();
+                        let _ = tab.writer.write(text.as_bytes());
+                    }
+                    self.snap_to_bottom();
+                }
+                Ime::Enabled => {}
+                Ime::Disabled => {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        tab.grid.lock().ime_preedit.clear();
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
                 // The edge band shows a resize cursor; everywhere else default.
