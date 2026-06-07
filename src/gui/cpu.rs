@@ -61,7 +61,9 @@ pub(crate) fn render(
     // inverts the cell's own fg/bg.
     let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
     let at_cursor = |col: usize, row: usize| cursor == Some((col, row));
-    let inverted = |col: usize, row: usize| grid.is_selected(col, row);
+    // Selection coordinates address the live grid, so highlight only the live
+    // view; while scrolled into history the composited rows don't line up.
+    let inverted = |col: usize, row: usize| grid.view_offset == 0 && grid.is_selected(col, row);
 
     // The status-line overlay (L13), when present, replaces the bottom row.
     let status = grid.status_row();
@@ -69,10 +71,10 @@ pub(crate) fn render(
 
     // Pass 1: backgrounds. A wide glyph's bitmap may spill into its trailer
     // cell, so fill every cell (including trailers) before drawing glyphs.
-    for (i, cell) in grid.cells.iter().enumerate() {
+    for i in 0..grid.cols * grid.rows {
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { *cell };
+        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
         let bg = if !on_status && at_cursor(col, row) {
             grid.cursor_color
         } else if !on_status && inverted(col, row) {
@@ -90,10 +92,10 @@ pub(crate) fn render(
     }
 
     // Pass 2: glyphs.
-    for (i, cell) in grid.cells.iter().enumerate() {
+    for i in 0..grid.cols * grid.rows {
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { *cell };
+        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
         if cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0) {
             continue;
         }
@@ -328,6 +330,29 @@ mod tests {
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &[], &mut MockFont, &mut buf, 4, 8);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "scrolled back: no cursor");
+    }
+
+    #[test]
+    fn scrolled_view_composites_history() {
+        // A blue-bg line scrolls into history above a green live top row.
+        let mut g = Grid::new(1, 2);
+        let mut p = AnsiParser::new();
+        p.advance(
+            &mut g,
+            b"\x1b[48;2;0;0;255m \r\n\x1b[48;2;0;128;0m \r\n\x1b[48;2;255;0;0m ",
+        );
+        g.cursor_visible = false;
+        assert_eq!(g.scrollback.len(), 1, "blue line scrolled into history");
+        // Cell is 4x8 (MockFont); two rows -> a 4x16 buffer. buf[0] is the top row.
+        let mut buf = vec![0u32; 4 * 16];
+        render(&g, &[], &mut MockFont, &mut buf, 4, 16);
+        assert_eq!(buf[0], 0x008000, "live view top row: green");
+        // Scroll up one line: the top row now shows the blue history line.
+        assert!(g.scroll_view_up(1));
+        let mut buf = vec![0u32; 4 * 16];
+        render(&g, &[], &mut MockFont, &mut buf, 4, 16);
+        assert_eq!(buf[0], 0x0000FF, "scrolled back: blue history in the top row");
+        assert_eq!(buf[8 * 4], 0x008000, "row below shows the live top row (green)");
     }
 
     #[test]

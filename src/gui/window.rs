@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
@@ -47,6 +47,8 @@ const RESIZE_BORDER: f64 = 6.0;
 const TAB_CELLS: usize = 20;
 /// Two clicks on the drag strip within this window toggle maximize.
 const DOUBLE_CLICK_MS: u128 = 400;
+/// Scrollback lines moved per mouse-wheel notch.
+const WHEEL_LINES: isize = 3;
 
 /// Wakeups sent from per-tab PTY reader threads into the winit loop, tagged
 /// with the tab id they concern.
@@ -204,7 +206,7 @@ struct App<'a> {
     theme: Theme,
     /// System clipboard for copy/paste; `None` if unavailable (e.g. headless).
     clipboard: Option<arboard::Clipboard>,
-    /// Last pointer position in physical pixels, for hit-testing.
+    /// Current pointer position in physical pixels, used for hit-testing.
     mouse_pos: (f64, f64),
     /// Whether the left button is held (a drag-selection is in progress).
     selecting: bool,
@@ -501,6 +503,55 @@ impl App<'_> {
         let _ = tab.writer.write(&encode_paste(&text, bracketed));
     }
 
+    /// Browse the active tab's scrollback: move the viewport by `lines`
+    /// (positive = up into history, negative = back toward the live bottom),
+    /// clamped to the available history. Repaints if the view actually moved.
+    fn scroll_active(&mut self, lines: isize) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let moved = {
+            let mut g = tab.grid.lock();
+            if lines >= 0 {
+                g.scroll_view_up(lines as usize)
+            } else {
+                g.scroll_view_down((-lines) as usize)
+            }
+        };
+        if moved && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Apply a scrollback-browse key to the active tab: Shift+PageUp/Down page
+    /// through history, the same with Ctrl jumps prompt-to-prompt (OSC 133
+    /// marks). Repaints if the view moved. Mirrors the TUI's scroll keys.
+    fn scroll_key(&mut self, ctrl: bool, up: bool) {
+        let page = (self.rows.saturating_sub(1)).max(1) as usize;
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let moved = {
+            let mut g = tab.grid.lock();
+            match (ctrl, up) {
+                (false, true) => g.scroll_view_up(page),
+                (false, false) => g.scroll_view_down(page),
+                (true, true) => g.scroll_to_prev_prompt(),
+                (true, false) => g.scroll_to_next_prompt(),
+            }
+        };
+        if moved && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Snap the active tab's viewport back to the live bottom (e.g. after the
+    /// user types), repainting if it had been scrolled into history.
+    fn snap_to_bottom(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        if tab.grid.lock().reset_view()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     /// Open the config file in the user's editor (Ctrl+Shift+,), creating it
     /// from the commented template first if needed. The live-reload watcher
     /// then applies any save the user makes.
@@ -677,6 +728,16 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     }
                     return;
                 }
+                // Scrollback browsing: Shift+PageUp/Down page through history,
+                // Ctrl+Shift+PageUp/Down jump prompt-to-prompt. Intercepted
+                // before native encoding so they never reach the child.
+                if self.mods.shift_key()
+                    && let PhysicalKey::Code(code @ (KeyCode::PageUp | KeyCode::PageDown)) =
+                        event.physical_key
+                {
+                    self.scroll_key(self.mods.control_key(), code == KeyCode::PageUp);
+                    return;
+                }
                 // Terminal-owned shortcuts are intercepted before native encoding.
                 if self.mods.control_key()
                     && self.mods.shift_key()
@@ -702,10 +763,13 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         _ => {}
                     }
                 }
-                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false)
-                    && let Some(tab) = self.tabs.get_mut(self.active)
-                {
-                    let _ = tab.writer.write(&bytes);
+                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let _ = tab.writer.write(&bytes);
+                    }
+                    // Typing returns the view to the live bottom, as most
+                    // terminals do, so the echoed input is visible.
+                    self.snap_to_bottom();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -740,6 +804,17 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 ElementState::Pressed => self.on_left_press(event_loop),
                 ElementState::Released => self.selecting = false,
             },
+            // Wheel up browses into scrollback history, wheel down back toward
+            // the live bottom. A notch is `WHEEL_LINES`; trackpads report pixels.
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as isize * WHEEL_LINES,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h as f64).round() as isize,
+                };
+                if lines != 0 {
+                    self.scroll_active(lines);
+                }
+            }
             _ => {}
         }
     }

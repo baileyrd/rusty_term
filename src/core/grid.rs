@@ -121,6 +121,11 @@ pub struct Grid {
     /// mode it is also relayed to the host; the windowed front-end reads it to
     /// decide whether to wrap pasted text in `ESC[200~` / `ESC[201~`.
     pub bracketed_paste: bool,
+    /// Mouse reporting enabled by the child (DECSET `?1000`/`?1002`/`?1003`),
+    /// plus extended-format bits (`?1006`/`?1015`/`?1016`). The window backend
+    /// uses this to route clicks/drags/scrolls back to the child as encoded
+    /// input bytes instead of handling them locally.
+    pub(crate) mouse_modes: MouseModes,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -216,6 +221,24 @@ pub(crate) enum AltMode {
     Dec1047,
     /// `?1049` — save cursor on entry (DECSC-style), restore on exit.
     Dec1049,
+}
+
+/// Active mouse-reporting mode envelope kept on the grid. The window backend
+/// consults this to decide whether a click/drag/scroll is forwarded to the
+/// child as an encoded input sequence or handled locally (selection, scroll).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct MouseModes {
+    /// Base mode: click (`1000`), drag (`1002`), any-event (`1003`).
+    pub base: usize,
+    /// Extended encoding flags combined from `1005`/`1006`/`1015`/`1016`.
+    pub extended: u8,
+}
+
+impl MouseModes {
+    /// Whether any mouse reporting is active.
+    fn active(self) -> bool {
+        self.base != 0
+    }
 }
 
 /// Map a DEC private parameter to its alternate-screen mode, if any.
@@ -606,6 +629,7 @@ impl Grid {
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
             bracketed_paste: false,
+            mouse_modes: MouseModes::default(),
             autowrap: true,
             origin_mode: false,
             insert_mode: false,
@@ -1874,6 +1898,22 @@ impl Grid {
         {
             Some(l) if l < h => self.set_view_offset(h - l),
             _ => self.reset_view(),
+        }
+    }
+
+    /// The cell visible at viewport `(col, row)`, compositing scrollback history
+    /// above the live grid according to [`Grid::view_offset`]: the top `off`
+    /// rows show the tail of history, the rest the live grid shifted down by
+    /// `off`. A blank cell fills positions past a short history line's width.
+    /// Used by the windowed renderers so a scrolled-up view paints history.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn viewport_cell(&self, col: usize, row: usize) -> Cell {
+        let off = self.view_offset.min(self.scrollback.len());
+        if row < off {
+            let line = &self.scrollback[self.scrollback.len() - off + row].cells;
+            line.get(col).copied().unwrap_or_else(Cell::blank)
+        } else {
+            self.cells[(row - off) * self.cols + col]
         }
     }
 

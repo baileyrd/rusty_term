@@ -342,17 +342,20 @@ impl GpuCore {
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg });
         }
-        for (i, cell) in grid.cells.iter().enumerate() {
+        for i in 0..grid.cols * grid.rows {
             let (col, row) = (i % grid.cols, i / grid.cols);
-            // The status-line overlay (L13), when present, replaces the bottom row.
+            // The status-line overlay (L13), when present, replaces the bottom row;
+            // otherwise `viewport_cell` composites scrollback history when scrolled.
             let on_status = status.is_some() && row == last_row;
-            let cell = if on_status { status.unwrap()[col] } else { *cell };
+            let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
+            // Selection coordinates address the live grid, so highlight only the
+            // live view; history rows don't line up while scrolled.
             let (fg, bg) = if !on_status && cursor == Some((col, row)) {
                 (cell.bg, grid.cursor_color)
-            } else if !on_status && grid.is_selected(col, row) {
+            } else if !on_status && grid.view_offset == 0 && grid.is_selected(col, row) {
                 (cell.bg, cell.fg)
             } else {
                 (cell.fg, cell.bg)
