@@ -133,6 +133,11 @@ pub struct Grid {
     /// Set when the child queried the clipboard (`OSC 52 ; … ; ?`); the window
     /// backend answers from the system clipboard and clears it.
     pub clipboard_query: bool,
+    /// Desktop notifications (OSC 9 / OSC 777) the child requested, drained by
+    /// the windowed front-end which raises them via the OS; the TUI relays the
+    /// OSC to the host. Each entry is `(title, body)`; an empty title means the
+    /// front-end picks a default. Bounded by [`Grid::push_notification`].
+    pub notifications: Vec<(String, String)>,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -661,6 +666,7 @@ impl Grid {
             bracketed_paste: false,
             clipboard_set: None,
             clipboard_query: false,
+            notifications: Vec::new(),
             mouse_modes: MouseModes::default(),
             autowrap: true,
             origin_mode: false,
@@ -2049,6 +2055,16 @@ impl Grid {
             None | Some("") => 0,
             Some(u) => self.intern_link(u),
         };
+    }
+
+    /// Queue a desktop notification (OSC 9/777) for the windowed front-end to
+    /// raise. Bounded so a flood can't grow the queue without limit between
+    /// drains; the TUI relays the OSC to the host instead.
+    pub(crate) fn push_notification(&mut self, title: String, body: String) {
+        const MAX: usize = 32;
+        if self.notifications.len() < MAX {
+            self.notifications.push((title, body));
+        }
     }
 
     /// Return the id for `uri`, interning it on first use. Ids are `index + 1`

@@ -2,8 +2,8 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 10,
-12, and 15** are implemented; the rest have no implementing code yet. Each entry
+"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 9,
+10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -60,8 +60,8 @@ Wire IME/composition events for CJK and dead-key input.
 ## 9. Desktop notifications via OSC 9/777
 Implement OSC 9 and OSC 777 notification support.
 
-- **Status:** not implemented
-- **Notes:** `src/core/osc.rs` dispatches 0/1/2/4/7/8/10/11/12/52/104/110-112/133 — there is no "9" or "777" arm. The only "notify" code is the unrelated l13 channel.
+- **Status:** done (2026-06-07)
+- **Notes:** `src/core/osc.rs` records OSC 9 (iTerm2, free-text message — ConEmu's numeric `9;N;…` progress subcommands are excluded) and OSC 777 (`777;notify;<title>;<body>`) into `Grid::notifications` (bounded by `push_notification`); both are also relayed to the host for TUI mode. The window backend drains them per tab on output (`App::service_notifications`) and raises an OS notification via `notify` — per-platform with no new crates (PowerShell `NotifyIcon` / `osascript` / `notify-send`), passing the untrusted title/body as environment variables to avoid command injection. Tests: `core::tests::{osc_9_records_notification_and_relays, osc_9_conemu_progress_is_not_a_notification, osc_777_parses_title_and_body, osc_777_non_notify_is_ignored}`.
 
 ## 10. Windows host resize propagation in TUI
 Fix host console size change detection and reflow in TUI/conhost mode.
@@ -100,12 +100,6 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 - **Notes:** `src/core/parser.rs::answer_xtgettcap` answers `DCS + q <hex>;... ST` queries: for each `;`-separated hex name it replies `DCS 1 + r <name>=<hexvalue> ST` (string/number cap), `DCS 1 + r <name> ST` (boolean), or `DCS 0 + r <name> ST` (unknown/malformed), echoing the requested name. The `+q` intermediate distinguishes it from Sixel. Advertised caps mirror `extra/rusty_term.terminfo`: `Co`/`colors` = 256, the `Tc` truecolor flag, and `TN`/`name` = `rusty_term`. Tests: `xtgettcap_answers_known_caps_and_truecolor`, `xtgettcap_reports_terminal_name`, `xtgettcap_unknown_and_malformed_fail`.
 
 ## Next up (recommended order)
-
-Contained, gui-side (reuse existing plumbing):
-
-1. **#9 OSC 9/777 notifications** — add the OSC arms in `src/core/osc.rs`; the gui
-   raises a desktop notification (needs an OS notification path under the
-   small-dependency constraint).
 
 Larger / multi-file (each its own project):
 

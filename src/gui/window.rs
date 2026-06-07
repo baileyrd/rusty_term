@@ -531,6 +531,23 @@ impl App<'_> {
         }
     }
 
+    /// Raise any desktop notifications (OSC 9/777) the tab's child queued. Run on
+    /// a tab's output, so background tabs notify too.
+    fn service_notifications(&mut self, id: u64) {
+        let notes = {
+            let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
+            let mut g = tab.grid.lock();
+            if g.notifications.is_empty() {
+                return;
+            }
+            std::mem::take(&mut g.notifications)
+        };
+        for (title, body) in notes {
+            let title = if title.is_empty() { "rusty_term" } else { title.as_str() };
+            notify(title, &body);
+        }
+    }
+
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
@@ -942,6 +959,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         match event {
             UserEvent::Redraw(id) => {
                 self.service_clipboard(id);
+                self.service_notifications(id);
                 // Output on a background tab doesn't repaint; its bar label
                 // refreshes with the next frame the active tab causes.
                 if self.tabs.get(self.active).is_some_and(|t| t.id == id)
@@ -998,6 +1016,34 @@ fn is_openable_url(url: &str) -> bool {
     ALLOWED
         .iter()
         .any(|p| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()))
+}
+
+/// Raise an OS desktop notification (OSC 9/777), per-platform with no extra
+/// crates (mirroring [`open_url`]). The untrusted title/body are passed as
+/// environment variables so they can't inject into the spawned PowerShell /
+/// AppleScript / `notify-send` command.
+fn notify(title: &str, body: &str) {
+    use std::process::Command;
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        const PS: &str = "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.BalloonTipTitle = $env:RT_TITLE; $n.BalloonTipText = $env:RT_BODY; $n.Visible = $true; $n.ShowBalloonTip(6000); Start-Sleep -Seconds 7; $n.Dispose()";
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("osascript");
+        c.args(["-e", "display notification (system attribute \"RT_BODY\") with title (system attribute \"RT_TITLE\")"]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("notify-send");
+        c.arg(title).arg(body);
+        c
+    };
+    let _ = cmd.env("RT_TITLE", title).env("RT_BODY", body).spawn();
 }
 
 /// Build the OSC 52 clipboard query reply for the child: `OSC 52 ; c ; <b64>`

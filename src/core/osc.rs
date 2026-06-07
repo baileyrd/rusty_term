@@ -1,12 +1,13 @@
 //! OSC (Operating System Command) dispatch (L08).
 //!
 //! Acts on a completed OSC string collected by the parser: window title (0/2),
-//! icon name (1), working directory (7), hyperlinks (8), clipboard (52), and the
+//! icon name (1), working directory (7), hyperlinks (8), clipboard (52), desktop
+//! notifications (9/777), and the
 //! color controls — palette (4/104) and the default fg/bg/cursor (10/11/12 and
 //! their resets 110/111/112). Color *query* (`?`) forms reply to the child via
 //! the parser's response buffer; sets mutate the shared [`Palette`], and default
 //! fg/bg changes are mirrored into the grid so cleared regions pick up a new
-//! background. Other OSC codes (9, 133, …) are recognized as well-formed and
+//! background. Other OSC codes (133, …) are recognized as well-formed and
 //! ignored for now.
 
 use super::cell::Pen;
@@ -88,6 +89,34 @@ pub(crate) fn dispatch(
                         && let Ok(s) = String::from_utf8(bytes)
                     {
                         g.clipboard_set = Some(s);
+                    }
+                }
+            }
+        }
+        // 9 (iTerm2) posts a desktop notification with the given message; the
+        // windowed front-end raises it and the TUI relays to the host. ConEmu
+        // reuses OSC 9 with a numeric subcommand (progress, etc.) — those start
+        // with a digit field and are not notifications, so they're left alone.
+        "9" => {
+            if let Some(body) = text {
+                let head = body.split(';').next().unwrap_or("");
+                let conemu = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
+                if !body.is_empty() && !conemu {
+                    forward_to_host(osc_buffer, g);
+                    g.push_notification(String::new(), body.to_string());
+                }
+            }
+        }
+        // 777 (rxvt) posts a notification: `777 ; notify ; <title> ; <body>`.
+        "777" => {
+            if let Some(text) = text {
+                let mut it = text.splitn(3, ';');
+                if it.next() == Some("notify") {
+                    let title = it.next().unwrap_or("");
+                    let body = it.next().unwrap_or("");
+                    if !title.is_empty() || !body.is_empty() {
+                        forward_to_host(osc_buffer, g);
+                        g.push_notification(title.to_string(), body.to_string());
                     }
                 }
             }

@@ -1167,6 +1167,42 @@ fn osc_52_query_flags_window_backend() {
 }
 
 #[test]
+fn osc_9_records_notification_and_relays() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]9;Build complete\x07");
+    assert_eq!(g.notifications, vec![(String::new(), "Build complete".to_string())]);
+    assert_eq!(g.take_host_out(), b"\x1b]9;Build complete\x07"); // relayed for TUI
+    assert_eq!(g.cells[0].ch, ' '); // not printed
+}
+
+#[test]
+fn osc_9_conemu_progress_is_not_a_notification() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]9;4;1;50\x07"); // ConEmu progress, not iTerm2 notify
+    assert!(g.notifications.is_empty());
+    assert!(g.take_host_out().is_empty());
+}
+
+#[test]
+fn osc_777_parses_title_and_body() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // The body keeps any further `;` (only the first two are structural).
+    p.advance(&mut g, b"\x1b]777;notify;Deploy;done; ok\x07");
+    assert_eq!(g.notifications, vec![("Deploy".to_string(), "done; ok".to_string())]);
+}
+
+#[test]
+fn osc_777_non_notify_is_ignored() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]777;something;x\x07");
+    assert!(g.notifications.is_empty());
+}
+
+#[test]
 fn osc_8_stamps_link_on_covered_cells() {
     let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
     assert_ne!(g.cells[0].link, 0);
