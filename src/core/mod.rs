@@ -39,6 +39,8 @@ pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 pub use cell::{Cell, char_width};
 #[cfg(feature = "gui")]
 pub use grid::{MouseModes, Selection};
+#[cfg(feature = "gui")]
+pub(crate) use base64::encode as base64_encode;
 pub use parser::AnsiParser;
 
 #[cfg(test)]

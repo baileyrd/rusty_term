@@ -74,9 +74,21 @@ pub(crate) fn dispatch(
         // forms aren't forwarded — the reply path isn't wired.
         "52" => {
             if let Some(text) = text {
-                let is_query = text.rsplit(';').next() == Some("?");
-                if !is_query {
+                // `<selection> ; <data>`; `?` for the data is a query.
+                let data = text.rsplit(';').next().unwrap_or("");
+                if data == "?" {
+                    // The window backend answers from the system clipboard; the
+                    // TUI relies on the host terminal for the reply.
+                    g.clipboard_query = true;
+                } else {
+                    // Set: relay to the host (TUI) and decode for the window
+                    // backend, which owns the clipboard.
                     forward_to_host(osc_buffer, g);
+                    if let Some(bytes) = super::base64::decode(data.as_bytes())
+                        && let Ok(s) = String::from_utf8(bytes)
+                    {
+                        g.clipboard_set = Some(s);
+                    }
                 }
             }
         }

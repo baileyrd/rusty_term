@@ -15,10 +15,10 @@
 //!
 //! Note: this drives a live window and so cannot be exercised in a headless
 //! environment — the render, input-encoding, and font layers it composes are
-//! unit-tested independently. Mouse drag-selection, clipboard copy/paste
-//! (Ctrl+Shift+C / Ctrl+Shift+V), the block cursor, and a Windows child-exit
-//! watcher are wired here; mouse *reporting* to the child and DECCKM
-//! application-cursor tracking remain documented gaps.
+//! unit-tested independently. Wired here: mouse drag-selection, clipboard
+//! copy/paste (Ctrl+Shift+C / Ctrl+Shift+V) plus OSC 52 get/set, SGR/1006 mouse
+//! reporting, Ctrl+click to open OSC 8 hyperlinks, DECSCUSR cursor styles +
+//! blink, and a Windows child-exit watcher.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -503,6 +503,34 @@ impl App<'_> {
         }
     }
 
+    /// Service a tab's pending OSC 52 clipboard request recorded by the parser.
+    /// A set copies the child's text to the system clipboard; a query replies to
+    /// the child from the system clipboard. Called on a tab's output, so
+    /// background tabs are serviced too.
+    fn service_clipboard(&mut self, id: u64) {
+        let (set, query) = {
+            let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
+            let mut g = tab.grid.lock();
+            if g.clipboard_set.is_none() && !g.clipboard_query {
+                return;
+            }
+            (g.clipboard_set.take(), std::mem::take(&mut g.clipboard_query))
+        };
+        if let Some(text) = set
+            && let Some(cb) = self.clipboard.as_mut()
+        {
+            let _ = cb.set_text(text);
+        }
+        if query
+            && let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
+        {
+            let reply = osc52_reply(&text);
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                let _ = tab.writer.write(&reply);
+            }
+        }
+    }
+
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
         let Some(cb) = self.clipboard.as_mut() else { return };
@@ -913,6 +941,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Redraw(id) => {
+                self.service_clipboard(id);
                 // Output on a background tab doesn't repaint; its bar label
                 // refreshes with the next frame the active tab causes.
                 if self.tabs.get(self.active).is_some_and(|t| t.id == id)
@@ -971,9 +1000,19 @@ fn is_openable_url(url: &str) -> bool {
         .any(|p| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()))
 }
 
+/// Build the OSC 52 clipboard query reply for the child: `OSC 52 ; c ; <b64>`
+/// (BEL-terminated), answering a `OSC 52 ; … ; ?` query from the system
+/// clipboard.
+fn osc52_reply(text: &str) -> Vec<u8> {
+    let mut out = Vec::from(&b"\x1b]52;c;"[..]);
+    out.extend_from_slice(crate::core::base64_encode(text.as_bytes()).as_bytes());
+    out.push(0x07);
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Hit, encode_paste, is_openable_url, mix, put_text};
+    use super::{Hit, encode_paste, is_openable_url, mix, osc52_reply, put_text};
     use crate::core::Cell;
 
     #[test]
@@ -1007,6 +1046,12 @@ mod tests {
         assert!(!is_openable_url("data:text/html,x"));
         assert!(!is_openable_url("https://")); // nothing after the scheme
         assert!(!is_openable_url("notaurl"));
+    }
+
+    #[test]
+    fn osc52_reply_wraps_base64() {
+        // "hi" -> base64 "aGk=", framed as an OSC 52 clipboard reply (BEL).
+        assert_eq!(osc52_reply("hi"), b"\x1b]52;c;aGk=\x07");
     }
 
     #[test]

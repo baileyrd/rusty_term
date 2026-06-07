@@ -126,6 +126,13 @@ pub struct Grid {
     /// uses this to route clicks/drags/scrolls back to the child as encoded
     /// input bytes instead of handling them locally.
     pub mouse_modes: MouseModes,
+    /// Text the child asked to place on the system clipboard via OSC 52 set,
+    /// pending pickup by the window backend (which owns the clipboard); `None`
+    /// when nothing is pending. The TUI relays OSC 52 to the host and ignores it.
+    pub clipboard_set: Option<String>,
+    /// Set when the child queried the clipboard (`OSC 52 ; … ; ?`); the window
+    /// backend answers from the system clipboard and clears it.
+    pub clipboard_query: bool,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -652,6 +659,8 @@ impl Grid {
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
             bracketed_paste: false,
+            clipboard_set: None,
+            clipboard_query: false,
             mouse_modes: MouseModes::default(),
             autowrap: true,
             origin_mode: false,

@@ -1149,6 +1149,24 @@ fn osc_52_query_is_not_forwarded() {
 }
 
 #[test]
+fn osc_52_set_records_decoded_text_for_window_backend() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]52;c;SGVsbG8=\x07"); // base64("Hello")
+    assert_eq!(g.clipboard_set.as_deref(), Some("Hello"));
+}
+
+#[test]
+fn osc_52_query_flags_window_backend() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.clipboard_query);
+    p.advance(&mut g, b"\x1b]52;c;?\x07");
+    assert!(g.clipboard_query);
+    assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
+}
+
+#[test]
 fn osc_8_stamps_link_on_covered_cells() {
     let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
     assert_ne!(g.cells[0].link, 0);
@@ -2371,6 +2389,17 @@ fn base64_decodes_standard_and_padding() {
     // Whitespace (line wrapping) is ignored; invalid bytes are rejected.
     assert_eq!(base64::decode(b"SGVs\nbG8=").unwrap(), b"Hello");
     assert!(base64::decode(b"@@@@").is_none());
+}
+
+#[test]
+fn base64_encodes_with_padding_and_round_trips() {
+    assert_eq!(base64::encode(b"Man"), "TWFu");
+    assert_eq!(base64::encode(b"Hello"), "SGVsbG8=");
+    assert_eq!(base64::encode(b"Hello!"), "SGVsbG8h");
+    assert_eq!(base64::encode(b""), "");
+    // Round-trips with decode across every byte value.
+    let data: Vec<u8> = (0u8..=255).collect();
+    assert_eq!(base64::decode(base64::encode(&data).as_bytes()).unwrap(), data);
 }
 
 #[test]
