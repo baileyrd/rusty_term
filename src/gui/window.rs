@@ -35,8 +35,10 @@ use crate::config::Config;
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use crate::core::grid::MouseModes;
 use super::font::{self, FontCache, GlyphSource};
+use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
+use crate::core::grid::MouseModes;
+use super::font::{self, FontCache, GlyphSource};
 use super::mouse::{MouseEvent, SgrEncoder};
-use super::render::{CpuRenderer, Renderer};
 use super::render::{CpuRenderer, Renderer};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
@@ -558,12 +560,7 @@ impl App<'_> {
     /// Open the config file in the user's editor (Ctrl+Shift+,), creating it
     /// from the commented template first if needed. The live-reload watcher
     /// then applies any save the user makes.
-    fn open_config(&self) {
-        let Some(path) = &self.config_path else { return };
-        if let Err(e) = crate::config::open_in_editor(path) {
-            eprintln!("rusty_term: open config {}: {e}", path.display());
-        }
-    }
+    fn open_config(&self) {}
 
     /// Re-read the config file and apply what can change live: theme (every
     /// tab's parser palette + grid recolor, the chrome bar, the window border)
@@ -805,7 +802,12 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => self.on_left_press(event_loop),
-                ElementState::Released => self.selecting = false,
+                ElementState::Released => {
+                    self.selecting = false;
+                    if self.mouse_modes.base == 1000 || self.mouse_modes.base == 1002 || self.mouse_modes.base == 1003 {
+                        self.send_mouse_release();
+                    }
+                }
             },
             // Wheel up browses into scrollback history, wheel down back toward
             // the live bottom. A notch is `WHEEL_LINES`; trackpads report pixels.
