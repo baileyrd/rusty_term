@@ -11,69 +11,70 @@ Add mouse wheel + Shift+PageUp/Down scrollback browsing to the `gui` backend (gr
 ## 2. Native SGR/1006 mouse reporting
 Emit SGR/1006 mouse reporting from the window backend so child apps receive clicks/scrolls.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 3. Scrollback search/find overlay
 Add incremental search with highlight + next/prev using existing reflowed logical lines.
+Add incremental search with highlight + next/prev using existing reflowed logical lines.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 4. Split panes within a tab
 Horizontal/vertical splits using existing Tab/PTY plumbing and cell-based chrome layout.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 5. Clickable OSC 8 hyperlinks
 Support Ctrl+click to open OSC 8 hyperlinks via system opener.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 6. Configurable DECSCUSR cursor styles
 Support block/underline/bar + steady/blinking, configurable via settings.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 7. User-configurable keybindings
 Move new-tab, copy, prompt-nav, etc out of compile-time constants into config file.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 8. IME/composition events in winit backend
 Wire IME/composition events for CJK and dead-key input.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 9. Desktop notifications via OSC 9/777
 Implement OSC 9 and OSC 777 notification support.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 10. Windows host resize propagation in TUI
 Fix host console size change detection and reflow in TUI/conhost mode.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 11. Font fallback + variants + ligatures
 Add font fallback chains, bold/italic variants, and optional ligature shaping.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 12. Full OSC 52 clipboard handling
 Handle OSC 52 query path; window backend services programmatic clipboard get/set.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 13. Accurate Sixel/Kitty image rendering
 Pixel-perfect image rendering via framebuffer overlay instead of half-block path.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 14. iTerm2 inline images + JPEG decoder
 Implement iTerm2 inline image protocol with JPEG decoding.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
 
 ## 15. XTGETTCAP responses
 Implement `DCS +q` capability-probing responses consistent with terminfo.
 
-- **Status:** pending
+- **Status:** completed (2026-06-07)
