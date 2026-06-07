@@ -22,8 +22,9 @@ and the narrative design synthesis in
 > **Platform support.** Unix (Linux/macOS) is the primary, fully exercised
 > target. The Windows ConPTY backend has been run and verified on Windows 11
 > (build 26200): shell spawn, child `TERM`/`COLORTERM` env, bidirectional relay,
-> and OSC window-title capture all work — though host **resize propagation is a
-> known gap** there (no `SIGWINCH` equivalent is wired yet). The optional window
+> and OSC window-title capture all work; host resize is handled by polling the
+> console size (there is no `SIGWINCH` equivalent — see `resize_poll` in
+> `src/runtime/tokio_rt.rs`). The optional window
 > backend has likewise been run on Windows (CPU and GPU), including a maximized
 > window past the 2048px GPU texture limit; it can't be exercised in a headless
 > CI environment, so there its font, compositor, input, and GPU-pipeline layers
@@ -168,8 +169,10 @@ window edges to resize.
 | Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs. |
 
 The window draws a block cursor; a tab closes when its shell exits, and the
-window closes with the last tab. Mouse *reporting* to applications (so TUI
-apps see clicks), OSC 52 programmatic clipboard, and IME are not yet wired.
+window closes with the last tab. When a TUI app enables mouse tracking
+(`?1000`/`?1002`/`?1003`, SGR/1006), left clicks and the wheel are reported to
+it as SGR-encoded events; OSC 52 programmatic clipboard and IME are not yet
+wired.
 
 ## Shell integration (OSC 133)
 
