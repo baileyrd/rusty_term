@@ -878,6 +878,36 @@ fn xtversion_query_reports_name_and_version() {
     assert_eq!(p.take_responses(), expected);
     assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
 }
+#[test]
+fn xtgettcap_answers_known_caps_and_truecolor() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // `Co` (436f) and `Tc` (5463) in one query.
+    p.advance(&mut g, b"\x1bP+q436f;5463\x1b\\");
+    // Co=256 -> value "256" hex-encoded (323536); Tc is a boolean (no value).
+    assert_eq!(p.take_responses(), b"\x1bP1+r436f=323536\x1b\\\x1bP1+r5463\x1b\\");
+    assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
+}
+
+#[test]
+fn xtgettcap_reports_terminal_name() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1bP+q544e\x1b\\"); // TN -> terminfo name
+    // "rusty_term" hex-encoded.
+    assert_eq!(p.take_responses(), b"\x1bP1+r544e=72757374795f7465726d\x1b\\");
+}
+
+#[test]
+fn xtgettcap_unknown_and_malformed_fail() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // "ZZ" (5a5a) is valid hex but an unknown cap; "abc" is malformed (odd len).
+    // Both echo the requested name back under the `0 + r` failure form.
+    p.advance(&mut g, b"\x1bP+q5a5a;abc\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP0+r5a5a\x1b\\\x1bP0+rabc\x1b\\");
+}
+
 
 #[test]
 fn da3_query_is_answered() {

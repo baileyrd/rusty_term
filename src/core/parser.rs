@@ -460,6 +460,13 @@ impl AnsiParser {
     /// decode it and render it into the grid as half-block cells; other DCS
     /// types are ignored. Clears the buffer either way.
     fn finish_dcs(&mut self, g: &mut Grid) {
+        // XTGETTCAP (`DCS + q <hex>;... ST`): answer terminfo capability queries.
+        // The `+` intermediate distinguishes it from Sixel (`<params> q <data>`).
+        if self.dcs_buffer.starts_with(b"+q") {
+            self.answer_xtgettcap();
+            self.dcs_buffer.clear();
+            return;
+        }
         let mut i = 0;
         // Skip the Sixel parameter bytes (digits and `;`) to the final byte,
         // which for Sixel is `q`.
@@ -473,6 +480,40 @@ impl AnsiParser {
             g.render_sixel(&img);
         }
         self.dcs_buffer.clear();
+    }
+
+    /// Answer an XTGETTCAP query (`DCS + q <hex>;... ST`). For each `;`-separated
+    /// hex-encoded capability name, reply `DCS 1 + r <name>=<value> ST` for a
+    /// string/number cap, `DCS 1 + r <name> ST` for a boolean, or `DCS 0 + r
+    /// <name> ST` for one we don't advertise. The requested name is echoed back
+    /// verbatim; values are hex-encoded. The advertised set mirrors the shipped
+    /// `extra/rusty_term.terminfo` (xterm-256color core + the `Tc` truecolor flag).
+    fn answer_xtgettcap(&mut self) {
+        // `starts_with(b"+q")` guarantees at least two bytes, so `[2..]` is safe.
+        for name in self.dcs_buffer[2..].split(|&b| b == b';') {
+            if name.is_empty() {
+                continue;
+            }
+            match hex_decode(name).as_deref().and_then(lookup_cap) {
+                Some(Cap::Bool) => {
+                    self.responses.extend_from_slice(b"\x1bP1+r");
+                    self.responses.extend_from_slice(name);
+                    self.responses.extend_from_slice(b"\x1b\\");
+                }
+                Some(Cap::Str(val)) => {
+                    self.responses.extend_from_slice(b"\x1bP1+r");
+                    self.responses.extend_from_slice(name);
+                    self.responses.push(b'=');
+                    push_hex(&mut self.responses, val.as_bytes());
+                    self.responses.extend_from_slice(b"\x1b\\");
+                }
+                None => {
+                    self.responses.extend_from_slice(b"\x1bP0+r");
+                    self.responses.extend_from_slice(name);
+                    self.responses.extend_from_slice(b"\x1b\\");
+                }
+            }
+        }
     }
 
     /// Finalize a collected APC string. Kitty graphics commands begin with `G`;
@@ -915,4 +956,52 @@ fn is_host_input_mode(param: usize) -> bool {
         param,
         1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004
     )
+}
+
+/// A terminfo capability rusty_term advertises via XTGETTCAP: a boolean flag
+/// (present, no value) or a string/number whose value is reported.
+#[derive(Clone, Copy)]
+enum Cap {
+    Bool,
+    Str(&'static str),
+}
+
+/// Look up a capability name we advertise, mirroring `extra/rusty_term.terminfo`
+/// (xterm-256color core + `Tc`): 256 colors, the `Tc` truecolor flag, and the
+/// terminal name. Anything else is unknown (the caller replies `DCS 0 + r`).
+fn lookup_cap(name: &[u8]) -> Option<Cap> {
+    match name {
+        b"Co" | b"colors" => Some(Cap::Str("256")),
+        b"Tc" => Some(Cap::Bool),
+        b"TN" | b"name" => Some(Cap::Str("rusty_term")),
+        _ => None,
+    }
+}
+
+/// Decode an even-length ASCII-hex slice into bytes; `None` on odd length or a
+/// non-hex digit.
+fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// Append `data` to `out` as lowercase ASCII hex (two digits per byte).
+fn push_hex(out: &mut Vec<u8>, data: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in data {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0xf) as usize]);
+    }
 }
