@@ -13,7 +13,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::core::{Cell, Grid, WIDE_TRAILER};
+use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER};
 
 use super::font::{FontCache, GlyphSource};
 use super::render::Renderer;
@@ -33,12 +33,17 @@ struct Inst {
     @location(2) slot: u32,
     @location(3) fg: u32,
     @location(4) bg: u32,
+    @location(5) curs: u32,
+    @location(6) ccol: u32,
 };
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) fg: vec4<f32>,
     @location(2) bg: vec4<f32>,
+    @location(3) @interpolate(flat) curs: u32,
+    @location(4) @interpolate(flat) ccol: vec4<f32>,
+    @location(5) local: vec2<f32>,
 };
 
 fn unpack(c: u32) -> vec4<f32> {
@@ -63,13 +68,20 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.uv = (vec2(slot_col, slot_row) + corner) / spr;
     out.fg = unpack(inst.fg);
     out.bg = unpack(inst.bg);
+    out.curs = inst.curs;
+    out.ccol = unpack(inst.ccol);
+    out.local = corner;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let a = textureSample(atlas_tex, atlas_smp, in.uv).r;
-    return mix(in.bg, in.fg, a);
+    let base = mix(in.bg, in.fg, a);
+    // curs: 0 none/block (block uses the fg/bg swap); 2 underline, 3 bar.
+    if (in.curs == 2u && in.local.y >= 0.85) { return in.ccol; }
+    if (in.curs == 3u && in.local.x <= 0.12) { return in.ccol; }
+    return base;
 }
 "#;
 
@@ -81,6 +93,8 @@ struct Instance {
     slot: u32,
     fg: u32,
     bg: u32,
+    curs: u32,
+    ccol: u32,
 }
 
 #[repr(C)]
@@ -227,7 +241,7 @@ impl GpuCore {
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Instance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32, 4 => Uint32],
+            attributes: &wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32, 4 => Uint32, 5 => Uint32, 6 => Uint32],
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cells pipeline"),
@@ -309,6 +323,7 @@ impl GpuCore {
     /// Render `grid` into `view` (a surface frame or an offscreen texture).
     /// A non-empty `chrome` row is drawn as cell row 0 with the grid shifted
     /// one row down (see [`Renderer::render`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
         view: &wgpu::TextureView,
@@ -317,6 +332,7 @@ impl GpuCore {
         grid: &Grid,
         chrome: &[Cell],
         font: &mut FontCache,
+        cursor_on: bool,
     ) {
         let uniforms = Uniforms {
             screen: [width.max(1) as f32, height.max(1) as f32],
@@ -330,7 +346,7 @@ impl GpuCore {
         // `cursor` config key) with the glyph in the cell's bg; drag-selection
         // inverts the cell's own fg/bg (no shader change either way). The
         // cursor shows only on the live view, not while scrolled into history.
-        let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
+        let cursor = (grid.cursor_visible && grid.view_offset == 0 && cursor_on).then_some(grid.cursor);
         let status = grid.status_row();
         let last_row = grid.rows.saturating_sub(1);
         let row_off = if chrome.is_empty() { 0 } else { 1 };
@@ -340,7 +356,7 @@ impl GpuCore {
                 continue;
             }
             let slot = self.ensure_slot(cell.ch, font);
-            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg });
+            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
         }
         for i in 0..grid.cols * grid.rows {
             let (col, row) = (i % grid.cols, i / grid.cols);
@@ -353,12 +369,16 @@ impl GpuCore {
             }
             // Selection coordinates address the live grid, so highlight only the
             // live view; history rows don't line up while scrolled.
-            let (fg, bg) = if !on_status && cursor == Some((col, row)) {
-                (cell.bg, grid.cursor_color)
+            let (fg, bg, curs, ccol) = if !on_status && cursor == Some((col, row)) {
+                match grid.cursor_shape {
+                    CursorShape::Block => (cell.bg, grid.cursor_color, 0u32, 0u32),
+                    CursorShape::Underline => (cell.fg, cell.bg, 2u32, grid.cursor_color),
+                    CursorShape::Bar => (cell.fg, cell.bg, 3u32, grid.cursor_color),
+                }
             } else if !on_status && grid.view_offset == 0 && grid.is_selected(col, row) {
-                (cell.bg, cell.fg)
+                (cell.bg, cell.fg, 0, 0)
             } else {
-                (cell.fg, cell.bg)
+                (cell.fg, cell.bg, 0, 0)
             };
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {
@@ -367,6 +387,8 @@ impl GpuCore {
                 slot,
                 fg,
                 bg,
+                curs,
+                ccol,
             });
         }
         let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -441,7 +463,7 @@ impl GpuRenderer {
 }
 
 impl Renderer for GpuRenderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32) {
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool) {
         if width == 0 || height == 0 {
             return;
         }
@@ -471,7 +493,7 @@ impl Renderer for GpuRenderer {
             return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render(&view, width, height, grid, chrome, font);
+        self.core.render(&view, width, height, grid, chrome, font, cursor_on);
         frame.present();
     }
 }
@@ -528,7 +550,7 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        core.render(&view, w, h, &grid, &[], &mut font);
+        core.render(&view, w, h, &grid, &[], &mut font, true);
 
         let bytes_per_row = (w * 4).next_multiple_of(256);
         let readback = core.device.create_buffer(&wgpu::BufferDescriptor {

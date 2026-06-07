@@ -4,7 +4,7 @@
 //! later hands the buffer to `softbuffer` for presentation. Pixels are
 //! `0x00RRGGBB` (the format `softbuffer` expects).
 
-use crate::core::{Cell, Grid, WIDE_TRAILER};
+use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER};
 
 use super::font::{Glyph, GlyphSource};
 
@@ -23,6 +23,7 @@ pub(crate) fn render(
     buf: &mut [u32],
     width: usize,
     height: usize,
+    cursor_on: bool,
 ) {
     let (cw, ch) = font.cell_size();
     let baseline = font.baseline();
@@ -59,8 +60,11 @@ pub(crate) fn render(
     // reads like an inversion but honors the configured color. It shows only
     // on the live view, not while scrolled into history. Drag-selection still
     // inverts the cell's own fg/bg.
-    let cursor = (grid.cursor_visible && grid.view_offset == 0).then_some(grid.cursor);
-    let at_cursor = |col: usize, row: usize| cursor == Some((col, row));
+    let cursor = (grid.cursor_visible && grid.view_offset == 0 && cursor_on).then_some(grid.cursor);
+    let shape = grid.cursor_shape;
+    // Only a Block cursor inverts the cell; Underline/Bar overlay a stripe after.
+    let block_cursor =
+        |col: usize, row: usize| shape == CursorShape::Block && cursor == Some((col, row));
     // Selection coordinates address the live grid, so highlight only the live
     // view; while scrolled into history the composited rows don't line up.
     let inverted = |col: usize, row: usize| grid.view_offset == 0 && grid.is_selected(col, row);
@@ -75,7 +79,7 @@ pub(crate) fn render(
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
         let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
-        let bg = if !on_status && at_cursor(col, row) {
+        let bg = if !on_status && block_cursor(col, row) {
             grid.cursor_color
         } else if !on_status && inverted(col, row) {
             cell.fg
@@ -103,7 +107,7 @@ pub(crate) fn render(
         if glyph.width == 0 {
             continue;
         }
-        let fg = if !on_status && (at_cursor(col, row) || inverted(col, row)) {
+        let fg = if !on_status && (block_cursor(col, row) || inverted(col, row)) {
             cell.bg
         } else {
             cell.fg
@@ -111,6 +115,38 @@ pub(crate) fn render(
         let pen_x = (col * cw) as i32 + glyph.left;
         let pen_y = ((row + row_off) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
+    }
+
+    // Underline / bar cursors overlay a thin stripe in the cursor color on the
+    // (normally rendered) cell; Block is handled by the fg/bg swap above. Never
+    // drawn on the status row.
+    if let Some((ccol, crow)) = cursor
+        && shape != CursorShape::Block
+        && !(status.is_some() && crow == last_row)
+    {
+        let (x0, y0) = (ccol * cw, (crow + row_off) * ch);
+        let color = grid.cursor_color;
+        match shape {
+            CursorShape::Underline => {
+                let thick = (ch / 8).max(1);
+                for y in (y0 + ch).saturating_sub(thick)..(y0 + ch).min(height) {
+                    let base = y * width;
+                    for x in x0..(x0 + cw).min(width) {
+                        buf[base + x] = color;
+                    }
+                }
+            }
+            CursorShape::Bar => {
+                let thick = (cw / 8).max(1);
+                for y in y0..(y0 + ch).min(height) {
+                    let base = y * width;
+                    for x in x0..(x0 + thick).min(width) {
+                        buf[base + x] = color;
+                    }
+                }
+            }
+            CursorShape::Block => {}
+        }
     }
 }
 
@@ -183,7 +219,7 @@ mod tests {
         p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mX");
         let (w, h) = (4usize, 8usize);
         let mut buf = vec![0u32; w * h];
-        render(&g, &[], &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         // The 2×2 block at the top-left is the red foreground...
         assert_eq!(buf[0], 0xFF0000);
         assert_eq!(buf[1], 0xFF0000);
@@ -207,7 +243,7 @@ mod tests {
         bar.bg = 0xFF0000;
         let (w, h) = (4usize, 16usize); // one column, two cell rows
         let mut buf = vec![0u32; w * h];
-        render(&g, &[bar], &mut MockFont, &mut buf, w, h);
+        render(&g, &[bar], &mut MockFont, &mut buf, w, h, true);
         // Row 0 carries the chrome: red bg with the white 2×2 glyph at top-left.
         assert_eq!(buf[0], 0xFFFFFF, "chrome glyph at top");
         assert_eq!(buf[3], 0xFF0000, "chrome bar background");
@@ -221,7 +257,7 @@ mod tests {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b[48;2;0;128;0m "); // a space painted with green bg
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(buf.iter().all(|&px| px == 0x008000));
     }
 
@@ -234,7 +270,7 @@ mod tests {
         let (cw, chh) = (4usize, 8usize);
         let (w, h) = (cw * 2, chh * 2);
         let mut buf = vec![0u32; w * h];
-        render(&g, &[], &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         // Bottom cell-row, second cell (no glyph there) is pure status bg.
         assert_eq!(buf[chh * w + cw + 1], 0x123456, "bottom row is the status overlay");
         // A non-cursor top-row cell (col 1) is untouched: default black background.
@@ -261,7 +297,7 @@ mod tests {
         p.advance(&mut g, b"\x1b[48;2;0;0;0mabc");
         let (w, h) = (cw * 3, chh);
         let mut buf = vec![0u32; w * h];
-        render(&g, &[], &mut fc, &mut buf, w, h);
+        render(&g, &[], &mut fc, &mut buf, w, h, true);
         // Glyphs were drawn: at least some pixels differ from the black bg.
         assert!(buf.iter().any(|&px| px != 0x000000), "expected rasterized glyph pixels");
     }
@@ -276,7 +312,7 @@ mod tests {
         g.cursor_visible = true;
         // Default cursor color (white): the cell is a white block.
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(
             buf.iter().all(|&px| px == 0xFFFFFF),
             "default cursor is a white block"
@@ -284,7 +320,7 @@ mod tests {
         // A configured/OSC-12 cursor color paints the block in that color.
         g.cursor_color = 0x00FF00;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(
             buf.iter().all(|&px| px == 0x00FF00),
             "cursor block honors cursor_color"
@@ -300,11 +336,50 @@ mod tests {
         g.cursor = (0, 0);
         g.cursor_visible = true;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(
             buf.iter().all(|&px| px == 0xFF8800),
             "OSC 12 color reaches the block cursor"
         );
+    }
+
+    #[test]
+    fn underline_cursor_overlays_only_the_bottom_row() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        // Blue cell bg, green cursor color, steady underline (DECSCUSR 4).
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m \x1b]12;#00ff00\x07\x1b[4 q");
+        g.cursor = (0, 0); // pin the cursor to the cell we wrote (1×1 grid wraps)
+        let (w, h) = (4, 8);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        assert_eq!(buf[0], 0x0000FF, "top of the cell keeps the cell bg");
+        assert_eq!(buf[(h - 1) * w], 0x00FF00, "bottom row is the underline cursor");
+    }
+
+    #[test]
+    fn bar_cursor_overlays_only_the_left_column() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        // Blue cell bg, green cursor color, steady bar (DECSCUSR 6).
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m \x1b]12;#00ff00\x07\x1b[6 q");
+        g.cursor = (0, 0); // pin the cursor to the cell we wrote (1×1 grid wraps)
+        let (w, h) = (4, 8);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        assert_eq!(buf[0], 0x00FF00, "left column is the bar cursor");
+        assert_eq!(buf[w - 1], 0x0000FF, "right of the cell keeps the cell bg");
+    }
+
+    #[test]
+    fn blinking_cursor_hidden_in_off_phase() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m \x1b[1 q"); // blinking block
+        let mut buf = vec![0u32; 4 * 8];
+        // cursor_on == false models the blink off-phase: nothing is drawn.
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, false);
+        assert!(buf.iter().all(|&px| px == 0x0000FF), "off-phase draws no cursor");
     }
 
     #[test]
@@ -315,7 +390,7 @@ mod tests {
         g.cursor = (0, 0);
         g.cursor_visible = false;
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "no cursor: plain blue bg");
     }
 
@@ -328,7 +403,7 @@ mod tests {
         g.cursor_visible = true;
         g.view_offset = 1; // browsing history — live cursor must not draw
         let mut buf = vec![0u32; 4 * 8];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 8);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(buf.iter().all(|&px| px == 0x0000FF), "scrolled back: no cursor");
     }
 
@@ -345,12 +420,12 @@ mod tests {
         assert_eq!(g.scrollback.len(), 1, "blue line scrolled into history");
         // Cell is 4x8 (MockFont); two rows -> a 4x16 buffer. buf[0] is the top row.
         let mut buf = vec![0u32; 4 * 16];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 16);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 16, true);
         assert_eq!(buf[0], 0x008000, "live view top row: green");
         // Scroll up one line: the top row now shows the blue history line.
         assert!(g.scroll_view_up(1));
         let mut buf = vec![0u32; 4 * 16];
-        render(&g, &[], &mut MockFont, &mut buf, 4, 16);
+        render(&g, &[], &mut MockFont, &mut buf, 4, 16, true);
         assert_eq!(buf[0], 0x0000FF, "scrolled back: blue history in the top row");
         assert_eq!(buf[8 * 4], 0x008000, "row below shows the live top row (green)");
     }
@@ -364,7 +439,7 @@ mod tests {
         g.selection = Some(crate::core::Selection { anchor: (0, 0), head: (0, 0) });
         let (w, h) = (8usize, 8usize); // 2 cols * 4px
         let mut buf = vec![0u32; w * h];
-        render(&g, &[], &mut MockFont, &mut buf, w, h);
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         // Col 0 inverted (red block), col 1 untouched (blue bg).
         assert_eq!(buf[0], 0xFF0000, "selected cell inverted");
         assert_eq!(buf[4], 0x0000FF, "unselected cell unchanged");

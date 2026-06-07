@@ -21,12 +21,12 @@
 //! application-cursor tracking remain documented gaps.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
@@ -139,6 +139,8 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         sel_anchor: None,
         hits: Vec::new(),
         last_strip_click: None,
+        cursor_blink_on: true,
+        last_blink: Instant::now(),
     };
     app.spawn_tab()?; // the first shell; more come from Ctrl+Shift+T / the + button
     event_loop.run_app(&mut app)?;
@@ -217,6 +219,10 @@ struct App<'a> {
     hits: Vec<Hit>,
     /// Time of the last single click on the drag strip (double-click detect).
     last_strip_click: Option<Instant>,
+    /// Whether the blinking cursor is in its visible phase this frame.
+    cursor_blink_on: bool,
+    /// When the blink phase last toggled, paced by the event loop.
+    last_blink: Instant,
 }
 
 impl App<'_> {
@@ -232,6 +238,10 @@ impl App<'_> {
             g.set_scrollback_max(max);
         }
         g.apply_theme(&self.theme);
+        g.set_default_cursor(
+            self.config.cursor_style.unwrap_or_default(),
+            self.config.cursor_blink.unwrap_or(false),
+        );
         let grid = Arc::new(Mutex::new(g));
         let parser = Arc::new(Mutex::new(AnsiParser::with_theme(self.theme)));
 
@@ -317,7 +327,8 @@ impl App<'_> {
         let size = window.inner_size();
         let g = tab.grid.lock();
         window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
-        renderer.render(&g, &chrome, &mut self.font, size.width, size.height);
+        let cursor_on = !g.cursor_blink || self.cursor_blink_on;
+        renderer.render(&g, &chrome, &mut self.font, size.width, size.height, cursor_on);
     }
 
     /// Lay out the chrome bar for the current tabs/size: tab labels and the
@@ -679,6 +690,31 @@ fn apply_chrome(window: &Window, theme: &Theme) {
 }
 
 impl ApplicationHandler<UserEvent> for App<'_> {
+    /// Drive cursor blink: when the active tab's cursor blinks and is visible,
+    /// wake on a fixed interval to toggle its phase and repaint; otherwise wait
+    /// for the next real event (no idle wakeups).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        const BLINK: Duration = Duration::from_millis(530);
+        let blinking = self.tabs.get(self.active).is_some_and(|t| {
+            let g = t.grid.lock();
+            g.cursor_blink && g.cursor_visible && g.view_offset == 0
+        });
+        if !blinking {
+            self.cursor_blink_on = true;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_blink) >= BLINK {
+            self.cursor_blink_on = !self.cursor_blink_on;
+            self.last_blink = now;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_blink + BLINK));
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;

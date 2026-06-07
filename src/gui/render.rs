@@ -19,7 +19,7 @@ use super::font::FontCache;
 /// pre-laid cells; when non-empty it occupies the first cell row and the grid
 /// is painted one row below. Empty means no chrome (headless tests).
 pub(crate) trait Renderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32);
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool);
 }
 
 /// CPU compositor presented through `softbuffer`.
@@ -38,7 +38,7 @@ impl CpuRenderer {
 }
 
 impl Renderer for CpuRenderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32) {
+    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool) {
         let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
@@ -48,7 +48,7 @@ impl Renderer for CpuRenderer {
         let Ok(mut buffer) = self.surface.buffer_mut() else {
             return;
         };
-        cpu::render(grid, chrome, font, &mut buffer, width as usize, height as usize);
+        cpu::render(grid, chrome, font, &mut buffer, width as usize, height as usize, cursor_on);
         let _ = buffer.present();
     }
 }

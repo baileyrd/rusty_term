@@ -908,6 +908,48 @@ fn xtgettcap_unknown_and_malformed_fail() {
     assert_eq!(p.take_responses(), b"\x1bP0+r5a5a\x1b\\\x1bP0+rabc\x1b\\");
 }
 
+#[test]
+fn decscusr_sets_cursor_shape_and_blink() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Power-on default: steady block.
+    assert_eq!(g.cursor_shape, CursorShape::Block);
+    assert!(!g.cursor_blink);
+    p.advance(&mut g, b"\x1b[6 q"); // steady bar
+    assert_eq!(g.cursor_shape, CursorShape::Bar);
+    assert!(!g.cursor_blink);
+    p.advance(&mut g, b"\x1b[3 q"); // blinking underline
+    assert_eq!(g.cursor_shape, CursorShape::Underline);
+    assert!(g.cursor_blink);
+    p.advance(&mut g, b"\x1b[ q"); // empty param == 0 == blinking block
+    assert_eq!(g.cursor_shape, CursorShape::Block);
+    assert!(g.cursor_blink);
+    p.advance(&mut g, b"\x1b[9 q"); // out of range: unchanged
+    assert_eq!(g.cursor_shape, CursorShape::Block);
+    assert!(g.cursor_blink);
+}
+
+#[test]
+fn decscusr_is_relayed_to_host_not_printed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[4 q");
+    assert_eq!(g.take_host_out(), b"\x1b[4 q");
+    assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
+}
+
+#[test]
+fn ris_restores_configured_default_cursor() {
+    let mut g = Grid::new(80, 24);
+    g.set_default_cursor(CursorShape::Bar, true); // config default: blinking bar
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[2 q"); // child switches to a steady block
+    assert_eq!(g.cursor_shape, CursorShape::Block);
+    assert!(!g.cursor_blink);
+    p.advance(&mut g, b"\x1bc"); // RIS restores the configured default
+    assert_eq!(g.cursor_shape, CursorShape::Bar);
+    assert!(g.cursor_blink);
+}
 
 #[test]
 fn da3_query_is_answered() {

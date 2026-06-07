@@ -15,7 +15,7 @@ use super::cell::{
 use super::channel;
 use super::charset::Charset;
 use super::color::Palette;
-use super::grid::{Grid, LineAttr, alt_mode};
+use super::grid::{CursorShape, Grid, LineAttr, alt_mode};
 use super::kitty;
 use super::osc;
 use super::sixel;
@@ -849,6 +849,25 @@ impl AnsiParser {
                 self.last_char = None;
                 self.charsets = [Charset::Ascii; 4];
                 self.gl = 0;
+            }
+            b'q' if self.csi_intermediate == b' ' => {
+                // DECSCUSR — set cursor style (`CSI Ps SP q`). Odd params blink,
+                // even are steady: 0/1 block, 2 block, 3/4 underline, 5/6 bar.
+                let (shape, blink) = match p(0, 0) {
+                    0 | 1 => (CursorShape::Block, true),
+                    2 => (CursorShape::Block, false),
+                    3 => (CursorShape::Underline, true),
+                    4 => (CursorShape::Underline, false),
+                    5 => (CursorShape::Bar, true),
+                    6 => (CursorShape::Bar, false),
+                    _ => return, // unknown style: leave the cursor unchanged
+                };
+                g.set_cursor_style(shape, blink);
+                // Relay to the host (TUI), which owns its own cursor; the windowed
+                // front-end reads the grid state and renders the shape directly.
+                g.host_out.extend_from_slice(b"\x1b[");
+                g.host_out.extend_from_slice(self.param_buffer.as_bytes());
+                g.host_out.extend_from_slice(b" q");
             }
             b'c' => {
                 // DA1 (Primary Device Attributes). Only the default/`0` form is

@@ -80,6 +80,10 @@ fn main() -> Result<(), std::io::Error> {
         grid.set_scrollback_max(max);
     }
     grid.apply_theme(&config.theme);
+    grid.set_default_cursor(
+        config.cursor_style.unwrap_or_default(),
+        config.cursor_blink.unwrap_or(false),
+    );
     let grid = Arc::new(Mutex::new(grid));
 
     // The child renders through rusty_term, not the host terminal, so it should

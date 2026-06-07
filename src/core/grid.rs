@@ -147,6 +147,16 @@ pub struct Grid {
     /// parser's palette like the defaults above. The windowed renderers paint
     /// the block cursor in it; the TUI host owns its own cursor.
     pub cursor_color: u32,
+    /// The cursor's rendered shape (DECSCUSR `CSI Ps SP q` or the `cursor_style`
+    /// config key). The windowed renderers draw it; the TUI relays DECSCUSR to
+    /// the host, which owns its own cursor.
+    pub cursor_shape: CursorShape,
+    /// Whether the cursor blinks (DECSCUSR odd params / the `cursor_blink` config
+    /// key). The windowed event loop animates it; the TUI relays it to the host.
+    pub cursor_blink: bool,
+    /// The power-on cursor shape/blink (from config), restored by RIS/DECSTR.
+    default_cursor_shape: CursorShape,
+    default_cursor_blink: bool,
     /// Logical line indices (counting from the oldest retained scrollback line)
     /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
     /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
@@ -239,6 +249,19 @@ impl MouseModes {
     pub fn active(self) -> bool {
         self.base != 0
     }
+}
+
+/// The cursor's rendered shape, set by DECSCUSR (`CSI Ps SP q`) or the
+/// `cursor_style` config key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CursorShape {
+    /// Filled block covering the whole cell (the default).
+    #[default]
+    Block,
+    /// A horizontal bar along the bottom of the cell.
+    Underline,
+    /// A vertical bar (I-beam) at the left of the cell.
+    Bar,
 }
 
 /// Map a DEC private parameter to its alternate-screen mode, if any.
@@ -636,6 +659,10 @@ impl Grid {
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
             cursor_color: DEFAULT_FG,
+            cursor_shape: CursorShape::default(),
+            cursor_blink: false,
+            default_cursor_shape: CursorShape::default(),
+            default_cursor_blink: false,
             line_attrs: vec![LineAttr::Single; rows],
             wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
@@ -1129,6 +1156,24 @@ impl Grid {
                 *d = true;
             }
         }
+    }
+
+    /// Apply DECSCUSR (`CSI Ps SP q`): set the cursor shape and blink, repainting
+    /// the cursor's row so the change shows.
+    pub(crate) fn set_cursor_style(&mut self, shape: CursorShape, blink: bool) {
+        self.cursor_shape = shape;
+        self.cursor_blink = blink;
+        if let Some(d) = self.dirty.get_mut(self.cursor.1) {
+            *d = true;
+        }
+    }
+
+    /// Set the power-on default cursor (from config) and apply it now. RIS and
+    /// DECSTR restore to this default.
+    pub fn set_default_cursor(&mut self, shape: CursorShape, blink: bool) {
+        self.default_cursor_shape = shape;
+        self.default_cursor_blink = blink;
+        self.set_cursor_style(shape, blink);
     }
 
     /// Override the scrollback line cap (the `scrollback` config key). `0`
@@ -1631,6 +1676,8 @@ impl Grid {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.cursor_shape = self.default_cursor_shape;
+        self.cursor_blink = self.default_cursor_blink;
         // default_fg/bg are intentionally untouched: the parser re-syncs them
         // from its (theme-seeded) palette right after — see RIS handling.
         self.current_link = 0;
@@ -1650,6 +1697,8 @@ impl Grid {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.cursor_shape = self.default_cursor_shape;
+        self.cursor_blink = self.default_cursor_blink;
         // default_fg/bg are intentionally untouched: the parser re-syncs them
         // from its (theme-seeded) palette right after — see DECSTR handling.
         self.current_link = 0;

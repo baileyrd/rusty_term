@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use crate::core::Theme;
+use crate::core::{CursorShape, Theme};
 
 /// Parsed configuration with everything optional; `None` / the [`Theme`]
 /// defaults mean "keep the built-in behavior".
@@ -39,6 +39,11 @@ pub struct Config {
     pub font_size: Option<f32>,
     /// Startup colors: default fg/bg/cursor and the 16-color ANSI palette.
     pub theme: Theme,
+    /// Default cursor shape (windowed front-end). DECSCUSR can override it at
+    /// runtime; RIS/DECSTR restore this default.
+    pub cursor_style: Option<CursorShape>,
+    /// Whether the cursor blinks by default (windowed front-end).
+    pub cursor_blink: Option<bool>,
 }
 
 impl Config {
@@ -213,6 +218,7 @@ enum Value {
     Str(String),
     Int(i64),
     Float(f64),
+    Bool(bool),
 }
 
 /// Parse config text. Never fails: every malformed or unknown line becomes a
@@ -293,6 +299,12 @@ fn parse_value(s: &str) -> Result<Value, String> {
     if bare.is_empty() {
         return Err("missing value".into());
     }
+    if bare == "true" {
+        return Ok(Value::Bool(true));
+    }
+    if bare == "false" {
+        return Ok(Value::Bool(false));
+    }
     if let Ok(i) = bare.parse::<i64>() {
         return Ok(Value::Int(i));
     }
@@ -342,6 +354,10 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             };
             cfg.theme.palette16[n] = expect_color(k, value)?;
         }
+        ("", "cursor_style") => {
+            cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
+        }
+        ("", "cursor_blink") => cfg.cursor_blink = Some(expect_bool(key, value)?),
         ("", k) => return Err(format!("unknown key `{k}`")),
         (s, k) => return Err(format!("unknown key `{k}` in [{s}]")),
     }
@@ -360,6 +376,24 @@ fn expect_int(key: &str, v: Value) -> Result<i64, String> {
         Value::Int(i) if i >= 0 => Ok(i),
         Value::Int(_) => Err(format!("{key}: must be non-negative")),
         _ => Err(format!("{key}: expected an integer")),
+    }
+}
+
+/// A boolean: bare `true` / `false`.
+fn expect_bool(key: &str, v: Value) -> Result<bool, String> {
+    match v {
+        Value::Bool(b) => Ok(b),
+        _ => Err(format!("{key}: expected true or false")),
+    }
+}
+
+/// A cursor shape name: block / underline / bar (with common aliases).
+fn parse_cursor_shape(s: &str) -> Result<CursorShape, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "block" => Ok(CursorShape::Block),
+        "underline" | "underscore" => Ok(CursorShape::Underline),
+        "bar" | "beam" | "ibeam" | "i-beam" | "line" | "vertical" => Ok(CursorShape::Bar),
+        _ => Err(format!("unknown cursor_style `{s}` (block, underline, or bar)")),
     }
 }
 
@@ -595,6 +629,26 @@ color15 = "ffffff"
         assert_eq!(warns.len(), 2);
         assert!(warns[0].contains("unknown key `bogus`"));
         assert!(warns[1].contains("[weird]"));
+    }
+
+    #[test]
+    fn cursor_style_and_blink_parse() {
+        let (cfg, warns) = parse("cursor_style = \"bar\"\ncursor_blink = true\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.cursor_style, Some(CursorShape::Bar));
+        assert_eq!(cfg.cursor_blink, Some(true));
+    }
+
+    #[test]
+    fn cursor_style_aliases_and_bad_values_warn() {
+        // "beam" is an alias for the bar/I-beam shape.
+        let (cfg, _) = parse("cursor_style = \"beam\"\n");
+        assert_eq!(cfg.cursor_style, Some(CursorShape::Bar));
+        // An unknown shape and a non-boolean blink each warn and are skipped.
+        let (cfg2, warns) = parse("cursor_style = \"triangle\"\ncursor_blink = maybe\n");
+        assert_eq!(cfg2.cursor_style, None);
+        assert_eq!(cfg2.cursor_blink, None);
+        assert_eq!(warns.len(), 2);
     }
 
     #[test]
