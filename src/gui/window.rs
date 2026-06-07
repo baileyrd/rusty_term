@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
@@ -142,6 +142,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         last_strip_click: None,
         cursor_blink_on: true,
         last_blink: Instant::now(),
+        searching: None,
     };
     app.spawn_tab()?; // the first shell; more come from Ctrl+Shift+T / the + button
     event_loop.run_app(&mut app)?;
@@ -224,6 +225,9 @@ struct App<'a> {
     cursor_blink_on: bool,
     /// When the blink phase last toggled, paced by the event loop.
     last_blink: Instant,
+    /// Active scrollback-search query (windowed front-end); `Some` means search
+    /// mode is on, intercepting keys and showing the find bar in the chrome.
+    searching: Option<String>,
 }
 
 impl App<'_> {
@@ -337,6 +341,28 @@ impl App<'_> {
     /// between. Rebuilds the per-cell hit map as it goes.
     fn chrome_row(&mut self) -> Vec<Cell> {
         let cols = self.cols as usize;
+        if let Some(query) = self.searching.clone() {
+            let mut row = vec![Cell::blank(); cols];
+            let bar_bg = mix(self.theme.bg, self.theme.fg, 45);
+            for c in &mut row {
+                c.fg = self.theme.fg;
+                c.bg = bar_bg;
+            }
+            let status = self.tabs.get(self.active).and_then(|t| t.grid.lock().search_status());
+            let count = match status {
+                Some((cur, total)) => format!(" {cur}/{total} "),
+                None if query.is_empty() => String::new(),
+                None => " no matches ".to_string(),
+            };
+            let limit = cols.saturating_sub(count.chars().count());
+            let mut hits = vec![Hit::Drag; cols];
+            let mut col = 0;
+            put_text(&mut row, &mut hits, &mut col, limit, &format!(" Find: {query}"), self.theme.fg, bar_bg, Hit::Drag);
+            let mut ccol = limit;
+            put_text(&mut row, &mut hits, &mut ccol, cols, &count, self.theme.fg, bar_bg, Hit::Drag);
+            self.hits = hits;
+            return row;
+        }
         let bar_bg = mix(self.theme.bg, self.theme.fg, 30);
         let dim_fg = mix(self.theme.fg, self.theme.bg, 110);
         let mut row: Vec<Cell> = vec![Cell::blank(); cols];
@@ -568,10 +594,74 @@ impl App<'_> {
             Action::NextTab => self.cycle_tab(true),
             Action::PrevTab => self.cycle_tab(false),
             Action::OpenConfig => self.open_config(),
+            Action::Search => self.start_search(),
             Action::ScrollPageUp => self.scroll_key(false, true),
             Action::ScrollPageDown => self.scroll_key(false, false),
             Action::ScrollPromptUp => self.scroll_key(true, true),
             Action::ScrollPromptDown => self.scroll_key(true, false),
+        }
+    }
+
+    /// Enter incremental scrollback-search mode with an empty query.
+    fn start_search(&mut self) {
+        self.searching = Some(String::new());
+        self.grid_clear_search();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Handle a key while in search mode: edit the query, step matches (Enter /
+    /// Shift+Enter), or exit (Esc). Returns whether it was consumed — `false`
+    /// when not searching, so normal handling continues.
+    fn search_key(&mut self, event: &KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        if self.searching.is_none() {
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.searching = None;
+                self.grid_clear_search();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let forward = !self.mods.shift_key();
+                if let Some(tab) = self.tabs.get(self.active) {
+                    tab.grid.lock().search_jump(forward);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(q) = self.searching.as_mut() {
+                    q.pop();
+                }
+                self.run_search();
+            }
+            Key::Character(s) if !self.mods.control_key() && !self.mods.alt_key() => {
+                if let Some(q) = self.searching.as_mut() {
+                    q.push_str(s);
+                }
+                self.run_search();
+            }
+            _ => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
+    /// Re-run the active tab's search for the current query.
+    fn run_search(&mut self) {
+        let q = self.searching.clone().unwrap_or_default();
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.grid.lock().search(&q);
+        }
+    }
+
+    /// Clear the active tab's search highlights.
+    fn grid_clear_search(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.grid.lock().clear_search();
         }
     }
 
@@ -879,6 +969,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+                // In search mode, keys edit the query / step matches; nothing
+                // reaches the keymap or the child until Esc exits.
+                if self.search_key(&event) {
                     return;
                 }
                 // Terminal-owned shortcuts (configurable via the `[keys]` config

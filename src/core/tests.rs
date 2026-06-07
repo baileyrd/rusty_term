@@ -1227,6 +1227,51 @@ fn link_at_resolves_covered_cells() {
 }
 
 #[test]
+fn search_finds_matches_across_scrollback_and_screen() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    // 5 lines, 3 rows: "alpha"/"beta" scroll into history, screen keeps the rest.
+    p.advance(&mut g, b"alpha\r\nbeta\r\ngamma\r\nalpha two\r\ndelta");
+    assert_eq!(g.search("alpha"), 2); // history "alpha" + screen "alpha two"
+    assert_eq!(g.search_status(), Some((1, 2)));
+    // Case-insensitive.
+    assert_eq!(g.search("ALPHA"), 2);
+    // No match.
+    assert_eq!(g.search("zzz"), 0);
+    assert_eq!(g.search_status(), None);
+}
+
+#[test]
+fn search_matches_across_a_soft_wrap() {
+    let mut g = Grid::new(5, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"abcdefgh"); // wraps: "abcde" then "fgh" as one logical line
+    assert_eq!(g.search("ef"), 1); // 'e' ends row 0, 'f' starts row 1
+    // Highlight spans both physical rows (view snapped to show the match).
+    assert_eq!(g.search_highlight(4, 0), Some(true));
+    assert_eq!(g.search_highlight(0, 1), Some(true));
+    assert_eq!(g.search_highlight(0, 0), None);
+}
+
+#[test]
+fn search_jump_cycles_and_clear_resets() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"alpha\r\nbeta\r\ngamma\r\nalpha two\r\ndelta");
+    assert_eq!(g.search("alpha"), 2);
+    assert_eq!(g.search_status(), Some((1, 2)));
+    g.search_jump(true);
+    assert_eq!(g.search_status(), Some((2, 2)));
+    g.search_jump(true); // wraps back to the first
+    assert_eq!(g.search_status(), Some((1, 2)));
+    g.search_jump(false); // previous wraps to the last
+    assert_eq!(g.search_status(), Some((2, 2)));
+    g.clear_search();
+    assert_eq!(g.search_status(), None);
+    assert_eq!(g.search_highlight(0, 0), None);
+}
+
+#[test]
 fn osc_8_with_id_param_links_uri() {
     // The params field (here `id=foo`) is skipped; the URI still links.
     let g = parse(b"\x1b]8;id=foo;http://e.com\x1b\\Z", 80, 24);

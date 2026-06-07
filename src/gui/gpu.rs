@@ -16,6 +16,11 @@ use winit::window::Window;
 use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{FontCache, GlyphSource};
+
+/// Search-match highlight (matches [`super::cpu`]): amber match, orange active.
+const SEARCH_BG: u32 = 0xFFD24A;
+const SEARCH_CUR_BG: u32 = 0xFF7A1A;
+const SEARCH_FG: u32 = 0x101010;
 use super::render::Renderer;
 
 /// Square slot grid in the atlas: up to `SLOTS_PER_ROW²` distinct glyphs.
@@ -375,6 +380,10 @@ impl GpuCore {
                     CursorShape::Underline => (cell.fg, cell.bg, 2u32, grid.cursor_color),
                     CursorShape::Bar => (cell.fg, cell.bg, 3u32, grid.cursor_color),
                 }
+            } else if !on_status
+                && let Some(cur) = grid.search_highlight(col, row)
+            {
+                (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG }, 0, 0)
             } else if !on_status && grid.view_offset == 0 && grid.is_selected(col, row) {
                 (cell.bg, cell.fg, 0, 0)
             } else {

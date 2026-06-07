@@ -2,8 +2,8 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 5, 6, 7, 8,
-9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
+"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 5, 6, 7,
+8, 9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -24,8 +24,8 @@ Emit SGR/1006 mouse reporting from the window backend so child apps receive clic
 ## 3. Scrollback search/find overlay
 Add incremental search with highlight + next/prev using existing reflowed logical lines.
 
-- **Status:** not implemented
-- **Notes:** No search state, input mode, or highlight overlay exists in `src/gui/window.rs`; the reflowed-line search was never built.
+- **Status:** done (2026-06-07)
+- **Notes:** `Grid::search` (`src/core/grid.rs`) scans the scrollback + live screen, joining soft-wrapped rows into logical lines so a query matches across a wrap, case-insensitively (ASCII); it stores per-row highlight spans + per-match anchors (bounded by `SEARCH_MAX`) and scrolls the first match into view. `search_highlight`/`search_jump`/`search_status`/`clear_search` drive rendering and next/prev (cycling, viewport snapped via `scroll_to_abs`). The window backend (`src/gui/window.rs`) adds a `Search` keymap action (Ctrl+Shift+F) that enters an incremental search mode: typing edits the query (re-searching live), Enter / Shift+Enter step matches, Esc exits; a find bar (`Find: <q>   n/m`) shows in the chrome row. Both renderers highlight matches amber / the active one orange (`search_highlight`, like `is_selected` — no signature change). Tests: `core::tests::{search_finds_matches_across_scrollback_and_screen, search_matches_across_a_soft_wrap, search_jump_cycles_and_clear_resets}`, `gui::cpu::tests::search_match_cell_is_highlighted`.
 
 ## 4. Split panes within a tab
 Horizontal/vertical splits using existing Tab/PTY plumbing and cell-based chrome layout.
@@ -103,6 +103,5 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#3** search overlay, **#4** split panes, **#11** font
-  fallback/variants/ligatures, **#13** image framebuffer overlay,
-  **#14** iTerm2 + JPEG.
+- **#4** split panes, **#11** font fallback/variants/ligatures,
+  **#13** image framebuffer overlay, **#14** iTerm2 + JPEG.

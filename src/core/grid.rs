@@ -6,6 +6,8 @@
 //! [`DirtyFrame`] snapshot for the renderer.
 
 use std::collections::VecDeque;
+#[cfg(any(test, feature = "gui"))]
+use std::collections::HashMap;
 
 use super::cell::{Cell, DEFAULT_BG, DEFAULT_FG, Pen, WIDE_TRAILER, char_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,6 +44,64 @@ pub struct Selection {
     pub anchor: (usize, usize),
     /// Cell under the pointer now.
     pub head: (usize, usize),
+}
+
+/// In-window scrollback search results (windowed front-end). Matches span the
+/// scrollback + live screen joined into logical lines, so a query can cross a
+/// soft wrap; the renderer highlights them and next/prev steps through.
+#[cfg(any(test, feature = "gui"))]
+#[derive(Default)]
+pub(crate) struct Search {
+    /// Absolute row → highlighted col spans `(start, end_exclusive, match_index)`.
+    rows: HashMap<usize, Vec<(usize, usize, usize)>>,
+    /// Per match, the cell to scroll into view: `(absolute_row, col)`.
+    anchors: Vec<(usize, usize)>,
+    /// The active match — highlighted distinctly and the target of next/prev.
+    current: usize,
+}
+
+/// Cap on retained search matches, bounding work and highlight storage.
+#[cfg(any(test, feature = "gui"))]
+const SEARCH_MAX: usize = 2000;
+
+/// Find every (non-overlapping) occurrence of `q` in one logical line's `text`
+/// (with parallel per-char `at` cell positions), recording each as an anchor
+/// plus per-row highlight spans in `st`. Trailing spaces are ignored.
+#[cfg(any(test, feature = "gui"))]
+fn find_matches(text: &[char], at: &[(usize, usize)], q: &[char], st: &mut Search) {
+    let mut len = text.len();
+    while len > 0 && text[len - 1] == ' ' {
+        len -= 1;
+    }
+    if q.is_empty() || q.len() > len {
+        return;
+    }
+    let mut i = 0;
+    while i + q.len() <= len {
+        if text[i..i + q.len()] != *q {
+            i += 1;
+            continue;
+        }
+        let mi = st.anchors.len();
+        st.anchors.push(at[i]);
+        let mut j = i;
+        while j < i + q.len() {
+            let row = at[j].0;
+            let start = at[j].1;
+            let mut end = at[j].1 + char_width(text[j]).max(1);
+            let mut k = j + 1;
+            while k < i + q.len() && at[k].0 == row {
+                end = at[k].1 + char_width(text[k]).max(1);
+                k += 1;
+            }
+            st.rows.entry(row).or_default().push((start, end, mi));
+            j = k;
+        }
+        i += q.len();
+        if st.anchors.len() >= SEARCH_MAX {
+            return;
+        }
+    }
 }
 
 /// The authoritative screen buffer: a row-major grid of [`Cell`]s plus a
@@ -94,6 +154,10 @@ pub struct Grid {
     /// [`Grid::view_offset`] — the TUI renderer ignores it (the host owns
     /// selection there).
     pub selection: Option<Selection>,
+    /// Active scrollback search (windowed front-end); `None` when not searching.
+    /// Pure view state like [`Grid::selection`]; the TUI ignores it.
+    #[cfg(any(test, feature = "gui"))]
+    search: Option<Search>,
     /// Bytes destined for the *host* terminal (not the grid): OSC 52 clipboard
     /// requests forwarded verbatim. The renderer drains these via
     /// [`Grid::take_host_out`] each frame and writes them to its stdout.
@@ -662,6 +726,8 @@ impl Grid {
             scrollback_max: SCROLLBACK_MAX,
             view_offset: 0,
             selection: None,
+            #[cfg(any(test, feature = "gui"))]
+            search: None,
             host_out: Vec::new(),
             links: Vec::new(),
             clusters: Vec::new(),
@@ -1893,6 +1959,120 @@ impl Grid {
     /// Snap the viewport back to the live bottom. Returns `true` if it moved.
     pub fn reset_view(&mut self) -> bool {
         self.set_view_offset(0)
+    }
+
+    /// Borrow physical row `abs` (0 = oldest scrollback line) as `(cells, wrapped)`.
+    #[cfg(any(test, feature = "gui"))]
+    fn phys_row(&self, abs: usize) -> (&[Cell], bool) {
+        let h = self.scrollback.len();
+        if abs < h {
+            (&self.scrollback[abs].cells, self.scrollback[abs].wrapped)
+        } else {
+            let y = abs - h;
+            (&self.cells[y * self.cols..(y + 1) * self.cols], self.wrapped[y])
+        }
+    }
+
+    /// Scroll the viewport so absolute row `abs` is visible, about a third down.
+    #[cfg(any(test, feature = "gui"))]
+    fn scroll_to_abs(&mut self, abs: usize) {
+        let h = self.scrollback.len();
+        let want = h as isize + (self.rows / 3) as isize - abs as isize;
+        let off = want.clamp(0, h as isize) as usize;
+        self.set_view_offset(off);
+    }
+
+    /// Search the scrollback + live screen for `query`, case-insensitively
+    /// (ASCII), joining soft-wrapped rows into logical lines so a match can cross
+    /// a wrap. Stores matches for highlighting and next/prev, scrolls the first
+    /// into view, and returns the count. An empty query clears the search.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn search(&mut self, query: &str) -> usize {
+        self.search = None;
+        let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if q.is_empty() {
+            self.dirty.iter_mut().for_each(|d| *d = true);
+            return 0;
+        }
+        let total = self.scrollback.len() + self.rows;
+        let mut st = Search::default();
+        let mut text: Vec<char> = Vec::new();
+        let mut at: Vec<(usize, usize)> = Vec::new();
+        for abs in 0..total {
+            let (cells, wrapped) = self.phys_row(abs);
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.flags & WIDE_TRAILER != 0 {
+                    continue;
+                }
+                text.push(cell.ch.to_ascii_lowercase());
+                at.push((abs, col));
+            }
+            if wrapped {
+                continue;
+            }
+            find_matches(&text, &at, &q, &mut st);
+            text.clear();
+            at.clear();
+            if st.anchors.len() >= SEARCH_MAX {
+                break;
+            }
+        }
+        find_matches(&text, &at, &q, &mut st);
+        let n = st.anchors.len();
+        if n > 0 {
+            let anchor = st.anchors[0].0;
+            self.search = Some(st);
+            self.scroll_to_abs(anchor);
+        }
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        n
+    }
+
+    /// Step to the next (`forward`) or previous match, scrolling it into view.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn search_jump(&mut self, forward: bool) -> bool {
+        let abs = {
+            let Some(s) = &mut self.search else { return false };
+            if s.anchors.is_empty() {
+                return false;
+            }
+            let n = s.anchors.len();
+            s.current = if forward { (s.current + 1) % n } else { (s.current + n - 1) % n };
+            s.anchors[s.current].0
+        };
+        self.scroll_to_abs(abs);
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        true
+    }
+
+    /// Highlight state for viewport cell `(col, vr)`: `None` (no match),
+    /// `Some(false)` (a match), `Some(true)` (the active match).
+    #[cfg(any(test, feature = "gui"))]
+    pub fn search_highlight(&self, col: usize, vr: usize) -> Option<bool> {
+        let s = self.search.as_ref()?;
+        let off = self.view_offset.min(self.scrollback.len());
+        let abs = self.scrollback.len() - off + vr;
+        for &(start, end, mi) in s.rows.get(&abs)? {
+            if col >= start && col < end {
+                return Some(mi == s.current);
+            }
+        }
+        None
+    }
+
+    /// `(current_match_1based, total)` while searching, else `None`.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn search_status(&self) -> Option<(usize, usize)> {
+        let s = self.search.as_ref()?;
+        Some((s.current + 1, s.anchors.len()))
+    }
+
+    /// Clear any active search (highlights + matches).
+    #[cfg(any(test, feature = "gui"))]
+    pub fn clear_search(&mut self) {
+        if self.search.take().is_some() {
+            self.dirty.iter_mut().for_each(|d| *d = true);
+        }
     }
 
     /// Set the scrollback view offset, marking every row dirty so the renderer

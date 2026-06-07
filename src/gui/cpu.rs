@@ -8,6 +8,12 @@ use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{Glyph, GlyphSource};
 
+/// Search-match highlight: amber for a match, orange for the active one, with a
+/// dark glyph so text stays legible on either.
+const SEARCH_BG: u32 = 0xFFD24A;
+const SEARCH_CUR_BG: u32 = 0xFF7A1A;
+const SEARCH_FG: u32 = 0x101010;
+
 /// Composite the grid's visible cells into `buf` (`width × height` pixels,
 /// `len() == width * height`). Each cell is filled with its background, then its
 /// glyph is blended on top in the foreground color. Geometry comes from the
@@ -68,6 +74,8 @@ pub(crate) fn render(
     // Selection coordinates address the live grid, so highlight only the live
     // view; while scrolled into history the composited rows don't line up.
     let inverted = |col: usize, row: usize| grid.view_offset == 0 && grid.is_selected(col, row);
+    // Scrollback search matches (amber / orange for the active one).
+    let search_hl = |col: usize, row: usize| grid.search_highlight(col, row);
 
     // The status-line overlay (L13), when present, replaces the bottom row.
     let status = grid.status_row();
@@ -81,6 +89,10 @@ pub(crate) fn render(
         let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
         let bg = if !on_status && block_cursor(col, row) {
             grid.cursor_color
+        } else if !on_status
+            && let Some(cur) = search_hl(col, row)
+        {
+            if cur { SEARCH_CUR_BG } else { SEARCH_BG }
         } else if !on_status && inverted(col, row) {
             cell.fg
         } else {
@@ -109,6 +121,8 @@ pub(crate) fn render(
         }
         let fg = if !on_status && (block_cursor(col, row) || inverted(col, row)) {
             cell.bg
+        } else if !on_status && search_hl(col, row).is_some() {
+            SEARCH_FG
         } else {
             cell.fg
         };
@@ -425,6 +439,21 @@ mod tests {
         // MockFont draws a 2x2 block top-left, so (3,0) is the reversed bg.
         assert_eq!(buf[3], 0x00FF00, "preedit cell bg is the reversed fg");
         assert_eq!(buf[0], 0x0000FF, "preedit glyph is the reversed bg");
+    }
+
+    #[test]
+    fn search_match_cell_is_highlighted() {
+        let mut g = Grid::new(5, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"xyz");
+        assert_eq!(g.search("y"), 1); // 'y' at col 1, the active (current) match
+        let (w, h) = (5 * 4, 8); // 5 cols * 4px cell width
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        // Cell col 1 spans x in [4, 8); a corner with no glyph is the active-match bg.
+        assert_eq!(buf[7 * w + 7], 0xFF7A1A, "active match cell is orange");
+        // col 0 (no match) keeps the default background.
+        assert_ne!(buf[7 * w], 0xFF7A1A);
     }
 
     #[test]
