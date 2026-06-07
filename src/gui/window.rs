@@ -33,7 +33,10 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 use crate::backend::{Backend, BackendHandle};
 use crate::config::Config;
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
+use crate::core::grid::MouseModes;
 use super::font::{self, FontCache, GlyphSource};
+use super::mouse::{MouseEvent, SgrEncoder};
+use super::render::{CpuRenderer, Renderer};
 use super::render::{CpuRenderer, Renderer};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).

@@ -18,6 +18,7 @@ mod font;
 #[cfg(feature = "gui-gpu")]
 mod gpu;
 mod input;
+mod mouse;
 mod render;
 mod window;
 
