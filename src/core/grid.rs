@@ -207,6 +207,14 @@ pub struct Grid {
     /// window backend on `WindowEvent::Ime`, not by the parser.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub ime_preedit: String,
+    /// Total lines ever scrolled into history — a stable serial anchoring
+    /// [`GridImage`]s so they track scroll/scrollback (windowed front-end only).
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) total_scrolled: usize,
+    /// Pixel images (Sixel/Kitty) drawn over their reserved half-block cells by
+    /// the windowed CPU renderer; the TUI and GPU use the half-block cells.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) images: Vec<GridImage>,
     /// Whether autowrap (DECAWM `?7`, default on) is enabled. When off, a glyph
     /// printed at the right margin overwrites the last column instead of
     /// wrapping to the next line.
@@ -403,6 +411,21 @@ fn reflow_clip(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows
 /// so a colored/attributed blank is *kept* (its background is content).
 fn is_padding(c: &Cell) -> bool {
     c.ch == ' ' && c.cluster == 0 && c.link == 0 && c.flags == 0
+}
+
+/// A pixel image (Sixel/Kitty) placed on the grid: source pixels plus the cell
+/// footprint reserved for it, anchored by `serial` (its top cell row's stable
+/// scroll position) so it tracks scrollback. Used by the CPU renderer only.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) struct GridImage {
+    pub(crate) serial: usize,
+    pub(crate) col: usize,
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) pw: usize,
+    pub(crate) ph: usize,
+    /// Source pixels, row-major `pw × ph`; `None` = transparent (skipped).
+    pub(crate) pixels: Vec<Option<u32>>,
 }
 
 /// The product of a wrap-aware reflow: the rebuilt history, the new on-screen
@@ -728,6 +751,10 @@ impl Grid {
             selection: None,
             #[cfg(any(test, feature = "gui"))]
             search: None,
+            #[cfg(any(test, feature = "gui"))]
+            total_scrolled: 0,
+            #[cfg(any(test, feature = "gui"))]
+            images: Vec::new(),
             host_out: Vec::new(),
             links: Vec::new(),
             clusters: Vec::new(),
@@ -905,6 +932,8 @@ impl Grid {
         let tw = width.min(avail);
         let th = (height * tw / width).max(1);
         let cell_rows = th.div_ceil(2);
+        #[cfg(any(test, feature = "gui"))]
+        self.store_image(width, height, pixels, origin, tw, cell_rows);
 
         for cr in 0..cell_rows {
             let y = self.cursor.1;
@@ -929,6 +958,40 @@ impl Grid {
         self.render_image(img.width, img.height, &img.pixels);
     }
 
+    /// Store a placed pixel image for the CPU renderer to overlay over its
+    /// reserved half-block cells, anchored by serial (top cell row) so it
+    /// scrolls with text. Bounded — the oldest image is dropped past the cap.
+    #[cfg(any(test, feature = "gui"))]
+    fn store_image(&mut self, pw: usize, ph: usize, pixels: &[Option<u32>], col: usize, cols: usize, rows: usize) {
+        const MAX_IMAGES: usize = 8;
+        let serial = self.total_scrolled + self.cursor.1;
+        self.images.push(GridImage { serial, col, cols, rows, pw, ph, pixels: pixels[..pw * ph].to_vec() });
+        if self.images.len() > MAX_IMAGES {
+            self.images.remove(0);
+        }
+    }
+
+    /// Drop images that have scrolled out of the retained scrollback.
+    #[cfg(any(test, feature = "gui"))]
+    fn evict_scrolled_images(&mut self) {
+        let oldest = self.total_scrolled.saturating_sub(self.scrollback.len());
+        self.images.retain(|im| im.serial + im.rows > oldest);
+    }
+
+    /// Placed pixel images for the CPU renderer to composite over the cells.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn images(&self) -> &[GridImage] {
+        &self.images
+    }
+
+    /// The viewport row of image `im`'s top cell (negative when scrolled partly
+    /// above the view).
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn image_top_row(&self, im: &GridImage) -> isize {
+        let off = self.view_offset.min(self.scrollback.len());
+        im.serial as isize - self.total_scrolled as isize + off as isize
+    }
+
     /// Scroll the current scrolling region up by one row, blanking the freed
     /// bottom row of the region. Only the region's rows are marked dirty.
     pub fn scroll_up(&mut self) {
@@ -951,6 +1014,11 @@ impl Grid {
                 if let Some(s) = &mut self.command_start {
                     *s = s.saturating_sub(1);
                 }
+            }
+            #[cfg(any(test, feature = "gui"))]
+            {
+                self.total_scrolled += 1;
+                self.evict_scrolled_images();
             }
             // If the user is browsing history, advance the offset in step with
             // the incoming line so the viewed region stays put under new output.
@@ -1214,6 +1282,8 @@ impl Grid {
     pub(crate) fn clear_all(&mut self) {
         let blank = self.erase_cell();
         self.cells.fill(blank);
+        #[cfg(any(test, feature = "gui"))]
+        self.images.clear();
         self.wrapped.iter_mut().for_each(|w| *w = false);
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.cursor = (0, 0);
@@ -1335,6 +1405,8 @@ impl Grid {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
         }
+        #[cfg(any(test, feature = "gui"))]
+        self.images.clear(); // serials/reflow change; drop placed images
         let (old_cols, old_rows) = (self.cols, self.rows);
         let clamp = |(x, y): (usize, usize)| (x.min(cols - 1), y.min(rows - 1));
         let blank = self.erase_cell();
@@ -1432,6 +1504,8 @@ impl Grid {
         if self.primary.is_some() {
             return;
         }
+        #[cfg(any(test, feature = "gui"))]
+        self.images.clear();
         let blank = self.erase_cell();
         self.primary = Some(SavedScreen {
             cells: std::mem::replace(&mut self.cells, vec![blank; self.cols * self.rows]),
@@ -1745,6 +1819,8 @@ impl Grid {
     pub(crate) fn reset(&mut self) {
         self.primary = None; // leave the alternate screen if active
         self.cells = vec![self.erase_cell(); self.cols * self.rows];
+        #[cfg(any(test, feature = "gui"))]
+        self.images.clear();
         self.dirty = vec![true; self.rows];
         self.line_attrs = vec![LineAttr::Single; self.rows];
         self.wrapped = vec![false; self.rows];

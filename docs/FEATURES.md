@@ -3,7 +3,7 @@
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
 "completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 4, 5, 6,
-7, 8, 9, 10, 11, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
+7, 8, 9, 10, 11, 12, 13, and 15** are implemented; only **#14** has no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -84,8 +84,9 @@ Handle OSC 52 query path; window backend services programmatic clipboard get/set
 ## 13. Accurate Sixel/Kitty image rendering
 Pixel-perfect image rendering via framebuffer overlay instead of half-block path.
 
-- **Status:** not implemented
-- **Notes:** Images still take the half-block-cell path (`Grid::render_sixel` writes cells; test `render_sixel_writes_halfblock_cells`); the renderers blit only glyph coverage tiles — there is no pixel framebuffer/image overlay in `src/gui/{cpu,gpu}.rs`.
+- **Status:** done (2026-06-07) — CPU framebuffer overlay; GPU/TUI keep half-block
+- **Notes:** `Grid::render_image` (the shared Sixel/Kitty/PNG sink in `src/core/grid.rs`) now also retains the full-resolution source as a serial-anchored `GridImage` (`store_image`, gated `#[cfg(any(test, feature = "gui"))]` like `search`): `serial = total_scrolled + cursor row`, so it scrolls with the text and is evicted once it falls out of scrollback (`evict_scrolled_images`, hooked into `scroll_up`); `clear_all`/`resize`/`enter_alt_screen`/`reset` drop placed images. The half-block cells are still written, so the **GPU and TUI renderers fall back to them**. The CPU renderer (`src/gui/cpu.rs::draw_grid`) composites each image after glyphs, nearest-neighbor scaled to its `cols x rows` cell footprint and clipped to the pane (`images()`/`image_top_row`), painting transparent pixels through to the cell behind. Capped at 8 images (oldest dropped). Tests: `core::tests::render_image_stores_pixel_image_for_overlay`, `gui::cpu::tests::image_pixels_overlay_the_cells`.
+- **Not yet:** GPU textured-quad image pipeline (the GPU path keeps the half-block fallback); ligatures/scaling filters beyond nearest-neighbor.
 
 ## 14. iTerm2 inline images + JPEG decoder
 Implement iTerm2 inline image protocol with JPEG decoding.
@@ -103,5 +104,6 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#13** image framebuffer overlay, **#14** iTerm2 + JPEG.
+- **#14** iTerm2 inline images + JPEG decoder.
+- **GPU image pipeline** (optional) — textured quads to replace the GPU half-block fallback for #13.
 - **#11 ligature shaping** (optional) — needs a shaping engine.

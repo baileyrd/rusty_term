@@ -158,6 +158,38 @@ pub(crate) fn draw_grid(
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
     }
 
+    // Pixel images (Sixel/Kitty) composited over their reserved half-block cells
+    // (pixel-perfect), scaled nearest-neighbor to the footprint and clipped to
+    // the pane. The grid anchors them by serial, so this tracks scroll/history.
+    for im in grid.images() {
+        let (dst_w, dst_h) = ((im.cols * cw) as isize, (im.rows * ch) as isize);
+        if dst_w <= 0 || dst_h <= 0 {
+            continue;
+        }
+        let x0 = ((col0 + im.col) * cw) as isize;
+        let y0 = (row0 as isize + grid.image_top_row(im)) * ch as isize;
+        let pane_top = (row0 * ch) as isize;
+        let pane_bottom = (((row0 + grid.rows) * ch).min(height)) as isize;
+        let pane_right = (((col0 + grid.cols) * cw).min(width)) as isize;
+        for dy in 0..dst_h {
+            let py = y0 + dy;
+            if py < pane_top || py >= pane_bottom {
+                continue;
+            }
+            let sy = dy as usize * im.ph / dst_h as usize;
+            for dx in 0..dst_w {
+                let px = x0 + dx;
+                if px < 0 || px >= pane_right {
+                    continue;
+                }
+                let sx = dx as usize * im.pw / dst_w as usize;
+                if let Some(c) = im.pixels[sy * im.pw + sx] {
+                    buf[py as usize * width + px as usize] = c;
+                }
+            }
+        }
+    }
+
     // Underline / bar cursors overlay a thin stripe (block is the fg/bg swap).
     if let Some((ccol, crow)) = cursor
         && shape != CursorShape::Block
@@ -493,6 +525,18 @@ mod tests {
         draw_grid(&mut buf, w, h, &g, 1, 1, false, false, &mut MockFont);
         assert_eq!(buf[ch * w + cw], 0x0000FF, "the cell is painted at the offset");
         assert_eq!(buf[0], 0, "the origin is left untouched (a divider gap)");
+    }
+
+    #[test]
+    fn image_pixels_overlay_the_cells() {
+        let mut g = Grid::new(4, 2);
+        g.render_image(2, 2, &[Some(0xFF0000); 4]); // a 2x2 red image at the cursor
+        let (cw, ch) = (4usize, 8usize);
+        let (w, h) = (4 * cw, 2 * ch);
+        let mut buf = vec![0u32; w * h];
+        draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut MockFont);
+        // The image composites as real pixels over its reserved half-block cell.
+        assert_eq!(buf[0], 0xFF0000, "image pixel composited at the origin");
     }
 
     #[test]

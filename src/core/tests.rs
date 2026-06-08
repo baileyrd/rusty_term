@@ -2367,6 +2367,26 @@ fn render_sixel_writes_halfblock_cells() {
 }
 
 #[test]
+fn render_image_stores_pixel_image_for_overlay() {
+    let mut g = Grid::new(10, 4);
+    g.render_image(4, 4, &[Some(0x00FF00); 16]);
+    // The full-resolution source is kept for the CPU pixel overlay, anchored at
+    // the top cell row so it tracks scroll/history.
+    assert_eq!(g.images().len(), 1);
+    let im = &g.images()[0];
+    assert_eq!(im.serial, 0);
+    assert_eq!(g.image_top_row(im), 0); // no scroll: top cell at viewport row 0
+    assert_eq!((im.col, im.cols, im.rows), (0, 4, 2)); // footprint: cols wide, 2 rows
+    assert_eq!((im.pw, im.ph), (4, 4)); // full source resolution retained
+    assert_eq!(im.pixels.len(), 16);
+    // ...alongside the half-block cells the TUI/GPU fall back to.
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    // Clearing the screen drops placed images.
+    g.clear_all();
+    assert!(g.images().is_empty());
+}
+
+#[test]
 fn render_sixel_transparent_lower_half_uses_default_bg() {
     // Only a top pixel: upper half block, fg = pixel, bg = default background.
     let img = SixelImage {
