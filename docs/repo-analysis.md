@@ -5,6 +5,17 @@
 > Verification basis: default build compiles; `cargo test` = **231 passing**
 > (228 at review time + 3 adversarial added with the fixes in section 4);
 > `cargo clippy` = 4 benign style nits; the binary decoders were traced by hand.
+>
+> **Update 2026-06-08.** This is a dated snapshot, kept as-is for the record.
+> Since it was written the 15-item feature backlog has been completed — see
+> [`docs/FEATURES.md`](FEATURES.md) and the 2026-06-08 note in
+> [`docs/research/implementation-status.md`](research/implementation-status.md).
+> Notably, the §5 documentation gaps (in-window mouse reporting, OSC 52, IME) and
+> the §7 "cell-resolution images" simplification are now closed: Sixel/Kitty/iTerm2
+> images composite pixel-for-pixel in the CPU renderer, iTerm2 (`OSC 1337`) +
+> a from-scratch JPEG decoder landed, and GSUB ligature shaping was added. The
+> test/clippy counts below are from 2026-06-03 (now ~300 core / 349 gui tests,
+> 9 clippy warnings).
 
 ## 1. What it is
 

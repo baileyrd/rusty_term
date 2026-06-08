@@ -16,8 +16,10 @@ It implements all 14 layers of the terminal stack catalogued in
 [`docs/research/terminal-stack-spec-tree.html`](docs/research/terminal-stack-spec-tree.html);
 the per-layer scorecard and backlog live in
 [`docs/research/implementation-status.md`](docs/research/implementation-status.md),
-and the narrative design synthesis in
-[`docs/research/terminal-stack-synthesis.md`](docs/research/terminal-stack-synthesis.md).
+the narrative design synthesis in
+[`docs/research/terminal-stack-synthesis.md`](docs/research/terminal-stack-synthesis.md),
+and the implemented-feature catalog (per-feature notes + test names) in
+[`docs/FEATURES.md`](docs/FEATURES.md).
 
 > **Platform support.** Unix (Linux/macOS) is the primary, fully exercised
 > target. The Windows ConPTY backend has been run and verified on Windows 11
@@ -51,7 +53,7 @@ relays it through the parser into the host terminal. Before spawning, it sets
 
 | Feature        | Default | What it adds |
 |----------------|:-------:|--------------|
-| `gui`          |         | Native window backend: a `winit` window with a `softbuffer` CPU renderer and `ab_glyph` glyph rasterization. |
+| `gui`          |         | Native window backend: a `winit` window with a `softbuffer` CPU renderer, `ab_glyph` glyph rasterization, and `ttf-parser`-driven GSUB ligature shaping. |
 | `gui-gpu`      |         | Adds a `wgpu` GPU renderer (glyph atlas + instanced quads) alongside the CPU one. Implies `gui`. |
 | `l13`          |         | L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP plus LSP/ACP negotiation. Requires a sibling `rusty_lsp` checkout (see below). |
 
@@ -119,8 +121,20 @@ shell = "pwsh"           # or "wsl", "powershell", "C:\\tools\\nu.exe", ...
 [window]                 # windowed (--gui) front-end only
 cols = 120               # initial size in cells; default 80x24
 rows = 40
-font = "/path/to/mono.ttf"  # else $RUSTY_TERM_FONT, else system search
-font-size = 16           # pixels; default 18
+font = "/path/to/mono.ttf"          # else $RUSTY_TERM_FONT, else system search
+font-size = 16                      # pixels; default 18
+font_bold = "/path/to/mono-bold.ttf"          # else derived from `font`
+font_italic = "/path/to/mono-italic.ttf"
+font_bold_italic = "/path/to/mono-bolditalic.ttf"
+font_fallback = "/path/to/cjk.ttf"  # glyphs the main font lacks (CJK, symbols)
+ligatures = true                    # GSUB liga/calt ligatures; default on
+cursor_style = "bar"                # block (default) | bar | underline
+cursor_blink = true                 # default off
+
+[keys]                   # rebind window shortcuts as  action = "chord"
+search = "Ctrl+Shift+F"
+split_right = "Ctrl+Shift+D"
+new_tab = "Ctrl+Shift+T"
 
 [colors]                 # startup theme; resets (RIS/OSC 1xx) restore it
 foreground = "#d8d8d8"
@@ -134,10 +148,26 @@ The `[colors]` theme is what every reset path (`RIS`, `DECSTR`, OSC
 104/110/111/112) restores, so a configured look survives a `reset` exactly
 the way the hardware defaults would. A `theme = "name"` preset seeds all the
 colors at once; `[colors]` keys placed after it override individual entries.
-The windowed block cursor is painted in the `cursor` color (and follows
+The windowed cursor is painted in the `cursor` color (and follows
 OSC 12 at runtime). Indexed colors 16–255 always come from the fixed xterm
 cube/ramp. In TUI mode `cols`/`rows` are ignored (the host terminal owns its
 size), and `font`/`font-size` apply only to `--gui`.
+
+The `[window]` block also configures the **font stack** and **cursor**:
+`font_bold` / `font_italic` / `font_bold_italic` name explicit variant faces
+(unset, they fall back to filename-derived siblings of `font`, then to the
+regular face), `font_fallback` covers glyphs the main font lacks, and
+`ligatures` toggles programming ligatures (the font's GSUB `liga`/`calt`
+features — on by default, ignored for fonts without them). `cursor_style`
+(`block`/`bar`/`underline`) and `cursor_blink` set the startup cursor; the
+child can still override both at runtime via DECSCUSR.
+
+The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
+actions are `copy`, `paste`, `search`, `new_tab`, `close_tab`, `next_tab`,
+`prev_tab`, `split_right`, `split_down`, `focus_next`, `open_config`,
+`scroll_page_up`, `scroll_page_down`, `scroll_prompt_up`, `scroll_prompt_down`;
+a chord is `+`-separated modifiers (`ctrl`/`shift`/`alt`) plus one key — a
+printable character or `comma`/`tab`/`pageup`/`pagedown`.
 
 #### Live reload
 
@@ -154,25 +184,38 @@ template on first use — edit, save, watch it apply.
 
 The window is borderless and draws its own chrome: a one-row bar across the
 top with the session **tabs**, a `+` new-tab button, and minimize/maximize/
-close. Each tab is its own shell session. Drag the empty bar to move the
+close. Each tab holds one or more shell sessions arranged as split panes. Drag the empty bar to move the
 window (double-click it to toggle maximize), and drag the thin band at the
 window edges to resize.
 
 | Input | Action |
 |-------|--------|
 | Left-drag | Select text (highlighted by inversion). |
+| Ctrl+click | Open the OSC 8 hyperlink under the cursor. |
 | Ctrl+Shift+C | Copy the selection to the system clipboard. |
 | Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
+| Ctrl+Shift+F | Open the in-window search bar (incremental match highlighting). |
 | Ctrl+Shift+, | Open the config file in your editor (created from a template on first use). |
 | Ctrl+Shift+T / `+` | Open a new tab (uses the configured shell). |
-| Ctrl+Shift+W | Close the current tab (the last one closes the window). |
+| Ctrl+Shift+W | Close the focused pane (its last pane closes the tab; the last tab closes the window). |
 | Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs. |
+| Ctrl+Shift+D / Ctrl+Shift+E | Split the focused pane right / down. |
+| Ctrl+Shift+J | Move focus to the next pane. |
+| Shift+PageUp / PageDown | Scroll the scrollback by a page. |
+| Ctrl+Shift+PageUp / PageDown | Jump to the previous / next shell prompt (OSC 133). |
 
-The window draws a block cursor; a tab closes when its shell exits, and the
-window closes with the last tab. When a TUI app enables mouse tracking
-(`?1000`/`?1002`/`?1003`, SGR/1006), left clicks and the wheel are reported to
-it as SGR-encoded events; OSC 52 programmatic clipboard and IME are not yet
-wired.
+Every shortcut above is rebindable in the `[keys]` config section (below).
+
+The cursor shape (block / bar / underline) and blink follow the `cursor_style`
+and `cursor_blink` config keys, and the child can change them at runtime via
+DECSCUSR (`CSI Sp q`); a tab closes when its shell exits, and the window closes
+with the last tab. The window is a full participant in the input and graphics
+protocols: when a TUI app enables mouse tracking (`?1000`/`?1002`/`?1003`,
+SGR/1006) clicks and the wheel are reported to it as SGR-encoded events; OSC 52
+reads and writes the system clipboard; IME pre-edit composes inline; OSC 9/777
+desktop notifications are forwarded to the OS; and Sixel / Kitty / iTerm2
+(`OSC 1337`) images render over the grid — pixel-for-pixel in the CPU renderer,
+with a half-block fallback in the GPU and TUI paths.
 
 ## Shell integration (OSC 133)
 
@@ -233,6 +276,9 @@ so the feature expects a checkout at `../rusty_lsp` relative to this repo.
 ```
 src/
   main.rs            entry point + runtime/window dispatch
+  config.rs          config-file parsing (TOML subset) + live reload
+  shells.rs          shell detection (--list-shells)
+  keymap.rs          window keybindings (rebindable via [keys])
   backend/           OS interface: PTY spawn, raw mode, resize
     unix.rs            openpty + fork/exec (libc)
     windows.rs         ConPTY (windows-sys)
@@ -240,37 +286,48 @@ src/
     tokio_rt.rs        async reactor: Unix AsyncFd / Windows ConPTY bridge
   core/              parser + grid + protocol surface
     parser.rs          VT/ANSI state machine
-    grid.rs            cells, scrollback, reflow, image rendering
+    grid.rs            cells, scrollback, reflow, image + ligature plumbing
     charset.rs         G0–G3 + DEC line-drawing
     color.rs           palette + truecolor
-    osc.rs             OSC dispatch
+    osc.rs             OSC dispatch (title, palette, hyperlinks, clipboard, …)
     sixel.rs           Sixel decoder
-    base64/inflate/png/kitty.rs   from-scratch Kitty graphics stack
+    kitty.rs           Kitty graphics (APC) protocol
+    iterm.rs           iTerm2 inline images (OSC 1337)
+    base64/inflate/png/jpeg.rs   from-scratch image-decode stack (no crates)
     channel.rs         L13 structured side-channel (feature `l13`)
     tests.rs           the core test suite
   render.rs          TUI-mode ANSI re-emission
   input.rs           TUI-mode input handling + scrollback keys
   term.rs            TERM probe-and-fallback selection
   gui/               native window backend (features `gui` / `gui-gpu`)
-    font.rs            ab_glyph glyph cache
-    cpu.rs             Grid → pixel-buffer compositor
+    font.rs            ab_glyph glyph cache (variants + fallback chain)
+    shape.rs           GSUB ligature shaper (ttf-parser)
+    layout.rs          tab / split-pane tree
+    cpu.rs             Grid → pixel-buffer compositor (+ image overlay)
     gpu.rs             wgpu glyph-atlas renderer
     render.rs          shared Renderer trait + CPU presenter
     input.rs           native winit-key → terminal-byte encoding
+    mouse.rs           pointer → SGR mouse-report encoding
     window.rs          winit event loop
   bin/bench_metrics.rs   grid-handoff microbenchmark
 extra/
   rusty_term.terminfo
   shell-integration/   bash / zsh / fish / pwsh OSC 133 emitters
-docs/research/         spec tree, synthesis, implementation status
+  gen_ligtest_font.py  regenerates the GSUB shaper test fixture
+docs/
+  FEATURES.md          implemented-feature catalog
+  research/            spec tree, synthesis, implementation status
 ```
 
 ## Design notes
 
 - **Small dependency surface.** The core depends only on `libc`, `parking_lot`,
-  `unicode-width`, and `unicode-segmentation`; Sixel and the full Kitty graphics
-  stack (base64 → zlib/DEFLATE → PNG) are hand-rolled, no crates. Windowing, GPU,
-  and font crates are pulled in only behind the `gui` / `gui-gpu` features.
+  `unicode-width`, and `unicode-segmentation`; Sixel, the Kitty graphics stack
+  (base64 → zlib/DEFLATE → PNG), the baseline JPEG decoder (iTerm2 images), and
+  the GSUB ligature shaper are all hand-rolled — no image or text-shaping crates.
+  Windowing, GPU, and font crates are pulled in only behind `gui` / `gui-gpu`;
+  the ligature shaper reads the font's GSUB table through `ttf-parser`, which
+  `ab_glyph` already depends on, so it adds no new compiled crate.
 - **Runtime-agnostic protocol logic.** Everything in `core/` works identically
   under both runtimes; replies ride a response channel back to the PTY master,
   which both runtimes drain.

@@ -62,6 +62,25 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 > clipped/extended (its apps repaint on resize). This closes the last
 > daily-use fidelity gap; the previous top-left clip truncated long lines and
 > dropped prompt marks + line attrs. Suite: **238** core tests (255 with `gui`).
+>
+> **Update 2026-06-08 — the 15-item feature backlog is complete.** Every item in
+> `docs/FEATURES.md` is now implemented (see that file for per-feature notes and
+> test names); the `[ ]`/`[~]` leftovers flagged inline below have been flipped.
+> Landed since the last update: **#2** in-window mouse reporting (SGR/1006),
+> **#15** XTGETTCAP, **#6** DECSCUSR cursor styles + blink, **#5** OSC 8
+> Ctrl+click to open hyperlinks, **#12** OSC 52 clipboard service (set + query)
+> in the window, **#9** OSC 9/777 desktop notifications, **#7** rebindable
+> keybindings (`[keys]`), **#8** IME pre-edit, **#3** in-window incremental
+> search, **#4** split panes, **#11** font fallback + bold/italic variants +
+> **GSUB ligature shaping** (hand-rolled over `ttf-parser`, no new crate), **#13**
+> a pixel-perfect CPU image overlay (Sixel/Kitty/iTerm2 composited over the grid;
+> GPU/TUI keep the half-block fallback), and **#14** iTerm2 inline images
+> (`OSC 1337`) with a from-scratch baseline JPEG decoder. Suite: **300** core
+> tests, **349** with `gui`. Still open (intentional long-tail): OSC 633 (VS
+> Code), DAP/Jupyter bridges, full LSP/ACP backends, in-window DECCKM tracking,
+> Windows host-resize propagation, and a GPU multi-cell-quad pipeline (so the GPU
+> renderer gets ligatures + pixel images instead of the per-cell / half-block
+> fallbacks).
 
 ## Appendix C — Minimum Viable Modern Terminal
 
@@ -70,10 +89,10 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] **Line discipline** — host raw mode via `cfmakeraw` + `VMIN=1/VTIME=0`, exact save/restore (`src/backend/unix.rs:88`). Complete for a PTY emulator: the cooked-mode line discipline (echo, canonical editing, signal chars, CR/LF) is the **kernel's** `N_TTY` on the PTY slave, configured by the child — not the emulator's to implement.
 - [x] **Encoding** — UTF-8 decode + UAX #11 width + **UAX #29 grapheme clustering** (`unicode-segmentation`; ZWJ emoji, skin tones, unbounded combining via interned clusters, `src/core/grid.rs`).
 - [x] **Escape codes** — broad pragmatic VT100/ECMA-48 subset (not a full xterm superset). See layer L06.
-- [x] **OSC minimum (0/1/2·4·7·8·52·133)** — 0/2 ✓, 1 ✓(host-forwarded), 4 ✓, 7 ✓, 8 ✓, 52 ✓(relayed), 133 ✓(prompt marks + nav) (`src/core/osc.rs`).
-- [x] **Graphics (Sixel and/or Kitty)** — **both Sixel and Kitty done, no crates**. Sixel: hand-rolled decoder (`src/core/sixel.rs`). Kitty: full APC protocol with a hand-rolled `base64` → DEFLATE/zlib `inflate` → `png` decode stack (`src/core/{base64,inflate,png,kitty}.rs`), incl. raw RGB/RGBA (`f=24/32`), PNG (`f=100`), `o=z` compression, chunked transmission, and query/transmit `OK` responses. Both render through the shared half-block path (`Grid::render_image`) — cell resolution, not pixel-perfect (no framebuffer). iTerm2 still out.
+- [x] **OSC minimum (0/1/2·4·7·8·52·133)** — 0/2 ✓, 1 ✓(host-forwarded), 4 ✓, 7 ✓, 8 ✓, 52 ✓(relayed in TUI, serviced against the system clipboard in the window), 133 ✓(prompt marks + nav) (`src/core/osc.rs`).
+- [x] **Graphics (Sixel and/or Kitty)** — **Sixel + Kitty + iTerm2, no crates**. Sixel: hand-rolled decoder (`src/core/sixel.rs`). Kitty: full APC protocol with a hand-rolled `base64` → DEFLATE/zlib `inflate` → `png` decode stack, incl. raw RGB/RGBA (`f=24/32`), PNG (`f=100`), `o=z`, chunked transmission, and query/transmit `OK` responses. iTerm2 (`OSC 1337`): base64 PNG/JPEG via a from-scratch baseline JPEG decoder (`src/core/{iterm,jpeg}.rs`). All feed the shared `Grid::render_image`; the TUI/GPU paths render half-blocks (cell resolution), the CPU renderer composites the full-resolution pixels over those cells (#13).
 - [x] **Input (SGR mouse 1006·bracketed paste 2004·Kitty keyboard)** — all relayed to the host: mouse 1006 + paste 2004 + **Kitty keyboard (`CSI >/</=/? … u`) and xterm modifyOtherKeys (`CSI > … m`)**. A capable host does the actual enhanced encoding and answers the query; native encoding is a window-backend concern (we see encoded bytes, not key events), so relay is both the consistent and the more-correct choice.
-- [x] **Identification (DA1·XTVERSION·terminfo)** — DA1/DA2/DA3 ✓, XTVERSION ✓ (`src/core/parser.rs`), XTGETTCAP still missing; `rusty_term` terminfo entry shipped (`extra/rusty_term.terminfo`) with probe-and-fallback `TERM` selection (`src/term.rs`).
+- [x] **Identification (DA1·XTVERSION·terminfo·XTGETTCAP)** — DA1/DA2/DA3 ✓, XTVERSION ✓, XTGETTCAP ✓ (DCS `+q`, `src/core/parser.rs`); `rusty_term` terminfo entry shipped (`extra/rusty_term.terminfo`) with probe-and-fallback `TERM` selection (`src/term.rs`).
 - [x] **Truecolor** — full 24-bit + 256-color (`src/core/color.rs`, `src/core/parser.rs:602`); advertises `COLORTERM=truecolor` (`src/main.rs:35`).
 - [x] **Shell integration** — OSC 133 emitter scripts for bash/zsh/fish/pwsh (`extra/shell-integration/`).
 - [x] **Structured channel** — full-duplex JSON-RPC over a private OSC (`OSC 5379 ; <protocol> ; <json> ST`) with capability negotiation and graceful ANSI fallback (`src/core/channel.rs`, feature `l13`). Hosts a complete **MCP** server (terminal introspection) plus **LSP/ACP** negotiation; reuses `rusty_lsp`'s JSON-RPC model + LSP types.
@@ -120,20 +139,21 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] Double-width/height lines (`ESC # 3/4/5/6` → per-row `LineAttr`, relayed to host; `src/core/grid.rs`, `src/render.rs`)
 - [ ] ANSI (non-private) modes beyond IRM
 
-### L07 Graphics — [x] (Sixel + Kitty; iTerm2 out)
+### L07 Graphics — [x] (Sixel + Kitty + iTerm2)
 - [x] Sixel: hand-rolled decoder (RGB + HLS color, repeat, bands, raster attrs) → half-block rendering with fit-to-width downsample + scroll (`src/core/sixel.rs`, DCS wiring in `parser.rs`)
 - [x] Kitty graphics protocol: APC parse + chunked accumulation + query/transmit responses (`src/core/kitty.rs`), with a from-scratch `base64`, DEFLATE/zlib `inflate`, and `png` decoder (8-bit, color types 0/2/3/6, all filters) — formats `f=24/32/100` and `o=z`
-- [x] Shared `Grid::render_image` half-block renderer used by both
-- [ ] iTerm2 inline images (base64 PNG/JPEG — would reuse the same png/inflate stack + a JPEG decoder)
+- [x] Shared `Grid::render_image`: TUI/GPU render half-blocks; the CPU renderer also composites the full-resolution image pixel-for-pixel over those cells (#13, `src/gui/cpu.rs`)
+- [x] iTerm2 inline images (`OSC 1337 ; File=`): base64 PNG/JPEG, reusing the png/inflate stack plus a from-scratch baseline JPEG decoder (`src/core/{iterm,jpeg}.rs`, #14)
 
-### L08 OSC — [x] (notifications out)
+### L08 OSC — [x]
 - [x] 0/2 window title; 1 icon name (host-forwarded)
 - [x] 4 / 104 palette set/reset/query; 10/11/12 + 110/111/112 default fg/bg/cursor set/reset/query (`src/core/osc.rs`, `src/core/color.rs`)
 - [x] 7 working directory (captured to `Grid.cwd`)
 - [x] 8 hyperlinks (interned, bounded, rendered)
 - [x] 133 semantic prompt marks → prompt-to-prompt scrollback navigation (`src/core/grid.rs`, keys in `src/input.rs`)
-- [~] 52 clipboard: set-requests relayed to host; query (`?`) path unwired
-- [ ] 9 / 777 notifications; 633 (VS Code), 1337 (iTerm2)
+- [x] 52 clipboard: relayed in TUI; the window services set **and** query (`?`) against the system clipboard (#12, `src/gui/window.rs`)
+- [x] 9 / 777 desktop notifications forwarded to the OS (#9); 1337 iTerm2 inline images (#14)
+- [ ] 633 (VS Code)
 
 ### L09 Input — [x] (TUI mode relays; native key encoding in the `gui` backend)
 - [x] Scrollback browse + prompt-nav keys intercepted locally (`src/input.rs`)
@@ -144,15 +164,16 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 - [x] Windowed UX (`gui`): **block cursor**, **left-drag text selection**, and
   **clipboard copy/paste** (Ctrl+Shift+C / Ctrl+Shift+V, bracketed-paste aware),
   plus a Windows child-exit watcher (`src/gui/window.rs`, #10)
-- [ ] Native **mouse reporting** to the child in the window (SGR/1006 etc. not yet
-  emitted; selection is local-only); DECCKM application-cursor not tracked in `gui`
+- [x] Window features: IME pre-edit overlay (#8), incremental in-window search (#3), split panes (#4), DECSCUSR cursor styles + blink (#6), OSC 8 Ctrl+click to open links (#5), and rebindable shortcuts via `[keys]` (#7)
+- [x] Native **mouse reporting** to the child in the window (SGR/1006, `src/gui/mouse.rs`, #2)
+- [ ] DECCKM application-cursor not tracked in `gui` (key encoding uses `app_cursor=false`)
 
-### L10 Identification — [x] (XTGETTCAP out)
+### L10 Identification — [x]
 - [x] DA1 (`CSI c` → `?1;2c`), DA2 (`CSI > c`), DA3 (`CSI = c`)
 - [x] DSR (`CSI 5n` status, `CSI 6n` CPR)
 - [x] XTVERSION (`CSI > q` → `DCS >|rusty_term(<ver>) ST`)
 - [x] Shipped `rusty_term`/`rusty_term-256color` terminfo entry + probe-and-fallback `TERM` selection (`extra/rusty_term.terminfo`, `src/term.rs`)
-- [ ] XTGETTCAP (DCS `+q`)
+- [x] XTGETTCAP (DCS `+q`) — answers Co/colors, Tc truecolor, RGB, TN/name (#15, `src/core/parser.rs`)
 
 ### L11 Shell — [x] (by delegation)
 - [x] Spawns external `$SHELL`/bash (Unix) and `%COMSPEC%`/cmd (Windows)
@@ -171,8 +192,10 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 
 P0–P2, P3, and the architectural fork (#10, the native window backend) have all
 landed (see the 2026-06-03 update note). Items below are kept as a record; the
-only open work is the long-tail leftovers flagged inline (iTerm2 images,
-DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
+the 15-item feature backlog (`docs/FEATURES.md`) is now complete; the only open
+work is the long-tail flagged in the 2026-06-08 note above (OSC 633, DAP/Jupyter
++ full LSP/ACP backends, in-window DECCKM tracking, Windows resize propagation,
+and a GPU multi-cell-quad pipeline).
 
 ### P0 — Correctness gaps that silently corrupted output — DONE
 1. [x] **Charset designation + DEC Special Graphics line-drawing** — G0–G3
@@ -203,7 +226,7 @@ DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
 8. **L07 graphics.** [x] **Sixel + Kitty done** — hand-rolled, no crates: Sixel
    decoder, plus a full `base64`/`inflate`/`png` stack feeding the Kitty APC
    protocol (raw, PNG, `o=z`, chunked, responses). Both render via the shared
-   half-block `Grid::render_image`. Remaining: iTerm2 (needs a JPEG decoder too).
+   half-block `Grid::render_image` (the CPU renderer adds a pixel-perfect overlay, #13). iTerm2 inline images are done (#14) via a from-scratch baseline JPEG decoder.
 9. **L13 structured side-channel.** [x] **Done** — full-duplex JSON-RPC over a
     private OSC (`OSC 5379`), one message per OSC, with capability negotiation
     (`channel/initialize`) and graceful ANSI fallback. Hosts a complete MCP
@@ -232,7 +255,9 @@ DAP/Jupyter + full LSP/ACP backends, in-window mouse/clipboard/IME).
       clipboard copy/paste (Ctrl+Shift+C / Ctrl+Shift+V, bracketed-paste aware,
       injection-guarded), and a child-exit watcher so the window closes when the
       shell quits (the Windows ConPTY output pipe only EOFs at teardown).
-    - **Documented gaps (not stubs):** mouse *reporting* to the child (selection is
-      local-only), OSC 52 programmatic clipboard, IME, DECCKM tracking in the
-      window, in-window scrollback, and host resize propagation on Windows. Text is
-      pixel-resolution; inline images still render at cell resolution (half-blocks).
+    - **Done since (#2–#14):** mouse reporting to the child (SGR/1006), OSC 52
+      clipboard (set + query), IME pre-edit, in-window scrollback + incremental
+      search, split panes, cursor styles, and pixel-perfect inline images in the
+      CPU renderer. **Still open:** DECCKM application-cursor tracking in the
+      window, host resize propagation on Windows, and GPU pixel images/ligatures
+      (the GPU path keeps the per-cell / half-block fallbacks).
