@@ -119,10 +119,16 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         std::env::set_var("COLORTERM", "truecolor");
     }
 
-    let font_bytes =
-        font::load_default_font(config.font.as_deref()).ok_or("no monospace font found")?;
     let font_px = config.font_size.unwrap_or(FONT_PX);
-    let font = FontCache::new(font_bytes, font_px).ok_or("font failed to parse")?;
+    let font_set = font::load_set(
+        config.font.as_deref(),
+        config.font_bold.as_deref(),
+        config.font_italic.as_deref(),
+        config.font_bold_italic.as_deref(),
+        config.font_fallback.as_deref(),
+    )
+    .ok_or("no monospace font found")?;
+    let font = FontCache::new(font_set, font_px).ok_or("font failed to parse")?;
     let (cell_w, cell_h) = font.cell_size();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

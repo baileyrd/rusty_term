@@ -3,7 +3,7 @@
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
 "completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 4, 5, 6,
-7, 8, 9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
+7, 8, 9, 10, 11, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -72,8 +72,8 @@ Fix host console size change detection and reflow in TUI/conhost mode.
 ## 11. Font fallback + variants + ligatures
 Add font fallback chains, bold/italic variants, and optional ligature shaping.
 
-- **Status:** not implemented
-- **Notes:** `src/gui/font.rs` loads a single face and caches glyph coverage; no fallback chain, no bold/italic faces, no ligature shaping. ("fallback" appears only as the wgpu adapter flag.)
+- **Status:** done (2026-06-07) — fallback + variants; ligature shaping deferred
+- **Notes:** `src/gui/font.rs` now holds a `Style` (Regular/Bold/Italic/BoldItalic) and a `FontCache` with four faces + a fallback chain, caching glyphs by `(char, Style)`; `glyph(ch, style)` picks the styled face (or regular if absent) and, when it lacks `ch`, the first fallback font that covers it (`face_for`). `load_set` loads the regular face plus explicit `[window]` `font_bold`/`font_italic`/`font_bold_italic`/`font_fallback` paths, with filename-derived siblings of `font` and built-in system CJK/symbol fonts as fallbacks. Renderers pass `Style::new(cell bold, italic)` per cell (the gpu atlas is keyed by `(char, Style)`). **Ligature shaping is deferred**: it needs a text-shaping engine (GSUB), a heavy dependency at odds with the lean-deps approach — not implemented. Tests: `gui::font::tests::real_font_metrics_and_glyphs` (styles + per-style caching).
 
 ## 12. Full OSC 52 clipboard handling
 Handle OSC 52 query path; window backend services programmatic clipboard get/set.
@@ -103,5 +103,5 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#11** font fallback/variants/ligatures,
-  **#13** image framebuffer overlay, **#14** iTerm2 + JPEG.
+- **#13** image framebuffer overlay, **#14** iTerm2 + JPEG.
+- **#11 ligature shaping** (optional) — needs a shaping engine.

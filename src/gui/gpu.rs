@@ -13,9 +13,9 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
+use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
-use super::font::{FontCache, GlyphSource};
+use super::font::{FontCache, GlyphSource, Style};
 
 /// Search-match highlight (matches [`super::cpu`]): amber match, orange active.
 const SEARCH_BG: u32 = 0xFFD24A;
@@ -121,7 +121,7 @@ pub(crate) struct GpuCore {
     bind_group: wgpu::BindGroup,
     cell_w: u32,
     cell_h: u32,
-    slots: HashMap<char, u32>,
+    slots: HashMap<(char, Style), u32>,
     next_slot: u32,
     /// The color format render targets must use.
     pub(crate) format: wgpu::TextureFormat,
@@ -288,14 +288,14 @@ impl GpuCore {
             format,
         };
         // Reserve slot 0 for the blank tile (space / overflow fallback).
-        core.ensure_slot(' ', font);
+        core.ensure_slot(' ', Style::Regular, font);
         Some(core)
     }
 
     /// Ensure `ch` has an atlas slot, rasterizing+uploading its cell tile on
     /// first use. Returns the slot (slot 0 if the atlas is full).
-    fn ensure_slot(&mut self, ch: char, font: &mut FontCache) -> u32 {
-        if let Some(&s) = self.slots.get(&ch) {
+    fn ensure_slot(&mut self, ch: char, style: Style, font: &mut FontCache) -> u32 {
+        if let Some(&s) = self.slots.get(&(ch, style)) {
             return s;
         }
         if self.next_slot >= SLOTS_PER_ROW * SLOTS_PER_ROW {
@@ -303,7 +303,7 @@ impl GpuCore {
         }
         let slot = self.next_slot;
         self.next_slot += 1;
-        let tile = cell_tile(font, ch, self.cell_w as usize, self.cell_h as usize);
+        let tile = cell_tile(font, ch, style, self.cell_w as usize, self.cell_h as usize);
         let x = (slot % SLOTS_PER_ROW) * self.cell_w;
         let y = (slot / SLOTS_PER_ROW) * self.cell_h;
         self.queue.write_texture(
@@ -321,7 +321,7 @@ impl GpuCore {
             },
             wgpu::Extent3d { width: self.cell_w, height: self.cell_h, depth_or_array_layers: 1 },
         );
-        self.slots.insert(ch, slot);
+        self.slots.insert((ch, style), slot);
         slot
     }
 
@@ -354,7 +354,7 @@ impl GpuCore {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let slot = self.ensure_slot(cell.ch, font);
+            let slot = self.ensure_slot(cell.ch, Style::Regular, font);
             instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
         }
         self.append_grid(&mut instances, grid, 0, row_off, true, cursor_on, font);
@@ -401,7 +401,8 @@ impl GpuCore {
             } else {
                 (cell.fg, cell.bg, 0, 0)
             };
-            let slot = self.ensure_slot(cell.ch, font);
+            let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+            let slot = self.ensure_slot(cell.ch, style, font);
             instances.push(Instance {
                 col: (col0 + col) as u32,
                 row: (row0 + row) as u32,
@@ -422,10 +423,10 @@ impl GpuCore {
                 }
                 let base = grid.viewport_cell(col, crow);
                 let row = (row0 + crow) as u32;
-                let slot = self.ensure_slot(pch, font);
+                let slot = self.ensure_slot(pch, Style::Regular, font);
                 instances.push(Instance { col: (col0 + col) as u32, row, slot, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
                 if w == 2 {
-                    let blank = self.ensure_slot(' ', font);
+                    let blank = self.ensure_slot(' ', Style::Regular, font);
                     instances.push(Instance { col: (col0 + col) as u32 + 1, row, slot: blank, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
                 }
                 col += w;
@@ -457,7 +458,7 @@ impl GpuCore {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let slot = self.ensure_slot(cell.ch, font);
+            let slot = self.ensure_slot(cell.ch, Style::Regular, font);
             instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
         }
         for p in panes {
@@ -505,9 +506,9 @@ impl GpuCore {
 
 /// Build a `cell_w × cell_h` R8 coverage tile for `ch`, blitting the glyph at
 /// its bearing within the cell box.
-fn cell_tile(font: &mut FontCache, ch: char, cell_w: usize, cell_h: usize) -> Vec<u8> {
+fn cell_tile(font: &mut FontCache, ch: char, style: Style, cell_w: usize, cell_h: usize) -> Vec<u8> {
     let baseline = font.baseline();
-    let glyph = font.glyph(ch);
+    let glyph = font.glyph(ch, style);
     let mut tile = vec![0u8; cell_w * cell_h];
     for gy in 0..glyph.height {
         let ty = baseline + glyph.top + gy as i32;
@@ -600,7 +601,7 @@ mod tests {
             eprintln!("no system font; skipping GPU core test");
             return;
         };
-        let mut font = FontCache::new(bytes, 16.0).unwrap();
+        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0).unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(core) = GpuCore::new(&instance, None, &mut font) else {
             eprintln!("no wgpu adapter; skipping GPU core test");
@@ -617,7 +618,8 @@ mod tests {
     #[test]
     #[ignore = "render+readback needs a working GPU adapter; lavapipe/dzn crash headless"]
     fn gpu_renders_to_texture() {
-        let mut font = FontCache::new(super::super::font::load_default_font(None).unwrap(), 16.0).unwrap();
+        let bytes = super::super::font::load_default_font(None).unwrap();
+        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0).unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut core = GpuCore::new(&instance, None, &mut font).expect("adapter");
 

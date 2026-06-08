@@ -38,6 +38,13 @@ pub struct Config {
     pub font: Option<PathBuf>,
     /// Font size in pixels (windowed front-end only).
     pub font_size: Option<f32>,
+    /// Bold / italic / bold-italic font paths (windowed front-end). Unset falls
+    /// back to filename-derived siblings of `font`, then to the regular face.
+    pub font_bold: Option<PathBuf>,
+    pub font_italic: Option<PathBuf>,
+    pub font_bold_italic: Option<PathBuf>,
+    /// Fallback font for glyphs the main font lacks (CJK, symbols, emoji).
+    pub font_fallback: Option<PathBuf>,
     /// Startup colors: default fg/bg/cursor and the 16-color ANSI palette.
     pub theme: Theme,
     /// Default cursor shape (windowed front-end). DECSCUSR can override it at
@@ -334,6 +341,14 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("window", "cols") => cfg.cols = Some(expect_dim(key, value)?),
         ("window", "rows") => cfg.rows = Some(expect_dim(key, value)?),
         ("window", "font") => cfg.font = Some(PathBuf::from(expect_str(key, value)?)),
+        ("window", "font_bold") => cfg.font_bold = Some(PathBuf::from(expect_str(key, value)?)),
+        ("window", "font_italic") => cfg.font_italic = Some(PathBuf::from(expect_str(key, value)?)),
+        ("window", "font_bold_italic") => {
+            cfg.font_bold_italic = Some(PathBuf::from(expect_str(key, value)?))
+        }
+        ("window", "font_fallback") => {
+            cfg.font_fallback = Some(PathBuf::from(expect_str(key, value)?))
+        }
         ("window", "font_size") => {
             let px = match value {
                 Value::Float(f) => f,

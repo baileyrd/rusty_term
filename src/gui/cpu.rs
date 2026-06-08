@@ -4,9 +4,9 @@
 //! later hands the buffer to `softbuffer` for presentation. Pixels are
 //! `0x00RRGGBB` (the format `softbuffer` expects).
 
-use crate::core::{Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
+use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
-use super::font::{Glyph, GlyphSource};
+use super::font::{Glyph, GlyphSource, Style};
 
 /// Search-match highlight: amber for a match, orange for the active one, with a
 /// dark glyph so text stays legible on either.
@@ -67,7 +67,7 @@ pub(crate) fn draw_chrome(
         if cell.flags & WIDE_TRAILER != 0 || cell.ch == ' ' {
             continue;
         }
-        let glyph = font.glyph(cell.ch);
+        let glyph = font.glyph(cell.ch, Style::Regular);
         if glyph.width == 0 {
             continue;
         }
@@ -141,7 +141,8 @@ pub(crate) fn draw_grid(
         if cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0) {
             continue;
         }
-        let glyph = font.glyph(cell.ch);
+        let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+        let glyph = font.glyph(cell.ch, style);
         if glyph.width == 0 {
             continue;
         }
@@ -206,7 +207,7 @@ pub(crate) fn draw_grid(
                     buf[b + x] = bg;
                 }
             }
-            let glyph = font.glyph(pch);
+            let glyph = font.glyph(pch, Style::Regular);
             if glyph.width != 0 {
                 let pen_x = x0 as i32 + glyph.left;
                 let pen_y = y0 as i32 + baseline + glyph.top;
@@ -269,7 +270,7 @@ mod tests {
         fn baseline(&self) -> i32 {
             6
         }
-        fn glyph(&mut self, ch: char) -> Rc<Glyph> {
+        fn glyph(&mut self, ch: char, _style: Style) -> Rc<Glyph> {
             if ch == ' ' {
                 return Rc::new(Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new() });
             }
@@ -357,7 +358,8 @@ mod tests {
             eprintln!("no system font; skipping real-font render");
             return;
         };
-        let mut fc = super::super::font::FontCache::new(bytes, 16.0).unwrap();
+        let set = super::super::font::FontSet { regular: bytes, ..Default::default() };
+        let mut fc = super::super::font::FontCache::new(set, 16.0).unwrap();
         let (cw, chh) = fc.cell_size();
         let mut g = Grid::new(3, 1);
         let mut p = AnsiParser::new();
