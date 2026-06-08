@@ -164,7 +164,7 @@ child can still override both at runtime via DECSCUSR.
 
 The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
 actions are `copy`, `paste`, `search`, `new_tab`, `close_tab`, `next_tab`,
-`prev_tab`, `split_right`, `split_down`, `focus_next`, `open_config`,
+`prev_tab`, `split_right`, `split_down`, `focus_next`, `open_config`, `open_settings`,
 `scroll_page_up`, `scroll_page_down`, `scroll_prompt_up`, `scroll_prompt_down`;
 a chord is `+`-separated modifiers (`ctrl`/`shift`/`alt`) plus one key — a
 printable character or `comma`/`tab`/`pageup`/`pagedown`.
@@ -183,7 +183,8 @@ template on first use — edit, save, watch it apply.
 #### Window backend controls (`--gui`)
 
 The window is borderless and draws its own chrome: a one-row bar across the
-top with the session **tabs**, a `+` new-tab button, and minimize/maximize/
+top with the session **tabs** (each carrying a `×` close button), a `+` new-tab
+button, a `▾` shell-launcher / settings dropdown, and minimize/maximize/
 close. Each tab holds one or more shell sessions arranged as split panes. Drag the empty bar to move the
 window (double-click it to toggle maximize), and drag the thin band at the
 window edges to resize.
@@ -196,8 +197,9 @@ window edges to resize.
 | Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
 | Ctrl+Shift+F | Open the in-window search bar (incremental match highlighting). |
 | Ctrl+Shift+, | Open the config file in your editor (created from a template on first use). |
-| Ctrl+Shift+T / `+` | Open a new tab (uses the configured shell). |
-| Ctrl+Shift+W | Close the focused pane (its last pane closes the tab; the last tab closes the window). |
+| Ctrl+, / `▾` menu | Open the in-app **settings page** (theme, font size, cursor, blink, ligatures, scrollback, default shell) — `←`/`→` change a row, `Esc` saves & closes. |
+| Ctrl+Shift+T / `+` | Open a new tab with the configured shell; the `▾` dropdown launches any detected shell (PowerShell, cmd, WSL, bash, …) in a new tab instead. |
+| Ctrl+Shift+W / tab `×` | Close the focused pane, or the whole tab via its `×` button (the last pane / tab closes the window). |
 | Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs. |
 | Ctrl+Shift+D / Ctrl+Shift+E | Split the focused pane right / down. |
 | Ctrl+Shift+J | Move focus to the next pane. |

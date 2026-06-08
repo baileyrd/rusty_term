@@ -18,6 +18,7 @@ pub enum Action {
     NextTab,
     PrevTab,
     OpenConfig,
+    OpenSettings,
     Search,
     SplitRight,
     SplitDown,
@@ -75,6 +76,7 @@ impl Default for Keymap {
                 (c(true, false, Tab), NextTab),
                 (c(true, true, Tab), PrevTab),
                 (c(true, true, Char(',')), OpenConfig),
+                (c(true, false, Char(',')), OpenSettings),
                 (c(true, true, Char('f')), Search),
                 (c(true, true, Char('d')), SplitRight),
                 (c(true, true, Char('e')), SplitDown),
@@ -114,6 +116,7 @@ pub fn parse_action(name: &str) -> Option<Action> {
         "next_tab" => Action::NextTab,
         "prev_tab" => Action::PrevTab,
         "open_config" => Action::OpenConfig,
+        "open_settings" => Action::OpenSettings,
         "search" => Action::Search,
         "split_right" => Action::SplitRight,
         "split_down" => Action::SplitDown,
@@ -173,6 +176,7 @@ mod tests {
         assert_eq!(km.action(Chord::new(true, false, false, Key::Tab)), Some(Action::NextTab));
         assert_eq!(km.action(Chord::new(true, true, false, Key::Tab)), Some(Action::PrevTab));
         assert_eq!(km.action(Chord::new(false, true, false, Key::PageUp)), Some(Action::ScrollPageUp));
+        assert_eq!(km.action(Chord::new(true, false, false, Key::Char(','))), Some(Action::OpenSettings));
         // Unbound chords (plain typing, Ctrl+C) fall through to the child.
         assert_eq!(km.action(Chord::new(false, false, false, Key::Char('a'))), None);
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char('c'))), None);
@@ -214,6 +218,7 @@ mod tests {
     fn parse_action_maps_names() {
         assert_eq!(parse_action("new_tab"), Some(Action::NewTab));
         assert_eq!(parse_action("scroll_prompt_down"), Some(Action::ScrollPromptDown));
+        assert_eq!(parse_action("open_settings"), Some(Action::OpenSettings));
         assert_eq!(parse_action("nonsense"), None);
     }
 }

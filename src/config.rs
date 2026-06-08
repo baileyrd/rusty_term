@@ -103,7 +103,8 @@ impl Config {
     pub fn template() -> &'static str {
         r##"# rusty_term configuration. Saving this file applies theme and
 # scrollback changes to running instances immediately; shell, font,
-# and window size apply on the next launch.
+# and window size apply on the next launch. The in-app settings page
+# (Ctrl+, in the --gui window) edits the common keys below and saves here.
 
 # shell = "pwsh"           # or "wsl", "powershell", a full path, ...
 # scrollback = 10000       # history line cap; 0 disables
@@ -197,6 +198,159 @@ pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
     {
         std::process::Command::new("xdg-open").arg(path).spawn().map(drop)
     }
+}
+
+/// A double-quoted TOML string literal for `s`, escaping the backslash, quote,
+/// tab, newline, and CR that [`parse_value`] understands — so a Windows path
+/// like `C:\Foo\bar.exe` round-trips through the config file unmangled.
+pub(crate) fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One setting the in-app settings page persists. `section` is the TOML section
+/// it belongs under (`""` for the top level). `value` is `Some(literal)` to set
+/// the key (e.g. [`toml_string`] output, `"18"`, `"true"`) or `None` to remove
+/// it (used when a choice returns to "use the platform default"). `insert`
+/// controls a `Some` value when the key is absent: `true` adds it, `false`
+/// leaves it out — so a setting left at its built-in default updates an existing
+/// line but never adds noise to a file that never mentioned it.
+pub(crate) struct SettingEdit {
+    pub section: &'static str,
+    pub key: &'static str,
+    pub value: Option<String>,
+    pub insert: bool,
+}
+
+/// Persist `edits` into the config file at `path`, preserving its comments,
+/// formatting, and every key the settings page doesn't manage (fonts, custom
+/// colors, keybindings). Creates the file (and parent dirs) from the commented
+/// [`Config::template`] when absent. The live-reload watcher re-reads the save.
+pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::template().to_string(),
+        Err(e) => return Err(e),
+    };
+    let updated = upsert(&text, edits);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, updated)
+}
+
+/// Upsert `edits` into config `text`: each setting's existing active `key = …`
+/// line (matched within its section) is rewritten to its new value or removed
+/// (`value: None`); a setting with no existing line is inserted when it carries
+/// a value and `insert`, creating the section header if needed. Comments, blank
+/// lines, and unmanaged keys are preserved verbatim. Pure (no I/O) so it is
+/// unit-tested directly.
+fn upsert(text: &str, edits: &[SettingEdit]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut done = vec![false; edits.len()];
+    let mut remove: Vec<usize> = Vec::new();
+
+    // Pass 1: rewrite (or mark for removal) existing assignments, tracking the
+    // active section so a key matches only under its own header (`font_size`
+    // lives in `[window]`).
+    let mut section = String::new();
+    for (li, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = header_name(trimmed) {
+            section = name;
+            continue;
+        }
+        let Some((k, _)) = trimmed.split_once('=') else { continue };
+        let k = k.trim().to_ascii_lowercase().replace('-', "_");
+        for (i, e) in edits.iter().enumerate() {
+            if !done[i] && e.section == section && e.key == k {
+                match &e.value {
+                    Some(v) => *line = format!("{} = {}", e.key, v),
+                    None => remove.push(li),
+                }
+                done[i] = true;
+                break;
+            }
+        }
+    }
+    if !remove.is_empty() {
+        let mut i = 0;
+        lines.retain(|_| {
+            let keep = !remove.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
+    // Pass 2: insert the rest — settings carrying a value and `insert` but with
+    // no existing line. Top-level keys go before the first section header (TOML
+    // scoping); a named section's keys go right after its header, the section
+    // being appended at EOF when it doesn't exist yet.
+    let pending: Vec<(&str, &str, &String)> = edits
+        .iter()
+        .zip(&done)
+        .filter_map(|(e, &d)| match &e.value {
+            Some(v) if !d && e.insert => Some((e.section, e.key, v)),
+            _ => None,
+        })
+        .collect();
+    let at = lines.iter().position(|l| header_name(l.trim()).is_some()).unwrap_or(lines.len());
+    for (off, &(_, key, v)) in pending.iter().filter(|(s, _, _)| s.is_empty()).enumerate() {
+        lines.insert(at + off, format!("{key} = {v}"));
+    }
+    let mut by_sec: std::collections::BTreeMap<&str, Vec<(&str, &String)>> =
+        std::collections::BTreeMap::new();
+    for &(sec, key, v) in pending.iter().filter(|(s, _, _)| !s.is_empty()) {
+        by_sec.entry(sec).or_default().push((key, v));
+    }
+    for (sec, items) in by_sec {
+        match lines.iter().position(|l| header_name(l.trim()).as_deref() == Some(sec)) {
+            Some(h) => {
+                for (off, (key, v)) in items.iter().enumerate() {
+                    lines.insert(h + 1 + off, format!("{key} = {v}"));
+                }
+            }
+            None => {
+                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(format!("[{sec}]"));
+                for (key, v) in &items {
+                    lines.push(format!("{key} = {v}"));
+                }
+            }
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// The lowercased name inside a `[section]` header line, or `None` when `line`
+/// (already trimmed) isn't a well-formed header. Mirrors [`parse`]'s rule.
+fn header_name(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('[')?;
+    let (name, tail) = rest.split_once(']')?;
+    let tail = tail.trim();
+    (tail.is_empty() || tail.starts_with('#')).then(|| name.trim().to_ascii_lowercase())
 }
 
 /// Watch `path` for changes from a daemon thread, invoking `on_change` after
@@ -340,7 +494,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("", "theme") => {
             let name = expect_str(key, value)?;
             cfg.theme = preset(&name)
-                .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESET_NAMES))?;
+                .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESETS.join(", ")))?;
         }
         ("window", "cols") => cfg.cols = Some(expect_dim(key, value)?),
         ("window", "rows") => cfg.rows = Some(expect_dim(key, value)?),
@@ -449,16 +603,20 @@ fn expect_color(key: &str, v: Value) -> Result<u32, String> {
     Err(format!("{key}: `{s}` is not #RRGGBB"))
 }
 
-/// The preset names, for the unknown-theme warning.
-const PRESET_NAMES: &str = "default, gruvbox-dark, dracula, solarized-dark, solarized-light, \
-     nord, one-dark, catppuccin-mocha, catppuccin-latte, tokyo-night, tokyo-night-storm, \
-     monokai, rose-pine, github-dark, kanagawa";
+/// Built-in theme preset names, in the order the settings page cycles them
+/// (the first being the default). The source of truth for both [`preset`]
+/// resolution and the unknown-theme warning.
+pub const PRESETS: &[&str] = &[
+    "default", "gruvbox-dark", "dracula", "solarized-dark", "solarized-light", "nord", "one-dark",
+    "catppuccin-mocha", "catppuccin-latte", "tokyo-night", "tokyo-night-storm", "monokai",
+    "rose-pine", "github-dark", "kanagawa",
+];
 
 /// A built-in theme preset by (case/sep-insensitive) name, or `None`. Colors
 /// are the published palettes of each scheme. `theme = "name"` seeds the whole
 /// [`Theme`]; explicit `[colors]` keys still override individual entries when
 /// they appear after it in the file.
-fn preset(name: &str) -> Option<Theme> {
+pub fn preset(name: &str) -> Option<Theme> {
     let key = name.to_ascii_lowercase().replace(['-', '_', ' '], "");
     let t = |fg, bg, cursor, palette16| Theme { fg, bg, cursor, palette16 };
     Some(match key.as_str() {
@@ -795,9 +953,8 @@ color15 = "ffffff"
             assert_eq!(theme.fg, fg, "{name} fg");
             assert_eq!(theme.palette16[slot], color, "{name} palette16[{slot}]");
         }
-        // Every name advertised in the warning text must actually resolve.
-        for name in PRESET_NAMES.split(',') {
-            let name = name.trim();
+        // Every advertised preset must actually resolve.
+        for &name in PRESETS {
             assert!(preset(name).is_some(), "advertised preset `{name}` missing");
         }
     }
@@ -828,5 +985,78 @@ color15 = "ffffff"
         assert_eq!(cfg.theme, Theme::default());
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("unknown theme"));
+    }
+
+    #[test]
+    fn toml_string_escapes_path_separators() {
+        assert_eq!(toml_string(r"C:\PowerShell\pwsh.exe"), r#""C:\\PowerShell\\pwsh.exe""#);
+        assert_eq!(toml_string("a\"b"), r#""a\"b""#);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_top_level_key_keeping_the_rest() {
+        let edits = [SettingEdit { section: "", key: "scrollback", value: Some("5000".into()), insert: true }];
+        let out = upsert("# hi\nscrollback = 10000\nshell = \"pwsh\"\n", &edits);
+        assert!(out.contains("scrollback = 5000"));
+        assert!(out.contains("# hi"), "comment preserved");
+        assert!(out.contains("shell = \"pwsh\""), "unmanaged key preserved");
+        assert_eq!(out.matches("scrollback").count(), 1, "no duplicate line");
+    }
+
+    #[test]
+    fn upsert_inserts_top_level_before_first_section() {
+        let edits = [SettingEdit { section: "", key: "theme", value: Some(toml_string("nord")), insert: true }];
+        let out = upsert("[window]\nfont_size = 18\n", &edits);
+        assert!(out.find("theme = ").unwrap() < out.find("[window]").unwrap(), "key precedes header");
+    }
+
+    #[test]
+    fn upsert_inserts_into_existing_section() {
+        let edits = [SettingEdit { section: "window", key: "ligatures", value: Some("false".into()), insert: true }];
+        let (cfg, warns) = parse(&upsert("[window]\nfont_size = 18\n", &edits));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.ligatures, Some(false));
+        assert_eq!(cfg.font_size, Some(18.0), "existing section key kept");
+    }
+
+    #[test]
+    fn upsert_creates_missing_section() {
+        let edits = [SettingEdit { section: "window", key: "font_size", value: Some("20".into()), insert: true }];
+        let (cfg, warns) = parse(&upsert("shell = \"pwsh\"\n", &edits));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.font_size, Some(20.0));
+        assert_eq!(cfg.shell.as_deref(), Some("pwsh"), "top-level key kept");
+    }
+
+    #[test]
+    fn upsert_without_insert_skips_absent_but_updates_present() {
+        let edit = |insert| [SettingEdit { section: "", key: "scrollback", value: Some("10000".into()), insert }];
+        assert_eq!(upsert("shell = \"pwsh\"\n", &edit(false)), "shell = \"pwsh\"\n", "absent key left out");
+        assert!(upsert("scrollback = 50\n", &edit(false)).contains("scrollback = 10000"), "present updated");
+    }
+
+    #[test]
+    fn upsert_removes_key_when_value_is_none() {
+        let edits = [SettingEdit { section: "", key: "shell", value: None, insert: false }];
+        // An existing line is dropped...
+        let out = upsert("shell = \"pwsh\"\nscrollback = 50\n", &edits);
+        assert!(!out.contains("shell"), "shell line removed: {out:?}");
+        assert!(out.contains("scrollback = 50"), "other keys kept");
+        // ...and an absent key is a no-op.
+        assert_eq!(upsert("scrollback = 50\n", &edits), "scrollback = 50\n");
+    }
+
+    #[test]
+    fn upsert_round_trips_through_parse() {
+        let edits = [
+            SettingEdit { section: "", key: "theme", value: Some(toml_string("gruvbox-dark")), insert: true },
+            SettingEdit { section: "", key: "cursor_blink", value: Some("true".into()), insert: true },
+            SettingEdit { section: "window", key: "font_size", value: Some("16".into()), insert: true },
+        ];
+        let (cfg, warns) = parse(&upsert("", &edits));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.theme, preset("gruvbox-dark").unwrap());
+        assert_eq!(cfg.cursor_blink, Some(true));
+        assert_eq!(cfg.font_size, Some(16.0));
     }
 }

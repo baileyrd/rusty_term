@@ -38,6 +38,7 @@ use crate::gui::mouse::{MouseEvent, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
 use super::layout::{Dir, Layout, Rect};
 use super::render::{CpuRenderer, PaneFrame, Renderer};
+use super::settings::{Field, Settings};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
 const FONT_PX: f32 = 18.0;
@@ -46,8 +47,10 @@ const INIT_ROWS: u16 = 24;
 /// Pixel band at the window edges acting as a resize handle (the native frame
 /// is gone with decorations off).
 const RESIZE_BORDER: f64 = 6.0;
-/// Cell budget for one tab's label in the chrome bar.
-const TAB_CELLS: usize = 20;
+/// Total cell budget for one tab in the chrome bar (label plus its × button).
+const TAB_CELLS: usize = 26;
+/// Grid row where overlay (menu / settings) list rows begin (header sits above).
+const OVERLAY_ITEMS_TOP: usize = 2;
 /// Two clicks on the drag strip within this window toggle maximize.
 const DOUBLE_CLICK_MS: u128 = 400;
 /// Scrollback lines moved per mouse-wheel notch.
@@ -69,13 +72,44 @@ enum UserEvent {
 enum Hit {
     /// Activate tab `i`.
     Tab(usize),
-    /// Spawn a new tab.
+    /// Close tab `i` (its × button).
+    CloseTab(usize),
+    /// Spawn a new tab (the `+` button).
     NewTab,
+    /// Open the shell-launcher / settings dropdown (the `▾` button).
+    ShellMenu,
     Minimize,
     Maximize,
     Close,
     /// Empty bar: drag moves the window, double-click toggles maximize.
     Drag,
+}
+
+/// A transient full-window page drawn over the active tab while open: the shell
+/// launcher / settings dropdown menu, or the settings page. Keys and
+/// below-chrome clicks route to it; clicking a tab or a chrome button dismisses
+/// it.
+enum Overlay {
+    /// The `▾` dropdown: a list of menu rows to choose from.
+    Menu { items: Vec<MenuItem>, sel: usize },
+    /// The settings page.
+    Settings(Settings),
+}
+
+/// One row of the dropdown menu and the action choosing it triggers.
+struct MenuItem {
+    label: String,
+    kind: MenuKind,
+}
+
+#[derive(Clone, Copy)]
+enum MenuKind {
+    /// Launch a new tab running detected shell `[index]`.
+    LaunchShell(usize),
+    /// Open the in-app settings page.
+    Settings,
+    /// Open the config file in the user's editor.
+    EditConfig,
 }
 
 /// One terminal session inside a tab (a split pane): its screen state and PTY
@@ -171,6 +205,9 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         cursor_blink_on: true,
         last_blink: Instant::now(),
         searching: None,
+        shells: crate::shells::detect_all(),
+        overlay: None,
+        font_px,
     };
     app.spawn_tab()?; // the first shell; more come from Ctrl+Shift+T / the + button
     event_loop.run_app(&mut app)?;
@@ -256,13 +293,19 @@ struct App<'a> {
     /// Active scrollback-search query (windowed front-end); `Some` means search
     /// mode is on, intercepting keys and showing the find bar in the chrome.
     searching: Option<String>,
+    /// Shells detected on this machine, for the launcher menu + settings page.
+    shells: Vec<crate::shells::DetectedShell>,
+    /// The open settings page / shell menu, if any (drawn over the active tab).
+    overlay: Option<Overlay>,
+    /// Current font size in px, tracked so the settings page can rebuild it.
+    font_px: f32,
 }
 
 impl App<'_> {
     /// Spawn one shell sized `cols × rows`, wire its reader + exit-watcher
     /// threads (which signal by pane id), and return the pane.
-    fn new_pane(&mut self, cols: u16, rows: u16) -> Result<Pane, std::io::Error> {
-        let handle = self.backend.spawn_shell(cols, rows, self.config.shell.as_deref())?;
+    fn new_pane(&mut self, cols: u16, rows: u16, shell: Option<&str>) -> Result<Pane, std::io::Error> {
+        let handle = self.backend.spawn_shell(cols, rows, shell)?;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -304,7 +347,15 @@ impl App<'_> {
 
     /// Open a new tab (one full-area pane) and make it active.
     fn spawn_tab(&mut self) -> Result<(), std::io::Error> {
-        let pane = self.new_pane(self.cols, self.rows)?;
+        self.spawn_tab_with(None)
+    }
+
+    /// Open a new tab running `shell` (or the configured default when `None`)
+    /// and make it active. Backs the `+` button, `Ctrl+Shift+T`, and the
+    /// shell-launcher menu (which passes a detected shell's path).
+    fn spawn_tab_with(&mut self, shell: Option<String>) -> Result<(), std::io::Error> {
+        let shell = shell.or_else(|| self.config.shell.clone());
+        let pane = self.new_pane(self.cols, self.rows, shell.as_deref())?;
         let focus = pane.id;
         self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus });
         self.active = self.tabs.len() - 1;
@@ -317,7 +368,8 @@ impl App<'_> {
     /// Split the active tab's focused pane, spawning a new shell beside it and
     /// focusing it. `dir` is the divider orientation.
     fn split_pane(&mut self, dir: Dir) {
-        let Ok(pane) = self.new_pane(self.cols.max(1), self.rows.max(1)) else {
+        let shell = self.config.shell.clone();
+        let Ok(pane) = self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref()) else {
             return;
         };
         let new_id = pane.id;
@@ -424,6 +476,24 @@ impl App<'_> {
     fn redraw(&mut self) {
         let chrome = self.chrome_row();
         let divider = mix(self.theme.bg, self.theme.fg, 60);
+        if self.overlay.is_some() {
+            let page = self.build_overlay_grid();
+            let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
+                return;
+            };
+            let size = window.inner_size();
+            let frame =
+                PaneFrame { grid: &page, col0: 0, row0: 1, focused: false, cursor_on: false };
+            renderer.render(
+                std::slice::from_ref(&frame),
+                &chrome,
+                &mut self.font,
+                size.width,
+                size.height,
+                divider,
+            );
+            return;
+        }
         let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
             return;
         };
@@ -510,13 +580,17 @@ impl App<'_> {
         }
         let mut hits = vec![Hit::Drag; cols];
 
-        // Caption buttons get the last 12 cells (4 each); tabs + the `+` fill
-        // the left, never running into them.
+        // Caption buttons get the last 12 cells (4 each); the `+` / `▾` buttons
+        // sit just left of them, and the tabs fill the rest without overrunning.
         let btn0 = cols.saturating_sub(12);
-        let tab_limit = btn0.saturating_sub(4);
+        let tab_limit = btn0.saturating_sub(8);
 
+        let close_w = 3; // " × " on each tab
         let mut col = 0usize;
         for (i, tab) in self.tabs.iter().enumerate() {
+            if col >= tab_limit {
+                break; // out of room; the rest stay reachable by keyboard
+            }
             let is_active = i == self.active;
             // The active tab adopts the terminal background, visually merging
             // with the grid below; inactive ones sit dimmed on the bar.
@@ -525,14 +599,31 @@ impl App<'_> {
                 let label = tab.focused().map(|p| p.grid.lock().title.clone()).unwrap_or_default();
                 if label.is_empty() { format!("shell {}", i + 1) } else { label }
             };
-            let label: String = format!(" {title} ").chars().take(TAB_CELLS).collect();
-            let end = (col + TAB_CELLS).min(tab_limit);
-            put_text(&mut row, &mut hits, &mut col, end, &label, fg, bg, Hit::Tab(i));
+            let tab_end = (col + TAB_CELLS).min(tab_limit);
+            // Paint the whole tab span in its color and make it activate on click.
+            for c in col..tab_end {
+                row[c] = Cell::blank();
+                row[c].fg = fg;
+                row[c].bg = bg;
+                hits[c] = Hit::Tab(i);
+            }
+            // Title text, leaving room for the per-tab close button when wide enough.
+            let has_close = tab_end - col > close_w + 1;
+            let label_end = if has_close { tab_end - close_w } else { tab_end };
+            let mut tcol = col;
+            let label: String = format!(" {title}").chars().take(label_end - col).collect();
+            put_text(&mut row, &mut hits, &mut tcol, label_end, &label, fg, bg, Hit::Tab(i));
+            if has_close {
+                let mut ccol = tab_end - close_w;
+                put_text(&mut row, &mut hits, &mut ccol, tab_end, " × ", fg, bg, Hit::CloseTab(i));
+            }
+            col = tab_end;
             if col < tab_limit {
                 col += 1; // one bar-colored cell as a tab separator
             }
         }
         put_text(&mut row, &mut hits, &mut col, btn0, " + ", self.theme.fg, bar_bg, Hit::NewTab);
+        put_text(&mut row, &mut hits, &mut col, btn0, " ▾ ", self.theme.fg, bar_bg, Hit::ShellMenu);
 
         let mut bcol = btn0;
         put_text(&mut row, &mut hits, &mut bcol, btn0 + 4, "  ─ ", self.theme.fg, bar_bg, Hit::Minimize);
@@ -609,6 +700,9 @@ impl App<'_> {
         if (y.max(0.0) as usize) < self.cell_h {
             return self.on_bar_click(x, event_loop);
         }
+        if self.overlay.is_some() {
+            return self.overlay_click(y);
+        }
         if let Some(id) = self.pane_under(x, y)
             && let Some(tab) = self.tabs.get_mut(self.active)
         {
@@ -658,15 +752,31 @@ impl App<'_> {
         };
         match self.hits[col] {
             Hit::Tab(i) => {
+                self.close_overlay();
                 if i < self.tabs.len() && i != self.active {
                     self.active = i;
-                    window.request_redraw();
+                }
+                window.request_redraw();
+            }
+            Hit::CloseTab(i) => {
+                self.close_overlay();
+                if i < self.tabs.len() {
+                    self.close_tab_at(i, event_loop);
                 }
             }
             Hit::NewTab => {
+                self.close_overlay();
                 if let Err(e) = self.spawn_tab() {
                     eprintln!("rusty_term: new tab: {e}");
                 }
+            }
+            Hit::ShellMenu => {
+                let was_menu = matches!(self.overlay, Some(Overlay::Menu { .. }));
+                self.close_overlay(); // persists a dirty settings page first
+                if !was_menu {
+                    self.open_menu();
+                }
+                window.request_redraw();
             }
             Hit::Minimize => window.set_minimized(true),
             Hit::Maximize => window.set_maximized(!window.is_maximized()),
@@ -759,6 +869,7 @@ impl App<'_> {
             Action::NextTab => self.cycle_tab(true),
             Action::PrevTab => self.cycle_tab(false),
             Action::OpenConfig => self.open_config(),
+            Action::OpenSettings => self.open_settings(),
             Action::Search => self.start_search(),
             Action::SplitRight => self.split_pane(Dir::Vertical),
             Action::SplitDown => self.split_pane(Dir::Horizontal),
@@ -961,7 +1072,12 @@ impl App<'_> {
     /// Open the config file in the user's editor (Ctrl+Shift+,), creating it
     /// from the commented template first if needed. The live-reload watcher
     /// then applies any save the user makes.
-    fn open_config(&self) {}
+    fn open_config(&self) {
+        let Some(path) = &self.config_path else { return };
+        if let Err(e) = crate::config::open_in_editor(path) {
+            eprintln!("rusty_term: open config: {e}");
+        }
+    }
 
     /// Re-read the config file and apply what can change live: theme (every
     /// tab's parser palette + grid recolor, the chrome bar, the window border)
@@ -991,6 +1107,366 @@ impl App<'_> {
             apply_chrome(window, &self.theme);
             window.request_redraw();
         }
+    }
+}
+
+impl App<'_> {
+    /// Open the in-app settings page over the active tab, seeded from the live
+    /// configuration. `Ctrl+,` and the dropdown's *Settings* entry route here.
+    fn open_settings(&mut self) {
+        let s = Settings::new(
+            &self.theme,
+            self.font_px,
+            self.config.cursor_style.unwrap_or_default(),
+            self.config.cursor_blink.unwrap_or(false),
+            self.config.ligatures.unwrap_or(true),
+            self.config.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX),
+            self.config.shell.as_deref(),
+            &self.shells,
+        );
+        self.overlay = Some(Overlay::Settings(s));
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Open the shell-launcher dropdown (the `▾` button): the detected shells
+    /// plus *Settings* and *Open config file* entries.
+    fn open_menu(&mut self) {
+        let items = shell_menu_items(&self.shells);
+        self.overlay = Some(Overlay::Menu { items, sel: 0 });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Close any open overlay, persisting settings changes on the way out.
+    fn close_overlay(&mut self) {
+        if let Some(Overlay::Settings(s)) = self.overlay.take()
+            && s.dirty
+        {
+            self.persist_settings(&s);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Write the settings page's values to the config file. The live-reload
+    /// watcher re-reads the save; live application already happened per change.
+    fn persist_settings(&self, s: &Settings) {
+        let Some(path) = &self.config_path else { return };
+        if let Err(e) = crate::config::save_settings(path, &s.edits()) {
+            eprintln!("rusty_term: save settings: {e}");
+        }
+    }
+
+    /// Route a key to the open overlay (it owns all input while up): arrows
+    /// navigate / change, Enter activates, digits pick a menu row, Esc closes.
+    fn overlay_key(&mut self, event: &KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_overlay(),
+            Key::Named(NamedKey::ArrowUp) => self.overlay_move(false),
+            Key::Named(NamedKey::ArrowDown) => self.overlay_move(true),
+            Key::Named(NamedKey::ArrowLeft) => self.overlay_change(false),
+            Key::Named(NamedKey::ArrowRight) => self.overlay_change(true),
+            Key::Named(NamedKey::Enter) => self.overlay_activate(),
+            Key::Character(s) => {
+                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                    self.menu_pick_index(d as usize);
+                }
+            }
+            _ => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Move the highlight within the overlay.
+    fn overlay_move(&mut self, forward: bool) {
+        match &mut self.overlay {
+            Some(Overlay::Menu { items, sel }) => {
+                let n = items.len();
+                if n > 0 {
+                    *sel = if forward { (*sel + 1) % n } else { (*sel + n - 1) % n };
+                }
+            }
+            Some(Overlay::Settings(s)) => s.move_sel(forward),
+            None => {}
+        }
+    }
+
+    /// Change the highlighted setting (no effect on the menu) and apply it live.
+    fn overlay_change(&mut self, forward: bool) {
+        let field = match &mut self.overlay {
+            Some(Overlay::Settings(s)) => s.change(forward),
+            _ => return,
+        };
+        self.apply_setting(field);
+    }
+
+    /// Activate the highlighted overlay row: pick a menu item, or cycle the
+    /// highlighted setting (Enter mirrors →).
+    fn overlay_activate(&mut self) {
+        match &self.overlay {
+            Some(Overlay::Menu { items, sel }) => {
+                if let Some(kind) = items.get(*sel).map(|i| i.kind) {
+                    self.menu_pick(kind);
+                }
+            }
+            Some(Overlay::Settings(_)) => self.overlay_change(true),
+            None => {}
+        }
+    }
+
+    /// Pick menu row `n` (1-based, from a digit key); ignored off the menu.
+    fn menu_pick_index(&mut self, n: usize) {
+        let kind = match &self.overlay {
+            Some(Overlay::Menu { items, .. }) if n >= 1 => items.get(n - 1).map(|i| i.kind),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.menu_pick(kind);
+        }
+    }
+
+    /// Carry out a chosen menu item.
+    fn menu_pick(&mut self, kind: MenuKind) {
+        match kind {
+            MenuKind::LaunchShell(i) => {
+                let shell = self.shells.get(i).map(|s| s.path.to_string_lossy().into_owned());
+                self.overlay = None;
+                if let Err(e) = self.spawn_tab_with(shell) {
+                    eprintln!("rusty_term: new tab: {e}");
+                }
+            }
+            MenuKind::Settings => self.open_settings(),
+            MenuKind::EditConfig => {
+                self.overlay = None;
+                self.open_config();
+            }
+        }
+    }
+
+    /// Handle a click in the overlay body (below the chrome bar): select the row
+    /// under the pointer, activating it for a menu.
+    fn overlay_click(&mut self, y: f64) {
+        let screen_row = (y.max(0.0) as usize) / self.cell_h;
+        let Some(grid_row) = screen_row.checked_sub(1) else { return };
+        let Some(i) = grid_row.checked_sub(OVERLAY_ITEMS_TOP) else { return };
+        let activate = match &mut self.overlay {
+            Some(Overlay::Menu { items, sel }) if i < items.len() => {
+                *sel = i;
+                true
+            }
+            Some(Overlay::Settings(s)) if i < s.len() => {
+                s.select(i);
+                false
+            }
+            _ => false,
+        };
+        if activate {
+            self.overlay_activate();
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Apply a just-changed setting to the running terminal. Values are
+    /// snapshotted first so the overlay borrow ends before we mutate `self`.
+    fn apply_setting(&mut self, field: Field) {
+        let Some(Overlay::Settings(s)) = self.overlay.as_ref() else { return };
+        let theme = crate::config::preset(s.theme_name());
+        let font_size = s.font_size();
+        let cursor = s.cursor();
+        let blink = s.blink();
+        let ligatures = s.ligatures();
+        let scrollback = s.scrollback();
+        let shell = s.shell_path();
+        match field {
+            Field::Theme => {
+                if let Some(t) = theme {
+                    self.apply_theme_live(t);
+                }
+            }
+            Field::FontSize => self.rebuild_font(font_size, self.config.ligatures.unwrap_or(true)),
+            Field::Cursor => {
+                self.config.cursor_style = Some(cursor);
+                let blink = self.config.cursor_blink.unwrap_or(false);
+                self.set_cursor_all(cursor, blink);
+            }
+            Field::Blink => {
+                self.config.cursor_blink = Some(blink);
+                let shape = self.config.cursor_style.unwrap_or_default();
+                self.set_cursor_all(shape, blink);
+            }
+            Field::Ligatures => self.rebuild_font(self.font_px, ligatures),
+            Field::Scrollback => {
+                self.config.scrollback = Some(scrollback);
+                for tab in &self.tabs {
+                    for p in &tab.panes {
+                        p.grid.lock().set_scrollback_max(scrollback);
+                    }
+                }
+            }
+            Field::Shell => self.config.shell = shell,
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Set the default (and live) cursor on every pane of every tab.
+    fn set_cursor_all(&self, shape: crate::core::CursorShape, blink: bool) {
+        for tab in &self.tabs {
+            for p in &tab.panes {
+                p.grid.lock().set_default_cursor(shape, blink);
+            }
+        }
+    }
+
+    /// Recolor every tab to `new` (mirrors the config live-reload path) and
+    /// repaint the chrome / window border.
+    fn apply_theme_live(&mut self, new: Theme) {
+        for tab in &self.tabs {
+            for p in &tab.panes {
+                let mut g = p.grid.lock();
+                let old = p.parser.lock().retheme(new);
+                if old != new {
+                    g.retheme(&old, &new);
+                }
+            }
+        }
+        self.theme = new;
+        self.config.theme = new;
+        if let Some(window) = &self.window {
+            apply_chrome(window, &self.theme);
+        }
+    }
+
+    /// Rebuild the glyph cache at `px` / `ligatures`, re-fit the grid to the new
+    /// cell size, and rebuild the renderer (the GPU atlas is font-bound).
+    fn rebuild_font(&mut self, px: f32, ligatures: bool) {
+        let Some(font_set) = font::load_set(
+            self.config.font.as_deref(),
+            self.config.font_bold.as_deref(),
+            self.config.font_italic.as_deref(),
+            self.config.font_bold_italic.as_deref(),
+            self.config.font_fallback.as_deref(),
+        ) else {
+            return;
+        };
+        let Some(font) = FontCache::new(font_set, px, ligatures) else { return };
+        let (cw, ch) = font.cell_size();
+        self.font = font;
+        self.cell_w = cw.max(1);
+        self.cell_h = ch.max(1);
+        self.font_px = px;
+        self.config.font_size = Some(px);
+        self.config.ligatures = Some(ligatures);
+        if let Some(window) = self.window.clone() {
+            if let Some(r) = self.make_renderer(window.clone()) {
+                self.renderer = Some(r);
+            }
+            let size = window.inner_size();
+            self.apply_size(size.width, size.height);
+        }
+    }
+
+    /// Render the open overlay into a fresh full-area grid (chrome stays on top).
+    fn build_overlay_grid(&self) -> Grid {
+        let (cols, rows) = (self.cols as usize, self.rows as usize);
+        let mut g = Grid::new(cols, rows);
+        let (fg, bg) = (self.theme.fg, self.theme.bg);
+        let dim = mix(self.theme.fg, self.theme.bg, 110);
+        for cell in &mut g.cells {
+            *cell = Cell::blank();
+            cell.fg = fg;
+            cell.bg = bg;
+        }
+        let bar = cols.min(56);
+        let footer = rows.saturating_sub(2);
+        match self.overlay.as_ref() {
+            Some(Overlay::Menu { items, sel }) => {
+                write_row(&mut g, 0, 2, "Open a new shell or page", dim, bg);
+                for (i, item) in items.iter().enumerate() {
+                    let r = OVERLAY_ITEMS_TOP + i;
+                    if r >= footer {
+                        break;
+                    }
+                    let on = i == *sel;
+                    let (rfg, rbg) = if on { (bg, self.theme.fg) } else { (fg, bg) };
+                    if on {
+                        fill_row(&mut g, r, 0, bar, rfg, rbg);
+                    }
+                    write_row(&mut g, r, 2, &format!("{}. {}", i + 1, item.label), rfg, rbg);
+                }
+                write_row(&mut g, footer, 2, "Up/Down select   Enter/1-9 open   Esc close", dim, bg);
+            }
+            Some(Overlay::Settings(s)) => {
+                write_row(&mut g, 0, 2, "Settings", fg, bg);
+                for (i, (label, value)) in s.display().into_iter().enumerate() {
+                    let r = OVERLAY_ITEMS_TOP + i;
+                    if r >= footer {
+                        break;
+                    }
+                    let on = i == s.sel;
+                    let (rfg, rbg) = if on { (bg, self.theme.fg) } else { (fg, bg) };
+                    if on {
+                        fill_row(&mut g, r, 0, bar, rfg, rbg);
+                    }
+                    write_row(&mut g, r, 2, label, rfg, rbg);
+                    let value = if on { format!("< {value} >") } else { format!("  {value}") };
+                    write_row(&mut g, r, 22, &value, rfg, rbg);
+                }
+                write_row(&mut g, footer, 2, "Up/Down select   Left/Right change   Esc close & save", dim, bg);
+            }
+            None => {}
+        }
+        g
+    }
+}
+
+/// Build the shell-launcher dropdown: each detected shell (launching a new tab)
+/// then the *Settings* and *Open config file* entries.
+fn shell_menu_items(shells: &[crate::shells::DetectedShell]) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = shells
+        .iter()
+        .enumerate()
+        .map(|(i, s)| MenuItem { label: s.name.to_string(), kind: MenuKind::LaunchShell(i) })
+        .collect();
+    items.push(MenuItem { label: "Settings".to_string(), kind: MenuKind::Settings });
+    items.push(MenuItem { label: "Open config file".to_string(), kind: MenuKind::EditConfig });
+    items
+}
+
+/// Write ASCII `text` into grid `row` from `col` (width-1 cells) in the given
+/// colors, clipping at the grid edge. Overlay-page labels are all ASCII.
+fn write_row(grid: &mut Grid, row: usize, col: usize, text: &str, fg: u32, bg: u32) {
+    for (i, ch) in text.chars().enumerate() {
+        let c = col + i;
+        if c >= grid.cols || row >= grid.rows {
+            break;
+        }
+        let mut cell = Cell::blank();
+        cell.ch = ch;
+        cell.fg = fg;
+        cell.bg = bg;
+        grid.set_cell(c, row, cell);
+    }
+}
+
+/// Fill grid `row` cells `[col0, col1)` with a blank cell in the given colors
+/// (the selection bar behind a highlighted overlay row).
+fn fill_row(grid: &mut Grid, row: usize, col0: usize, col1: usize, fg: u32, bg: u32) {
+    for c in col0..col1.min(grid.cols) {
+        let mut cell = Cell::blank();
+        cell.fg = fg;
+        cell.bg = bg;
+        grid.set_cell(c, row, cell);
     }
 }
 
@@ -1139,6 +1615,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+                // A settings page / shell menu, if open, owns all key input.
+                if self.overlay.is_some() {
+                    self.overlay_key(&event);
                     return;
                 }
                 // In search mode, keys edit the query / step matches; nothing
@@ -1432,7 +1913,7 @@ fn osc52_reply(text: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hit, encode_paste, is_openable_url, mix, osc52_reply, put_text};
+    use super::{Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, put_text, shell_menu_items};
     use crate::core::Cell;
 
     #[test]
@@ -1518,5 +1999,21 @@ mod tests {
         assert_eq!(mix(0x000000, 0xFFFFFF, 255), 0xFFFFFF);
         let mid = mix(0x000000, 0xFFFFFF, 128);
         assert!((0x7F..=0x81).contains(&(mid & 0xff)), "roughly half: {mid:#x}");
+    }
+
+    #[test]
+    fn shell_menu_lists_shells_then_settings_and_config() {
+        use crate::shells::DetectedShell;
+        use std::path::PathBuf;
+        let shells = vec![
+            DetectedShell { name: "pwsh", path: PathBuf::from("/x/pwsh") },
+            DetectedShell { name: "bash", path: PathBuf::from("/bin/bash") },
+        ];
+        let items = shell_menu_items(&shells);
+        assert_eq!(items.len(), 4, "2 shells + Settings + config file");
+        assert!(matches!(items[0].kind, MenuKind::LaunchShell(0)));
+        assert!(matches!(items[1].kind, MenuKind::LaunchShell(1)));
+        assert!(matches!(items[2].kind, MenuKind::Settings));
+        assert!(matches!(items[3].kind, MenuKind::EditConfig));
     }
 }

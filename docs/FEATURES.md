@@ -102,6 +102,24 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 - **Status:** done (2026-06-07)
 - **Notes:** `src/core/parser.rs::answer_xtgettcap` answers `DCS + q <hex>;... ST` queries: for each `;`-separated hex name it replies `DCS 1 + r <name>=<hexvalue> ST` (string/number cap), `DCS 1 + r <name> ST` (boolean), or `DCS 0 + r <name> ST` (unknown/malformed), echoing the requested name. The `+q` intermediate distinguishes it from Sixel. Advertised caps mirror `extra/rusty_term.terminfo`: `Co`/`colors` = 256, the `Tc` truecolor flag, and `TN`/`name` = `rusty_term`. Tests: `xtgettcap_answers_known_caps_and_truecolor`, `xtgettcap_reports_terminal_name`, `xtgettcap_unknown_and_malformed_fail`.
 
+## 16. In-app settings page
+Edit the common config keys from a `Ctrl+,` overlay instead of only the file.
+
+- **Status:** done (2026-06-08)
+- **Notes:** `src/gui/settings.rs` is a toolkit-free, unit-tested model (`Settings`): theme, font size, cursor shape/blink, ligatures, scrollback, and default shell, seeded from the live `Config`/`Theme`/detected shells. `←`/`→`/Enter cycle/clamp/toggle the highlighted row; the window (`App::{open_settings, overlay_change, apply_setting}` in `src/gui/window.rs`) applies each change live — `apply_theme_live` (retheme every pane), `rebuild_font` (reload the glyph cache + re-grid + renderer), per-grid `set_default_cursor`/`set_scrollback_max`, and `config.shell` for new tabs. Esc (or dismissing the page) persists via `config::save_settings`, which `upsert`s only the managed keys into the file — preserving comments and unmanaged keys (fonts, custom colors, keybindings); a "(default)" choice removes the key. The live-reload watcher re-reads the save. Bound to `open_settings` (Ctrl+,); the previously dead `open_config` stub is now wired to `config::open_in_editor` (Ctrl+Shift+,). Tests: `gui::settings::tests::*`, `config::tests::{toml_string_*, upsert_*}`, `keymap::tests::*`.
+
+## 17. Shell-launcher dropdown
+Launch any detected shell in a new tab from a chrome menu, not just the configured one.
+
+- **Status:** done (2026-06-08)
+- **Notes:** A `▾` chrome button (`Hit::ShellMenu`) opens an `Overlay::Menu` listing `shells::detect_all()` plus *Settings* and *Open config file* rows (`shell_menu_items` in `src/gui/window.rs`); Up/Down + Enter, a digit key, or a click pick a row. Choosing a shell runs `spawn_tab_with(Some(path))` — a new `shell` parameter on `new_pane` threads the override through to `Backend::spawn_shell` (split panes still inherit the configured shell). Test: `gui::window::tests::shell_menu_lists_shells_then_settings_and_config`.
+
+## 18. Per-tab close button + wider tabs
+Give each tab an `×` close button and a little more label room.
+
+- **Status:** done (2026-06-08)
+- **Notes:** `chrome_row` (`src/gui/window.rs`) widens `TAB_CELLS` (20→26) and paints a `×` at each wide-enough tab's right edge mapped to `Hit::CloseTab(i)`, which `close_tab_at`s the whole tab (the last tab closes the window) — the first mouse path to close a tab, complementing `Ctrl+Shift+W`. The chrome also gains the `▾` shell-launcher button beside `+`.
+
 ## Next up (optional follow-ups)
 
 All 15 backlog items are implemented. Remaining optional enhancements:
