@@ -127,6 +127,11 @@ pub struct AnsiParser {
 /// storing it.
 const OSC_MAX: usize = 4096;
 
+/// Upper bound on an OSC string carrying an iTerm2 inline image
+/// (`OSC 1337 ; File=...:<base64>`), which is far larger than a title. Matched on
+/// the `1337;File=` prefix so ordinary OSC strings keep the tight [`OSC_MAX`] cap.
+const OSC_IMAGE_MAX: usize = 8 * 1024 * 1024;
+
 /// Upper bound on the bytes buffered for a single DCS string. Sixel images can
 /// be large but are bounded here; past this we keep consuming but stop storing.
 const DCS_MAX: usize = 4 * 1024 * 1024;
@@ -374,8 +379,13 @@ impl AnsiParser {
                     }
                     0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
                     _ => {
-                        // Accumulate the payload byte, bounded.
-                        if self.osc_buffer.len() < OSC_MAX {
+                        // Accumulate the payload byte, bounded. iTerm2 inline
+                        // images (`1337;File=`) get a much larger cap; the cheap
+                        // length check short-circuits for every ordinary OSC.
+                        if self.osc_buffer.len() < OSC_MAX
+                            || (self.osc_buffer.len() < OSC_IMAGE_MAX
+                                && self.osc_buffer.starts_with(b"1337;File="))
+                        {
                             self.osc_buffer.push(b);
                         }
                     }

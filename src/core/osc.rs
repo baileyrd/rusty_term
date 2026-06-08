@@ -186,6 +186,13 @@ pub(crate) fn dispatch(
                 }
             }
         }
+        // 1337 (iTerm2) multiplexes several subcommands; we handle inline images
+        // (`File=<args>:<base64>`) and ignore the rest.
+        "1337" => {
+            if let Some(text) = text {
+                super::iterm::feed(text, g);
+            }
+        }
         _ => {}
     }
 }

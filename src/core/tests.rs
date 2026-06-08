@@ -3,7 +3,7 @@ use super::color::*;
 use super::grid::*;
 use super::parser::*;
 use super::sixel::{SixelImage, decode};
-use super::{base64, inflate, png};
+use super::{base64, inflate, jpeg, png};
 
 fn parse(input: &[u8], cols: usize, rows: usize) -> Grid {
     let mut g = Grid::new(cols, rows);
@@ -2592,6 +2592,134 @@ fn png_reverses_sub_and_paeth_filters() {
 #[test]
 fn png_rejects_non_png() {
     assert!(png::decode(b"not a png").is_none());
+}
+
+// Baseline JPEG fixtures (generated with PIL, embedded as base64). See the
+// decoder in src/core/jpeg.rs.
+const GRAY8_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/wAALCAAIAAgBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/ACv/2Q==";
+const RED8_420_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAAIAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDxSiiivzc/vs//2Q==";
+const LRBLUE16_444_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wAARCAAQABADAREAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDwevyI/wBGDzev9Yj/ACkPSK/ydP8AVs83r/WI/wApD//Z";
+const NOISE34_444_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAAiACIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwB+kPZan4guNKubq11TRNMt9smkQ2SnZM0h+cReZI378wxEAI+DIoj+baXyr4DExxlTL3QnOr7SpySU4Jx51GpGo/3cVeClJTrSUUoJNpvlpnly/dUKMPrVabjOn70rqpO1GfK4SruUnRpqdV2i6dSDjB+x5m6kYvDOtat460rxXrF6NfSC7uZrq4h1R3toigtniij2DynZZT5aq2HaJrZWZZDIAvTToYTIsRQw1OpGXtlKKclB1OeDlOtKaVKo4yWq5bSi02rqKpOX0VTHZJepRVWm6kILnlLncuSUle0buKo8tR1Y0+aVSUJOXvykrdmNKi8FeEPFOt6pNp9za2TXJtbqRVaOyZpUliiMUjIIvs8io6xurFTJGF8x9qL4Ff6r7joRcoVZUqTblK8ouPPOUJQpVKnvtVJKVHlhdub5qUFfw8NTrOycXDE1Jc1RKUZP91P2bnJqE+e1CScaiqyd5TlOg4qMZeceDNG1Bpra8toj4b0YWUl2smn2ySNMFgMN3II0fYysQ6bZNgL5kxwyN9Pnsp1MNSvWnGupKKtGpC7lWSjTkrqpJ06k3NOPPUsuWal7SjOfnV8VgsLisVhsXBVq06lWEqalJ/xH7SynTlBxinTVpqpLkT9nZwpy9jz+tXvxjfWL9tK0hU0szyG0W4tLlpBDuOwMTsJbbjJ2rz/COld0MqyOrFVK+LxDm9ZNV+VNve0XG8VfZPVbPU/LcVDDxxFSMcVWsm7Xqxi9+sYylGL7qMpJbJtanpLaHBqviiwg8RJe674nigub61u7m0+0SW6K8CmVFi/exSyPauQyFmheRXYg5jXzqODxFPBYyeBh7OnHlcFNyc/ehNypzUGoQhFypuEY8nOuaEIte0T/AHDKa9KdStHMKyhzVIylOEYRh7k01CE017SUYRSqybj+7pckqVqc6hgaN4us9f1KLQ4NE/t7QrFriW7W4UfZpYIvMnikW4Lurl8yyS71lnwpbIkgXZ2Vspp1MulmdHGSw6m7NUppz517ri405Q5laMaVFwVKEoyfxUanMdOFwWFp4mOAm03KkoRhyyfMm5xm4cjV405qLw9OE60Ep8sJJvlWv4OtNIMWuSwWOolo7+HUYZ9UulhS8mSOYxzNuuolWRXjh+V2JXzUyoQtIvy+JxVStVpU8tTTcq+jX8KcpUnKcoxpTvGME+S75nLnXNKSjF/P47H1aOBhk3PCFONPni0uVuVlzOFXmqUoR5ErTppRnJTqQVSKdMv+GjPpflzi4kv45Jrg3A1NxqENm8iBrN+QpZ3itY1WTYCMzeZktGg2qYGH1SjRpWqSq01GSpqmqk4pRc3Jw5U1Co0p3qWqKF/ecZSXs4vOcTnVL6piYqlh37HWXK3VtGS0lKM3GPN7041OdwXPKUFGEpO5pvhDV9R061u9Mt7kabPEktqBqNtjymAKdUB+6R1ANcONxuY08VVhi5SVVSal71H4rvm3qt733bZ4lbijO6lWU1h67u27xdXlfnG+Ivy9r9DmfBi65p+mwa14a0W1fUri0bT4Le6CWzlY4StyqSp5W/OGd38tSJC6LIASV+m4ky/CThOGJq8uHcW9XdSkudpcsYVJRiqfNF8lb3YJpWpu8/Sr5xGpDBZZWm5UqtRKsoyjGKjN1Iqo4yh7WCxK/fRu1+7SklKUpKM2qaxqeoaDYwGSW+eexQx2JtGtreRVlRYflS4ESglXfZHNtdkQS7BDsOOGhXqutUzak4Qw84zjJP2sWlSnzpOVPnqKUbxlXrJxSnOVKT5qjqbYfFwilVwuKozqQhUg05KDnGK9nOcZwjpGV4RipxUqkIQcHJqPLlWUFnbeHtX0y3W3sNUv9Ijto7+3thIdViupppPJLrIoMfMCeYjEDzCuNuwj6HGUJ8kZZpTnOhCs5+ykuedOpTVO+jg7Si5TUORez5bqXMlKC7MPVnejipwjTp1L3XLaScIwp8sZVVKpXfKlUjyNpwXs4p1KsWzRk03R9K2wadNe+IyVvY9NtLYkFNvmrMCwYssYFxCh2uYlWRmULJ+7+dxsnha9OpQxTlSlzKE4SvaNnCcLQqPldSUXNVG6jqSq6z9tGTqfP4mliKT/ANl5KlCUn7Tn1g/Z3j7NpN1UnONStJTdOdScVe04xa970Dw0df0HTdU1iOKPVr22jubxJRZh1mdQ0gYblwdxOflX6DpXxGOzjJsJiquGo0cO4QlKKtRbVk2lZqrJbdpSX957nz2L4Rx9bEVKs8zrwcpNuNOc/Zxbfww96XuLaPvS0tq9zw6+XV7q5urCzfVvFmnqo+2WdvDE1pdJG9uGaaMSTBpIzJGfLf5FjdCP3fD/AKJGgmqeNjOivac3slKUn7SThOKjaKp0vehGmoyUqUlUpygoOo3Ne5icxwOf4ihDDKNCHNG1SU5ScIqfNFym4uEIRl7WK5lOEY1OfklVbtqNFrHiKOHULXS9Y0Vp1jtrqHUIra3tb22W3VdzRyO0cjtGkCtKg+RI0xuVESR5pHLMHVhhMa4OMFOcLSq1H7RV+X2c6i+Nv94vZSbnztxi+ebjD6rBzjRwGJo4V01yzox9yU3O/KotKUUoulacJRSklVk6kIylFxqyv/aB4putJvZr2z1zUtUuWtrW4ffPbm2LTuYxbKgaRgQ+fLBbDbXVDiGtHhMPg6trwUFCnGXO4QjP3oVbxnFOHO3UjZzXspJpU5zlOpOPjYNYivglSwVOFbDOoppL20JUqsINRnGUadHliryk5Tkr1eb2c4zXtzjba41C2i1C71KS/vNeufMu5IYfIthPd3EuJJJZYXZZlSQvG4kGwmPyf3oRS/hVcFipfVZ4qlanTVOK5oylVStCceVVIKrzSSacoKMk1ze2puVSNLBZxSr5ZBKHNGpFwdWd5LR83s2p3+ODpuPJzSmlTl7CVNS5eaHxK0QgG8TxCt2f9cLTXLXyQ/8AFs863Mm3OceYS+MbiTmvXp8LZpioRxFDEVuSavHWs9HqvgjOG38spR/lk1Zv9Zq4TIFUksVlLdS75mqV05dWmq0U1e9rRirbJbHrHjHSrLTPGHh+Szs7e0ki8IX08bwRKhSSOSx8twQOGX7TcbT1Hny4++2fzvh+pPHY1YfFt1Kd8PHll7y5XhdVZ3VnZXWzsj8qws5f2JkuJv8AvKsvfl9qd5qL5nvK8fdd73jpsc/8VtIsdF+HeuQafZW9jBYaqptIraJY1tt5YP5YUAJuCqDjGQBnpX7vwjThj6uW1cWlUlXwt6jl7zqOnOkqbm3fncFKSg5X5U3y2uz5ziOpPCcRYjDYeThTjKnJRjpFSWEpTUklomptyT3Um5bu5xOv3M2s6Zey6hK99LB4m1uxhe5YyNHbxrEY4VLZxGu99qjgb2wOTXk4GKp5RSUFZPAe0dutT2dL94+8/wC98XmfXcM4ejjcswGIxUFObnSvKSTb/d4l6t3e8I/+Ax7K298OtUvPEXiPWbrVbufU7qz1PxLHbT3kjSvAqWcioqMxJUKFUADoAMdK8CtQpUcvwGHpwUYVHR54pJKX7uoveW0tNNb6H3PBFGliatKVeKk4V6fLdXtdUm7X2u9Xbd67nsdt4N8P21vFDDoemxRRqESNLSMKqgYAAA4Ar+PamcZlOcpSxM22/wCeX+Z/F3ELcc5xsYuyVWp/6Wz/2Q==";
+
+/// A decoded JPEG pixel `(r, g, b)` as signed ints (for tolerance comparisons).
+fn jpx(img: &jpeg::Image, x: usize, y: usize) -> (i32, i32, i32) {
+    let o = (y * img.width + x) * 4;
+    (img.rgba[o] as i32, img.rgba[o + 1] as i32, img.rgba[o + 2] as i32)
+}
+
+#[test]
+fn jpeg_decodes_grayscale() {
+    let data = base64::decode(GRAY8_B64.as_bytes()).unwrap();
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (8, 8));
+    let (r, g, b) = jpx(&img, 4, 4);
+    assert_eq!((r, g), (b, b)); // a single-component image replicates luma
+    assert!((r - 128).abs() <= 8, "mid-gray ~128, got {r}");
+    assert_eq!(img.rgba[3], 255); // JPEG is opaque
+}
+
+#[test]
+fn jpeg_decodes_solid_rgb_with_420_subsampling() {
+    let data = base64::decode(RED8_420_B64.as_bytes()).unwrap();
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (8, 8));
+    let (r, g, b) = jpx(&img, 4, 4);
+    assert!(
+        (r - 220).abs() <= 16 && (g - 30).abs() <= 18 && (b - 40).abs() <= 18,
+        "solid red ~(220,30,40), got {:?}",
+        (r, g, b)
+    );
+}
+
+#[test]
+fn jpeg_decodes_two_colors_444() {
+    // Left half red, right half blue at 4:4:4 (no chroma subsampling).
+    let data = base64::decode(LRBLUE16_444_B64.as_bytes()).unwrap();
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (16, 16));
+    let (lr, lg, lb) = jpx(&img, 2, 8);
+    assert!(lr > 180 && lg < 80 && lb < 80, "left red, got {:?}", (lr, lg, lb));
+    let (rr, rg, rb) = jpx(&img, 13, 8);
+    assert!(rb > 180 && rr < 80 && rg < 90, "right blue, got {:?}", (rr, rg, rb));
+}
+
+#[test]
+fn jpeg_decodes_multi_mcu_image() {
+    // 34x34 spans multiple MCUs and many blocks (exercises DC prediction across
+    // blocks); we only assert it decodes to the right shape.
+    let data = base64::decode(NOISE34_444_B64.as_bytes()).unwrap();
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (34, 34));
+    assert_eq!(img.rgba.len(), 34 * 34 * 4);
+}
+
+#[test]
+fn jpeg_rejects_unsupported() {
+    assert!(jpeg::decode(b"not a jpeg at all").is_none());
+    assert!(jpeg::decode(&[0xFF, 0xD8, 0xFF]).is_none()); // SOI then truncated
+}
+
+#[test]
+fn iterm2_inline_jpeg_renders_image() {
+    // OSC 1337 ; File=inline=1 : <base64 JPEG> BEL
+    let mut input = b"\x1b]1337;File=inline=1:".to_vec();
+    input.extend_from_slice(GRAY8_B64.as_bytes());
+    input.push(0x07);
+    let g = parse(&input, 20, 10);
+    assert_eq!(g.cells[0].ch, '\u{2580}'); // a half-block image cell
+    let (r, gn, b) = (
+        (g.cells[0].fg >> 16) & 0xff,
+        (g.cells[0].fg >> 8) & 0xff,
+        g.cells[0].fg & 0xff,
+    );
+    assert!(
+        (118..=138).contains(&r) && r == gn && gn == b,
+        "mid-gray image, got {:?}",
+        (r, gn, b)
+    );
+}
+
+#[test]
+fn iterm2_non_inline_transfer_is_ignored() {
+    // inline=0 is a download, which a terminal has no surface for: render nothing.
+    let mut input = b"\x1b]1337;File=inline=0:".to_vec();
+    input.extend_from_slice(GRAY8_B64.as_bytes());
+    input.push(0x07);
+    let g = parse(&input, 20, 10);
+    assert_eq!(g.cells[0].ch, ' ');
+}
+
+#[test]
+fn iterm2_non_file_subcommand_is_ignored() {
+    let g = parse(b"\x1b]1337;SetUserVar=foo=YmFy\x07", 20, 10);
+    assert_eq!(g.cells[0].ch, ' ');
+}
+
+#[test]
+fn iterm2_large_image_payload_is_not_truncated() {
+    // The base64 is 4500 chars, past the ordinary OSC cap (4096). If the parser
+    // truncated the OSC string the JPEG would corrupt and the lower rows (whose
+    // entropy bytes sit far past the cap) would differ from a direct decode.
+    let data = base64::decode(NOISE34_444_B64.as_bytes()).unwrap();
+    let img = jpeg::decode(&data).unwrap();
+    let pixels: Vec<Option<u32>> = img
+        .rgba
+        .chunks_exact(4)
+        .map(|p| Some(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32))
+        .collect();
+    let mut gref = Grid::new(40, 30);
+    gref.render_image(img.width, img.height, &pixels);
+
+    let mut input = b"\x1b]1337;File=inline=1:".to_vec();
+    input.extend_from_slice(NOISE34_444_B64.as_bytes());
+    input.push(0x07);
+    let g = parse(&input, 40, 30);
+
+    // 34px tall -> 17 cell rows; row 16 (the bottom) depends on late entropy.
+    let bottom = 16 * 40;
+    assert_ne!(g.cells[bottom].ch, ' '); // an image actually rendered there
+    assert_eq!(g.cells[bottom].fg, gref.cells[bottom].fg);
+    assert_eq!(g.cells[0].fg, gref.cells[0].fg);
 }
 
 #[test]

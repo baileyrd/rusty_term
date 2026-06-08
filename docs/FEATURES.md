@@ -2,8 +2,8 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 4, 5, 6,
-7, 8, 9, 10, 11, 12, 13, and 15** are implemented; only **#14** has no implementing code yet. Each entry
+"completed (2026-06-07)" stamps did not match the code. **All 15 items** are now
+implemented. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -91,8 +91,9 @@ Pixel-perfect image rendering via framebuffer overlay instead of half-block path
 ## 14. iTerm2 inline images + JPEG decoder
 Implement iTerm2 inline image protocol with JPEG decoding.
 
-- **Status:** not implemented
-- **Notes:** No iTerm2 `OSC 1337` handler and no JPEG decoder (no `jpeg`/`jpg`/`1337` anywhere). Image decoders are PNG/Sixel/Kitty only.
+- **Status:** done (2026-06-08)
+- **Notes:** `src/core/iterm.rs` handles `OSC 1337 ; File=<args>:<base64>`: it honors `inline=1` (a non-inline transfer is a download, which a terminal has no surface for — ignored), base64-decodes the payload, format-detects PNG (`src/core/png.rs`) vs baseline JPEG by magic bytes, and feeds the pixels to the shared `Grid::render_image` sink (half-block cells in every build, plus the full-res overlay under the `gui` CPU renderer from #13). Dispatched from `src/core/osc.rs` (`1337` arm); other `1337;` subcommands are ignored. Because an OSC image far exceeds a title, `src/core/parser.rs` raises the OSC buffer cap to `OSC_IMAGE_MAX` (8 MiB) only for the `1337;File=` prefix, leaving ordinary OSC strings at the tight `OSC_MAX` (4096). `src/core/jpeg.rs` is a from-scratch baseline (SOF0/SOF1) decoder: Huffman (Annex F), dequant + zig-zag, separable float IDCT, restart intervals, 1-component grayscale and 3-component YCbCr at 4:4:4 / 4:2:2 / 4:2:0 (nearest-neighbor chroma upsample); progressive/arithmetic/12-bit/CMYK decode to `None` (caller skips display), mirroring the PNG decoder. Tests: `jpeg_decodes_grayscale`, `jpeg_decodes_solid_rgb_with_420_subsampling`, `jpeg_decodes_two_colors_444`, `jpeg_decodes_multi_mcu_image`, `jpeg_rejects_unsupported`, `iterm2_inline_jpeg_renders_image`, `iterm2_non_inline_transfer_is_ignored`, `iterm2_non_file_subcommand_is_ignored`, `iterm2_large_image_payload_is_not_truncated`.
+- **Not yet:** the optional `width`/`height`/`preserveAspectRatio` geometry hints are not honored (images auto-fit to the available columns like Sixel/Kitty); GIF/WebP payloads and progressive JPEG are not decoded.
 
 ## 15. XTGETTCAP responses
 Implement `DCS +q` capability-probing responses consistent with terminfo.
@@ -100,10 +101,10 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 - **Status:** done (2026-06-07)
 - **Notes:** `src/core/parser.rs::answer_xtgettcap` answers `DCS + q <hex>;... ST` queries: for each `;`-separated hex name it replies `DCS 1 + r <name>=<hexvalue> ST` (string/number cap), `DCS 1 + r <name> ST` (boolean), or `DCS 0 + r <name> ST` (unknown/malformed), echoing the requested name. The `+q` intermediate distinguishes it from Sixel. Advertised caps mirror `extra/rusty_term.terminfo`: `Co`/`colors` = 256, the `Tc` truecolor flag, and `TN`/`name` = `rusty_term`. Tests: `xtgettcap_answers_known_caps_and_truecolor`, `xtgettcap_reports_terminal_name`, `xtgettcap_unknown_and_malformed_fail`.
 
-## Next up (recommended order)
+## Next up (optional follow-ups)
 
-Larger / multi-file (each its own project):
+All 15 backlog items are implemented. Remaining optional enhancements:
 
-- **#14** iTerm2 inline images + JPEG decoder.
-- **GPU image pipeline** (optional) — textured quads to replace the GPU half-block fallback for #13.
-- **#11 ligature shaping** (optional) — needs a shaping engine.
+- **GPU image pipeline** — textured quads to replace the GPU half-block fallback for #13/#14.
+- **#11 ligature shaping** — needs a text-shaping engine (a new dependency).
+- **iTerm2 geometry hints** — honor `width`/`height`/`preserveAspectRatio` sizing for #14.

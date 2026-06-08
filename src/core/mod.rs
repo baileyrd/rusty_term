@@ -23,6 +23,8 @@ mod charset;
 mod color;
 mod grid;
 mod inflate;
+mod iterm;
+mod jpeg;
 mod kitty;
 mod osc;
 mod parser;
