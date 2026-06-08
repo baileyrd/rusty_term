@@ -22,6 +22,7 @@ const SEARCH_FG: u32 = 0x101010;
 /// A non-empty `chrome` row (the window's own tab/caption bar) is painted as
 /// the first cell row and pushes the grid one row down; empty paints the grid
 /// at the top, unchanged.
+#[cfg(test)]
 pub(crate) fn render(
     grid: &Grid,
     chrome: &[Cell],
@@ -32,16 +33,30 @@ pub(crate) fn render(
     cursor_on: bool,
 ) {
     let (cw, ch) = font.cell_size();
-    let baseline = font.baseline();
     if cw == 0 || ch == 0 {
         return;
     }
-    let row_off = if chrome.is_empty() { 0 } else { 1 };
+    if !chrome.is_empty() {
+        draw_chrome(buf, width, height, chrome, font, cw, ch);
+    }
+    let row0 = if chrome.is_empty() { 0 } else { 1 };
+    draw_grid(buf, width, height, grid, 0, row0, true, cursor_on, font);
+}
 
-    // Chrome bar: same bg-then-glyph compositing, fixed at pixel row 0.
+/// Paint the window's chrome bar (tabs + caption buttons) at pixel row 0.
+pub(crate) fn draw_chrome(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    chrome: &[Cell],
+    font: &mut dyn GlyphSource,
+    cw: usize,
+    ch: usize,
+) {
+    let baseline = font.baseline();
     for (col, cell) in chrome.iter().enumerate() {
-        let (x0, y0) = (col * cw, 0);
-        for y in y0..(y0 + ch).min(height) {
+        let x0 = col * cw;
+        for y in 0..ch.min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
                 buf[base + x] = cell.bg;
@@ -60,29 +75,40 @@ pub(crate) fn render(
         let pen_y = baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, cell.fg);
     }
+}
 
-    // The block cursor paints the cell in the cursor color (OSC 12 / the
-    // `cursor` config key) with the glyph in the cell's background, so it
-    // reads like an inversion but honors the configured color. It shows only
-    // on the live view, not while scrolled into history. Drag-selection still
-    // inverts the cell's own fg/bg.
-    let cursor = (grid.cursor_visible && grid.view_offset == 0 && cursor_on).then_some(grid.cursor);
+/// Composite one grid's visible cells into `buf` at cell offset `(col0, row0)`,
+/// extent `grid.cols × grid.rows`. The cursor (block / bar / underline) and IME
+/// preedit show only when `focused`; selection and search highlights come from
+/// the grid's own state. Cells past the buffer edge are clipped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_grid(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    grid: &Grid,
+    col0: usize,
+    row0: usize,
+    focused: bool,
+    cursor_on: bool,
+    font: &mut dyn GlyphSource,
+) {
+    let (cw, ch) = font.cell_size();
+    let baseline = font.baseline();
+    if cw == 0 || ch == 0 {
+        return;
+    }
+    let cursor = (focused && grid.cursor_visible && grid.view_offset == 0 && cursor_on)
+        .then_some(grid.cursor);
     let shape = grid.cursor_shape;
-    // Only a Block cursor inverts the cell; Underline/Bar overlay a stripe after.
     let block_cursor =
         |col: usize, row: usize| shape == CursorShape::Block && cursor == Some((col, row));
-    // Selection coordinates address the live grid, so highlight only the live
-    // view; while scrolled into history the composited rows don't line up.
     let inverted = |col: usize, row: usize| grid.view_offset == 0 && grid.is_selected(col, row);
-    // Scrollback search matches (amber / orange for the active one).
     let search_hl = |col: usize, row: usize| grid.search_highlight(col, row);
-
-    // The status-line overlay (L13), when present, replaces the bottom row.
     let status = grid.status_row();
     let last_row = grid.rows.saturating_sub(1);
 
-    // Pass 1: backgrounds. A wide glyph's bitmap may spill into its trailer
-    // cell, so fill every cell (including trailers) before drawing glyphs.
+    // Pass 1: backgrounds (every cell, incl. wide trailers, before glyphs).
     for i in 0..grid.cols * grid.rows {
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
@@ -98,7 +124,7 @@ pub(crate) fn render(
         } else {
             cell.bg
         };
-        let (x0, y0) = (col * cw, (row + row_off) * ch);
+        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
@@ -126,19 +152,17 @@ pub(crate) fn render(
         } else {
             cell.fg
         };
-        let pen_x = (col * cw) as i32 + glyph.left;
-        let pen_y = ((row + row_off) * ch) as i32 + baseline + glyph.top;
+        let pen_x = ((col0 + col) * cw) as i32 + glyph.left;
+        let pen_y = ((row0 + row) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, &glyph, pen_x, pen_y, fg);
     }
 
-    // Underline / bar cursors overlay a thin stripe in the cursor color on the
-    // (normally rendered) cell; Block is handled by the fg/bg swap above. Never
-    // drawn on the status row.
+    // Underline / bar cursors overlay a thin stripe (block is the fg/bg swap).
     if let Some((ccol, crow)) = cursor
         && shape != CursorShape::Block
         && !(status.is_some() && crow == last_row)
     {
-        let (x0, y0) = (ccol * cw, (crow + row_off) * ch);
+        let (x0, y0) = ((col0 + ccol) * cw, (row0 + crow) * ch);
         let color = grid.cursor_color;
         match shape {
             CursorShape::Underline => {
@@ -163,20 +187,19 @@ pub(crate) fn render(
         }
     }
 
-    // IME preedit (composition): reverse-video glyphs starting at the cursor, so
-    // the composing text is visible in place over the cells beneath it.
-    if !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
+    // IME preedit (composition): reverse-video glyphs at the cursor.
+    if focused && !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
         let crow = grid.cursor.1;
         let mut col = grid.cursor.0;
-        let y0 = (crow + row_off) * ch;
+        let y0 = (row0 + crow) * ch;
         for pch in grid.ime_preedit.chars() {
             let w = char_width(pch).max(1);
             if col + w > grid.cols {
                 break;
             }
             let base = grid.viewport_cell(col, crow);
-            let (fg, bg) = (base.bg, base.fg); // reverse video
-            let x0 = col * cw;
+            let (fg, bg) = (base.bg, base.fg);
+            let x0 = (col0 + col) * cw;
             for y in y0..(y0 + ch).min(height) {
                 let b = y * width;
                 for x in x0..(x0 + w * cw).min(width) {
@@ -454,6 +477,20 @@ mod tests {
         assert_eq!(buf[7 * w + 7], 0xFF7A1A, "active match cell is orange");
         // col 0 (no match) keeps the default background.
         assert_ne!(buf[7 * w], 0xFF7A1A);
+    }
+
+    #[test]
+    fn draw_grid_honors_cell_offset() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[48;2;0;0;255m "); // blue-bg cell
+        let (cw, ch) = (4usize, 8usize);
+        let (w, h) = (3 * cw, 2 * ch);
+        let mut buf = vec![0u32; w * h];
+        // A split pane draws its grid at a cell offset; here (1, 1).
+        draw_grid(&mut buf, w, h, &g, 1, 1, false, false, &mut MockFont);
+        assert_eq!(buf[ch * w + cw], 0x0000FF, "the cell is painted at the offset");
+        assert_eq!(buf[0], 0, "the origin is left untouched (a divider gap)");
     }
 
     #[test]

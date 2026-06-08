@@ -2,8 +2,8 @@
 
 15 enhancements were identified for rusty_term via review. **The statuses below
 were re-audited against the source tree on 2026-06-07** — the earlier bulk
-"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 5, 6, 7,
-8, 9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
+"completed (2026-06-07)" stamps did not match the code. Items **1, 2, 3, 4, 5, 6,
+7, 8, 9, 10, 12, and 15** are implemented; the rest have no implementing code yet. Each entry
 records what exists and what is missing, grounded in the symbols/files that
 back it.
 
@@ -30,8 +30,8 @@ Add incremental search with highlight + next/prev using existing reflowed logica
 ## 4. Split panes within a tab
 Horizontal/vertical splits using existing Tab/PTY plumbing and cell-based chrome layout.
 
-- **Status:** not implemented
-- **Notes:** No split/pane/region/layout code; `src/gui/window.rs` models tabs only (one PTY per tab).
+- **Status:** done (2026-06-07)
+- **Notes:** New `src/gui/layout.rs` is a toolkit-free binary split tree (`Layout` over pane ids) that tiles a tab's cell area into rects with one-cell dividers (unit-tested). A `Tab` now holds `Vec<Pane>` + a `Layout` + a focused pane id; `Pane` is the former per-shell state (grid/parser/PTY). The renderer trait paints `&[PaneFrame]` (each grid at a cell offset, cursor/IME only on the focused pane); `cpu::draw_grid` and `gpu::append_grid` were extracted to draw one grid at `(col0, row0)`, the window clears gaps to a divider color. Keys (rebindable): `split_right` (Ctrl+Shift+D), `split_down` (Ctrl+Shift+E), `focus_next` (Ctrl+Shift+J); `close_tab` (Ctrl+Shift+W) now closes the focused pane (last pane closes the tab). Each pane runs its own shell, is resized to its rect (grid + PTY) on window resize/split, and click-to-focus + pane-local selection/links/mouse use `pane_under`/`cell_in_focused`. Tests: `gui::layout::tests::*` (7), `gui::cpu::tests::draw_grid_honors_cell_offset`.
 
 ## 5. Clickable OSC 8 hyperlinks
 Support Ctrl+click to open OSC 8 hyperlinks via system opener.
@@ -103,5 +103,5 @@ Implement `DCS +q` capability-probing responses consistent with terminfo.
 
 Larger / multi-file (each its own project):
 
-- **#4** split panes, **#11** font fallback/variants/ligatures,
+- **#11** font fallback/variants/ligatures,
   **#13** image framebuffer overlay, **#14** iTerm2 + JPEG.

@@ -329,6 +329,7 @@ impl GpuCore {
     /// A non-empty `chrome` row is drawn as cell row 0 with the grid shifted
     /// one row down (see [`Renderer::render`]).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn render(
         &mut self,
         view: &wgpu::TextureView,
@@ -347,13 +348,6 @@ impl GpuCore {
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        // The block cursor paints the cell in the cursor color (OSC 12 / the
-        // `cursor` config key) with the glyph in the cell's bg; drag-selection
-        // inverts the cell's own fg/bg (no shader change either way). The
-        // cursor shows only on the live view, not while scrolled into history.
-        let cursor = (grid.cursor_visible && grid.view_offset == 0 && cursor_on).then_some(grid.cursor);
-        let status = grid.status_row();
-        let last_row = grid.rows.saturating_sub(1);
         let row_off = if chrome.is_empty() { 0 } else { 1 };
         let mut instances = Vec::with_capacity(grid.cells.len() + chrome.len());
         for (col, cell) in chrome.iter().enumerate() {
@@ -363,17 +357,35 @@ impl GpuCore {
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
         }
+        self.append_grid(&mut instances, grid, 0, row_off, true, cursor_on, font);
+        self.draw_instances(view, &instances, 0x000000);
+    }
+
+    /// Append `grid`'s cell + IME-preedit instances at cell offset `(col0,
+    /// row0)`. The cursor and preedit show only when `focused`; selection and
+    /// search highlights come from the grid's own state.
+    #[allow(clippy::too_many_arguments)]
+    fn append_grid(
+        &mut self,
+        instances: &mut Vec<Instance>,
+        grid: &Grid,
+        col0: usize,
+        row0: usize,
+        focused: bool,
+        cursor_on: bool,
+        font: &mut FontCache,
+    ) {
+        let cursor = (focused && grid.cursor_visible && grid.view_offset == 0 && cursor_on)
+            .then_some(grid.cursor);
+        let status = grid.status_row();
+        let last_row = grid.rows.saturating_sub(1);
         for i in 0..grid.cols * grid.rows {
             let (col, row) = (i % grid.cols, i / grid.cols);
-            // The status-line overlay (L13), when present, replaces the bottom row;
-            // otherwise `viewport_cell` composites scrollback history when scrolled.
             let on_status = status.is_some() && row == last_row;
             let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            // Selection coordinates address the live grid, so highlight only the
-            // live view; history rows don't line up while scrolled.
             let (fg, bg, curs, ccol) = if !on_status && cursor == Some((col, row)) {
                 match grid.cursor_shape {
                     CursorShape::Block => (cell.bg, grid.cursor_color, 0u32, 0u32),
@@ -391,8 +403,8 @@ impl GpuCore {
             };
             let slot = self.ensure_slot(cell.ch, font);
             instances.push(Instance {
-                col: col as u32,
-                row: (row + row_off) as u32,
+                col: (col0 + col) as u32,
+                row: (row0 + row) as u32,
                 slot,
                 fg,
                 bg,
@@ -400,8 +412,7 @@ impl GpuCore {
                 ccol,
             });
         }
-        // IME preedit (composition): reverse-video glyphs at the cursor.
-        if !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
+        if focused && !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
             let crow = grid.cursor.1;
             let mut col = grid.cursor.0;
             for pch in grid.ime_preedit.chars() {
@@ -410,35 +421,74 @@ impl GpuCore {
                     break;
                 }
                 let base = grid.viewport_cell(col, crow);
-                let row = (crow + row_off) as u32;
+                let row = (row0 + crow) as u32;
                 let slot = self.ensure_slot(pch, font);
-                instances.push(Instance { col: col as u32, row, slot, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                instances.push(Instance { col: (col0 + col) as u32, row, slot, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
                 if w == 2 {
                     let blank = self.ensure_slot(' ', font);
-                    instances.push(Instance { col: col as u32 + 1, row, slot: blank, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                    instances.push(Instance { col: (col0 + col) as u32 + 1, row, slot: blank, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
                 }
                 col += w;
             }
         }
+    }
+
+    /// Render a tab's `panes` into `view`, filling the gaps with `divider`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_panes(
+        &mut self,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        panes: &[super::render::PaneFrame],
+        chrome: &[Cell],
+        font: &mut FontCache,
+        divider: u32,
+    ) {
+        let uniforms = Uniforms {
+            screen: [width.max(1) as f32, height.max(1) as f32],
+            cell: [self.cell_w as f32, self.cell_h as f32],
+            slots_per_row: SLOTS_PER_ROW,
+            _pad: [0; 3],
+        };
+        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        let mut instances = Vec::new();
+        for (col, cell) in chrome.iter().enumerate() {
+            if cell.flags & WIDE_TRAILER != 0 {
+                continue;
+            }
+            let slot = self.ensure_slot(cell.ch, font);
+            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
+        }
+        for p in panes {
+            self.append_grid(&mut instances, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
+        }
+        self.draw_instances(view, &instances, divider);
+    }
+
+    /// Build the instance buffer and submit the cells pass, clearing to the
+    /// `clear` color (`0x00RRGGBB`).
+    fn draw_instances(&self, view: &wgpu::TextureView, instances: &[Instance], clear: u32) {
         let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("instances"),
-            contents: bytemuck::cast_slice(&instances),
+            contents: bytemuck::cast_slice(instances),
             usage: wgpu::BufferUsages::VERTEX,
         });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let c = wgpu::Color {
+            r: ((clear >> 16) & 0xff) as f64 / 255.0,
+            g: ((clear >> 8) & 0xff) as f64 / 255.0,
+            b: (clear & 0xff) as f64 / 255.0,
+            a: 1.0,
+        };
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cells pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(c), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -492,7 +542,15 @@ impl GpuRenderer {
 }
 
 impl Renderer for GpuRenderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool) {
+    fn render(
+        &mut self,
+        panes: &[super::render::PaneFrame],
+        chrome: &[Cell],
+        font: &mut FontCache,
+        width: u32,
+        height: u32,
+        divider: u32,
+    ) {
         if width == 0 || height == 0 {
             return;
         }
@@ -522,7 +580,7 @@ impl Renderer for GpuRenderer {
             return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render(&view, width, height, grid, chrome, font, cursor_on);
+        self.core.render_panes(&view, width, height, panes, chrome, font, divider);
         frame.present();
     }
 }

@@ -12,14 +12,32 @@ use winit::window::Window;
 use crate::core::{Cell, Grid};
 
 use super::cpu;
-use super::font::FontCache;
+use super::font::{FontCache, GlyphSource};
 
-/// A present target: paint one frame of `grid` at the given pixel size.
-/// `chrome` is the window's own top bar (tabs + caption buttons) as one row of
-/// pre-laid cells; when non-empty it occupies the first cell row and the grid
-/// is painted one row below. Empty means no chrome (headless tests).
+/// One pane to paint this frame: its `grid` at cell offset `(col0, row0)`,
+/// sized to the grid's own `cols × rows`. `focused` gates the cursor/IME
+/// preedit (only the focused pane shows them); `cursor_on` is the blink phase.
+pub(crate) struct PaneFrame<'a> {
+    pub grid: &'a Grid,
+    pub col0: usize,
+    pub row0: usize,
+    pub focused: bool,
+    pub cursor_on: bool,
+}
+
+/// A present target: paint one frame of the tab's `panes` at the given pixel
+/// size. `chrome` is the window's own top bar (tabs + caption buttons) as one
+/// pre-laid cell row at the top; `divider` fills the gaps between panes.
 pub(crate) trait Renderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool);
+    fn render(
+        &mut self,
+        panes: &[PaneFrame],
+        chrome: &[Cell],
+        font: &mut FontCache,
+        width: u32,
+        height: u32,
+        divider: u32,
+    );
 }
 
 /// CPU compositor presented through `softbuffer`.
@@ -38,7 +56,15 @@ impl CpuRenderer {
 }
 
 impl Renderer for CpuRenderer {
-    fn render(&mut self, grid: &Grid, chrome: &[Cell], font: &mut FontCache, width: u32, height: u32, cursor_on: bool) {
+    fn render(
+        &mut self,
+        panes: &[PaneFrame],
+        chrome: &[Cell],
+        font: &mut FontCache,
+        width: u32,
+        height: u32,
+        divider: u32,
+    ) {
         let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
@@ -48,7 +74,15 @@ impl Renderer for CpuRenderer {
         let Ok(mut buffer) = self.surface.buffer_mut() else {
             return;
         };
-        cpu::render(grid, chrome, font, &mut buffer, width as usize, height as usize, cursor_on);
+        buffer.fill(divider); // gaps between panes show the divider color
+        let (w, h) = (width as usize, height as usize);
+        if !chrome.is_empty() {
+            let (cw, ch) = font.cell_size();
+            cpu::draw_chrome(&mut buffer, w, h, chrome, font, cw, ch);
+        }
+        for p in panes {
+            cpu::draw_grid(&mut buffer, w, h, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
+        }
         let _ = buffer.present();
     }
 }

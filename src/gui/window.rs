@@ -36,7 +36,8 @@ use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_w
 use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseEvent, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
-use super::render::{CpuRenderer, Renderer};
+use super::layout::{Dir, Layout, Rect};
+use super::render::{CpuRenderer, PaneFrame, Renderer};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
 const FONT_PX: f32 = 18.0;
@@ -77,16 +78,36 @@ enum Hit {
     Drag,
 }
 
-/// One terminal session under a tab: its screen state and PTY plumbing. The
-/// owning PTY handle lives here, so dropping a `Tab` tears the session down
-/// (its reader thread then EOFs and its exit event becomes a no-op).
-struct Tab {
+/// One terminal session inside a tab (a split pane): its screen state and PTY
+/// plumbing. The owning PTY handle lives here, so dropping a `Pane` tears the
+/// session down (its reader thread then EOFs and its exit event becomes a no-op).
+struct Pane {
     id: u64,
     grid: Arc<Mutex<Grid>>,
-    /// Shared with the tab's reader thread; the loop takes it only on config
-    /// reload.
+    /// Shared with the pane's reader thread; the loop takes it only on config reload.
     parser: Arc<Mutex<AnsiParser>>,
     writer: Box<dyn BackendHandle>,
+}
+
+/// A tab: one or more [`Pane`]s tiled by a [`Layout`], one of them focused.
+struct Tab {
+    panes: Vec<Pane>,
+    layout: Layout,
+    /// Id of the focused pane — it receives input and shows the cursor.
+    focus: u64,
+}
+
+impl Tab {
+    fn pane(&self, id: u64) -> Option<&Pane> {
+        self.panes.iter().find(|p| p.id == id)
+    }
+    fn focused(&self) -> Option<&Pane> {
+        self.pane(self.focus)
+    }
+    fn focused_mut(&mut self) -> Option<&mut Pane> {
+        let f = self.focus;
+        self.panes.iter_mut().find(|p| p.id == f)
+    }
 }
 
 /// Launch the windowed terminal. Blocks until the window closes or the last
@@ -231,14 +252,14 @@ struct App<'a> {
 }
 
 impl App<'_> {
-    /// Spawn a shell in a new tab sized to the current grid, wire its reader
-    /// and exit watcher, and make it the active tab.
-    fn spawn_tab(&mut self) -> Result<(), std::io::Error> {
-        let handle = self.backend.spawn_shell(self.cols, self.rows, self.config.shell.as_deref())?;
+    /// Spawn one shell sized `cols × rows`, wire its reader + exit-watcher
+    /// threads (which signal by pane id), and return the pane.
+    fn new_pane(&mut self, cols: u16, rows: u16) -> Result<Pane, std::io::Error> {
+        let handle = self.backend.spawn_shell(cols, rows, self.config.shell.as_deref())?;
         let id = self.next_id;
         self.next_id += 1;
 
-        let mut g = Grid::new(self.cols as usize, self.rows as usize);
+        let mut g = Grid::new(cols as usize, rows as usize);
         if let Some(max) = self.config.scrollback {
             g.set_scrollback_max(max);
         }
@@ -251,7 +272,7 @@ impl App<'_> {
         let parser = Arc::new(Mutex::new(AnsiParser::with_theme(self.theme)));
 
         // Reader thread: PTY -> parser -> grid, writing replies back and waking
-        // the loop. Uses independent handle clones so it shares no lock with us.
+        // the loop. Independent handle clones so it shares no lock with us.
         let read_handle = handle.try_clone()?;
         let reply_handle = handle.try_clone()?;
         let reader_grid = Arc::clone(&grid);
@@ -261,10 +282,9 @@ impl App<'_> {
             reader_loop(id, read_handle, reply_handle, reader_grid, reader_proxy, reader_parser)
         });
 
-        // Child-exit watcher. On Windows the ConPTY output pipe only EOFs at
-        // teardown, not when the shell exits, so read-EOF can't close the tab;
-        // block on the child process handle instead. `None` where read-EOF
-        // already signals exit (Unix), keeping this a no-op there.
+        // Child-exit watcher (Windows ConPTY: the output pipe only EOFs at
+        // teardown, so block on the child handle; `None` on Unix where read-EOF
+        // already signals exit).
         if let Some(wait) = handle.exit_token() {
             let exit_proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -272,8 +292,14 @@ impl App<'_> {
                 let _ = exit_proxy.send_event(UserEvent::Exit(id));
             });
         }
+        Ok(Pane { id, grid, parser, writer: handle })
+    }
 
-        self.tabs.push(Tab { id, grid, parser, writer: handle });
+    /// Open a new tab (one full-area pane) and make it active.
+    fn spawn_tab(&mut self) -> Result<(), std::io::Error> {
+        let pane = self.new_pane(self.cols, self.rows)?;
+        let focus = pane.id;
+        self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus });
         self.active = self.tabs.len() - 1;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -281,19 +307,71 @@ impl App<'_> {
         Ok(())
     }
 
-    /// Close the tab with `id` (idempotent: a stale exit event for an
-    /// already-closed tab is a no-op). Closing the last tab exits the app.
-    fn close_tab(&mut self, id: u64, event_loop: &ActiveEventLoop) {
-        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+    /// Split the active tab's focused pane, spawning a new shell beside it and
+    /// focusing it. `dir` is the divider orientation.
+    fn split_pane(&mut self, dir: Dir) {
+        let Ok(pane) = self.new_pane(self.cols.max(1), self.rows.max(1)) else {
             return;
         };
-        self.tabs.remove(idx); // drops the owning handle: PTY + child torn down
+        let new_id = pane.id;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let target = tab.focus;
+        tab.panes.push(pane);
+        tab.layout.split(target, new_id, dir);
+        tab.focus = new_id;
+        self.layout_panes(self.active);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Move focus to the next (`forward`) or previous pane of the active tab.
+    fn focus_pane(&mut self, forward: bool) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.focus = tab.layout.cycle(tab.focus, forward);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Close pane `id`: collapse its split into the sibling, or close the whole
+    /// tab when it was the last pane. Idempotent for stale exit events.
+    fn close_pane(&mut self, id: u64, event_loop: &ActiveEventLoop) {
+        let Some(ti) = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id)) else {
+            return;
+        };
+        let tab = &mut self.tabs[ti];
+        match tab.layout.close(id) {
+            None => {
+                self.close_tab_at(ti, event_loop);
+                return;
+            }
+            Some(next) => {
+                tab.panes.retain(|p| p.id != id); // drops the PTY handle
+                if tab.focus == id {
+                    tab.focus = next;
+                }
+            }
+        }
+        self.layout_panes(ti);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Remove the tab at `ti` (dropping all its panes). The last tab closes the
+    /// window.
+    fn close_tab_at(&mut self, ti: usize, event_loop: &ActiveEventLoop) {
+        self.tabs.remove(ti);
         if self.tabs.is_empty() {
             event_loop.exit();
             return;
         }
-        if idx < self.active {
-            self.active -= 1; // indices above the removed tab shifted down
+        if ti < self.active {
+            self.active -= 1;
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
@@ -302,27 +380,43 @@ impl App<'_> {
         }
     }
 
+    /// Resize tab `ti`'s panes (grids + PTYs) to their layout rectangles.
+    fn layout_panes(&mut self, ti: usize) {
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        let Some(tab) = self.tabs.get_mut(ti) else {
+            return;
+        };
+        for (id, r) in tab.layout.rects(area) {
+            if let Some(p) = tab.panes.iter_mut().find(|p| p.id == id) {
+                let (c, rw) = (r.cols.max(1) as u16, r.rows.max(1) as u16);
+                {
+                    let mut g = p.grid.lock();
+                    g.resize(c as usize, rw as usize);
+                    g.selection = None; // viewport changed; old coords are stale
+                }
+                let _ = p.writer.set_winsize(c, rw);
+            }
+        }
+    }
+
     /// Recompute the cell grid from the window's pixel size (minus the chrome
-    /// row) and inform every tab's child.
+    /// row) and relay it to every pane of every tab.
     fn apply_size(&mut self, px_w: u32, px_h: u32) {
         let cols = ((px_w as usize / self.cell_w).max(1)) as u16;
         let rows = (((px_h as usize / self.cell_h).saturating_sub(1)).max(1)) as u16;
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
             self.rows = rows;
-            for tab in &mut self.tabs {
-                let mut g = tab.grid.lock();
-                g.resize(cols as usize, rows as usize);
-                g.selection = None; // viewport changed; old selection coords are stale
-                drop(g);
-                let _ = tab.writer.set_winsize(cols, rows);
+            for ti in 0..self.tabs.len() {
+                self.layout_panes(ti);
             }
         }
     }
 
-    /// Paint the chrome bar + the active tab's grid through the renderer.
+    /// Paint the chrome bar + the active tab's panes through the renderer.
     fn redraw(&mut self) {
         let chrome = self.chrome_row();
+        let divider = mix(self.theme.bg, self.theme.fg, 60);
         let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
             return;
         };
@@ -330,10 +424,47 @@ impl App<'_> {
             return;
         };
         let size = window.inner_size();
-        let g = tab.grid.lock();
-        window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
-        let cursor_on = !g.cursor_blink || self.cursor_blink_on;
-        renderer.render(&g, &chrome, &mut self.font, size.width, size.height, cursor_on);
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        if let Some(p) = tab.focused() {
+            let g = p.grid.lock();
+            window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
+        }
+        // Lock each pane's grid for the frame, then hand the renderer offset views
+        // (the chrome bar occupies screen row 0, so panes start at row 1).
+        let blink = self.cursor_blink_on;
+        let focus = tab.focus;
+        let mut held = Vec::new();
+        for (id, r) in tab.layout.rects(area) {
+            if let Some(p) = tab.pane(id) {
+                held.push((p.grid.lock(), r, id == focus));
+            }
+        }
+        let frames: Vec<PaneFrame> = held
+            .iter()
+            .map(|(g, r, foc)| PaneFrame {
+                grid: g,
+                col0: r.col,
+                row0: r.row + 1,
+                focused: *foc,
+                cursor_on: blink,
+            })
+            .collect();
+        renderer.render(&frames, &chrome, &mut self.font, size.width, size.height, divider);
+    }
+
+    /// The active tab's focused pane — the input, cursor, and search target.
+    fn pane(&self) -> Option<&Pane> {
+        self.tabs.get(self.active).and_then(|t| t.focused())
+    }
+    fn pane_mut(&mut self) -> Option<&mut Pane> {
+        self.tabs.get_mut(self.active).and_then(|t| t.focused_mut())
+    }
+    /// Any pane by id across all tabs (reader/exit threads signal by pane id).
+    fn pane_by_id(&self, id: u64) -> Option<&Pane> {
+        self.tabs.iter().find_map(|t| t.pane(id))
+    }
+    fn pane_by_id_mut(&mut self, id: u64) -> Option<&mut Pane> {
+        self.tabs.iter_mut().find_map(|t| t.panes.iter_mut().find(|p| p.id == id))
     }
 
     /// Lay out the chrome bar for the current tabs/size: tab labels and the
@@ -348,7 +479,7 @@ impl App<'_> {
                 c.fg = self.theme.fg;
                 c.bg = bar_bg;
             }
-            let status = self.tabs.get(self.active).and_then(|t| t.grid.lock().search_status());
+            let status = self.pane().and_then(|p| p.grid.lock().search_status());
             let count = match status {
                 Some((cur, total)) => format!(" {cur}/{total} "),
                 None if query.is_empty() => String::new(),
@@ -384,8 +515,8 @@ impl App<'_> {
             // with the grid below; inactive ones sit dimmed on the bar.
             let (fg, bg) = if is_active { (self.theme.fg, self.theme.bg) } else { (dim_fg, bar_bg) };
             let title = {
-                let g = tab.grid.lock();
-                if g.title.is_empty() { format!("shell {}", i + 1) } else { g.title.clone() }
+                let label = tab.focused().map(|p| p.grid.lock().title.clone()).unwrap_or_default();
+                if label.is_empty() { format!("shell {}", i + 1) } else { label }
             };
             let label: String = format!(" {title} ").chars().take(TAB_CELLS).collect();
             let end = (col + TAB_CELLS).min(tab_limit);
@@ -471,14 +602,42 @@ impl App<'_> {
         if (y.max(0.0) as usize) < self.cell_h {
             return self.on_bar_click(x, event_loop);
         }
-        self.sel_anchor = Some(self.cell_at(x, y));
+        if let Some(id) = self.pane_under(x, y)
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.focus = id; // click focuses the pane under the pointer
+        }
+        self.sel_anchor = Some(self.cell_in_focused(x, y));
         self.selecting = true;
-        if let Some(tab) = self.tabs.get(self.active) {
-            tab.grid.lock().selection = None; // cleared until the drag moves
+        if let Some(p) = self.pane() {
+            p.grid.lock().selection = None; // cleared until the drag moves
         }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// The pane under pixel `(px, py)` in the active tab's grid area, if any.
+    fn pane_under(&self, px: f64, py: f64) -> Option<u64> {
+        let (col, row) = self.cell_at(px, py);
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        self.tabs.get(self.active)?.layout.pane_at(area, col, row)
+    }
+
+    /// Map pixel `(px, py)` to a cell within the *focused* pane, clamped to it.
+    fn cell_in_focused(&self, px: f64, py: f64) -> (usize, usize) {
+        let (col, row) = self.cell_at(px, py);
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        if let Some(tab) = self.tabs.get(self.active)
+            && let Some((_, r)) =
+                tab.layout.rects(area).into_iter().find(|(id, _)| *id == tab.focus)
+        {
+            return (
+                col.saturating_sub(r.col).min(r.cols.saturating_sub(1)),
+                row.saturating_sub(r.row).min(r.rows.saturating_sub(1)),
+            );
+        }
+        (col, row)
     }
 
     /// Dispatch a click on the chrome bar through the hit map.
@@ -523,9 +682,9 @@ impl App<'_> {
 
     /// Copy the active tab's selection to the system clipboard (Ctrl+Shift+C).
     fn copy_selection(&mut self) {
-        let Some(cb) = self.clipboard.as_mut() else { return };
-        let Some(tab) = self.tabs.get(self.active) else { return };
-        if let Some(text) = tab.grid.lock().selected_text() {
+        let Some(p) = self.pane() else { return };
+        let text = p.grid.lock().selected_text();
+        if let (Some(text), Some(cb)) = (text, self.clipboard.as_mut()) {
             let _ = cb.set_text(text);
         }
     }
@@ -536,8 +695,8 @@ impl App<'_> {
     /// background tabs are serviced too.
     fn service_clipboard(&mut self, id: u64) {
         let (set, query) = {
-            let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
-            let mut g = tab.grid.lock();
+            let Some(p) = self.pane_by_id(id) else { return };
+            let mut g = p.grid.lock();
             if g.clipboard_set.is_none() && !g.clipboard_query {
                 return;
             }
@@ -552,8 +711,8 @@ impl App<'_> {
             && let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
         {
             let reply = osc52_reply(&text);
-            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-                let _ = tab.writer.write(&reply);
+            if let Some(p) = self.pane_by_id_mut(id) {
+                let _ = p.writer.write(&reply);
             }
         }
     }
@@ -562,8 +721,8 @@ impl App<'_> {
     /// a tab's output, so background tabs notify too.
     fn service_notifications(&mut self, id: u64) {
         let notes = {
-            let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
-            let mut g = tab.grid.lock();
+            let Some(p) = self.pane_by_id(id) else { return };
+            let mut g = p.grid.lock();
             if g.notifications.is_empty() {
                 return;
             }
@@ -586,15 +745,17 @@ impl App<'_> {
                 }
             }
             Action::CloseTab => {
-                if let Some(tab) = self.tabs.get(self.active) {
-                    let id = tab.id;
-                    self.close_tab(id, event_loop);
+                if let Some(id) = self.tabs.get(self.active).map(|t| t.focus) {
+                    self.close_pane(id, event_loop);
                 }
             }
             Action::NextTab => self.cycle_tab(true),
             Action::PrevTab => self.cycle_tab(false),
             Action::OpenConfig => self.open_config(),
             Action::Search => self.start_search(),
+            Action::SplitRight => self.split_pane(Dir::Vertical),
+            Action::SplitDown => self.split_pane(Dir::Horizontal),
+            Action::FocusNext => self.focus_pane(true),
             Action::ScrollPageUp => self.scroll_key(false, true),
             Action::ScrollPageDown => self.scroll_key(false, false),
             Action::ScrollPromptUp => self.scroll_key(true, true),
@@ -626,8 +787,8 @@ impl App<'_> {
             }
             Key::Named(NamedKey::Enter) => {
                 let forward = !self.mods.shift_key();
-                if let Some(tab) = self.tabs.get(self.active) {
-                    tab.grid.lock().search_jump(forward);
+                if let Some(p) = self.pane() {
+                    p.grid.lock().search_jump(forward);
                 }
             }
             Key::Named(NamedKey::Backspace) => {
@@ -653,15 +814,15 @@ impl App<'_> {
     /// Re-run the active tab's search for the current query.
     fn run_search(&mut self) {
         let q = self.searching.clone().unwrap_or_default();
-        if let Some(tab) = self.tabs.get(self.active) {
-            tab.grid.lock().search(&q);
+        if let Some(p) = self.pane() {
+            p.grid.lock().search(&q);
         }
     }
 
     /// Clear the active tab's search highlights.
     fn grid_clear_search(&mut self) {
-        if let Some(tab) = self.tabs.get(self.active) {
-            tab.grid.lock().clear_search();
+        if let Some(p) = self.pane() {
+            p.grid.lock().clear_search();
         }
     }
 
@@ -684,10 +845,10 @@ impl App<'_> {
     /// Tell the IME where the text cursor is, so its candidate/composition popup
     /// appears at the terminal cursor rather than the window origin.
     fn update_ime_area(&self) {
-        let (Some(window), Some(tab)) = (&self.window, self.tabs.get(self.active)) else {
+        let (Some(window), Some(p)) = (&self.window, self.pane()) else {
             return;
         };
-        let (col, row) = tab.grid.lock().cursor;
+        let (col, row) = p.grid.lock().cursor;
         let x = (col * self.cell_w) as f64;
         // +1 cell row for the chrome bar above the grid.
         let y = ((row + 1) * self.cell_h) as f64;
@@ -704,9 +865,9 @@ impl App<'_> {
         if text.is_empty() {
             return;
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let bracketed = tab.grid.lock().bracketed_paste;
-        let _ = tab.writer.write(&encode_paste(&text, bracketed));
+        let Some(p) = self.pane_mut() else { return };
+        let bracketed = p.grid.lock().bracketed_paste;
+        let _ = p.writer.write(&encode_paste(&text, bracketed));
     }
 
     /// Encode a native mouse event as SGR/1006 and send it to the active tab's
@@ -715,19 +876,19 @@ impl App<'_> {
     /// whether bytes were sent, so the wheel path can fall back to local
     /// scrollback browsing when the child isn't tracking the mouse.
     fn report_mouse(&mut self, build: impl FnOnce(usize, usize) -> MouseEvent) -> bool {
-        let Some(tab) = self.tabs.get(self.active) else { return false };
-        let modes = tab.grid.lock().mouse_modes;
+        let Some(p) = self.pane() else { return false };
+        let modes = p.grid.lock().mouse_modes;
         if !modes.active() {
             return false;
         }
-        let (col, row) = self.cell_at(self.mouse_pos.0, self.mouse_pos.1);
+        let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
         let mut out = Vec::new();
         SgrEncoder::new(modes).write(build(col, row), &mut out);
         if out.is_empty() {
             return false;
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else { return false };
-        let _ = tab.writer.write(&out);
+        let Some(p) = self.pane_mut() else { return false };
+        let _ = p.writer.write(&out);
         true
     }
 
@@ -735,9 +896,9 @@ impl App<'_> {
     /// OS handler. Returns whether a link was opened, so a Ctrl+click can
     /// suppress the normal selection / mouse-report path.
     fn open_link_under_pointer(&self) -> bool {
-        let Some(tab) = self.tabs.get(self.active) else { return false };
-        let (col, row) = self.cell_at(self.mouse_pos.0, self.mouse_pos.1);
-        let url = tab.grid.lock().link_at(col, row).map(str::to_owned);
+        let Some(p) = self.pane() else { return false };
+        let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
+        let url = p.grid.lock().link_at(col, row).map(str::to_owned);
         url.is_some_and(|u| open_url(&u))
     }
 
@@ -745,9 +906,9 @@ impl App<'_> {
     /// (positive = up into history, negative = back toward the live bottom),
     /// clamped to the available history. Repaints if the view actually moved.
     fn scroll_active(&mut self, lines: isize) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(p) = self.pane() else { return };
         let moved = {
-            let mut g = tab.grid.lock();
+            let mut g = p.grid.lock();
             if lines >= 0 {
                 g.scroll_view_up(lines as usize)
             } else {
@@ -764,9 +925,9 @@ impl App<'_> {
     /// marks). Repaints if the view moved. Mirrors the TUI's scroll keys.
     fn scroll_key(&mut self, ctrl: bool, up: bool) {
         let page = (self.rows.saturating_sub(1)).max(1) as usize;
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(p) = self.pane() else { return };
         let moved = {
-            let mut g = tab.grid.lock();
+            let mut g = p.grid.lock();
             match (ctrl, up) {
                 (false, true) => g.scroll_view_up(page),
                 (false, false) => g.scroll_view_down(page),
@@ -782,8 +943,8 @@ impl App<'_> {
     /// Snap the active tab's viewport back to the live bottom (e.g. after the
     /// user types), repainting if it had been scrolled into history.
     fn snap_to_bottom(&mut self) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
-        if tab.grid.lock().reset_view()
+        let Some(p) = self.pane() else { return };
+        if p.grid.lock().reset_view()
             && let Some(window) = &self.window
         {
             window.request_redraw();
@@ -808,12 +969,14 @@ impl App<'_> {
             eprintln!("rusty_term: {w}");
         }
         for tab in &self.tabs {
-            let mut g = tab.grid.lock();
-            let old = tab.parser.lock().retheme(new.theme);
-            if old != new.theme {
-                g.retheme(&old, &new.theme);
+            for p in &tab.panes {
+                let mut g = p.grid.lock();
+                let old = p.parser.lock().retheme(new.theme);
+                if old != new.theme {
+                    g.retheme(&old, &new.theme);
+                }
+                g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
             }
-            g.set_scrollback_max(new.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX));
         }
         self.theme = new.theme;
         self.config = new;
@@ -899,8 +1062,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     /// for the next real event (no idle wakeups).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         const BLINK: Duration = Duration::from_millis(530);
-        let blinking = self.tabs.get(self.active).is_some_and(|t| {
-            let g = t.grid.lock();
+        let blinking = self.pane().is_some_and(|p| {
+            let g = p.grid.lock();
             g.cursor_blink && g.cursor_visible && g.view_offset == 0
         });
         if !blinking {
@@ -995,12 +1158,12 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 }
                 // While the IME is composing, it owns key input; don't also
                 // encode it (the committed text arrives via `WindowEvent::Ime`).
-                if self.tabs.get(self.active).is_some_and(|t| !t.grid.lock().ime_preedit.is_empty()) {
+                if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
                     return;
                 }
                 if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        let _ = tab.writer.write(&bytes);
+                    if let Some(p) = self.pane_mut() {
+                        let _ = p.writer.write(&bytes);
                     }
                     // Typing returns the view to the live bottom, as most
                     // terminals do, so the echoed input is visible.
@@ -1009,8 +1172,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
             WindowEvent::Ime(ime) => match ime {
                 Ime::Preedit(text, _) => {
-                    if let Some(tab) = self.tabs.get(self.active) {
-                        tab.grid.lock().ime_preedit = text;
+                    if let Some(p) = self.pane() {
+                        p.grid.lock().ime_preedit = text;
                     }
                     self.update_ime_area();
                     if let Some(window) = &self.window {
@@ -1018,16 +1181,16 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     }
                 }
                 Ime::Commit(text) => {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        tab.grid.lock().ime_preedit.clear();
-                        let _ = tab.writer.write(text.as_bytes());
+                    if let Some(p) = self.pane_mut() {
+                        p.grid.lock().ime_preedit.clear();
+                        let _ = p.writer.write(text.as_bytes());
                     }
                     self.snap_to_bottom();
                 }
                 Ime::Enabled => {}
                 Ime::Disabled => {
-                    if let Some(tab) = self.tabs.get(self.active) {
-                        tab.grid.lock().ime_preedit.clear();
+                    if let Some(p) = self.pane() {
+                        p.grid.lock().ime_preedit.clear();
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1053,10 +1216,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 }
                 if self.selecting
                     && let Some(anchor) = self.sel_anchor
-                    && let Some(tab) = self.tabs.get(self.active)
+                    && let Some(p) = self.pane()
                 {
-                    let head = self.cell_at(position.x, position.y);
-                    tab.grid.lock().selection = Some(Selection { anchor, head });
+                    let head = self.cell_in_focused(position.x, position.y);
+                    p.grid.lock().selection = Some(Selection { anchor, head });
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1115,13 +1278,13 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.service_notifications(id);
                 // Output on a background tab doesn't repaint; its bar label
                 // refreshes with the next frame the active tab causes.
-                if self.tabs.get(self.active).is_some_and(|t| t.id == id)
+                if self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
                     && let Some(window) = &self.window
                 {
                     window.request_redraw();
                 }
             }
-            UserEvent::Exit(id) => self.close_tab(id, event_loop),
+            UserEvent::Exit(id) => self.close_pane(id, event_loop),
             UserEvent::ConfigChanged => self.reload_config(),
         }
     }
