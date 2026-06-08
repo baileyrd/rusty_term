@@ -45,6 +45,9 @@ pub struct Config {
     pub font_bold_italic: Option<PathBuf>,
     /// Fallback font for glyphs the main font lacks (CJK, symbols, emoji).
     pub font_fallback: Option<PathBuf>,
+    /// Enable programming-font ligatures (GSUB `liga`/`calt`) in the windowed
+    /// front-end. Default on; ignored if the font has no ligatures.
+    pub ligatures: Option<bool>,
     /// Startup colors: default fg/bg/cursor and the 16-color ANSI palette.
     pub theme: Theme,
     /// Default cursor shape (windowed front-end). DECSCUSR can override it at
@@ -111,6 +114,7 @@ impl Config {
 # rows = 40
 # font = "C:\\Windows\\Fonts\\CascadiaMono.ttf"
 # font-size = 18
+# ligatures = false        # disable programming-font ligatures (default on)
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -349,6 +353,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("window", "font_fallback") => {
             cfg.font_fallback = Some(PathBuf::from(expect_str(key, value)?))
         }
+        ("window", "ligatures") => cfg.ligatures = Some(expect_bool(key, value)?),
         ("window", "font_size") => {
             let px = match value {
                 Value::Float(f) => f,
@@ -644,6 +649,16 @@ color15 = "ffffff"
         let (cfg, warns) = parse("[window]\nfont_size = 14\n");
         assert!(warns.is_empty());
         assert_eq!(cfg.font_size, Some(14.0));
+    }
+
+    #[test]
+    fn ligatures_key_parses() {
+        let (cfg, warns) = parse("[window]\nligatures = false\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.ligatures, Some(false));
+        // Unset by default (the front-end treats absence as enabled).
+        let (cfg2, _) = parse("[window]\ncols = 80\n");
+        assert_eq!(cfg2.ligatures, None);
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! later hands the buffer to `softbuffer` for presentation. Pixels are
 //! `0x00RRGGBB` (the format `softbuffer` expects).
 
+use std::rc::Rc;
+
 use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{Glyph, GlyphSource, Style};
@@ -133,19 +135,71 @@ pub(crate) fn draw_grid(
         }
     }
 
-    // Pass 2: glyphs.
-    for i in 0..grid.cols * grid.rows {
-        let (col, row) = (i % grid.cols, i / grid.cols);
+    // Ligature plan: per row, shape maximal runs of same-style, same-fg,
+    // single-width, printable, non-highlighted cells through the font's GSUB
+    // (liga/calt). `plan[i]` is the glyph drawn at cell `i` — a wide ligature
+    // glyph overdraws the cells it spans; `None` means draw nothing (blank, wide
+    // trailer, or a column consumed by a ligature to its left). Cursor/selection/
+    // search cells stay out of runs, so ligatures never split across them.
+    let mut plan: Vec<Option<Rc<Glyph>>> = vec![None; grid.cols * grid.rows];
+    let mut run: Vec<char> = Vec::new();
+    for row in 0..grid.rows {
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
-        if cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0) {
-            continue;
+        let cell_at = |col: usize| {
+            if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) }
+        };
+        let eligible = |col: usize, cell: &Cell| {
+            let special = !on_status
+                && (block_cursor(col, row) || inverted(col, row) || search_hl(col, row).is_some());
+            !special
+                && cell.flags & WIDE_TRAILER == 0
+                && cell.cluster == 0
+                && cell.ch != ' '
+                && char_width(cell.ch) == 1
+        };
+        let mut col = 0;
+        while col < grid.cols {
+            let cell = cell_at(col);
+            if !eligible(col, &cell) {
+                let blank = cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0);
+                plan[row * grid.cols + col] = (!blank).then(|| {
+                    let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+                    font.glyph(cell.ch, style)
+                });
+                col += 1;
+                continue;
+            }
+            let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+            let fg = cell.fg;
+            run.clear();
+            let mut end = col;
+            while end < grid.cols {
+                let c2 = cell_at(end);
+                let s2 = Style::new(c2.flags & ATTR_BOLD != 0, c2.flags & ATTR_ITALIC != 0);
+                if !eligible(end, &c2) || s2 != style || c2.fg != fg {
+                    break;
+                }
+                run.push(c2.ch);
+                end += 1;
+            }
+            let mut pos = col;
+            for (glyph, span) in font.shape(&run, style) {
+                plan[row * grid.cols + pos] = Some(glyph);
+                pos += span;
+            }
+            col = end;
         }
-        let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
-        let glyph = font.glyph(cell.ch, style);
+    }
+
+    // Pass 2: glyphs, from the ligature plan.
+    for (i, slot) in plan.iter().enumerate() {
+        let Some(glyph) = slot.as_ref() else { continue };
         if glyph.width == 0 {
             continue;
         }
+        let (col, row) = (i % grid.cols, i / grid.cols);
+        let on_status = status.is_some() && row == last_row;
+        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
         let fg = if !on_status && (block_cursor(col, row) || inverted(col, row)) {
             cell.bg
         } else if !on_status && search_hl(col, row).is_some() {
@@ -155,7 +209,7 @@ pub(crate) fn draw_grid(
         };
         let pen_x = ((col0 + col) * cw) as i32 + glyph.left;
         let pen_y = ((row0 + row) * ch) as i32 + baseline + glyph.top;
-        blit(buf, width, height, &glyph, pen_x, pen_y, fg);
+        blit(buf, width, height, glyph, pen_x, pen_y, fg);
     }
 
     // Pixel images (Sixel/Kitty) composited over their reserved half-block cells
@@ -391,7 +445,7 @@ mod tests {
             return;
         };
         let set = super::super::font::FontSet { regular: bytes, ..Default::default() };
-        let mut fc = super::super::font::FontCache::new(set, 16.0).unwrap();
+        let mut fc = super::super::font::FontCache::new(set, 16.0, false).unwrap();
         let (cw, chh) = fc.cell_size();
         let mut g = Grid::new(3, 1);
         let mut p = AnsiParser::new();
@@ -600,5 +654,42 @@ mod tests {
         // Col 0 inverted (red block), col 1 untouched (blue bg).
         assert_eq!(buf[0], 0xFF0000, "selected cell inverted");
         assert_eq!(buf[4], 0x0000FF, "unselected cell unchanged");
+    }
+
+    #[test]
+    fn ligatures_collapse_a_run_into_one_glyph() {
+        // The test font ligates `f i` -> `fi`; render "fi" with shaping on vs off
+        // and compare the second cell. (Generated by extra/gen_ligtest_font.py.)
+        let render_fi = |ligatures: bool| -> (Vec<u32>, usize, usize) {
+            let set = super::super::font::FontSet {
+                regular: include_bytes!("testdata/ligtest.ttf").to_vec(),
+                ..Default::default()
+            };
+            let mut fc = super::super::font::FontCache::new(set, 40.0, ligatures).unwrap();
+            let (cw, chh) = fc.cell_size();
+            let mut g = Grid::new(2, 1);
+            let mut p = AnsiParser::new();
+            p.advance(&mut g, b"fi");
+            let (w, h) = (cw * 2, chh);
+            let mut buf = vec![0u32; w * h];
+            draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut fc);
+            (buf, cw, chh)
+        };
+        // Count glyph (non-background) pixels in cell column `c`.
+        let nonbg = |buf: &[u32], cw: usize, chh: usize, c: usize| -> usize {
+            let (w, bg) = (cw * 2, buf[0]); // (0,0) is above the glyph -> background
+            (0..chh)
+                .flat_map(|y| (c * cw..(c + 1) * cw).map(move |x| y * w + x))
+                .filter(|&i| buf[i] != bg)
+                .count()
+        };
+        let (on, cw, chh) = render_fi(true);
+        let (off, _, _) = render_fi(false);
+        assert!(nonbg(&on, cw, chh, 0) > 0, "first cell renders (ligatures on)");
+        assert!(nonbg(&off, cw, chh, 0) > 0, "first cell renders (ligatures off)");
+        // With ligatures the run collapses to one glyph, leaving the 2nd cell empty.
+        assert_eq!(nonbg(&on, cw, chh, 1), 0, "ligature consumes the second cell");
+        // Without ligatures, the second cell renders its own glyph.
+        assert!(nonbg(&off, cw, chh, 1) > 0, "no ligature: second cell renders");
     }
 }

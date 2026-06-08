@@ -16,7 +16,7 @@ l13 = ["dep:rusty_lsp", "dep:serde_json"]
 # Native window backend (the tcore-font/tcore-app fork): a standalone window
 # instead of rendering into a host terminal. winit for windowing/input,
 # softbuffer for CPU presentation, ab_glyph for glyph rasterization.
-gui = ["dep:ab_glyph", "dep:winit", "dep:softbuffer", "dep:arboard"]
+gui = ["dep:ab_glyph", "dep:ttf-parser", "dep:winit", "dep:softbuffer", "dep:arboard"]
 # Adds the wgpu GPU renderer alongside the CPU (softbuffer) one.
 gui-gpu = ["gui", "dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
@@ -36,6 +36,10 @@ tokio = { version = "1", default-features = false, features = [
 rusty_lsp = { path = "../rusty_lsp", optional = true }
 serde_json = { version = "1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
+# Reading the font's GSUB table for ligature shaping. Already in the tree via
+# ab_glyph -> owned_ttf_parser, so this adds no new compiled crate; we only
+# enable opentype-layout (a default feature) and a direct path to it.
+ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["opentype-layout"] }
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 # System clipboard for the window backend's copy/paste (cross-platform).

@@ -21,6 +21,7 @@ mod input;
 mod layout;
 mod mouse;
 mod render;
+mod shape;
 mod window;
 
 pub use window::run;

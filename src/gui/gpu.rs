@@ -601,7 +601,7 @@ mod tests {
             eprintln!("no system font; skipping GPU core test");
             return;
         };
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0).unwrap();
+        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(core) = GpuCore::new(&instance, None, &mut font) else {
             eprintln!("no wgpu adapter; skipping GPU core test");
@@ -619,7 +619,7 @@ mod tests {
     #[ignore = "render+readback needs a working GPU adapter; lavapipe/dzn crash headless"]
     fn gpu_renders_to_texture() {
         let bytes = super::super::font::load_default_font(None).unwrap();
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0).unwrap();
+        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut core = GpuCore::new(&instance, None, &mut font).expect("adapter");
 

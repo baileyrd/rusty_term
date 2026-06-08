@@ -128,7 +128,8 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         config.font_fallback.as_deref(),
     )
     .ok_or("no monospace font found")?;
-    let font = FontCache::new(font_set, font_px).ok_or("font failed to parse")?;
+    let ligatures = config.ligatures.unwrap_or(true);
+    let font = FontCache::new(font_set, font_px, ligatures).ok_or("font failed to parse")?;
     let (cell_w, cell_h) = font.cell_size();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

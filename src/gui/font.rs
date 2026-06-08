@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont};
+
+use super::shape::Shaper;
 
 /// A rasterized glyph: a `width × height` 8-bit coverage (alpha) bitmap plus its
 /// placement relative to the cell pen origin (left edge, text baseline).
@@ -72,6 +74,14 @@ pub(crate) trait GlyphSource {
     fn baseline(&self) -> i32;
     /// The (cached) rasterized glyph for `ch` in `style`.
     fn glyph(&mut self, ch: char, style: Style) -> Rc<Glyph>;
+    /// Shape a run of cells (same style, single-width, printable) into a sequence
+    /// of `(glyph, span)`, where `span` is the number of cells the glyph covers
+    /// (>1 for a ligature). The summed spans equal `text.len()`. The default maps
+    /// each char to its own glyph — no ligatures; [`FontCache`] overrides it with
+    /// GSUB shaping.
+    fn shape(&mut self, text: &[char], style: Style) -> Vec<(Rc<Glyph>, usize)> {
+        text.iter().map(|&c| (self.glyph(c, style), 1)).collect()
+    }
 }
 
 /// A glyph cache over `ab_glyph` fonts at a fixed pixel size, with bold/italic
@@ -80,6 +90,9 @@ pub(crate) struct FontCache {
     /// `[Regular, Bold, Italic, BoldItalic]`; index 0 is always present, the
     /// others fall back to Regular when a variant font wasn't provided.
     faces: [Option<FontVec>; 4],
+    /// Per-face GSUB ligature shapers (same indexing as `faces`); `None` when the
+    /// face has no `liga`/`calt` lookups or ligatures are disabled.
+    shapers: [Option<Shaper>; 4],
     /// Fonts tried in order when the chosen face lacks a glyph (CJK, symbols, …).
     fallback: Vec<FontVec>,
     scale: PxScale,
@@ -87,22 +100,51 @@ pub(crate) struct FontCache {
     cell_h: usize,
     baseline: i32,
     cache: HashMap<(char, Style), Rc<Glyph>>,
+    /// Glyphs rasterized by glyph id (ligatures / contextual substitutions),
+    /// which the `(char, Style)` cache can't key.
+    gid_cache: HashMap<(u16, Style), Rc<Glyph>>,
 }
 
 impl FontCache {
     /// Build a cache from a [`FontSet`] at a `px` pixel size. Cell metrics come
     /// from the regular face. `None` if the regular bytes aren't a usable font.
-    pub(crate) fn new(set: FontSet, px: f32) -> Option<Self> {
+    pub(crate) fn new(set: FontSet, px: f32, ligatures: bool) -> Option<Self> {
+        let mut shapers: [Option<Shaper>; 4] = [None, None, None, None];
+        if ligatures {
+            shapers[0] = Shaper::new(set.regular.clone());
+        }
         let regular = FontVec::try_from_vec(set.regular).ok()?;
         let scale = PxScale::from(px);
         let scaled = regular.as_scaled(scale);
         let cell_w = scaled.h_advance(regular.glyph_id('M')).ceil().max(1.0) as usize;
         let cell_h = (scaled.ascent() - scaled.descent() + scaled.line_gap()).ceil().max(1.0) as usize;
         let baseline = scaled.ascent().ceil() as i32;
-        let parse = |b: Option<Vec<u8>>| b.and_then(|b| FontVec::try_from_vec(b).ok());
-        let faces = [Some(regular), parse(set.bold), parse(set.italic), parse(set.bold_italic)];
+        // Parse a styled variant, building its GSUB shaper from the same bytes.
+        let styled = |slot: usize, bytes: Option<Vec<u8>>, sh: &mut [Option<Shaper>; 4]| {
+            let bytes = bytes?;
+            if ligatures {
+                sh[slot] = Shaper::new(bytes.clone());
+            }
+            FontVec::try_from_vec(bytes).ok()
+        };
+        let faces = [
+            Some(regular),
+            styled(1, set.bold, &mut shapers),
+            styled(2, set.italic, &mut shapers),
+            styled(3, set.bold_italic, &mut shapers),
+        ];
         let fallback = set.fallback.into_iter().filter_map(|b| FontVec::try_from_vec(b).ok()).collect();
-        Some(FontCache { faces, fallback, scale, cell_w, cell_h, baseline, cache: HashMap::new() })
+        Some(FontCache {
+            faces,
+            shapers,
+            fallback,
+            scale,
+            cell_w,
+            cell_h,
+            baseline,
+            cache: HashMap::new(),
+            gid_cache: HashMap::new(),
+        })
     }
 
     /// The face that has a glyph for `ch` in `style`: the styled face (or regular
@@ -115,6 +157,26 @@ impl FontCache {
             return styled;
         }
         self.fallback.iter().find(|f| f.glyph_id(ch).0 != 0).unwrap_or(styled)
+    }
+
+    /// The face index used to shape and render `style`: the styled face if
+    /// present, else regular (index 0). Shaping (cmap + GSUB) and outlining must
+    /// use the same face so glyph ids line up.
+    fn eff_face(&self, style: Style) -> usize {
+        if self.faces[style as usize].is_some() { style as usize } else { 0 }
+    }
+
+    /// Rasterize and cache a glyph by glyph id (ligatures / contextual
+    /// substitutions, which the `(char, Style)` cache can't key), outlined from
+    /// face `eff`.
+    fn glyph_by_gid(&mut self, gid: u16, eff: usize, style: Style) -> Rc<Glyph> {
+        if let Some(g) = self.gid_cache.get(&(gid, style)) {
+            return Rc::clone(g);
+        }
+        let face = self.faces[eff].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
+        let g = Rc::new(rasterize_id(face, self.scale, GlyphId(gid)));
+        self.gid_cache.insert((gid, style), Rc::clone(&g));
+        g
     }
 }
 
@@ -135,12 +197,44 @@ impl GlyphSource for FontCache {
         self.cache.insert((ch, style), Rc::clone(&g));
         g
     }
+
+    fn shape(&mut self, text: &[char], style: Style) -> Vec<(Rc<Glyph>, usize)> {
+        let eff = self.eff_face(style);
+        // Glyph ids via the effective face's cmap (the same face GSUB indexes).
+        let face = self.faces[eff].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
+        let gids: Vec<u16> = text.iter().map(|&c| face.glyph_id(c).0).collect();
+        let shaped: Vec<(u16, u8)> = match self.shapers[eff].as_ref() {
+            Some(sh) => sh.shape(&gids),
+            None => gids.iter().map(|&g| (g, 1)).collect(),
+        };
+        let mut out = Vec::with_capacity(shaped.len());
+        let mut src = 0usize;
+        for (gid, span) in shaped {
+            let span = span as usize;
+            // Unchanged glyphs (and fallback chars, gid 0 in this face) go through
+            // the full per-char path so the CJK/symbol fallback chain still works;
+            // substitutions and ligatures rasterize by their shaped glyph id.
+            let glyph = if (span == 1 && gid == gids[src]) || gid == 0 {
+                self.glyph(text[src], style)
+            } else {
+                self.glyph_by_gid(gid, eff, style)
+            };
+            out.push((glyph, span));
+            src += span;
+        }
+        out
+    }
 }
 
-/// Rasterize `ch` to a coverage bitmap; whitespace and unoutlined glyphs yield
-/// an empty bitmap.
+/// Rasterize `ch` to a coverage bitmap (whitespace / unoutlined glyphs yield an
+/// empty bitmap), via its glyph id.
 fn rasterize(font: &FontVec, scale: PxScale, ch: char) -> Glyph {
-    let glyph = font.glyph_id(ch).with_scale(scale);
+    rasterize_id(font, scale, font.glyph_id(ch))
+}
+
+/// Rasterize a glyph id to a coverage bitmap.
+fn rasterize_id(font: &FontVec, scale: PxScale, id: GlyphId) -> Glyph {
+    let glyph = id.with_scale(scale);
     let Some(outlined) = font.outline_glyph(glyph) else {
         return Glyph::blank();
     };
@@ -268,7 +362,7 @@ mod tests {
             return;
         };
         let mut fc =
-            FontCache::new(FontSet { regular: bytes, ..Default::default() }, 18.0).expect("font parses");
+            FontCache::new(FontSet { regular: bytes, ..Default::default() }, 18.0, false).expect("font parses");
         let (w, h) = fc.cell_size();
         assert!(w > 0 && h > 0, "cell size must be positive: {w}x{h}");
         assert!(fc.baseline() > 0);
