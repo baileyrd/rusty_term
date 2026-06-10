@@ -334,7 +334,10 @@ pub struct MouseModes {
 }
 
 impl MouseModes {
-    /// Whether any mouse reporting is active.
+    /// Whether any mouse reporting is active. Consumed by the windowed
+    /// front-end's mouse path (and tests); the TUI relays mouse modes to the
+    /// host instead of acting on them.
+    #[cfg(any(test, feature = "gui"))]
     pub fn active(self) -> bool {
         self.base != 0
     }

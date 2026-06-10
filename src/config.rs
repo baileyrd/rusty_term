@@ -78,7 +78,12 @@ impl Config {
                 }
                 (cfg, warnings)
             }
-            Err(e) if explicit => (
+            // A genuinely missing default-path file is the normal case (start
+            // with defaults, no noise). But anything else — an explicit path
+            // that won't read, or a default-path file that exists yet is
+            // unreadable/permission-denied — is worth a warning so it isn't
+            // silently ignored.
+            Err(e) if explicit || e.kind() != std::io::ErrorKind::NotFound => (
                 Config::default(),
                 vec![format!("config {}: {}", path.display(), e)],
             ),
@@ -100,6 +105,7 @@ impl Config {
 
     /// A commented starter config, written when the open-config shortcut
     /// targets a file that doesn't exist yet.
+    #[cfg(feature = "gui")]
     pub fn template() -> &'static str {
         r##"# rusty_term configuration. Saving this file applies theme and
 # scrollback changes to running instances immediately; shell, font,
@@ -171,6 +177,7 @@ fn default_config_dir() -> Option<PathBuf> {
 /// exist. Detached — the editor is not a child we wait on. `$VISUAL`/`$EDITOR`
 /// win when set; else the platform opener (`start`/`open`/`xdg-open`) routes
 /// to the user's associated editor.
+#[cfg(feature = "gui")]
 pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
     if !path.exists() {
         if let Some(dir) = path.parent() {
@@ -203,6 +210,7 @@ pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
 /// A double-quoted TOML string literal for `s`, escaping the backslash, quote,
 /// tab, newline, and CR that [`parse_value`] understands — so a Windows path
 /// like `C:\Foo\bar.exe` round-trips through the config file unmangled.
+#[cfg(any(feature = "gui", test))]
 pub(crate) fn toml_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -227,6 +235,7 @@ pub(crate) fn toml_string(s: &str) -> String {
 /// controls a `Some` value when the key is absent: `true` adds it, `false`
 /// leaves it out — so a setting left at its built-in default updates an existing
 /// line but never adds noise to a file that never mentioned it.
+#[cfg(any(feature = "gui", test))]
 pub(crate) struct SettingEdit {
     pub section: &'static str,
     pub key: &'static str,
@@ -238,6 +247,7 @@ pub(crate) struct SettingEdit {
 /// formatting, and every key the settings page doesn't manage (fonts, custom
 /// colors, keybindings). Creates the file (and parent dirs) from the commented
 /// [`Config::template`] when absent. The live-reload watcher re-reads the save.
+#[cfg(feature = "gui")]
 pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> std::io::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -257,6 +267,7 @@ pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> st
 /// a value and `insert`, creating the section header if needed. Comments, blank
 /// lines, and unmanaged keys are preserved verbatim. Pure (no I/O) so it is
 /// unit-tested directly.
+#[cfg(any(feature = "gui", test))]
 fn upsert(text: &str, edits: &[SettingEdit]) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let mut done = vec![false; edits.len()];
@@ -346,6 +357,7 @@ fn upsert(text: &str, edits: &[SettingEdit]) -> String {
 
 /// The lowercased name inside a `[section]` header line, or `None` when `line`
 /// (already trimmed) isn't a well-formed header. Mirrors [`parse`]'s rule.
+#[cfg(any(feature = "gui", test))]
 fn header_name(line: &str) -> Option<String> {
     let rest = line.strip_prefix('[')?;
     let (name, tail) = rest.split_once(']')?;
