@@ -34,12 +34,7 @@ use crate::core::{
 };
 
 use super::font::{FontCache, Glyph, GlyphSource, Style};
-use super::render::Renderer;
-
-/// Search-match highlight (matches [`super::cpu`]): amber match, orange active.
-const SEARCH_BG: u32 = 0xFFD24A;
-const SEARCH_CUR_BG: u32 = 0xFF7A1A;
-const SEARCH_FG: u32 = 0x101010;
+use super::render::{Renderer, SEARCH_BG, SEARCH_CUR_BG, SEARCH_FG};
 
 /// Atlas texture edge (clamped to the device limit at creation).
 const ATLAS_MAX: u32 = 2048;

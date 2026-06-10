@@ -129,8 +129,15 @@ impl Settings {
         match field {
             Field::Theme => self.theme = wrap(self.theme, config::PRESETS.len(), forward),
             Field::FontSize => {
-                let step = if forward { 1.0 } else { -1.0 };
-                self.font_size = (self.font_size + step).clamp(FONT_MIN, FONT_MAX);
+                // Step to the next whole point. A config-seeded fractional size
+                // (e.g. 18.5) would otherwise stay fractional forever; round
+                // toward the step direction so it lands on integers.
+                let next = if forward {
+                    (self.font_size + 1.0).floor()
+                } else {
+                    (self.font_size - 1.0).ceil()
+                };
+                self.font_size = next.clamp(FONT_MIN, FONT_MAX);
             }
             Field::Cursor => {
                 const ORDER: [CursorShape; 3] =
@@ -353,6 +360,22 @@ mod tests {
         assert!(s.ligatures());
         s.change(true);
         assert!(!s.ligatures());
+    }
+
+    #[test]
+    fn font_step_rounds_a_fractional_seed_to_integers() {
+        let mut s = Settings::new(
+            &Theme::default(), 18.5, CursorShape::Block, false, true, SCROLLBACK_MAX, None, &shells(),
+        );
+        s.sel = 1; // Font size
+        s.change(true);
+        assert_eq!(s.font_size(), 19.0, "stepping up lands on a whole point");
+        let mut s = Settings::new(
+            &Theme::default(), 18.5, CursorShape::Block, false, true, SCROLLBACK_MAX, None, &shells(),
+        );
+        s.sel = 1;
+        s.change(false);
+        assert_eq!(s.font_size(), 18.0, "stepping down lands on a whole point");
     }
 
     #[test]
