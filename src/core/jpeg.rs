@@ -366,6 +366,11 @@ fn parse_sos(seg: &[u8], comps: &mut [Component]) -> Option<()> {
     for s in 0..ns {
         let cs = seg[1 + s * 2];
         let tdta = seg[2 + s * 2];
+        // The selectors index `[Huff; 4]` tables in decode_scan; the byte can
+        // claim 0..=15, so reject out-of-range values here rather than panic.
+        if (tdta >> 4) > 3 || (tdta & 0x0F) > 3 {
+            return None;
+        }
         let comp = comps.iter_mut().find(|c| c.id == cs)?;
         comp.td = (tdta >> 4) as usize;
         comp.ta = (tdta & 0x0F) as usize;

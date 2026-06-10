@@ -86,6 +86,10 @@ pub struct AnsiParser {
     utf8_acc: u32,
     /// Number of UTF-8 continuation bytes still expected.
     utf8_remaining: usize,
+    /// Smallest scalar the in-flight sequence's length may legally encode.
+    /// Anything below it is an overlong form — rejected, or a sequence like
+    /// `E0 80 9B` would smuggle a raw ESC past the parser into a cell.
+    utf8_min: u32,
     /// Bytes the parser owes the host in reply to a query (DA1/DA2/DSR). The
     /// driver drains these via [`AnsiParser::take_responses`] after each
     /// `advance` and writes them back to the PTY master, where the child reads
@@ -167,6 +171,7 @@ impl AnsiParser {
             csi_intermediate: 0,
             utf8_acc: 0,
             utf8_remaining: 0,
+            utf8_min: 0,
             responses: Vec::new(),
             osc_buffer: Vec::new(),
             dcs_buffer: Vec::new(),
@@ -215,7 +220,11 @@ impl AnsiParser {
                         self.utf8_acc = (self.utf8_acc << 6) | (b as u32 & 0x3f);
                         self.utf8_remaining -= 1;
                         if self.utf8_remaining == 0 {
-                            let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
+                            // `from_u32` rejects surrogates and > U+10FFFF; the
+                            // minimum check rejects overlong encodings.
+                            let ch = char::from_u32(self.utf8_acc)
+                                .filter(|_| self.utf8_acc >= self.utf8_min)
+                                .unwrap_or('\u{FFFD}');
                             g.put_char(ch, self.pen);
                             self.last_char = Some(ch);
                             self.state = ParserState::Ground;
@@ -592,16 +601,19 @@ impl AnsiParser {
             0xc2..=0xdf => {
                 self.utf8_acc = (b as u32) & 0x1f;
                 self.utf8_remaining = 1;
+                self.utf8_min = 0x80;
                 self.state = ParserState::Utf8;
             }
             0xe0..=0xef => {
                 self.utf8_acc = (b as u32) & 0x0f;
                 self.utf8_remaining = 2;
+                self.utf8_min = 0x800;
                 self.state = ParserState::Utf8;
             }
             0xf0..=0xf4 => {
                 self.utf8_acc = (b as u32) & 0x07;
                 self.utf8_remaining = 3;
+                self.utf8_min = 0x10000;
                 self.state = ParserState::Utf8;
             }
             // Stray continuation or otherwise invalid lead byte.

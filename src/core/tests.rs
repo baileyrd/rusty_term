@@ -783,6 +783,35 @@ fn utf8_truncated_then_ascii_recovers() {
 }
 
 #[test]
+fn utf8_overlong_yields_replacement() {
+    // E0 80 9B is an overlong encoding of ESC (0x1B). Accepting it would put a
+    // raw control scalar in a cell — an escape-injection vector once the
+    // renderer replays cell text to the host terminal.
+    let g = parse(b"\xe0\x80\x9bX", 80, 24);
+    assert_eq!(g.cells[0].ch, '\u{FFFD}');
+    assert_eq!(g.cells[1].ch, 'X');
+    // The largest overlong values each length admits (C0/C1 leads are already
+    // rejected, so 2-byte overlongs can't begin; test 3- and 4-byte forms).
+    let g = parse(b"\xe0\x9f\xbfX", 80, 24); // U+07FF in three bytes
+    assert_eq!(g.cells[0].ch, '\u{FFFD}');
+    let g = parse(b"\xf0\x8f\xbf\xbfX", 80, 24); // U+FFFF in four bytes
+    assert_eq!(g.cells[0].ch, '\u{FFFD}');
+    assert_eq!(g.cells[1].ch, 'X');
+    // The boundary values themselves still decode.
+    let g = parse("\u{800}\u{10000}".as_bytes(), 80, 24);
+    assert_eq!(g.cells[0].ch, '\u{800}');
+    assert_eq!(g.cells[1].ch, '\u{10000}');
+}
+
+#[test]
+fn wide_glyph_in_one_column_grid_does_not_panic() {
+    // A width-2 glyph can never fit in a 1-column grid; the cursor must still
+    // stay within the row (it used to run past it and index out of bounds).
+    let g = parse("世界世界".as_bytes(), 1, 3);
+    assert!(g.cursor.0 <= 1, "cursor past the row: {:?}", g.cursor);
+}
+
+#[test]
 fn escape_sequence_split_across_chunks() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
@@ -2660,6 +2689,16 @@ fn jpeg_rejects_unsupported() {
 }
 
 #[test]
+fn jpeg_rejects_out_of_range_huffman_selectors() {
+    // Patch the scan header's Huffman-table selector byte to 0xFF (td=15,
+    // ta=15): decode must return None, not index past the [Huff; 4] tables.
+    let mut data = base64::decode(GRAY8_B64.as_bytes()).unwrap();
+    let sos = data.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    data[sos + 6] = 0xFF; // marker(2) + len(2) + ns(1) + cs(1) -> td/ta
+    assert!(jpeg::decode(&data).is_none());
+}
+
+#[test]
 fn iterm2_inline_jpeg_renders_image() {
     // OSC 1337 ; File=inline=1 : <base64 JPEG> BEL
     let mut input = b"\x1b]1337;File=inline=1:".to_vec();
@@ -3337,6 +3376,17 @@ fn is_selected_includes_full_intermediate_rows() {
     assert!(!g.is_selected(4, 0), "before the start col on the start row");
     assert!(!g.is_selected(2, 2), "after the end col on the end row");
     assert!(g.is_selected(1, 2), "the end cell is inclusive");
+}
+
+#[test]
+fn selection_in_scrolled_history_copies_viewport_text() {
+    // "one" scrolls into history on a 2-row grid. Scrolled back one line, the
+    // top viewport row shows "one"; selecting it must copy that history line,
+    // not whatever the live grid holds at the same coordinates ("two").
+    let mut g = parse(b"one\r\ntwo\r\nthree", 10, 2);
+    assert!(g.scroll_view_up(1));
+    g.selection = Some(Selection { anchor: (0, 0), head: (4, 0) });
+    assert_eq!(g.selected_text().as_deref(), Some("one"));
 }
 
 #[test]
