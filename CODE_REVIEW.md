@@ -15,6 +15,36 @@ real programs, and structural debt in the GUI layer.
 
 ---
 
+## Status (resolved vs. deferred)
+
+**Fixed**, each with a regression test where testable, verified against the default
+build, `--features gui`/`gui-gpu`, and the `x86_64-pc-windows-gnu` target:
+
+- All five high-severity bugs (H1–H3 here, plus the bracketed-paste sanitizer bypass
+  and the scrolled-history selection mismatch).
+- Core protocol/robustness: colon-form (ISO 8613-6) SGR, CSI parameter-buffer cap,
+  `CSI 3 J` scrollback erase, JPEG SOS-vs-SOF validation, Kitty over-cap transmission
+  reporting failure instead of rendering a truncated buffer.
+- Runtime/backend (Unix): `ShutdownOnDrop` guard so a task panic can't wedge the
+  terminal in raw mode; shell spawned before the runtime starts (single-threaded
+  fork); failed `execvp` now reports to the terminal and exits 127; `FD_CLOEXEC` on
+  the PTY master and dups.
+- Config: warn on an unreadable default-path config; gui-only write-back code gated
+  (default build is now warning-clean); atomic settings write (temp + rename).
+- Windows backend: HRESULT→`io::Error` mapping, pipe-leak on the second `CreatePipe`
+  failure, stale resize comment.
+- GUI: glyph atlas recycles when full instead of rendering blank forever; settings
+  font-size step rounds a fractional seed; shared search-highlight constants.
+
+**Deferred** (need visual verification or a large refactor, tracked below): the
+dirty-tracking GUI repaint optimization (M1), the `window.rs` split (ST1), the
+CPU/GPU per-cell resolution dedup beyond the shared constants (ST2), and the minor
+cosmetic GUI items (wide chrome-glyph clipping, tiny-window row math). The `l13`
+resize-write path (M4) is gated behind a feature that can't build without the private
+`rusty_lsp` sibling crate, so it's left for when that dependency is resolved (B1).
+
+---
+
 ## 1. Build & packaging
 
 ### B1 (high) — A fresh clone cannot build at all
