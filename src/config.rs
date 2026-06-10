@@ -366,7 +366,12 @@ pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> st
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, updated)
+    // Write to a sibling temp file then rename: the live-reload watcher (and
+    // any concurrent loader) polls this path, so an atomic replace avoids it
+    // ever observing a half-written config.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, updated)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Upsert `edits` into config `text`: each setting's existing active `key = …`
