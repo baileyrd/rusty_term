@@ -1897,14 +1897,17 @@ impl Grid {
                 },
             );
         }
-        self.cursor.0 += w;
+        // `cols` (one past the last column) is the pending-wrap position; a
+        // glyph wider than the grid itself (w=2, cols=1) must not push past it,
+        // or later column arithmetic indexes outside the row.
+        self.cursor.0 = (self.cursor.0 + w).min(self.cols);
     }
 
     /// The base cell of the grapheme immediately left of the cursor, stepping
     /// back over a wide glyph's trailer to its head. `None` at column 0.
     fn left_base(&self) -> Option<(usize, usize)> {
         let (cx, cy) = self.cursor;
-        if cy >= self.rows || cx == 0 {
+        if cy >= self.rows || cx == 0 || cx > self.cols {
             return None;
         }
         let left = cx - 1;
@@ -1924,10 +1927,15 @@ impl Grid {
         s.graphemes(true).count() == 1
     }
 
-    /// The full glyph text at `(x, y)`: the base scalar plus any interned
-    /// grapheme continuation.
+    /// The full glyph text at `(x, y)` of the live grid: the base scalar plus
+    /// any interned grapheme continuation.
     fn glyph_text(&self, x: usize, y: usize) -> String {
-        let cell = self.cells[y * self.cols + x];
+        self.cell_text(self.cells[y * self.cols + x])
+    }
+
+    /// The full glyph text of `cell` (live or scrollback — the cluster table is
+    /// shared): the base scalar plus any interned grapheme continuation.
+    fn cell_text(&self, cell: Cell) -> String {
         let mut s = String::new();
         s.push(cell.ch);
         if cell.cluster != 0

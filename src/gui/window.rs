@@ -3212,9 +3212,16 @@ impl ApplicationHandler<UserEvent> for App<'_> {
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
+        // Strip until no marker remains: a single pass is bypassable, since
+        // removing one occurrence can splice a new one together (e.g.
+        // `ESC[2` + `ESC[201~` + `01~` re-forms the end marker).
+        let mut text = text;
+        while text.contains("\x1b[201~") {
+            text = text.replace("\x1b[201~", "");
+        }
         let mut out = Vec::with_capacity(text.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
+        out.extend_from_slice(text.as_bytes());
         out.extend_from_slice(b"\x1b[201~");
         out
     } else {
@@ -3500,6 +3507,19 @@ mod tests {
     fn bracketed_paste_wraps_and_strips_end_marker() {
         // An embedded end marker must not close the bracket early.
         assert_eq!(encode_paste("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
+    }
+
+    #[test]
+    fn bracketed_paste_strips_spliced_end_marker() {
+        // Removing one marker can splice a new one together; the sanitizer
+        // must iterate until none remain or the bracket closes early.
+        let out = encode_paste("\x1b[2\x1b[201~01~rm -rf ~", true);
+        let body = &out[6..out.len() - 6];
+        assert!(
+            !body.windows(6).any(|w| w == b"\x1b[201~"),
+            "end marker survived sanitization: {:?}",
+            String::from_utf8_lossy(body)
+        );
     }
 
     #[test]

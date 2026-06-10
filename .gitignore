@@ -1,4 +1,6 @@
 /target
 .gitnexus
+# Serena MCP tool metadata
+.serena/
 # WSL/NTFS download metadata (alternate data streams)
 *:Zone.Identifier
