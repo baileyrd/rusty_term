@@ -50,6 +50,10 @@ pub(crate) struct Transmission {
     /// `d` for `a=d`: the delete scope letter.
     delete: u8,
     payload: Vec<u8>,
+    /// Set when a chunk would push the payload past [`MAX_PAYLOAD`]. The rest
+    /// of the transmission is still consumed, but the final chunk reports
+    /// failure instead of decoding a silently truncated payload.
+    truncated: bool,
 }
 
 /// Process one Kitty APC command — `apc` is the bytes between `ESC _` and `ST`,
@@ -111,14 +115,20 @@ pub(crate) fn feed(t: &mut Transmission, apc: &[u8], g: &mut Grid, responses: &m
 
     if t.payload.len().saturating_add(payload.len()) <= MAX_PAYLOAD {
         t.payload.extend_from_slice(payload);
+    } else {
+        t.truncated = true;
     }
     if more {
         return; // await the final chunk
     }
 
-    // Final chunk: act on the completed command.
+    // Final chunk: act on the completed command. An over-cap transmission is
+    // a clean failure, not a render of whatever prefix happened to fit.
     let ok = match t.action {
         b'q' => true, // query: we speak the protocol
+        // Data-bearing actions refuse a truncated (over-cap) transmission and
+        // report failure, rather than decoding a silently clipped payload.
+        b'T' | b't' | b'f' if t.truncated => false,
         b'T' => {
             // Transmit-and-display: store (so later `a=p`/frames can refer
             // to it) and place at the cursor — or virtually with `U=1`.
