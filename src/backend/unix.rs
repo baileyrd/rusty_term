@@ -30,6 +30,16 @@ impl crate::backend::Backend for UnixBackend {
             .and_then(|s| std::ffi::CString::new(s).ok())
             .unwrap_or_else(|| std::ffi::CString::new("/bin/bash").unwrap());
 
+        // Diagnostic for a failed exec, assembled here (pre-fork) so the
+        // child's post-fork path only does async-signal-safe work (write(2)).
+        // CRLF because the host terminal is already in raw mode by now.
+        let exec_err = {
+            let mut m = b"rusty_term: failed to start shell '".to_vec();
+            m.extend_from_slice(shell.as_bytes());
+            m.extend_from_slice(b"'\r\n");
+            m
+        };
+
         unsafe {
             // Seed the PTY with the initial window size so the child shell and
             // its children start out knowing the geometry.
@@ -55,6 +65,12 @@ impl crate::backend::Backend for UnixBackend {
             if rc < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+
+            // Don't leak the master into shells spawned later (e.g. the GUI's
+            // "open in editor"): a held dup would keep this PTY alive past exit.
+            // The child closes master explicitly and uses dup2 for std{in,out,
+            // err} (dup2 clears CLOEXEC on its targets), so this is safe.
+            libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
 
             let pid = libc::fork();
             if pid == -1 {
@@ -82,8 +98,16 @@ impl crate::backend::Backend for UnixBackend {
                 let args = [shell.as_ptr(), std::ptr::null()];
                 libc::execvp(shell.as_ptr(), args.as_ptr());
 
-                // Only reached if exec failed.
-                libc::_exit(1);
+                // Only reached if exec failed. Tell the user on the terminal
+                // (write(2) is async-signal-safe) rather than vanishing with a
+                // bare exit, then use 127 — the conventional "command not
+                // found" code — so the wait status is diagnosable.
+                libc::write(
+                    libc::STDERR_FILENO,
+                    exec_err.as_ptr() as *const libc::c_void,
+                    exec_err.len(),
+                );
+                libc::_exit(127);
             }
 
             // Parent: close the slave, keep the master.
@@ -195,6 +219,9 @@ impl crate::backend::BackendHandle for UnixHandle {
         if dup_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // Keep the no-leak-into-later-children property across dups too (dup(2)
+        // does not copy the flag).
+        unsafe { libc::fcntl(dup_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         Ok(Box::new(UnixHandle {
             fd: dup_fd,
             child: None,

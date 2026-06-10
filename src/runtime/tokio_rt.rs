@@ -36,6 +36,24 @@ use std::io::Read;
 #[cfg(windows)]
 use std::time::Duration;
 
+/// Signals the render loop to stop when a task ends — on its own, the task's
+/// `running.store(false)` + `frame.notify_one()` only run after the loop body,
+/// so a panic anywhere inside (e.g. in the untrusted-byte parser) would skip
+/// them and leave the main `select!` waiting forever with the host terminal
+/// stuck in raw mode. As a `Drop` guard this fires on every exit, panic
+/// included.
+struct ShutdownOnDrop {
+    running: Arc<AtomicBool>,
+    frame: Arc<Notify>,
+}
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.frame.notify_one();
+    }
+}
+
 /// A PTY master descriptor registered with the reactor that does **not** close
 /// the fd on drop — ownership stays with the `BackendHandle` that produced it,
 /// which closes it. `AsyncFd<FdRef>` only deregisters from the reactor on drop.
@@ -149,11 +167,18 @@ pub fn run(
     init_rows: u16,
     config: crate::config::Config,
 ) -> std::io::Result<()> {
+    // Spawn the shell *before* the runtime exists. On Unix this keeps the
+    // fork single-threaded: POSIX only guarantees async-signal-safe calls
+    // between fork and exec in a multithreaded process, and a worker thread
+    // holding e.g. the malloc lock at fork time could otherwise deadlock the
+    // child. `reader` owns the master/ConPTY + child and reaps it on drop.
+    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    rt.block_on(run_async(backend, grid, init_cols, init_rows, config))
+    rt.block_on(run_async(backend, reader, grid, config))
 }
 
 /// Live config reload for the TUI: watch the config file and, on each save,
@@ -186,18 +211,17 @@ fn watch_config(parser: Arc<Mutex<AnsiParser>>, grid: Arc<Mutex<Grid>>, frame: A
 #[cfg(unix)]
 async fn run_async(
     backend: Box<dyn Backend>,
+    reader: Box<dyn crate::backend::BackendHandle>,
     grid: Arc<Mutex<Grid>>,
-    init_cols: u16,
-    init_rows: u16,
     config: crate::config::Config,
 ) -> std::io::Result<()> {
     // Raw mode for the host terminal; restored on drop (any exit path).
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
-    // `reader` owns the master fd + child and reaps it on drop; keeping it in
-    // this top-level future means the child is reaped on every exit path.
-    // Independent dups feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+    // `reader` (the shell, spawned before the runtime started) owns the master
+    // fd + child and reaps it on drop; keeping it in this top-level future
+    // means the child is reaped on every exit path. Independent dups feed the
+    // read, write, and resize paths.
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
@@ -229,6 +253,12 @@ async fn run_async(
         let frame = Arc::clone(&frame);
         let parser = Arc::clone(&parser);
         tokio::spawn(async move {
+            // Wakes the render loop on every exit from this task — including a
+            // panic in `parser.advance` on hostile child bytes.
+            let _shutdown = ShutdownOnDrop {
+                running: Arc::clone(&running),
+                frame: Arc::clone(&frame),
+            };
             // Keep the read dup alive for the task; `master` deregisters before
             // it (declared after, dropped first) so the fd is still open then.
             let _read_handle = read_handle;
@@ -261,8 +291,7 @@ async fn run_async(
                     Err(_would_block) => continue, // readiness was spurious
                 }
             }
-            running.store(false, Ordering::Relaxed);
-            frame.notify_one();
+            // `_shutdown` signals the render loop on drop.
         })
     };
 
@@ -272,22 +301,18 @@ async fn run_async(
         let running = Arc::clone(&running);
         let frame = Arc::clone(&frame);
         tokio::spawn(async move {
+            let _shutdown = ShutdownOnDrop {
+                running: Arc::clone(&running),
+                frame: Arc::clone(&frame),
+            };
             let _write_handle = write_handle;
             let tty = match open_tty_nonblocking().and_then(AsyncFd::new) {
                 Ok(t) => t,
-                Err(_) => {
-                    running.store(false, Ordering::Relaxed);
-                    frame.notify_one();
-                    return;
-                }
+                Err(_) => return,
             };
             let writer = match AsyncFd::new(FdRef(write_fd)) {
                 Ok(w) => w,
-                Err(_) => {
-                    running.store(false, Ordering::Relaxed);
-                    frame.notify_one();
-                    return;
-                }
+                Err(_) => return,
             };
             loop {
                 let mut guard = match tty.readable().await {
@@ -333,8 +358,7 @@ async fn run_async(
                     Err(_would_block) => continue,
                 }
             }
-            running.store(false, Ordering::Relaxed);
-            frame.notify_one();
+            // `_shutdown` signals the render loop on drop.
         })
     };
 
@@ -415,16 +439,15 @@ async fn run_async(
 #[cfg(windows)]
 async fn run_async(
     backend: Box<dyn Backend>,
+    reader: Box<dyn crate::backend::BackendHandle>,
     grid: Arc<Mutex<Grid>>,
-    init_cols: u16,
-    init_rows: u16,
     config: crate::config::Config,
 ) -> std::io::Result<()> {
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
-    // `reader` owns the ConPTY + child and reaps it on drop; independent dups
-    // feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+    // `reader` (the shell, spawned before the runtime started) owns the
+    // ConPTY + child and reaps it on drop; independent dups feed the read,
+    // write, and resize paths.
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
