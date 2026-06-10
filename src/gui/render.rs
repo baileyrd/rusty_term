@@ -14,6 +14,12 @@ use crate::core::{Cell, Grid};
 use super::cpu;
 use super::font::{FontCache, GlyphSource};
 
+/// Search-match highlight, shared by both renderers: amber for a match, orange
+/// for the active one, with a dark glyph so text stays legible on either.
+pub(super) const SEARCH_BG: u32 = 0xFFD24A;
+pub(super) const SEARCH_CUR_BG: u32 = 0xFF7A1A;
+pub(super) const SEARCH_FG: u32 = 0x101010;
+
 /// One pane to paint this frame: its `grid` at cell offset `(col0, row0)`,
 /// sized to the grid's own `cols × rows`. `focused` gates the cursor/IME
 /// preedit (only the focused pane shows them); `cursor_on` is the blink phase.

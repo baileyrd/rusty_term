@@ -16,12 +16,7 @@ use winit::window::Window;
 use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{FontCache, GlyphSource, Style};
-
-/// Search-match highlight (matches [`super::cpu`]): amber match, orange active.
-const SEARCH_BG: u32 = 0xFFD24A;
-const SEARCH_CUR_BG: u32 = 0xFF7A1A;
-const SEARCH_FG: u32 = 0x101010;
-use super::render::Renderer;
+use super::render::{Renderer, SEARCH_BG, SEARCH_CUR_BG, SEARCH_FG};
 
 /// Square slot grid in the atlas: up to `SLOTS_PER_ROW²` distinct glyphs.
 const SLOTS_PER_ROW: u32 = 32;

@@ -9,12 +9,7 @@ use std::rc::Rc;
 use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
 
 use super::font::{Glyph, GlyphSource, Style};
-
-/// Search-match highlight: amber for a match, orange for the active one, with a
-/// dark glyph so text stays legible on either.
-const SEARCH_BG: u32 = 0xFFD24A;
-const SEARCH_CUR_BG: u32 = 0xFF7A1A;
-const SEARCH_FG: u32 = 0x101010;
+use super::render::{SEARCH_BG, SEARCH_CUR_BG, SEARCH_FG};
 
 /// Composite the grid's visible cells into `buf` (`width × height` pixels,
 /// `len() == width * height`). Each cell is filled with its background, then its
