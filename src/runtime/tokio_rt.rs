@@ -41,12 +41,15 @@ use std::time::Duration;
 /// so a panic anywhere inside (e.g. in the untrusted-byte parser) would skip
 /// them and leave the main `select!` waiting forever with the host terminal
 /// stuck in raw mode. As a `Drop` guard this fires on every exit, panic
-/// included.
+/// included. (Unix only — the Windows path bridges through blocking threads
+/// and channels rather than these reactor-driven tasks.)
+#[cfg(unix)]
 struct ShutdownOnDrop {
     running: Arc<AtomicBool>,
     frame: Arc<Notify>,
 }
 
+#[cfg(unix)]
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);

@@ -9,7 +9,8 @@
 //!
 //! NOTE: run and verified on Windows 11 (build 26200) — shell spawn, child
 //! `TERM`/`COLORTERM`, bidirectional relay, and OSC title capture all work.
-//! Host resize propagation is a known gap (no `SIGWINCH` equivalent is wired).
+//! Host resize propagation is wired through a console-size poll in the runtime
+//! (there is no `SIGWINCH` equivalent); see `runtime::tokio_rt`.
 
 use crate::backend::{Backend, BackendHandle};
 use parking_lot::Mutex;
@@ -39,6 +40,20 @@ pub struct WindowsBackend;
 /// Tuple is `(stdin_mode, stdout_mode)`.
 static ORIGINAL_MODES: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
+/// Render a ConPTY HRESULT as an `io::Error`. `CreatePseudoConsole` and
+/// `ResizePseudoConsole` return HRESULTs, not Win32 error codes; an
+/// `HRESULT_FROM_WIN32` value (`0x8007xxxx`) carries the real Win32 code in its
+/// low 16 bits, which `from_raw_os_error` renders correctly. Passing the raw
+/// HRESULT straight through (as before) produced a garbled message.
+fn hresult_to_io_error(hr: i32) -> std::io::Error {
+    let u = hr as u32;
+    if u >> 16 == 0x8007 {
+        std::io::Error::from_raw_os_error((u & 0xFFFF) as i32)
+    } else {
+        std::io::Error::from_raw_os_error(hr)
+    }
+}
+
 impl Backend for WindowsBackend {
     fn spawn_shell(
         &self,
@@ -55,10 +70,15 @@ impl Backend for WindowsBackend {
             let mut input_write: HANDLE = std::ptr::null_mut();
             let mut output_read: HANDLE = std::ptr::null_mut();
             let mut output_write: HANDLE = std::ptr::null_mut();
-            if CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) == 0
-                || CreatePipe(&mut output_read, &mut output_write, std::ptr::null(), 0) == 0
-            {
+            if CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) == 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if CreatePipe(&mut output_read, &mut output_write, std::ptr::null(), 0) == 0 {
+                // The first pipe succeeded; don't leak its ends on this path.
+                let e = std::io::Error::last_os_error();
+                CloseHandle(input_read);
+                CloseHandle(input_write);
+                return Err(e);
             }
 
             // Allocate the pseudoconsole over the child-side pipe ends.
@@ -74,7 +94,7 @@ impl Backend for WindowsBackend {
             if hr != 0 {
                 CloseHandle(input_write);
                 CloseHandle(output_read);
-                return Err(std::io::Error::from_raw_os_error(hr));
+                return Err(hresult_to_io_error(hr));
             }
 
             // Build STARTUPINFOEXW carrying the pseudoconsole attribute.
@@ -336,7 +356,7 @@ impl BackendHandle for WindowsHandle {
         };
         let hr = unsafe { ResizePseudoConsole(self.hpc, size) };
         if hr != 0 {
-            return Err(std::io::Error::from_raw_os_error(hr));
+            return Err(hresult_to_io_error(hr));
         }
         Ok(())
     }
