@@ -293,14 +293,30 @@ impl GpuCore {
     }
 
     /// Ensure `ch` has an atlas slot, rasterizing+uploading its cell tile on
-    /// first use. Returns the slot (slot 0 if the atlas is full).
+    /// first use. Returns the slot.
     fn ensure_slot(&mut self, ch: char, style: Style, font: &mut FontCache) -> u32 {
         if let Some(&s) = self.slots.get(&(ch, style)) {
             return s;
         }
         if self.next_slot >= SLOTS_PER_ROW * SLOTS_PER_ROW {
-            return 0;
+            // Atlas full: recycle it wholesale rather than rendering every
+            // further glyph blank forever. The visible working set re-populates
+            // over the next frames; the blank tile goes back to slot 0. (A
+            // single frame with >1024 distinct glyph+style pairs can briefly
+            // show a stale tile, self-correcting on the next frame — far better
+            // than the previous permanent blanking.)
+            self.slots.clear();
+            self.next_slot = 0;
+            self.alloc_slot(' ', Style::Regular, font);
+            if ch == ' ' && style == Style::Regular {
+                return 0;
+            }
         }
+        self.alloc_slot(ch, style, font)
+    }
+
+    /// Rasterize and upload `ch` into the next free atlas slot, recording it.
+    fn alloc_slot(&mut self, ch: char, style: Style, font: &mut FontCache) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;
         let tile = cell_tile(font, ch, style, self.cell_w as usize, self.cell_h as usize);
