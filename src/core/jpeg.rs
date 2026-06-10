@@ -360,7 +360,9 @@ fn parse_sos(seg: &[u8], comps: &mut [Component]) -> Option<()> {
         return None;
     }
     let ns = seg[0] as usize;
-    if ns == 0 || seg.len() < 1 + ns * 2 + 3 {
+    // A baseline JPEG has exactly one scan covering every frame component; a
+    // scan listing fewer/more would decode with stale selector defaults.
+    if ns == 0 || ns != comps.len() || seg.len() < 1 + ns * 2 + 3 {
         return None;
     }
     for s in 0..ns {

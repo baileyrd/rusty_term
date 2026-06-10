@@ -104,6 +104,41 @@ fn sgr_truecolor_and_256() {
 }
 
 #[test]
+fn sgr_colon_subparameters() {
+    // ISO 8613-6 colon forms (libvte et al.): both must set the color and not
+    // leak the tail onto the screen as the old `;`-only parser did.
+    let g = parse(b"\x1b[38:2:10:20:30mX", 80, 24);
+    assert_eq!(g.cells[0].fg, 0x0A141E);
+    assert_eq!(g.cells[1].ch, ' ', "no leaked tail");
+
+    let g = parse(b"\x1b[48:5:15mY", 80, 24);
+    assert_eq!(g.cells[0].bg, 0xFFFFFF);
+
+    // T.416 form with a colorspace field between `2` and the RGB triple.
+    let g = parse(b"\x1b[38:2:0:10:20:30mZ", 80, 24);
+    assert_eq!(g.cells[0].fg, 0x0A141E);
+
+    // A colon group mixed with ordinary parameters: bold + colon-fg.
+    let g = parse(b"\x1b[1;38:5:1mW", 80, 24);
+    assert_eq!(g.cells[0].fg, PALETTE_16[1]);
+    assert_ne!(g.cells[0].flags & ATTR_BOLD, 0);
+}
+
+#[test]
+fn csi_param_buffer_is_bounded() {
+    // An unterminated CSI with a huge digit run must not grow without bound;
+    // the parser keeps consuming but caps storage, then recovers on a final
+    // byte and prints normally.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[");
+    let flood = vec![b'1'; 1_000_000];
+    p.advance(&mut g, &flood);
+    p.advance(&mut g, b"mX"); // SGR final byte then a printable
+    assert_eq!(g.cells[0].ch, 'X');
+}
+
+#[test]
 fn cursor_position_is_clamped() {
     let g = parse(b"\x1b[999;999H", 80, 24);
     assert_eq!(g.cursor, (79, 23));
@@ -141,6 +176,22 @@ fn erase_display_full() {
     p.advance(&mut g, b"\x1b[2J");
     assert_eq!(g.cells[0].ch, ' ');
     assert_eq!(g.cursor, (0, 0));
+}
+
+#[test]
+fn erase_display_3_clears_scrollback() {
+    // Scroll a few lines into history, then `CSI 3 J` (xterm "erase saved
+    // lines"). `2 J` leaves history; `3 J` must drop it.
+    let mut g = Grid::new(10, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"a\r\nb\r\nc\r\nd");
+    assert!(!g.scrollback.is_empty(), "lines scrolled into history");
+
+    p.advance(&mut g, b"\x1b[2J");
+    assert!(!g.scrollback.is_empty(), "2J keeps scrollback");
+
+    p.advance(&mut g, b"\x1b[3J");
+    assert!(g.scrollback.is_empty(), "3J erases scrollback");
 }
 
 #[test]
@@ -2799,6 +2850,29 @@ fn kitty_chunked_transmission_accumulates() {
     p.advance(&mut g, b"\x1b_Gm=0;/w==\x1b\\");
     assert_eq!(g.cells[0].ch, '\u{2580}');
     assert_eq!(g.cells[0].fg, 0xFF0000);
+}
+
+#[test]
+fn kitty_oversized_chunk_reports_failure_not_truncated_render() {
+    // Payload accumulated across chunks past the 8 MiB cap must abort cleanly
+    // (EBADF), not render whatever prefix fit. Each chunk stays under the
+    // parser's 4 MiB per-APC cap; three of them overflow the kitty cap.
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    let chunk = vec![b'A'; 3 * 1024 * 1024];
+    let mut first = b"\x1b_Gf=32,s=1,v=1,a=T,i=7,m=1;".to_vec();
+    first.extend_from_slice(&chunk);
+    first.extend_from_slice(b"\x1b\\");
+    p.advance(&mut g, &first);
+    for _ in 0..2 {
+        let mut more = b"\x1b_Gm=1;".to_vec();
+        more.extend_from_slice(&chunk);
+        more.extend_from_slice(b"\x1b\\");
+        p.advance(&mut g, &more);
+    }
+    p.advance(&mut g, b"\x1b_Gm=0;\x1b\\"); // final chunk
+    assert_eq!(g.cells[0].ch, ' ', "no image rendered from truncated payload");
+    assert_eq!(p.take_responses(), b"\x1b_Gi=7;EBADF\x1b\\");
 }
 
 #[test]

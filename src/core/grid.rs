@@ -1301,6 +1301,17 @@ impl Grid {
         self.cursor = (0, 0);
     }
 
+    /// Erase saved lines (xterm `ED 3`): drop the scrollback history, the
+    /// prompt marks that index into it, and any scrolled view of it. The
+    /// visible screen is untouched — `ED 3` callers pair this with
+    /// [`Grid::clear_all`].
+    pub(crate) fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.prompt_marks.clear();
+        self.view_offset = 0;
+        self.dirty.iter_mut().for_each(|d| *d = true);
+    }
+
     /// A blank cell painted in the current default colors — the fill used by
     /// every erase / scroll-clear path, so a default background set via OSC 11
     /// applies to cleared regions, not only to text.
