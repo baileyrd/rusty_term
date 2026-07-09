@@ -82,6 +82,10 @@ cargo run --features l13
 | `--gpu` | `gui-gpu`   | Use the `wgpu` GPU renderer in the window (CPU fallback on failure). |
 | `--config <path>` | — | Read the configuration file from `<path>` (see below). |
 | `--list-shells` | — | Print the shells detected on this machine and exit. |
+| `--cwd <dir>` / `--starting-directory <dir>` | — | Starting working directory for the spawned shell. A missing directory fails the spawn cleanly (nonzero exit) rather than crashing. |
+| `--title <t>` | `gui` | Seed the window's initial title; the child's own OSC 0/2 title still wins once it emits one. |
+| `--maximized` / `--fullscreen` | `gui` | Open the window maximized or borderless-fullscreen. `--fullscreen` wins if both are given. |
+| `-- <prog> [args...]` (aliases: `-e`, `--command`) | — | Run `<prog>` with the given args instead of the configured/detected shell — everything after the token is passed through untouched, so it's also where a child's own flags go, e.g. `rusty_term --gui -- bash -lc 'echo hi; exec bash'`. |
 
 | Variable          | Effect |
 |-------------------|--------|

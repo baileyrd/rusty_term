@@ -129,6 +129,7 @@ impl Config {
 # shell = "pwsh"           # or "wsl", "powershell", a full path, ...
 # scrollback = 10000       # history line cap; 0 disables
 # theme = "gruvbox-dark"   # see README for the preset list
+# title = "naner: dev"     # initial window title; child OSC 0/2 still wins
 
 # [window]                 # windowed (--gui) front-end only
 # cols = 120
@@ -136,6 +137,7 @@ impl Config {
 # font = "C:\\Windows\\Fonts\\CascadiaMono.ttf"
 # font-size = 18
 # ligatures = false        # disable programming-font ligatures (default on)
+# launch_mode = "maximized" # or "fullscreen"
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
