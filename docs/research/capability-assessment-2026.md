@@ -334,6 +334,27 @@ from what the app expects, natively-GUI-mode-only.
 **Size** S · **Deps** `gui` feature.
 
 ### C12 — iTerm2 protocol: geometry hints + additional formats
+**Status: geometry hints done; GIF/WebP/progressive-JPEG deferred.**
+`Grid::render_image_sized` (`src/core/grid.rs`) generalizes the existing
+auto-fit `render_image` to accept explicit `target_cols`/`target_rows` and a
+`preserve_aspect` flag, "contain"-fitting within both when both are given
+and aspect is preserved, stretching to fill both exactly when it isn't.
+`core/iterm.rs`'s `resolve_dimension` parses each of iTerm2's `width=`/
+`height=` forms (bare cell count, `N%` of the terminal's current columns/
+rows, `Npx` converted via `Grid::cell_px` — `None` and left unresolved in
+TUI mode, which has no real pixel size to convert against — and `auto`) and
+`preserveAspectRatio=0/1`, wired through OSC 1337's `File=` handler.
+GIF/WebP/progressive-JPEG decode is **not** implemented: tracing through
+what each actually needs — animated GIF wants a frame-timer this
+synchronous decode-and-place path has nowhere to hook into; WebP (lossy or
+lossless) is a materially bigger from-scratch decoder than PNG/JPEG were,
+on par with a second image codec project rather than a wave item;
+progressive JPEG needs multi-scan coefficient accumulation the current
+single-scan baseline decoder isn't structured for — showed each is its own
+project-sized effort, not a shared afternoon's work the way the three were
+bundled in the original sizing. Left for dedicated future items rather than
+rushed.
+
 **Current.** `docs/FEATURES.md` #14 notes that OSC 1337's
 `width`/`height`/`preserveAspectRatio` geometry hints go unhonored, and that
 only PNG + baseline JPEG decode (via the from-scratch `core/{iterm,jpeg}.rs`
@@ -346,8 +367,9 @@ stack) — no GIF, no WebP, no progressive JPEG.
 genuinely differentiated (a from-scratch decoder, no image crates); these
 are the specific documented edges left short of full protocol compliance.
 
-**Size** M · **Deps** none beyond the existing `core/iterm.rs`,
-`core/jpeg.rs`.
+**Size** M for the geometry hints (done); GIF/WebP/progressive-JPEG each
+revised to roughly **L** on their own once actually scoped · **Deps** none
+beyond the existing `core/iterm.rs`, `core/jpeg.rs`.
 
 ---
 

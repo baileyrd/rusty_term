@@ -3,7 +3,7 @@ use super::color::*;
 use super::grid::*;
 use super::parser::*;
 use super::sixel::{SixelImage, decode};
-use super::{base64, inflate, jpeg, png};
+use super::{base64, inflate, iterm, jpeg, png};
 
 fn parse(input: &[u8], cols: usize, rows: usize) -> Grid {
     let mut g = Grid::new(cols, rows);
@@ -3109,6 +3109,91 @@ fn iterm2_large_image_payload_is_not_truncated() {
     assert_ne!(g.cells[bottom].ch, ' '); // an image actually rendered there
     assert_eq!(g.cells[bottom].fg, gref.cells[bottom].fg);
     assert_eq!(g.cells[0].fg, gref.cells[0].fg);
+}
+
+#[test]
+fn iterm2_resolve_dimension_cells_percent_px_and_auto() {
+    assert_eq!(iterm::resolve_dimension("10", 80, Some(9)), Some(10));
+    assert_eq!(iterm::resolve_dimension("50%", 80, Some(9)), Some(40));
+    assert_eq!(iterm::resolve_dimension("90px", 80, Some(9)), Some(10));
+    // A pixel hint with no known cell pixel size (TUI mode) can't resolve.
+    assert_eq!(iterm::resolve_dimension("90px", 80, None), None);
+    assert_eq!(iterm::resolve_dimension("auto", 80, Some(9)), None);
+    assert_eq!(iterm::resolve_dimension("AUTO", 80, Some(9)), None);
+    assert_eq!(iterm::resolve_dimension("garbage", 80, Some(9)), None);
+}
+
+#[test]
+fn iterm2_width_hint_shrinks_the_image_footprint() {
+    // Natural size is 8x8 (one cell column per pixel column): unhinted, all
+    // 8 columns of row 0 get painted.
+    let g = parse(
+        &[b"\x1b]1337;File=inline=1:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        20,
+        10,
+    );
+    assert_ne!(g.cells[7].ch, ' ');
+
+    // width=4 shrinks the footprint to 4 columns; nothing past it is touched.
+    let g = parse(
+        &[b"\x1b]1337;File=inline=1;width=4:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        20,
+        10,
+    );
+    assert_ne!(g.cells[3].ch, ' ');
+    assert_eq!(g.cells[4].ch, ' ');
+}
+
+#[test]
+fn iterm2_height_hint_shrinks_the_row_footprint() {
+    // Natural 8px tall -> 4 cell rows unhinted.
+    let g = parse(
+        &[b"\x1b]1337;File=inline=1:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        20,
+        10,
+    );
+    assert_ne!(g.cells[3 * 20].ch, ' ');
+
+    // height=2 shrinks it to 2 cell rows; row 2 onward is never touched.
+    let g = parse(
+        &[b"\x1b]1337;File=inline=1;height=2:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        20,
+        10,
+    );
+    assert_ne!(g.cells[20].ch, ' '); // row 1 painted
+    assert_eq!(g.cells[2 * 20].ch, ' '); // row 2 untouched
+}
+
+#[test]
+fn iterm2_preserve_aspect_ratio_zero_stretches_to_both_axes() {
+    // Both width and height hints, aspect off: the footprint is exactly
+    // width x height cells (5 cols x 3 rows), not "contain"-fit.
+    let g = parse(
+        &[
+            b"\x1b]1337;File=inline=1;width=5;height=3;preserveAspectRatio=0:".as_slice(),
+            GRAY8_B64.as_bytes(),
+            b"\x07",
+        ]
+        .concat(),
+        20,
+        10,
+    );
+    assert_ne!(g.cells[4].ch, ' '); // col 4 (5th column) painted
+    assert_eq!(g.cells[5].ch, ' '); // col 5 not
+    assert_ne!(g.cells[2 * 20].ch, ' '); // row 2 (3rd row) painted
+    assert_eq!(g.cells[3 * 20].ch, ' '); // row 3 not
+}
+
+#[test]
+fn render_image_sized_contain_fits_within_both_axes_preserving_aspect() {
+    // A 4x2 source (2:1) into a 4x8-cell requested box, aspect preserved:
+    // width is the binding constraint (scaling to 4 columns needs only 1
+    // cell row for a 2:1 source), so the much taller height budget goes
+    // unused rather than stretching the image to fill it.
+    let mut g = Grid::new(20, 10);
+    g.render_image_sized(4, 2, &[Some(0xFF0000); 8], Some(4), Some(8), true);
+    assert_ne!(g.cells[3].ch, ' '); // all 4 requested columns painted
+    assert_eq!(g.cells[20].ch, ' '); // only 1 cell row used, not 8
 }
 
 #[test]

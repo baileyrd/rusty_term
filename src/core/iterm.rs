@@ -3,11 +3,15 @@
 //! Only the inline-image subcommand is handled here; other `1337;` subcommands
 //! (SetUserVar, CurrentDir, shell integration, …) are ignored by the OSC
 //! dispatcher. The payload is a complete image file — PNG (via [`super::png`])
-//! or baseline JPEG (via [`super::jpeg`]) — decoded to pixels and handed to the
-//! shared [`Grid::render_image`] sink (half-block cells, plus the full-res
-//! overlay under the `gui` renderer). The display is auto-fit to the available
-//! columns like Sixel/Kitty; the optional `width`/`height`/`preserveAspectRatio`
-//! geometry hints are not honored yet.
+//! or baseline JPEG (via [`super::jpeg`]) — decoded to pixels and handed to
+//! [`Grid::render_image_sized`] (half-block cells, plus the full-res overlay
+//! under the `gui` renderer), honoring the `width`/`height`/
+//! `preserveAspectRatio` geometry hints when present; display auto-fits to
+//! the available columns otherwise, like Sixel/Kitty. GIF and WebP aren't
+//! decoded (no matches for either format's magic bytes below); animated GIF
+//! in particular would need a frame-timer this synchronous decode-and-place
+//! path has no way to drive, and WebP a decoder (lossy or lossless) this
+//! codebase doesn't have — both out of scope for now.
 
 use super::grid::Grid;
 use super::{base64, jpeg, png};
@@ -26,10 +30,20 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
     };
     // iTerm2 displays inline only when `inline=1`; absent/0 means a file
     // download, which a terminal emulator has no surface for.
-    let inline = args.split(';').any(|kv| {
-        kv.split_once('=')
-            .is_some_and(|(k, v)| k.eq_ignore_ascii_case("inline") && v == "1")
-    });
+    let mut inline = false;
+    let mut target_cols = None;
+    let mut target_rows = None;
+    let mut preserve_aspect = true;
+    for kv in args.split(';') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k {
+            "inline" => inline = v == "1",
+            "width" => target_cols = resolve_dimension(v, g.cols, g.cell_px.map(|(w, _)| w)),
+            "height" => target_rows = resolve_dimension(v, g.rows, g.cell_px.map(|(_, h)| h)),
+            "preserveAspectRatio" => preserve_aspect = v != "0",
+            _ => {}
+        }
+    }
     if !inline {
         return;
     }
@@ -61,5 +75,31 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
             }
         })
         .collect();
-    g.render_image(w, h, &pixels);
+    g.render_image_sized(w, h, &pixels, target_cols, target_rows, preserve_aspect);
+}
+
+/// Resolve an iTerm2 `width=`/`height=` value to a cell count along one axis:
+/// a bare integer is cells, `N%` a percentage of `axis_cells` (the terminal's
+/// current column or row count), `Npx` a pixel count converted via
+/// `axis_cell_px` (that axis's real cell size in pixels — `None` in TUI mode,
+/// where no real pixel size is ours to report, so a pixel hint can't be
+/// resolved and falls back to "unset"/auto). `auto` is `None` too — iTerm2's
+/// own spelling for "use the image's natural size here".
+pub(crate) fn resolve_dimension(spec: &str, axis_cells: usize, axis_cell_px: Option<u16>) -> Option<usize> {
+    if let Some(pct) = spec.strip_suffix('%') {
+        let p: f64 = pct.parse().ok()?;
+        return Some(((axis_cells as f64 * p / 100.0).round().max(1.0)) as usize);
+    }
+    if let Some(px) = spec.strip_suffix("px") {
+        let n: f64 = px.parse().ok()?;
+        let cell_px = axis_cell_px? as f64;
+        if cell_px <= 0.0 {
+            return None;
+        }
+        return Some(((n / cell_px).round().max(1.0)) as usize);
+    }
+    if spec.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    spec.parse::<usize>().ok()
 }
