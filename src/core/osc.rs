@@ -41,7 +41,7 @@ pub(crate) fn dispatch(
             {
                 g.title = text.to_string();
                 #[cfg(feature = "l13")]
-                super::channel::notify_resource_changed(g, super::channel::RES_TITLE, responses);
+                rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_TITLE, responses);
             }
         }
         // 1 sets the icon name only. We have no icon-name surface, so forward it
@@ -58,7 +58,7 @@ pub(crate) fn dispatch(
             {
                 g.cwd = text.to_string();
                 #[cfg(feature = "l13")]
-                super::channel::notify_resource_changed(g, super::channel::RES_CWD, responses);
+                rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_CWD, responses);
             }
         }
         // 8 sets/clears the active hyperlink: `8 ; params ; URI`. An empty URI
@@ -179,8 +179,8 @@ pub(crate) fn dispatch(
                     Some("D") => {
                         let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
                         g.command_finished(exit);
-                        super::channel::notify_command_finished(g, exit, responses);
-                        super::channel::notify_resource_changed(g, super::channel::RES_COMMAND, responses);
+                        rusty_term_l13::notify_command_finished(g, exit, responses);
+                        rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_COMMAND, responses);
                     }
                     _ => {}
                 }

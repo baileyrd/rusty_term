@@ -55,7 +55,7 @@ relays it through the parser into the host terminal. Before spawning, it sets
 |----------------|:-------:|--------------|
 | `gui`          |         | Native window backend: a `winit` window with a `softbuffer` CPU renderer, `ab_glyph` glyph rasterization, and `ttf-parser`-driven GSUB ligature shaping. |
 | `gui-gpu`      |         | Adds a `wgpu` GPU renderer (glyph atlas + instanced quads) alongside the CPU one. Implies `gui`. |
-| `l13`          |         | L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP plus LSP/ACP negotiation. Requires a sibling `rusty_lsp` checkout (see below). |
+| `l13`          |         | L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP plus LSP/ACP negotiation. Lives in its own crate (`l13/`, see below). |
 
 The runtime is always **tokio** — a single async reactor. On Unix it registers
 the PTY master + `/dev/tty` with the reactor (`AsyncFd` → mio → epoll) and takes
@@ -70,7 +70,7 @@ cargo run --features gui -- --gui
 # Native window, GPU renderer (falls back to CPU if no adapter).
 cargo run --features gui-gpu -- --gui --gpu
 
-# Structured side-channel (requires ../rusty_lsp; see below).
+# Structured side-channel (see below).
 cargo run --features l13
 ```
 
@@ -274,8 +274,14 @@ the child's stdin; terminals that don't understand the OSC ignore it. It hosts:
   a status-line overlay across the bottom row, honored by all three render paths;
 - **LSP** and **ACP** `initialize` negotiation endpoints.
 
-It reuses the JSON-RPC model and LSP types from the sibling `rusty_lsp` crate,
-so the feature expects a checkout at `../rusty_lsp` relative to this repo.
+It lives in its own workspace crate, `l13/` (package `rusty_term_l13`), addressed
+against a narrow `TerminalState` trait rather than this repo's `Grid` type
+directly — independently buildable and unit-tested with no dependency on
+`rusty_term` itself (`cargo test -p rusty_term_l13`); `Grid` implements the
+trait as a thin delegation layer (`src/core/grid.rs`). It reuses the JSON-RPC
+model and LSP types from `rusty_lsp`, pinned as a `git` dependency (tag
+`v0.1.0`) rather than a local path, so building `--features l13` needs
+network access but no sibling checkout.
 
 ## Repository layout
 
@@ -300,7 +306,6 @@ src/
     kitty.rs           Kitty graphics (APC) protocol
     iterm.rs           iTerm2 inline images (OSC 1337)
     base64/inflate/png/jpeg.rs   from-scratch image-decode stack (no crates)
-    channel.rs         L13 structured side-channel (feature `l13`)
     tests.rs           the core test suite
   render.rs          TUI-mode ANSI re-emission
   input.rs           TUI-mode input handling + scrollback keys
@@ -316,6 +321,8 @@ src/
     mouse.rs           pointer → SGR mouse-report encoding
     window.rs          winit event loop
   bin/bench_metrics.rs   grid-handoff microbenchmark
+l13/                 the `rusty_term_l13` workspace crate (feature `l13`)
+  src/lib.rs           L13 structured side-channel, against a TerminalState trait
 extra/
   rusty_term.terminfo
   shell-integration/   bash / zsh / fish / pwsh OSC 133 emitters

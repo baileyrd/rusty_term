@@ -255,7 +255,7 @@ pub struct Grid {
     /// because it must outlive any single channel OSC and ride alongside the grid
     /// state whose changes it reports.
     #[cfg(feature = "l13")]
-    pub(crate) channel: super::channel::ChannelState,
+    pub(crate) channel: rusty_term_l13::ChannelState,
     /// Optional status-line overlay set via the L13 `render` protocol; composited
     /// over the bottom row by every renderer. `None` (no allocation) when unset.
     status_line: Option<StatusLine>,
@@ -781,7 +781,7 @@ impl Grid {
             wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
             #[cfg(feature = "l13")]
-            channel: super::channel::ChannelState::default(),
+            channel: rusty_term_l13::ChannelState::default(),
             status_line: None,
             #[cfg(feature = "l13")]
             last_exit: None,
@@ -1984,7 +1984,7 @@ impl Grid {
     #[cfg(feature = "l13")]
     pub(crate) fn resize_notification(&self) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        super::channel::notify_resource_changed(self, super::channel::RES_DIMENSIONS, &mut buf);
+        rusty_term_l13::notify_resource_changed(self, rusty_term_l13::RES_DIMENSIONS, &mut buf);
         (!buf.is_empty()).then_some(buf)
     }
 
@@ -2340,6 +2340,77 @@ impl Grid {
         }
         self.links.push(uri.to_string());
         self.links.len() as u16
+    }
+}
+
+/// The narrow view of `Grid` the `l13` crate's protocol handlers see — they
+/// have no dependency on `Grid` itself, only on this trait, so the side-channel
+/// stays independently buildable/testable (see `l13/src/lib.rs`). Every method
+/// here delegates to an existing inherent method or field; this impl carries no
+/// logic of its own.
+#[cfg(feature = "l13")]
+impl rusty_term_l13::TerminalState for Grid {
+    fn screen_text(&self) -> String {
+        let mut lines: Vec<String> =
+            self.cells.chunks(self.cols).map(|row| row_text(row, &self.clusters)).collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    fn scrollback_text(&self, max: usize) -> String {
+        let skip = self.scrollback.len().saturating_sub(max);
+        self.scrollback
+            .iter()
+            .skip(skip)
+            .map(|line| row_text(&line.cells, &self.clusters))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn dimensions(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+
+    fn cursor(&self) -> (usize, usize) {
+        self.cursor
+    }
+
+    fn last_command_exit(&self) -> Option<i32> {
+        Grid::last_command_exit(self)
+    }
+
+    fn last_command_output(&self) -> Option<&str> {
+        Grid::last_command_output(self)
+    }
+
+    fn set_status_line(&mut self, text: String, fg: Option<u32>, bg: Option<u32>) {
+        Grid::set_status_line(self, text, fg, bg)
+    }
+
+    fn clear_status_line(&mut self) {
+        Grid::clear_status_line(self)
+    }
+
+    fn is_subscribed(&self, uri: &'static str) -> bool {
+        self.channel.is_subscribed(uri)
+    }
+
+    fn subscribe(&mut self, uri: &'static str) {
+        self.channel.subscribe(uri)
+    }
+
+    fn unsubscribe(&mut self, uri: &str) {
+        self.channel.unsubscribe(uri)
     }
 }
 

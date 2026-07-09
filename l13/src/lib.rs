@@ -3,9 +3,9 @@
 //!
 //! **Wire format:** `OSC <CODE> ; <protocol> ; <json-rpc-message> ST` — one
 //! JSON-RPC 2.0 message per OSC. It is full-duplex: the child emits these on its
-//! stdout (we parse them out of the byte stream) and we reply by queuing OSCs on
-//! the response channel, which the driver writes to the PTY master — i.e. the
-//! child's stdin. serde_json escapes control bytes, so a JSON payload never
+//! stdout (the host parses them out of the byte stream) and replies by queuing
+//! OSCs on the response channel, which the driver writes to the PTY master — i.e.
+//! the child's stdin. serde_json escapes control bytes, so a JSON payload never
 //! contains the `ST` terminator.
 //!
 //! **Graceful degradation:** a terminal without channel support just ignores the
@@ -24,22 +24,29 @@
 //!   implemented; deeper methods return `method not found` until a backend is
 //!   registered (a terminal has no language/agent backend of its own).
 //!
+//! **Crate boundary:** this crate has no dependency on rusty_term's `Grid` (or
+//! any other rusty_term type). Everything it needs from the host terminal is
+//! expressed as the [`TerminalState`] trait — the whole point of splitting it
+//! out of `rusty_term`'s `core` module: the side-channel is independently
+//! buildable, testable, and reusable against any terminal implementation that
+//! can implement thirteen narrow methods, rather than being welded to one
+//! specific `Grid` struct.
+//!
 //! The JSON-RPC 2.0 message model and the LSP types are reused from `rusty_lsp`.
 
-use super::grid::{Grid, row_text};
 use rusty_lsp::error::{ResponseError, codes};
 use rusty_lsp::jsonrpc::{Message, Notification, Request, Response};
 use serde_json::{Value, json};
 
 /// Private OSC code for the structured channel. Distinctive and unassigned by
 /// the common terminals.
-pub(crate) const OSC_CODE: &str = "5379";
+pub const OSC_CODE: &str = "5379";
 /// The `OSC <CODE> ;` byte prefix the parser matches to route a payload here.
-pub(crate) const OSC_PREFIX: &[u8] = b"5379;";
+pub const OSC_PREFIX: &[u8] = b"5379;";
 
 const CHANNEL_VERSION_MIN: u32 = 1;
 const CHANNEL_VERSION_MAX: u32 = 1;
-/// MCP wire-protocol revision we implement (the dated MCP spec version).
+/// MCP wire-protocol revision this crate implements (the dated MCP spec version).
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const TERMINAL_NAME: &str = "rusty_term";
 const TERMINAL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,33 +57,66 @@ const SUPPORTED_PROTOCOLS: &[&str] = &["channel", "mcp", "lsp", "acp", "render"]
 /// Resources that emit `notifications/resources/updated` when their underlying
 /// state changes. Only low-frequency, discrete signals are pushable; high-churn
 /// resources (screen/scrollback/cursor) are polled via `resources/read`.
-pub(crate) const RES_CWD: &str = "terminal://cwd";
-pub(crate) const RES_TITLE: &str = "terminal://title";
-pub(crate) const RES_EXIT: &str = "terminal://exit";
-pub(crate) const RES_COMMAND: &str = "terminal://command";
-pub(crate) const RES_DIMENSIONS: &str = "terminal://dimensions";
+pub const RES_CWD: &str = "terminal://cwd";
+pub const RES_TITLE: &str = "terminal://title";
+pub const RES_EXIT: &str = "terminal://exit";
+pub const RES_COMMAND: &str = "terminal://command";
+pub const RES_DIMENSIONS: &str = "terminal://dimensions";
 const NOTIFIABLE: &[&str] = &[RES_CWD, RES_TITLE, RES_EXIT, RES_COMMAND, RES_DIMENSIONS];
 
-/// Per-session channel state held on the [`Grid`]: the set of resource URIs a
-/// client has subscribed to for change notifications. Empty until the client
-/// calls MCP `resources/subscribe`.
+/// Everything this crate needs to read or mutate on the host terminal. A host
+/// implements this once (rusty_term's `Grid` does) and every protocol handler
+/// here is written against the trait, never against a concrete terminal type.
+pub trait TerminalState {
+    /// The visible screen as text: one line per row, trailing blank rows dropped.
+    fn screen_text(&self) -> String;
+    /// The most recent `max` scrollback lines as text (oldest first).
+    fn scrollback_text(&self, max: usize) -> String;
+    /// The child's working directory as last reported via OSC 7 (empty if none).
+    fn cwd(&self) -> &str;
+    /// The window title as last reported via OSC 0/2 (empty if none).
+    fn title(&self) -> &str;
+    /// Terminal size in cells, as `(cols, rows)`.
+    fn dimensions(&self) -> (usize, usize);
+    /// Cursor position in cells, as `(col, row)` (both zero-based).
+    fn cursor(&self) -> (usize, usize);
+    /// Exit code of the last finished command (OSC 133;D), if any finished yet.
+    fn last_command_exit(&self) -> Option<i32>;
+    /// Output text of the last finished command (OSC 133;C..D), if captured.
+    fn last_command_output(&self) -> Option<&str>;
+    /// Set the bottom-row status overlay (the `render` protocol).
+    fn set_status_line(&mut self, text: String, fg: Option<u32>, bg: Option<u32>);
+    /// Clear the status overlay set by [`Self::set_status_line`].
+    fn clear_status_line(&mut self);
+    /// Whether a client has subscribed to change notifications for `uri`.
+    fn is_subscribed(&self, uri: &'static str) -> bool;
+    /// Record a client's subscription to `uri` (idempotent).
+    fn subscribe(&mut self, uri: &'static str);
+    /// Drop a client's subscription to `uri` (a no-op if never subscribed).
+    fn unsubscribe(&mut self, uri: &str);
+}
+
+/// Per-session channel state a host holds (typically as a `Grid` field) and
+/// delegates [`TerminalState`]'s subscribe/unsubscribe/is_subscribed to: the
+/// set of resource URIs a client has subscribed to for change notifications.
+/// Empty until the client calls MCP `resources/subscribe`.
 #[derive(Default)]
-pub(crate) struct ChannelState {
+pub struct ChannelState {
     subscriptions: Vec<&'static str>,
 }
 
 impl ChannelState {
-    fn subscribe(&mut self, uri: &'static str) {
+    pub fn subscribe(&mut self, uri: &'static str) {
         if !self.subscriptions.contains(&uri) {
             self.subscriptions.push(uri);
         }
     }
 
-    fn unsubscribe(&mut self, uri: &str) {
+    pub fn unsubscribe(&mut self, uri: &str) {
         self.subscriptions.retain(|s| *s != uri);
     }
 
-    fn is_subscribed(&self, uri: &'static str) -> bool {
+    pub fn is_subscribed(&self, uri: &'static str) -> bool {
         self.subscriptions.contains(&uri)
     }
 }
@@ -84,7 +124,7 @@ impl ChannelState {
 /// Handle one channel OSC payload — the bytes after the `OSC <CODE> ;` prefix,
 /// i.e. `<protocol> ; <json>`. Routes the JSON-RPC message and queues any reply
 /// onto `responses` (child-bound).
-pub(crate) fn handle(payload: &[u8], g: &mut Grid, responses: &mut Vec<u8>) {
+pub fn handle(payload: &[u8], state: &mut impl TerminalState, responses: &mut Vec<u8>) {
     let Ok(text) = std::str::from_utf8(payload) else {
         return; // non-UTF-8 payload: ignore
     };
@@ -96,7 +136,7 @@ pub(crate) fn handle(payload: &[u8], g: &mut Grid, responses: &mut Vec<u8>) {
     };
     match message {
         Message::Request(req) => {
-            let response = match dispatch(protocol, &req, g) {
+            let response = match dispatch(protocol, &req, state) {
                 Ok(result) => Response::success(req.id, result),
                 Err(error) => Response::error(Some(req.id), error),
             };
@@ -109,13 +149,13 @@ pub(crate) fn handle(payload: &[u8], g: &mut Grid, responses: &mut Vec<u8>) {
 }
 
 /// Route a request to its protocol handler.
-fn dispatch(protocol: &str, req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
+fn dispatch(protocol: &str, req: &Request, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     match protocol {
         "channel" => channel_request(req),
-        "mcp" => mcp_request(req, g),
+        "mcp" => mcp_request(req, state),
         "lsp" => lsp_request(req),
         "acp" => acp_request(req),
-        "render" => render_request(req, g),
+        "render" => render_request(req, state),
         other => Err(error(
             codes::METHOD_NOT_FOUND,
             format!("unknown channel protocol: {other}"),
@@ -218,7 +258,7 @@ fn channel_describe() -> Value {
 }
 
 /// The MCP server: exposes the terminal's state to agents as tools and resources.
-fn mcp_request(req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
+fn mcp_request(req: &Request, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     match req.method.as_str() {
         "initialize" => Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -226,11 +266,11 @@ fn mcp_request(req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
             "serverInfo": { "name": TERMINAL_NAME, "version": TERMINAL_VERSION },
         })),
         "tools/list" => Ok(json!({ "tools": mcp_tools() })),
-        "tools/call" => mcp_call(req.params.as_ref(), g),
+        "tools/call" => mcp_call(req.params.as_ref(), state),
         "resources/list" => Ok(json!({ "resources": mcp_resources() })),
-        "resources/read" => mcp_resource_read(req.params.as_ref(), g),
-        "resources/subscribe" => mcp_subscribe(req.params.as_ref(), g),
-        "resources/unsubscribe" => mcp_unsubscribe(req.params.as_ref(), g),
+        "resources/read" => mcp_resource_read(req.params.as_ref(), state),
+        "resources/subscribe" => mcp_subscribe(req.params.as_ref(), state),
+        "resources/unsubscribe" => mcp_unsubscribe(req.params.as_ref(), state),
         other => Err(error(
             codes::METHOD_NOT_FOUND,
             format!("mcp: unknown method {other}"),
@@ -242,7 +282,7 @@ fn mcp_request(req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
 /// updated` when this resource changes. Only [`NOTIFIABLE`] resources push
 /// updates, so subscribing to anything else is an error rather than a silent
 /// no-op the client would wait on forever.
-fn mcp_subscribe(params: Option<&Value>, g: &mut Grid) -> Result<Value, ResponseError> {
+fn mcp_subscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
@@ -252,17 +292,17 @@ fn mcp_subscribe(params: Option<&Value>, g: &mut Grid) -> Result<Value, Response
         .copied()
         .find(|&u| u == uri)
         .ok_or_else(|| error(codes::INVALID_PARAMS, format!("resource not subscribable: {uri}")))?;
-    g.channel.subscribe(canonical);
+    state.subscribe(canonical);
     Ok(json!({}))
 }
 
 /// Drop a `resources/subscribe`. An unknown or never-subscribed URI is a no-op.
-fn mcp_unsubscribe(params: Option<&Value>, g: &mut Grid) -> Result<Value, ResponseError> {
+fn mcp_unsubscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
         .ok_or_else(|| error(codes::INVALID_PARAMS, "missing resource uri"))?;
-    g.channel.unsubscribe(uri);
+    state.unsubscribe(uri);
     Ok(json!({}))
 }
 
@@ -270,8 +310,8 @@ fn mcp_unsubscribe(params: Option<&Value>, g: &mut Grid) -> Result<Value, Respon
 /// is subscribed — the structured channel's event half. Called from the state
 /// mutators (OSC 7 cwd, OSC 0/2 title) right after the change lands, so the
 /// notification rides the same child-bound `responses` egress as every reply.
-pub(crate) fn notify_resource_changed(g: &Grid, uri: &'static str, responses: &mut Vec<u8>) {
-    if !g.channel.is_subscribed(uri) {
+pub fn notify_resource_changed(state: &impl TerminalState, uri: &'static str, responses: &mut Vec<u8>) {
+    if !state.is_subscribed(uri) {
         return;
     }
     let note = Notification {
@@ -285,8 +325,8 @@ pub(crate) fn notify_resource_changed(g: &Grid, uri: &'static str, responses: &m
 /// (OSC 133;D) and a client is subscribed to `terminal://exit`. Unlike a generic
 /// `resources/updated`, this carries the exit code (or `null` when the shell
 /// omitted it) in the push itself, so the client needs no follow-up read.
-pub(crate) fn notify_command_finished(g: &Grid, exit: Option<i32>, responses: &mut Vec<u8>) {
-    if !g.channel.is_subscribed(RES_EXIT) {
+pub fn notify_command_finished(state: &impl TerminalState, exit: Option<i32>, responses: &mut Vec<u8>) {
+    if !state.is_subscribed(RES_EXIT) {
         return;
     }
     let note = Notification {
@@ -325,7 +365,7 @@ fn mcp_tools() -> Value {
 }
 
 /// Execute an MCP `tools/call`, returning the standard `{ content: [...] }`.
-fn mcp_call(params: Option<&Value>, g: &Grid) -> Result<Value, ResponseError> {
+fn mcp_call(params: Option<&Value>, state: &impl TerminalState) -> Result<Value, ResponseError> {
     let params = params.ok_or_else(|| error(codes::INVALID_PARAMS, "missing params"))?;
     let name = params
         .get("name")
@@ -334,18 +374,21 @@ fn mcp_call(params: Option<&Value>, g: &Grid) -> Result<Value, ResponseError> {
     let args = params.get("arguments");
 
     let text = match name {
-        "get_screen" => screen_text(g),
+        "get_screen" => state.screen_text(),
         "get_scrollback" => {
             let lines = args
                 .and_then(|a| a.get("lines"))
                 .and_then(Value::as_u64)
                 .unwrap_or(100) as usize;
-            scrollback_text(g, lines)
+            state.scrollback_text(lines)
         }
-        "get_cwd" => g.cwd.clone(),
-        "get_title" => g.title.clone(),
-        "get_dimensions" => format!("{}x{}", g.cols, g.rows),
-        "get_cursor" => cursor_text(g),
+        "get_cwd" => state.cwd().to_string(),
+        "get_title" => state.title().to_string(),
+        "get_dimensions" => {
+            let (cols, rows) = state.dimensions();
+            format!("{cols}x{rows}")
+        }
+        "get_cursor" => cursor_text(state),
         other => return Err(error(codes::INVALID_PARAMS, format!("unknown tool: {other}"))),
     };
     Ok(json!({ "content": [ { "type": "text", "text": text } ] }))
@@ -371,20 +414,23 @@ fn mcp_resources() -> Value {
 
 /// Read one MCP resource by `params.uri`, returning the standard
 /// `{ contents: [...] }`. Mirrors the `get_*` tools over the resource URIs.
-fn mcp_resource_read(params: Option<&Value>, g: &Grid) -> Result<Value, ResponseError> {
+fn mcp_resource_read(params: Option<&Value>, state: &impl TerminalState) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
         .ok_or_else(|| error(codes::INVALID_PARAMS, "missing resource uri"))?;
     let text = match uri {
-        "terminal://screen" => screen_text(g),
-        "terminal://scrollback" => scrollback_text(g, 1000),
-        "terminal://cwd" => g.cwd.clone(),
-        "terminal://title" => g.title.clone(),
-        "terminal://dimensions" => format!("{}x{}", g.cols, g.rows),
-        "terminal://cursor" => cursor_text(g),
-        "terminal://exit" => g.last_command_exit().map(|c| c.to_string()).unwrap_or_default(),
-        "terminal://command" => g.last_command_output().unwrap_or_default().to_string(),
+        "terminal://screen" => state.screen_text(),
+        "terminal://scrollback" => state.scrollback_text(1000),
+        "terminal://cwd" => state.cwd().to_string(),
+        "terminal://title" => state.title().to_string(),
+        "terminal://dimensions" => {
+            let (cols, rows) = state.dimensions();
+            format!("{cols}x{rows}")
+        }
+        "terminal://cursor" => cursor_text(state),
+        "terminal://exit" => state.last_command_exit().map(|c| c.to_string()).unwrap_or_default(),
+        "terminal://command" => state.last_command_output().unwrap_or_default().to_string(),
         other => return Err(error(codes::INVALID_PARAMS, format!("unknown resource: {other}"))),
     };
     Ok(json!({ "contents": [ { "uri": uri, "mimeType": "text/plain", "text": text } ] }))
@@ -392,8 +438,9 @@ fn mcp_resource_read(params: Option<&Value>, g: &Grid) -> Result<Value, Response
 
 /// The cursor position as `"COL,ROW"` (both zero-based) — the format shared by
 /// the `get_cursor` tool and the `terminal://cursor` resource.
-fn cursor_text(g: &Grid) -> String {
-    format!("{},{}", g.cursor.0, g.cursor.1)
+fn cursor_text(state: &impl TerminalState) -> String {
+    let (col, row) = state.cursor();
+    format!("{col},{row}")
 }
 
 /// LSP endpoint — negotiates via `rusty_lsp`'s LSP types. A terminal has no
@@ -444,11 +491,11 @@ fn acp_request(req: &Request) -> Result<Value, ResponseError> {
 /// composites independent of the child's text stream — currently a status-line
 /// overlay across the bottom row. An unaware terminal ignores the OSC, so the
 /// child simply gets no overlay (graceful degradation).
-fn render_request(req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
+fn render_request(req: &Request, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     match req.method.as_str() {
-        "set_status" => render_set_status(req.params.as_ref(), g),
+        "set_status" => render_set_status(req.params.as_ref(), state),
         "clear_status" => {
-            g.clear_status_line();
+            state.clear_status_line();
             Ok(json!({}))
         }
         other => Err(error(
@@ -460,7 +507,7 @@ fn render_request(req: &Request, g: &mut Grid) -> Result<Value, ResponseError> {
 
 /// Set the bottom-row status overlay. `text` is required; `fg`/`bg` are optional
 /// `0xRRGGBB` integers defaulting to the grid's current default colors.
-fn render_set_status(params: Option<&Value>, g: &mut Grid) -> Result<Value, ResponseError> {
+fn render_set_status(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
     let params = params.ok_or_else(|| error(codes::INVALID_PARAMS, "missing params"))?;
     let text = params
         .get("text")
@@ -468,7 +515,7 @@ fn render_set_status(params: Option<&Value>, g: &mut Grid) -> Result<Value, Resp
         .ok_or_else(|| error(codes::INVALID_PARAMS, "missing status text"))?;
     let fg = params.get("fg").and_then(Value::as_u64).map(|v| v as u32);
     let bg = params.get("bg").and_then(Value::as_u64).map(|v| v as u32);
-    g.set_status_line(text.to_string(), fg, bg);
+    state.set_status_line(text.to_string(), fg, bg);
     Ok(json!({}))
 }
 
@@ -486,30 +533,221 @@ fn send(protocol: &str, msg: &Message, responses: &mut Vec<u8>) {
     responses.extend_from_slice(b"\x1b\\");
 }
 
-/// The visible screen as text: one line per row, trailing blank rows dropped.
-fn screen_text(g: &Grid) -> String {
-    let mut lines: Vec<String> = g
-        .cells
-        .chunks(g.cols)
-        .map(|row| row_text(row, &g.clusters))
-        .collect();
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    lines.join("\n")
-}
-
-/// The most recent `max` scrollback lines as text (oldest first).
-fn scrollback_text(g: &Grid, max: usize) -> String {
-    let skip = g.scrollback.len().saturating_sub(max);
-    g.scrollback
-        .iter()
-        .skip(skip)
-        .map(|line| row_text(&line.cells, &g.clusters))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn error(code: i64, message: impl Into<String>) -> ResponseError {
     ResponseError { code, message: message.into(), data: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal in-memory [`TerminalState`] for exercising the protocol
+    /// handlers without any of rusty_term's `Grid`/parser machinery — the
+    /// payoff of the trait boundary: this crate's tests need no rusty_term
+    /// dependency at all.
+    #[derive(Default)]
+    struct FakeTerminal {
+        screen: String,
+        scrollback: Vec<String>,
+        cwd: String,
+        title: String,
+        dims: (usize, usize),
+        cursor: (usize, usize),
+        exit: Option<i32>,
+        command_output: Option<String>,
+        status: Option<(String, Option<u32>, Option<u32>)>,
+        channel: ChannelState,
+    }
+
+    impl TerminalState for FakeTerminal {
+        fn screen_text(&self) -> String {
+            self.screen.clone()
+        }
+        fn scrollback_text(&self, max: usize) -> String {
+            let skip = self.scrollback.len().saturating_sub(max);
+            self.scrollback[skip..].join("\n")
+        }
+        fn cwd(&self) -> &str {
+            &self.cwd
+        }
+        fn title(&self) -> &str {
+            &self.title
+        }
+        fn dimensions(&self) -> (usize, usize) {
+            self.dims
+        }
+        fn cursor(&self) -> (usize, usize) {
+            self.cursor
+        }
+        fn last_command_exit(&self) -> Option<i32> {
+            self.exit
+        }
+        fn last_command_output(&self) -> Option<&str> {
+            self.command_output.as_deref()
+        }
+        fn set_status_line(&mut self, text: String, fg: Option<u32>, bg: Option<u32>) {
+            self.status = Some((text, fg, bg));
+        }
+        fn clear_status_line(&mut self) {
+            self.status = None;
+        }
+        fn is_subscribed(&self, uri: &'static str) -> bool {
+            self.channel.is_subscribed(uri)
+        }
+        fn subscribe(&mut self, uri: &'static str) {
+            self.channel.subscribe(uri);
+        }
+        fn unsubscribe(&mut self, uri: &str) {
+            self.channel.unsubscribe(uri);
+        }
+    }
+
+    fn call(state: &mut FakeTerminal, protocol: &str, method: &str, params: Value) -> Value {
+        let payload = format!(
+            "{protocol};{}",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+        );
+        let mut responses = Vec::new();
+        handle(payload.as_bytes(), state, &mut responses);
+        extract_result(&responses)
+    }
+
+    /// Pull the JSON payload out of one queued `OSC 5379;<protocol>;<json> ST`
+    /// response frame.
+    fn extract_result(responses: &[u8]) -> Value {
+        let text = std::str::from_utf8(responses).unwrap();
+        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let (_protocol, json) = body.split_once(';').unwrap();
+        let msg: Value = serde_json::from_str(json).unwrap();
+        msg["result"].clone()
+    }
+
+    #[test]
+    fn channel_initialize_agrees_version_and_protocols() {
+        let mut state = FakeTerminal::default();
+        let result = call(&mut state, "channel", "initialize", json!({}));
+        assert_eq!(result["version"], 1);
+        assert_eq!(result["terminalInfo"]["name"], "rusty_term");
+        assert_eq!(result["protocols"].as_array().unwrap().len(), SUPPORTED_PROTOCOLS.len());
+    }
+
+    #[test]
+    fn channel_initialize_rejects_unsupported_version() {
+        let mut state = FakeTerminal::default();
+        let payload = format!(
+            "channel;{}",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "version": 0 } })
+        );
+        let mut responses = Vec::new();
+        handle(payload.as_bytes(), &mut state, &mut responses);
+        let text = std::str::from_utf8(&responses).unwrap();
+        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let (_protocol, json) = body.split_once(';').unwrap();
+        let msg: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(msg["error"]["code"], codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_get_cwd_and_title_tools_read_through_the_trait() {
+        let mut state = FakeTerminal { cwd: "/home/user".into(), title: "session".into(), ..Default::default() };
+        let cwd = call(&mut state, "mcp", "tools/call", json!({ "name": "get_cwd" }));
+        assert_eq!(cwd["content"][0]["text"], "/home/user");
+        let title = call(&mut state, "mcp", "tools/call", json!({ "name": "get_title" }));
+        assert_eq!(title["content"][0]["text"], "session");
+    }
+
+    #[test]
+    fn mcp_get_dimensions_and_cursor_format_correctly() {
+        let mut state = FakeTerminal { dims: (80, 24), cursor: (5, 3), ..Default::default() };
+        let dims = call(&mut state, "mcp", "tools/call", json!({ "name": "get_dimensions" }));
+        assert_eq!(dims["content"][0]["text"], "80x24");
+        let cursor = call(&mut state, "mcp", "tools/call", json!({ "name": "get_cursor" }));
+        assert_eq!(cursor["content"][0]["text"], "5,3");
+    }
+
+    #[test]
+    fn mcp_resource_read_mirrors_tools() {
+        let mut state = FakeTerminal { cwd: "/tmp".into(), ..Default::default() };
+        let result =
+            call(&mut state, "mcp", "resources/read", json!({ "uri": "terminal://cwd" }));
+        assert_eq!(result["contents"][0]["text"], "/tmp");
+    }
+
+    #[test]
+    fn mcp_subscribe_then_notify_pushes_update() {
+        let mut state = FakeTerminal::default();
+        call(&mut state, "mcp", "resources/subscribe", json!({ "uri": RES_CWD }));
+        assert!(state.is_subscribed(RES_CWD));
+
+        let mut responses = Vec::new();
+        notify_resource_changed(&state, RES_CWD, &mut responses);
+        let result = extract_result_notification(&responses);
+        assert_eq!(result["method"], "notifications/resources/updated");
+        assert_eq!(result["params"]["uri"], RES_CWD);
+    }
+
+    #[test]
+    fn unsubscribed_resource_gets_no_notification() {
+        let state = FakeTerminal::default();
+        let mut responses = Vec::new();
+        notify_resource_changed(&state, RES_CWD, &mut responses);
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn subscribing_to_a_non_notifiable_resource_errors() {
+        let mut state = FakeTerminal::default();
+        let payload = format!(
+            "mcp;{}",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/subscribe", "params": { "uri": "terminal://screen" } })
+        );
+        let mut responses = Vec::new();
+        handle(payload.as_bytes(), &mut state, &mut responses);
+        let text = std::str::from_utf8(&responses).unwrap();
+        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let (_protocol, json) = body.split_once(';').unwrap();
+        let msg: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(msg["error"]["code"], codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn render_set_and_clear_status_round_trip_through_the_trait() {
+        let mut state = FakeTerminal::default();
+        call(&mut state, "render", "set_status", json!({ "text": "building..." }));
+        assert_eq!(state.status.as_ref().unwrap().0, "building...");
+        call(&mut state, "render", "clear_status", json!({}));
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn lsp_and_acp_initialize_advertise_empty_backends() {
+        let mut state = FakeTerminal::default();
+        let lsp = call(&mut state, "lsp", "initialize", json!({}));
+        assert_eq!(lsp["serverInfo"]["name"], "rusty_term");
+        let acp = call(&mut state, "acp", "initialize", json!({}));
+        assert_eq!(acp["agentInfo"]["name"], "rusty_term");
+    }
+
+    #[test]
+    fn malformed_json_is_dropped_silently() {
+        let mut state = FakeTerminal::default();
+        let mut responses = Vec::new();
+        handle(b"mcp;not json", &mut state, &mut responses);
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_payload_is_ignored() {
+        let mut state = FakeTerminal::default();
+        let mut responses = Vec::new();
+        handle(&[0xff, 0xfe, 0xfd], &mut state, &mut responses);
+        assert!(responses.is_empty());
+    }
+
+    fn extract_result_notification(responses: &[u8]) -> Value {
+        let text = std::str::from_utf8(responses).unwrap();
+        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let (_protocol, json) = body.split_once(';').unwrap();
+        serde_json::from_str(json).unwrap()
+    }
 }

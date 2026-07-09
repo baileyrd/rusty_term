@@ -1,0 +1,15 @@
+[package]
+name = "rusty_term_l13"
+version = "0.1.0"
+edition = "2024"
+description = "rusty_term's L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP + LSP/ACP negotiation, addressed against a narrow TerminalState trait rather than rusty_term's own Grid type."
+license = "MIT"
+
+[dependencies]
+# A path dependency to a sibling checkout (the previous approach) breaks
+# *every* rusty_term build without that checkout present, not just l13 ones —
+# Cargo resolves every optional dependency's manifest to build the lockfile
+# regardless of active features. A git dependency only needs network access
+# to resolve, which CI has.
+rusty_lsp = { git = "https://github.com/baileyrd/rusty_lsp", tag = "v0.1.0" }
+serde_json = "1"
