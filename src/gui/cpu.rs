@@ -6,7 +6,10 @@
 
 use std::rc::Rc;
 
-use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
+use crate::core::{
+    ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Cell, CursorShape,
+    Grid, UnderlineStyle, WIDE_TRAILER, char_width,
+};
 
 use super::font::{Glyph, GlyphSource, Style};
 
@@ -212,6 +215,46 @@ pub(crate) fn draw_grid(
         blit(buf, width, height, glyph, pen_x, pen_y, fg);
     }
 
+    // Pass 2.5: underline / strikethrough decorations (SGR 4/9). Neither is a
+    // glyph, so they're drawn as thin pixel stripes here rather than through
+    // the font. A colored underline (SGR 58, or `4:2`.."4:5"` undercurl/
+    // dotted/dashed styles) follows `cell.underline_color`; otherwise it
+    // follows whatever color the glyph pass used (fg, or bg under a
+    // cursor/selection swap) so the line matches the text it decorates.
+    for i in 0..grid.cols * grid.rows {
+        let (col, row) = (i % grid.cols, i / grid.cols);
+        let on_status = status.is_some() && row == last_row;
+        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
+        if cell.flags & WIDE_TRAILER != 0 {
+            continue;
+        }
+        let underline = cell.flags & ATTR_UNDERLINE != 0;
+        let strike = cell.flags & ATTR_STRIKE != 0;
+        if !underline && !strike {
+            continue;
+        }
+        let swapped = !on_status && (block_cursor(col, row) || inverted(col, row));
+        let base_fg = if swapped {
+            cell.bg
+        } else if !on_status && search_hl(col, row).is_some() {
+            SEARCH_FG
+        } else {
+            cell.fg
+        };
+        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+        if underline {
+            let color = if !swapped && cell.flags & ATTR_UNDERLINE_COLOR != 0 {
+                cell.underline_color
+            } else {
+                base_fg
+            };
+            draw_underline(buf, width, height, x0, y0, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
+        }
+        if strike {
+            draw_strike(buf, width, height, x0, y0, cw, ch, base_fg);
+        }
+    }
+
     // Pixel images (Sixel/Kitty) composited over their reserved half-block cells
     // (pixel-perfect), scaled nearest-neighbor to the footprint and clipped to
     // the pane. The grid anchors them by serial, so this tracks scroll/history.
@@ -302,6 +345,102 @@ pub(crate) fn draw_grid(
             col += w;
         }
     }
+}
+
+/// Fill a `cw`-wide, `thick`-tall horizontal stripe at `(x0, y0)` in `color`.
+#[allow(clippy::too_many_arguments)]
+fn hline(buf: &mut [u32], width: usize, height: usize, x0: usize, cw: usize, y0: usize, thick: usize, color: u32) {
+    for y in y0..(y0 + thick).min(height) {
+        let base = y * width;
+        for x in x0..(x0 + cw).min(width) {
+            buf[base + x] = color;
+        }
+    }
+}
+
+/// Draw one cell's underline stripe in `style`, near the bottom of the cell
+/// box (leaving descenders visible above it).
+#[allow(clippy::too_many_arguments)]
+fn draw_underline(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    cw: usize,
+    ch: usize,
+    color: u32,
+    style: UnderlineStyle,
+) {
+    let thick = (ch / 12).max(1);
+    let base_y = (y0 + ch).saturating_sub(thick + 1);
+    match style {
+        UnderlineStyle::Straight => hline(buf, width, height, x0, cw, base_y, thick, color),
+        UnderlineStyle::Double => {
+            let y1 = base_y.saturating_sub(thick + 1);
+            hline(buf, width, height, x0, cw, y1, thick, color);
+            hline(buf, width, height, x0, cw, base_y, thick, color);
+        }
+        UnderlineStyle::Curly => {
+            let amp = (ch / 10).max(1) as isize;
+            let period = (cw / 2).max(2) as f32;
+            for dx in 0..cw {
+                let x = x0 + dx;
+                if x >= width {
+                    break;
+                }
+                let phase = (dx as f32 / period) * std::f32::consts::TAU;
+                let offset = (phase.sin() * amp as f32).round() as isize;
+                let y = base_y as isize + offset;
+                for t in 0..thick as isize {
+                    let py = y + t;
+                    if py >= 0 && (py as usize) < height {
+                        buf[py as usize * width + x] = color;
+                    }
+                }
+            }
+        }
+        UnderlineStyle::Dotted => {
+            for dx in (0..cw).step_by(2) {
+                let x = x0 + dx;
+                if x >= width {
+                    break;
+                }
+                for t in 0..thick {
+                    let py = base_y + t;
+                    if py < height {
+                        buf[py * width + x] = color;
+                    }
+                }
+            }
+        }
+        UnderlineStyle::Dashed => {
+            for dx in 0..cw {
+                if (dx / 3) % 2 != 0 {
+                    continue;
+                }
+                let x = x0 + dx;
+                if x >= width {
+                    break;
+                }
+                for t in 0..thick {
+                    let py = base_y + t;
+                    if py < height {
+                        buf[py * width + x] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Draw one cell's strikethrough stripe through the vertical middle of the
+/// cell box.
+#[allow(clippy::too_many_arguments)]
+fn draw_strike(buf: &mut [u32], width: usize, height: usize, x0: usize, y0: usize, cw: usize, ch: usize, color: u32) {
+    let thick = (ch / 12).max(1);
+    let y = (y0 + ch / 2).saturating_sub(thick / 2);
+    hline(buf, width, height, x0, cw, y, thick, color);
 }
 
 /// Alpha-blend a glyph's coverage in `fg` over whatever is already in `buf`.
@@ -413,6 +552,45 @@ mod tests {
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
         assert!(buf.iter().all(|&px| px == 0x008000));
+    }
+
+    #[test]
+    fn straight_underline_draws_a_stripe_near_the_bottom() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[4m ");
+        let (w, h) = (4usize, 8usize);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        // Row 6 (near the bottom of an 8px cell, thick=1) is the underline
+        // stripe in the text's foreground.
+        assert_eq!(buf[6 * w], 0xFF0000);
+        assert_eq!(buf[6 * w + 3], 0xFF0000);
+        // The top of the cell is untouched background.
+        assert_eq!(buf[0], 0x000000);
+    }
+
+    #[test]
+    fn strikethrough_draws_a_stripe_through_the_middle() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;0;255;0m\x1b[9m ");
+        let (w, h) = (4usize, 8usize);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        assert_eq!(buf[4 * w], 0x00FF00);
+        assert_eq!(buf[6 * w], 0x000000, "strike doesn't also draw near the bottom");
+    }
+
+    #[test]
+    fn colored_underline_follows_underline_color_not_fg() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[4m\x1b[58;2;0;0;255m ");
+        let (w, h) = (4usize, 8usize);
+        let mut buf = vec![0u32; w * h];
+        render(&g, &[], &mut MockFont, &mut buf, w, h, true);
+        assert_eq!(buf[6 * w], 0x0000FF);
     }
 
     #[cfg(feature = "l13")]

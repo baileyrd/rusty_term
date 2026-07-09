@@ -31,7 +31,7 @@ mod sixel;
 
 pub use cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
-    ATTR_STRIKE, ATTR_UNDERLINE, WIDE_TRAILER,
+    ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, UnderlineStyle, WIDE_TRAILER,
 };
 pub use color::Theme;
 pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};

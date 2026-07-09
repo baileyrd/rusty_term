@@ -734,7 +734,7 @@ impl StatusLine {
     /// by two columns with a flagged trailer, drop zero-width scalars, stop at the
     /// margin, and pad the tail with blanks in `bg`.
     fn lay_out(text: &str, fg: u32, bg: u32, cols: usize) -> Vec<Cell> {
-        let blank = Cell { ch: ' ', cluster: 0, fg, bg, flags: 0, link: 0 };
+        let blank = Cell { ch: ' ', cluster: 0, fg, bg, flags: 0, link: 0, underline_color: fg };
         let mut cells = vec![blank; cols];
         let mut x = 0;
         for ch in text.chars() {
@@ -745,9 +745,17 @@ impl StatusLine {
             if x + w > cols {
                 break;
             }
-            cells[x] = Cell { ch, cluster: 0, fg, bg, flags: 0, link: 0 };
+            cells[x] = Cell { ch, cluster: 0, fg, bg, flags: 0, link: 0, underline_color: fg };
             if w == 2 {
-                cells[x + 1] = Cell { ch: ' ', cluster: 0, fg, bg, flags: WIDE_TRAILER, link: 0 };
+                cells[x + 1] = Cell {
+                    ch: ' ',
+                    cluster: 0,
+                    fg,
+                    bg,
+                    flags: WIDE_TRAILER,
+                    link: 0,
+                    underline_color: fg,
+                };
             }
             x += w;
         }
@@ -999,6 +1007,7 @@ impl Grid {
                 bg,
                 flags: 0,
                 link: 0,
+                underline_color: fg,
             };
             match (top, bottom) {
                 (None, None) => None,
@@ -1194,6 +1203,7 @@ impl Grid {
                 bg: pen.bg,
                 flags: pen.attrs,
                 link,
+                underline_color: pen.underline_color,
             },
         );
         if w == 2 && x + 1 < self.cols {
@@ -1209,6 +1219,7 @@ impl Grid {
                     bg: pen.bg,
                     flags: WIDE_TRAILER,
                     link,
+                    underline_color: pen.underline_color,
                 },
             );
         }
@@ -1628,6 +1639,11 @@ impl Grid {
             self.reset_scroll_region();
             self.dirty.iter_mut().for_each(|d| *d = true);
         }
+    }
+
+    /// Whether the alternate screen buffer (`?47`/`?1047`/`?1049`) is active.
+    pub(crate) fn in_alt_screen(&self) -> bool {
+        self.primary.is_some()
     }
 
     /// Save the current cursor position (`DECSC` / `CSI s`).
