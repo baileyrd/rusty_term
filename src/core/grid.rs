@@ -1123,8 +1123,29 @@ impl Grid {
     /// shrunk to fit the columns remaining from the cursor (aspect-preserving,
     /// never enlarged), placed top-left at the cursor, and scrolled like printed
     /// lines if it runs past the bottom; the cursor ends at column 0 of the row
-    /// below it (xterm "sixel scrolling"). Shared by the Sixel and Kitty paths.
+    /// below it (xterm "sixel scrolling"). Shared by the Sixel and Kitty paths,
+    /// which have no explicit-size concept of their own.
     pub(crate) fn render_image(&mut self, width: usize, height: usize, pixels: &[Option<u32>]) {
+        self.render_image_sized(width, height, pixels, None, None, true);
+    }
+
+    /// [`Self::render_image`], but honoring iTerm2's `File=` geometry hints:
+    /// `target_cols`/`target_rows` (cell counts, `None` meaning "use the
+    /// image's own size for this axis") and `preserve_aspect` (iTerm2's
+    /// `preserveAspectRatio`, default-on `true`). With both axes given and
+    /// aspect preserved, the image is "contain"-fit within the requested
+    /// footprint (never cropped or stretched off-axis). Either axis is still
+    /// clamped to the columns available from the cursor — an explicit size
+    /// can shrink or grow the image within that limit, never exceed it.
+    pub(crate) fn render_image_sized(
+        &mut self,
+        width: usize,
+        height: usize,
+        pixels: &[Option<u32>],
+        target_cols: Option<usize>,
+        target_rows: Option<usize>,
+        preserve_aspect: bool,
+    ) {
         if width == 0 || height == 0 || pixels.len() < width * height {
             return;
         }
@@ -1157,9 +1178,49 @@ impl Grid {
 
         let origin = self.cursor.0;
         let avail = self.cols.saturating_sub(origin).max(1);
-        // Fit to the available width (shrink only), preserving aspect.
-        let tw = width.min(avail);
-        let th = (height * tw / width).max(1);
+        // `tw` is both the cell-column count and the pixel-column count (one
+        // pixel column per cell column, this function's whole convention);
+        // `th` is a *pixel*-row count (two pixel rows pack into one cell row
+        // via the half-block glyphs below) — so a `target_rows` cell count
+        // becomes `target_rows * 2` in this local `th` domain.
+        let (tw, th) = match (target_cols, target_rows) {
+            (None, None) => {
+                // No hint: fit to the available width (shrink only), aspect
+                // always preserved — the pre-C12 behavior, unchanged.
+                let tw = width.min(avail);
+                (tw, (height * tw / width).max(1))
+            }
+            (Some(cols), None) => {
+                let tw = cols.min(avail).max(1);
+                let th = if preserve_aspect { (height * tw / width).max(1) } else { height };
+                (tw, th)
+            }
+            (None, Some(rows)) => {
+                let th = rows.saturating_mul(2).max(1);
+                let tw = if preserve_aspect {
+                    (width * th / height).max(1).min(avail)
+                } else {
+                    width.min(avail)
+                };
+                (tw, th)
+            }
+            (Some(cols), Some(rows)) => {
+                let tw_req = cols.min(avail).max(1);
+                let th_req = rows.saturating_mul(2).max(1);
+                if preserve_aspect {
+                    // "Contain"-fit: try filling the width, and if that would
+                    // overshoot the requested height, fill the height instead.
+                    let th_from_w = (height * tw_req / width).max(1);
+                    if th_from_w <= th_req {
+                        (tw_req, th_from_w)
+                    } else {
+                        ((width * th_req / height).max(1).min(avail), th_req)
+                    }
+                } else {
+                    (tw_req, th_req)
+                }
+            }
+        };
         let cell_rows = th.div_ceil(2);
         #[cfg(any(test, feature = "gui"))]
         self.store_image(width, height, pixels, origin, tw, cell_rows);
