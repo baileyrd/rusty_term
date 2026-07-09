@@ -13,7 +13,8 @@ use parking_lot::Mutex;
 use crate::backend::Backend;
 use crate::core::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
-    ATTR_STRIKE, ATTR_UNDERLINE, DirtyFrame, Grid, LineAttr, WIDE_TRAILER,
+    ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, DirtyFrame, Grid, LineAttr, UnderlineStyle,
+    WIDE_TRAILER,
 };
 
 /// Minimum wall-clock spacing between repaints. Bursts of output coalesce into
@@ -52,10 +53,13 @@ pub(crate) fn restore_host_modes() {
     let _ = out.flush();
 }
 
-/// Build the combined SGR introducer for a foreground/background/attribute
-/// triple. Starts with a reset (`0`) so attributes left active by the previous
-/// run are cleared, then re-states the active attributes and truecolor pair.
-fn sgr_for(fg: u32, bg: u32, attrs: u16) -> String {
+/// Build the combined SGR introducer for a foreground/background/attribute/
+/// underline-color quadruple. Starts with a reset (`0`) so attributes left
+/// active by the previous run are cleared, then re-states the active
+/// attributes and truecolor pairs. The underline style/color re-emit as the
+/// colon sub-parameter forms (`4:N`, `58;2;…`) so a host terminal that
+/// understands undercurl/colored-underline gets the same rendition back.
+fn sgr_for(fg: u32, bg: u32, attrs: u16, underline_color: u32) -> String {
     let mut s = String::from("\x1b[0");
     if attrs & ATTR_BOLD != 0 {
         s.push_str(";1");
@@ -67,7 +71,15 @@ fn sgr_for(fg: u32, bg: u32, attrs: u16) -> String {
         s.push_str(";3");
     }
     if attrs & ATTR_UNDERLINE != 0 {
-        s.push_str(";4");
+        let style = match UnderlineStyle::from_attrs(attrs) {
+            UnderlineStyle::Straight => 1,
+            UnderlineStyle::Double => 2,
+            UnderlineStyle::Curly => 3,
+            UnderlineStyle::Dotted => 4,
+            UnderlineStyle::Dashed => 5,
+        };
+        use std::fmt::Write as _;
+        let _ = write!(s, ";4:{style}");
     }
     if attrs & ATTR_BLINK != 0 {
         s.push_str(";5");
@@ -84,7 +96,16 @@ fn sgr_for(fg: u32, bg: u32, attrs: u16) -> String {
     let (fr, fg_, fb) = ((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
     let (br, bg_, bb) = ((bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF);
     use std::fmt::Write as _;
-    let _ = write!(s, ";38;2;{};{};{};48;2;{};{};{}m", fr, fg_, fb, br, bg_, bb);
+    let _ = write!(s, ";38;2;{};{};{};48;2;{};{};{}", fr, fg_, fb, br, bg_, bb);
+    if attrs & ATTR_UNDERLINE_COLOR != 0 {
+        let (ur, ug, ub) = (
+            (underline_color >> 16) & 0xFF,
+            (underline_color >> 8) & 0xFF,
+            underline_color & 0xFF,
+        );
+        let _ = write!(s, ";58;2;{ur};{ug};{ub}");
+    }
+    s.push('m');
     s
 }
 
@@ -116,7 +137,7 @@ pub(crate) fn draw(frame: &DirtyFrame, position_cursor: bool) {
         };
         let mut line_buf = String::with_capacity(cells.len() + 32);
         line_buf.push_str(dec_seq);
-        let mut last: Option<(u32, u32, u16)> = None;
+        let mut last: Option<(u32, u32, u16, u32)> = None;
         // Active hyperlink id while painting this row; reset per row so a link
         // is reopened at the start of each line it covers and closed at row end.
         let mut cur_link: u16 = 0;
@@ -142,9 +163,10 @@ pub(crate) fn draw(frame: &DirtyFrame, position_cursor: bool) {
             // Style key excludes the WIDE_TRAILER layout bit (trailers are
             // skipped above, so only rendition attributes reach here).
             let attrs = cell.flags & ATTR_MASK;
-            if last != Some((cell.fg, cell.bg, attrs)) {
-                line_buf.push_str(&sgr_for(cell.fg, cell.bg, attrs));
-                last = Some((cell.fg, cell.bg, attrs));
+            let key = (cell.fg, cell.bg, attrs, cell.underline_color);
+            if last != Some(key) {
+                line_buf.push_str(&sgr_for(cell.fg, cell.bg, attrs, cell.underline_color));
+                last = Some(key);
             }
             line_buf.push(cell.ch);
             // Emit the grapheme continuation (combining marks, ZWJ joins, …) so

@@ -13,7 +13,10 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::core::{ATTR_BOLD, ATTR_ITALIC, Cell, CursorShape, Grid, WIDE_TRAILER, char_width};
+use crate::core::{
+    ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Cell, CursorShape,
+    Grid, UnderlineStyle, WIDE_TRAILER, char_width,
+};
 
 use super::font::{FontCache, GlyphSource, Style};
 
@@ -40,6 +43,8 @@ struct Inst {
     @location(4) bg: u32,
     @location(5) curs: u32,
     @location(6) ccol: u32,
+    @location(7) deco: u32,
+    @location(8) dcol: u32,
 };
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -49,6 +54,8 @@ struct VsOut {
     @location(3) @interpolate(flat) curs: u32,
     @location(4) @interpolate(flat) ccol: vec4<f32>,
     @location(5) local: vec2<f32>,
+    @location(6) @interpolate(flat) deco: u32,
+    @location(7) dcol: vec4<f32>,
 };
 
 fn unpack(c: u32) -> vec4<f32> {
@@ -76,6 +83,8 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     out.curs = inst.curs;
     out.ccol = unpack(inst.ccol);
     out.local = corner;
+    out.deco = inst.deco;
+    out.dcol = unpack(inst.dcol);
     return out;
 }
 
@@ -86,6 +95,40 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // curs: 0 none/block (block uses the fg/bg swap); 2 underline, 3 bar.
     if (in.curs == 2u && in.local.y >= 0.85) { return in.ccol; }
     if (in.curs == 3u && in.local.x <= 0.12) { return in.ccol; }
+    // deco: bit 3 (8) strikethrough; bits 0-2 underline style (0 = none, per
+    // UnderlineStyle::pack_into's 1-5 encoding). Drawn as thin stripes near
+    // the cell's bottom (underline) or vertical middle (strike), matching the
+    // CPU rasterizer's `draw_underline`/`draw_strike`.
+    if ((in.deco & 8u) != 0u && in.local.y >= 0.45 && in.local.y < 0.55) {
+        return in.dcol;
+    }
+    let style = in.deco & 7u;
+    if (style != 0u) {
+        let thick = 0.08;
+        let bottom = 1.0 - thick - 0.05;
+        if (style == 1u && in.local.y >= bottom && in.local.y < bottom + thick) {
+            return in.dcol;
+        }
+        if (style == 2u && ((in.local.y >= bottom && in.local.y < bottom + thick)
+            || (in.local.y >= bottom - 2.0 * thick && in.local.y < bottom - thick))) {
+            return in.dcol;
+        }
+        if (style == 3u) {
+            let amp = 0.06;
+            let y = bottom + sin(in.local.x * 6.283185) * amp;
+            if (in.local.y >= y - thick * 0.5 && in.local.y < y + thick * 0.5) {
+                return in.dcol;
+            }
+        }
+        if (style == 4u && in.local.y >= bottom && in.local.y < bottom + thick
+            && fract(in.local.x * 6.0) < 0.5) {
+            return in.dcol;
+        }
+        if (style == 5u && in.local.y >= bottom && in.local.y < bottom + thick
+            && fract(in.local.x * 3.0) < 0.6) {
+            return in.dcol;
+        }
+    }
     return base;
 }
 "#;
@@ -100,6 +143,11 @@ struct Instance {
     bg: u32,
     curs: u32,
     ccol: u32,
+    /// Bit 3: strikethrough. Bits 0-2: underline style, `0` none else
+    /// `UnderlineStyle`'s 1-5 encoding (straight/double/curly/dotted/dashed).
+    deco: u32,
+    /// Underline/strike stripe color (`dcol`), used only when `deco != 0`.
+    dcol: u32,
 }
 
 #[repr(C)]
@@ -246,7 +294,7 @@ impl GpuCore {
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Instance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32, 4 => Uint32, 5 => Uint32, 6 => Uint32],
+            attributes: &wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32, 4 => Uint32, 5 => Uint32, 6 => Uint32, 7 => Uint32, 8 => Uint32],
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cells pipeline"),
@@ -355,7 +403,17 @@ impl GpuCore {
                 continue;
             }
             let slot = self.ensure_slot(cell.ch, Style::Regular, font);
-            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
+            instances.push(Instance {
+                col: col as u32,
+                row: 0,
+                slot,
+                fg: cell.fg,
+                bg: cell.bg,
+                curs: 0,
+                ccol: 0,
+                deco: 0,
+                dcol: 0,
+            });
         }
         self.append_grid(&mut instances, grid, 0, row_off, true, cursor_on, font);
         self.draw_instances(view, &instances, 0x000000);
@@ -386,23 +444,25 @@ impl GpuCore {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let (fg, bg, curs, ccol) = if !on_status && cursor == Some((col, row)) {
-                match grid.cursor_shape {
+            let (fg, bg, curs, ccol, plain) = if !on_status && cursor == Some((col, row)) {
+                let (fg, bg, curs, ccol) = match grid.cursor_shape {
                     CursorShape::Block => (cell.bg, grid.cursor_color, 0u32, 0u32),
                     CursorShape::Underline => (cell.fg, cell.bg, 2u32, grid.cursor_color),
                     CursorShape::Bar => (cell.fg, cell.bg, 3u32, grid.cursor_color),
-                }
+                };
+                (fg, bg, curs, ccol, false)
             } else if !on_status
                 && let Some(cur) = grid.search_highlight(col, row)
             {
-                (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG }, 0, 0)
+                (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG }, 0, 0, false)
             } else if !on_status && grid.view_offset == 0 && grid.is_selected(col, row) {
-                (cell.bg, cell.fg, 0, 0)
+                (cell.bg, cell.fg, 0, 0, false)
             } else {
-                (cell.fg, cell.bg, 0, 0)
+                (cell.fg, cell.bg, 0, 0, true)
             };
             let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
             let slot = self.ensure_slot(cell.ch, style, font);
+            let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, plain);
             instances.push(Instance {
                 col: (col0 + col) as u32,
                 row: (row0 + row) as u32,
@@ -411,6 +471,8 @@ impl GpuCore {
                 bg,
                 curs,
                 ccol,
+                deco,
+                dcol,
             });
         }
         if focused && !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
@@ -424,10 +486,30 @@ impl GpuCore {
                 let base = grid.viewport_cell(col, crow);
                 let row = (row0 + crow) as u32;
                 let slot = self.ensure_slot(pch, Style::Regular, font);
-                instances.push(Instance { col: (col0 + col) as u32, row, slot, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                instances.push(Instance {
+                    col: (col0 + col) as u32,
+                    row,
+                    slot,
+                    fg: base.bg,
+                    bg: base.fg,
+                    curs: 0,
+                    ccol: 0,
+                    deco: 0,
+                    dcol: 0,
+                });
                 if w == 2 {
                     let blank = self.ensure_slot(' ', Style::Regular, font);
-                    instances.push(Instance { col: (col0 + col) as u32 + 1, row, slot: blank, fg: base.bg, bg: base.fg, curs: 0, ccol: 0 });
+                    instances.push(Instance {
+                        col: (col0 + col) as u32 + 1,
+                        row,
+                        slot: blank,
+                        fg: base.bg,
+                        bg: base.fg,
+                        curs: 0,
+                        ccol: 0,
+                        deco: 0,
+                        dcol: 0,
+                    });
                 }
                 col += w;
             }
@@ -459,7 +541,17 @@ impl GpuCore {
                 continue;
             }
             let slot = self.ensure_slot(cell.ch, Style::Regular, font);
-            instances.push(Instance { col: col as u32, row: 0, slot, fg: cell.fg, bg: cell.bg, curs: 0, ccol: 0 });
+            instances.push(Instance {
+                col: col as u32,
+                row: 0,
+                slot,
+                fg: cell.fg,
+                bg: cell.bg,
+                curs: 0,
+                ccol: 0,
+                deco: 0,
+                dcol: 0,
+            });
         }
         for p in panes {
             self.append_grid(&mut instances, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
@@ -502,6 +594,28 @@ impl GpuCore {
         }
         self.queue.submit([encoder.finish()]);
     }
+}
+
+/// Pack a cell's underline/strikethrough state into the `Instance::deco` bits
+/// and pick the stripe color: `underline_color` when SGR 58 set it and `plain`
+/// (the cell isn't under the cursor, a selection, or a search highlight —
+/// those already swapped `fg` to something that should win instead).
+fn deco_for(flags: u16, underline_color: u32, fg: u32, plain: bool) -> (u32, u32) {
+    let mut deco = 0u32;
+    if flags & ATTR_STRIKE != 0 {
+        deco |= 8;
+    }
+    if flags & ATTR_UNDERLINE != 0 {
+        deco |= match UnderlineStyle::from_attrs(flags) {
+            UnderlineStyle::Straight => 1,
+            UnderlineStyle::Double => 2,
+            UnderlineStyle::Curly => 3,
+            UnderlineStyle::Dotted => 4,
+            UnderlineStyle::Dashed => 5,
+        };
+    }
+    let dcol = if plain && flags & ATTR_UNDERLINE_COLOR != 0 { underline_color } else { fg };
+    (deco, dcol)
 }
 
 /// Build a `cell_w × cell_h` R8 coverage tile for `ch`, blitting the glyph at

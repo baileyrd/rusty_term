@@ -33,11 +33,11 @@ in one case — investigated and rejected outright.
 | ID | Capability | Tier | Notable adopters | Size |
 |---|---|---|---|---|
 | ✅ C01 | Synchronized output (mode 2026) | T1 | kitty, Ghostty, Windows Terminal | M |
-| C02 | Undercurl + colored underlines | T1 | kitty, VTE, Alacritty, iTerm2 | M |
+| ✅ C02 | Undercurl + colored underlines | T1 | kitty, VTE, Alacritty, iTerm2 | M |
 | C03 | Kitty keyboard protocol (native GUI) | T1 | kitty, WezTerm, Ghostty, +5 more | M–L |
 | ✅ C04 | OSC 22 pointer shape | T1 | xterm, kitty | S |
 | ✅ C05 | Window title stack | T1 | xterm, VTE | S |
-| C06 | DECRQM mode query | T1 | xterm, kitty | S–M |
+| ✅ C06 | DECRQM mode query | T1 | xterm, kitty | S–M |
 | ✅ C07 | XTWINOPS pixel-size queries | T1 | xterm, kitty, WezTerm | S |
 | C08 | GPU renderer ligatures | T2 | internal parity | L |
 | C09 | GPU renderer image protocols | T2 | internal parity | L |
@@ -94,7 +94,24 @@ claims not to flicker.
 **Size** M · **Deps** none.
 
 ### C02 — Undercurl + colored underlines (SGR 4:3, 58/59)
-**Current.** `ATTR_UNDERLINE` is a single boolean bit; no curly/dashed/
+**Status: done.** `UnderlineStyle` + `ATTR_UNDERLINE_COLOR` (`src/core/cell.rs`)
+pack style and a colored-underline flag alongside the existing attribute
+bits; `underline_color` is a new field on both `Cell` and `Pen`. The parser's
+`parse_sgr_params` (`src/core/parser.rs`) distinguishes the ECMA-48 colon
+sub-parameter form (`4:3`, one code) from the semicolon form (`4;3`, two
+independent codes) via a synthetic sentinel, so the two are never confused;
+SGR 58/59 reuse the existing `Palette::extended` truecolor/256-color decoder,
+so both `58;2;r;g;b` and the colon `58:2:r:g:b` form work identically. The
+CPU rasterizer (`src/gui/cpu.rs`) draws straight/double/curly/dotted/dashed
+strokes and strikethrough as pixel stripes — a new decoration pass, since
+neither was drawn anywhere before (the existing "underline" code there is
+the DECSCUSR *cursor* shape, unrelated). The GPU renderer (`src/gui/gpu.rs`)
+gets the same five styles + strikethrough drawn directly in the WGSL
+fragment shader via two new per-instance fields, so the two render paths
+stay at parity. TUI passthrough mode re-emits the style/color via `sgr_for`
+(`src/render.rs`) so a capable host terminal renders the same thing.
+
+**Current (before).** `ATTR_UNDERLINE` is a single boolean bit; no curly/dashed/
 dotted underline styles and no separate underline-color channel. No matches
 for SGR 58/59 anywhere in `src/`.
 
@@ -172,7 +189,16 @@ quitting vim can leave the window titled "vim" indefinitely.
 title-fallback path from the `--title` work.
 
 ### C06 — DECRQM (mode query/report)
-**Current.** rusty_term accepts DECSET/DECRST (mode-setting) but has no
+**Status: done.** `AnsiParser::report_dec_mode`/`report_ansi_mode`
+(`src/core/parser.rs`) answer `CSI ? Ps $p` (DEC private) and `CSI Ps $p`
+(ANSI) with a DECRPM report for every mode rusty_term actually tracks state
+for (DECOM, DECAWM, DECTCEM, alt-screen, mouse tracking + extended
+encodings, bracketed paste, synchronized output C01, IRM); a mode we only
+relay to the host and don't track ourselves (DECCKM, focus reporting)
+answers "not recognized" (`0`) honestly rather than guessing, and so does
+any genuinely unimplemented mode (e.g. LNM, until C22).
+
+**Current (before).** rusty_term accepts DECSET/DECRST (mode-setting) but has no
 matches for answering `CSI Ps $p` ("is mode *N* currently set?") queries at
 all.
 

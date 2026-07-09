@@ -37,6 +37,16 @@ pub const ATTR_REVERSE: u16 = 1 << 6;
 pub const ATTR_HIDDEN: u16 = 1 << 7;
 /// SGR 9 — crossed-out / strikethrough.
 pub const ATTR_STRIKE: u16 = 1 << 8;
+/// SGR 58 — a custom underline color is set (in [`Cell::underline_color`] /
+/// [`Pen::underline_color`]) rather than following the foreground.
+pub const ATTR_UNDERLINE_COLOR: u16 = 1 << 12;
+
+/// Bit offset of the 3-bit underline-style sub-field (SGR `4:0`-`4:5`) packed
+/// into the same `u16` as the `ATTR_*` bits. Only meaningful when
+/// [`ATTR_UNDERLINE`] is set.
+const UNDERLINE_STYLE_SHIFT: u16 = 9;
+/// Mask isolating the underline-style sub-field before shifting.
+const UNDERLINE_STYLE_MASK: u16 = 0b111 << UNDERLINE_STYLE_SHIFT;
 
 /// Mask of every rendition attribute bit (everything except [`WIDE_TRAILER`]).
 pub const ATTR_MASK: u16 = ATTR_BOLD
@@ -46,7 +56,53 @@ pub const ATTR_MASK: u16 = ATTR_BOLD
     | ATTR_BLINK
     | ATTR_REVERSE
     | ATTR_HIDDEN
-    | ATTR_STRIKE;
+    | ATTR_STRIKE
+    | ATTR_UNDERLINE_COLOR
+    | UNDERLINE_STYLE_MASK;
+
+/// Underline stroke style (SGR `4:0`.."4:5"` — the colon sub-parameter form
+/// Kitty and others use to pick something other than a plain straight line).
+/// Packed into 3 bits of [`Cell::flags`] / [`Pen::attrs`]; only meaningful
+/// while [`ATTR_UNDERLINE`] is also set — clearing the attribute (SGR `24`)
+/// hides the stroke regardless of what style bits are left behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    Straight,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Decode the style packed into `attrs` (a `Cell::flags` or `Pen::attrs`
+    /// value). An out-of-range sub-field (shouldn't happen — only this module
+    /// writes it) falls back to [`UnderlineStyle::Straight`].
+    pub fn from_attrs(attrs: u16) -> Self {
+        match (attrs & UNDERLINE_STYLE_MASK) >> UNDERLINE_STYLE_SHIFT {
+            1 => UnderlineStyle::Double,
+            2 => UnderlineStyle::Curly,
+            3 => UnderlineStyle::Dotted,
+            4 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::Straight,
+        }
+    }
+
+    /// Pack `self` into the style sub-field of an attribute bitset, replacing
+    /// whatever was there (the other `ATTR_*` bits of `attrs` pass through
+    /// untouched).
+    pub fn pack_into(self, attrs: u16) -> u16 {
+        let bits = match self {
+            UnderlineStyle::Straight => 0,
+            UnderlineStyle::Double => 1,
+            UnderlineStyle::Curly => 2,
+            UnderlineStyle::Dotted => 3,
+            UnderlineStyle::Dashed => 4,
+        };
+        (attrs & !UNDERLINE_STYLE_MASK) | (bits << UNDERLINE_STYLE_SHIFT)
+    }
+}
 
 /// The current SGR graphic rendition — foreground/background color and the set
 /// of active text attributes — that the parser stamps onto each glyph it
@@ -59,6 +115,9 @@ pub struct Pen {
     pub bg: u32,
     /// Active text-attribute bits (`ATTR_*`).
     pub attrs: u16,
+    /// Underline color as `0xRRGGBB` (SGR 58). Only consulted when
+    /// [`ATTR_UNDERLINE_COLOR`] is set; otherwise the underline follows `fg`.
+    pub underline_color: u32,
 }
 
 impl Default for Pen {
@@ -68,6 +127,7 @@ impl Default for Pen {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             attrs: 0,
+            underline_color: DEFAULT_FG,
         }
     }
 }
@@ -107,6 +167,9 @@ pub struct Cell {
     pub flags: u16,
     /// Hyperlink id (OSC 8): `0` for none, else an index+1 into `Grid::links`.
     pub link: u16,
+    /// Underline color as `0xRRGGBB` (SGR 58). Only meaningful when
+    /// [`ATTR_UNDERLINE_COLOR`] is set in `flags`.
+    pub underline_color: u32,
 }
 
 impl Cell {
@@ -119,6 +182,7 @@ impl Cell {
             bg: DEFAULT_BG,
             flags: 0,
             link: 0,
+            underline_color: DEFAULT_FG,
         }
     }
 }

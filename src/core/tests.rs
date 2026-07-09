@@ -1077,6 +1077,91 @@ fn ris_and_decstr_clear_sync_output_and_cursor_icon() {
 }
 
 #[test]
+fn sgr4_colon_style_sets_undercurl_and_other_styles() {
+    let g = parse(b"\x1b[4:3ma\x1b[4:4mb\x1b[4:5mc\x1b[4:2md\x1b[4:1me\x1b[4:0mf", 80, 24);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Curly);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[1].flags), UnderlineStyle::Dotted);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[2].flags), UnderlineStyle::Dashed);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[3].flags), UnderlineStyle::Double);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[4].flags), UnderlineStyle::Straight);
+    // `4:0` turns the underline off outright rather than just resetting style.
+    assert_eq!(g.cells[5].flags & ATTR_UNDERLINE, 0);
+}
+
+#[test]
+fn sgr4_semicolon_form_is_unambiguous_from_colon_sub_param() {
+    // `4;3` is two independent codes (underline, then italic) — never the
+    // curly-style sub-parameter `4:3` means.
+    let g = parse(b"\x1b[4;3mx", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
+    assert_ne!(g.cells[0].flags & ATTR_ITALIC, 0);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Straight);
+}
+
+#[test]
+fn sgr4_bare_forces_straight_even_over_a_leftover_colon_style() {
+    let g = parse(b"\x1b[4:3m\x1b[4mx", 80, 24);
+    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Straight);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
+}
+
+#[test]
+fn sgr58_sets_underline_color_independent_of_fg_and_59_resets() {
+    let g = parse(b"\x1b[4m\x1b[38;2;10;20;30m\x1b[58;2;255;0;0mA\x1b[59mB", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE_COLOR, 0);
+    assert_eq!(g.cells[0].underline_color, 0xFF0000);
+    assert_eq!(g.cells[0].fg, 0x0A141E); // fg untouched by SGR 58
+    // 59 turns the custom-color flag back off; the rendering fallback (fg) is
+    // the renderer's job, not the model's — the flag alone is what matters.
+    assert_eq!(g.cells[1].flags & ATTR_UNDERLINE_COLOR, 0);
+}
+
+#[test]
+fn sgr58_colon_form_matches_semicolon_form() {
+    let g = parse(b"\x1b[4m\x1b[58:2:0:255:0mA", 80, 24);
+    assert_ne!(g.cells[0].flags & ATTR_UNDERLINE_COLOR, 0);
+    assert_eq!(g.cells[0].underline_color, 0x00FF00);
+}
+
+#[test]
+fn sgr_reset_clears_underline_style_and_color() {
+    let g = parse(b"\x1b[4:3m\x1b[58;2;1;2;3m\x1b[0mx", 80, 24);
+    assert_eq!(g.cells[0].flags & ATTR_UNDERLINE, 0);
+    assert_eq!(g.cells[0].flags & ATTR_UNDERLINE_COLOR, 0);
+}
+
+#[test]
+fn decrqm_reports_known_dec_private_modes_and_unknown_as_not_recognized() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?7$p"); // DECAWM, default on
+    assert_eq!(p.take_responses(), b"\x1b[?7;1$y");
+    p.advance(&mut g, b"\x1b[?7l\x1b[?7$p"); // reset it, query again
+    assert_eq!(p.take_responses(), b"\x1b[?7;2$y");
+    p.advance(&mut g, b"\x1b[?2026$p"); // synchronized output, default off
+    assert_eq!(p.take_responses(), b"\x1b[?2026;2$y");
+    p.advance(&mut g, b"\x1b[?2026h\x1b[?2026$p");
+    assert_eq!(p.take_responses(), b"\x1b[?2026;1$y");
+    // A mode we don't track state for (e.g. DECCKM, relayed to the host only)
+    // is answered honestly rather than guessed.
+    p.advance(&mut g, b"\x1b[?1$p");
+    assert_eq!(p.take_responses(), b"\x1b[?1;0$y");
+}
+
+#[test]
+fn decrqm_reports_ansi_irm_and_unknown_modes() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[4$p"); // IRM, default off
+    assert_eq!(p.take_responses(), b"\x1b[4;2$y");
+    p.advance(&mut g, b"\x1b[4h\x1b[4$p");
+    assert_eq!(p.take_responses(), b"\x1b[4;1$y");
+    p.advance(&mut g, b"\x1b[20$p"); // LNM: not modeled yet
+    assert_eq!(p.take_responses(), b"\x1b[20;0$y");
+}
+
+#[test]
 fn osc_2_sets_window_title() {
     let mut g = parse(b"\x1b]2;My Title\x07", 80, 24);
     assert_eq!(g.title, "My Title");

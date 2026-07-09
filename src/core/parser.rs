@@ -9,7 +9,7 @@
 
 use super::cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
-    ATTR_UNDERLINE, Pen,
+    ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Pen, UnderlineStyle,
 };
 use super::charset::Charset;
 use super::color::Palette;
@@ -155,6 +155,7 @@ impl AnsiParser {
             fg: palette.fg,
             bg: palette.bg,
             attrs: 0,
+            underline_color: palette.fg,
         };
         Self {
             state: ParserState::Ground,
@@ -319,8 +320,12 @@ impl AnsiParser {
                     _ => self.state = ParserState::Ground,
                 },
                 ParserState::Csi => match b {
-                    // Parameter bytes.
-                    b'0'..=b'9' | b';' => self.param_buffer.push(b as char),
+                    // Parameter bytes. `:` (ECMA-48 sub-parameter separator) is
+                    // only meaningful to SGR (see `parse_sgr_params`); every
+                    // other command's `parse_params` never sees a field
+                    // containing one in practice, so collecting it here
+                    // unconditionally is harmless.
+                    b'0'..=b'9' | b';' | b':' => self.param_buffer.push(b as char),
                     // Private markers (`<`, `=`, `>`, `?`): flag, remember which,
                     // and keep collecting.
                     0x3c..=0x3f => {
@@ -659,6 +664,13 @@ impl AnsiParser {
             g.host_out.push(cmd);
             return;
         }
+        // DECRQM (`CSI ? Ps $ p`) — report whether DEC private mode `Ps` is
+        // set/reset, answered with a DECRPM (`CSI ? Ps ; Pv $ y`).
+        if self.csi_marker == b'?' && self.csi_intermediate == b'$' && cmd == b'p' {
+            let mode = self.parse_params().first().copied().flatten().unwrap_or(0);
+            self.report_dec_mode(g, mode);
+            return;
+        }
         // Only DEC-private (`?`) set/reset (`h`/`l`) sequences are actionable
         // here; other private forms are consumed without effect.
         if self.csi_marker != b'?' || (cmd != b'h' && cmd != b'l') {
@@ -732,6 +744,50 @@ impl AnsiParser {
         }
     }
 
+    /// Answer a DEC private DECRQM query (`CSI ? Ps $ p`) with a DECRPM report
+    /// (`CSI ? Ps ; Pv $ y`). `Pv` is `1` set, `2` reset, or `0` "not
+    /// recognized" — used honestly for modes this terminal only relays to the
+    /// host and doesn't track state for itself (DECCKM, focus reporting),
+    /// rather than guessing. Never reports the "permanently set/reset" `3`/`4`
+    /// forms — nothing here is locked.
+    fn report_dec_mode(&mut self, g: &mut Grid, mode: usize) {
+        let set = match mode {
+            6 => g.origin_mode,
+            7 => g.autowrap,
+            25 => g.cursor_visible,
+            47 | 1047 | 1049 => g.in_alt_screen(),
+            1000 | 1002 | 1003 => g.mouse_modes.base == mode,
+            1005 => g.mouse_modes.extended & 1 != 0,
+            1006 => g.mouse_modes.extended & 2 != 0,
+            1015 => g.mouse_modes.extended & 4 != 0,
+            1016 => g.mouse_modes.extended & 8 != 0,
+            2004 => g.bracketed_paste,
+            2026 => g.sync_output_active(),
+            _ => {
+                self.responses.extend_from_slice(format!("\x1b[?{mode};0$y").as_bytes());
+                return;
+            }
+        };
+        let status = if set { 1 } else { 2 };
+        self.responses.extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
+    }
+
+    /// Answer an ANSI (non-private) DECRQM query (`CSI Ps $ p`) with a DECRPM
+    /// report (`CSI Ps ; Pv $ y`). See [`Self::report_dec_mode`] for `Pv`.
+    fn report_ansi_mode(&mut self, g: &Grid, mode: usize) {
+        let status = match mode {
+            4 => {
+                if g.insert_mode {
+                    1
+                } else {
+                    2
+                }
+            }
+            _ => 0,
+        };
+        self.responses.extend_from_slice(format!("\x1b[{mode};{status}$y").as_bytes());
+    }
+
     /// Parse `param_buffer` into positional parameters. An empty slot (e.g. the
     /// leading field of `CSI ;5H`) becomes `None` so callers can apply the
     /// per-command default in the correct position, per ECMA-48 §5.4.2.
@@ -745,6 +801,39 @@ impl AnsiParser {
             .collect()
     }
 
+    /// Parse `param_buffer` for an SGR (`m`) sequence into the flat parameter
+    /// list [`apply_sgr`] consumes. Semicolon (`;`) always separates
+    /// independent SGR codes; colon (`:`) groups ECMA-48 sub-parameters within
+    /// *one* code. The two are ambiguous only for SGR 4 — `4;3` means
+    /// "underline, then italic" but `4:3` means "underline, curly style" — so
+    /// a colon-grouped `4:N` is encoded as a synthetic `4000 + N` sentinel that
+    /// `apply_sgr` decodes back into the style. Every other code's
+    /// colon-grouped sub-parameters (e.g. the `38:2:r:g:b` truecolor form) are
+    /// simply flattened, since `apply_sgr` already consumes the semicolon form
+    /// of those the same way, positionally.
+    fn parse_sgr_params(&self) -> Vec<usize> {
+        if self.param_buffer.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for field in self.param_buffer.split(';') {
+            if field.contains(':') {
+                let mut sub = field.split(':').map(|s| s.parse::<usize>().unwrap_or(0));
+                let base = sub.next().unwrap_or(0);
+                if base == 4 {
+                    let style = sub.next().unwrap_or(1).min(5);
+                    out.push(4000 + style);
+                } else {
+                    out.push(base);
+                    out.extend(sub);
+                }
+            } else {
+                out.push(field.parse().unwrap_or(0));
+            }
+        }
+        out
+    }
+
     /// Dispatch a completed CSI sequence given its final command byte.
     fn handle_csi(&mut self, cmd: u8, g: &mut Grid) {
         let params = self.parse_params();
@@ -756,8 +845,7 @@ impl AnsiParser {
 
         match cmd {
             b'm' => {
-                // SGR: an empty list resets; otherwise an empty slot means 0.
-                let sgr: Vec<usize> = params.iter().map(|o| o.unwrap_or(0)).collect();
+                let sgr = self.parse_sgr_params();
                 self.apply_sgr(&sgr);
             }
             b'H' | b'f' => {
@@ -854,6 +942,11 @@ impl AnsiParser {
                     g.insert_mode = set;
                 }
             }
+            // DECRQM, ANSI (non-private) form (`CSI Ps $ p`) — report whether
+            // standard mode `Ps` is set/reset via DECRPM (`CSI Ps ; Pv $ y`).
+            b'p' if self.csi_intermediate == b'$' => {
+                self.report_ansi_mode(g, p(0, 0));
+            }
             b'p' if self.csi_intermediate == b'!' => {
                 // DECSTR — soft terminal reset (`CSI ! p`).
                 self.palette.reset();
@@ -943,14 +1036,18 @@ impl AnsiParser {
             fg: self.palette.fg,
             bg: self.palette.bg,
             attrs: 0,
+            underline_color: self.palette.fg,
         };
     }
 
     /// Apply an SGR (`CSI … m`) parameter list. Supports reset, the text
     /// attributes (bold/dim/italic/underline/blink/reverse/hidden/strike and
-    /// their resets), the 16-color palette (normal + bright), and the extended
+    /// their resets), the underline style/color sub-forms (`4:0`-`4:5`, `58`,
+    /// `59`), the 16-color palette (normal + bright), and the extended
     /// `38/48;5;n` (256-color) and `38/48;2;r;g;b` (truecolor) forms. An empty
-    /// list means reset.
+    /// list means reset. `params[i]` in `4000..=4005` is the synthetic
+    /// underline-style sentinel [`Self::parse_sgr_params`] produces for the
+    /// colon sub-parameter form — not a real SGR code.
     fn apply_sgr(&mut self, params: &[usize]) {
         if params.is_empty() {
             self.reset_sgr();
@@ -964,7 +1061,27 @@ impl AnsiParser {
                 1 => self.pen.attrs |= ATTR_BOLD,
                 2 => self.pen.attrs |= ATTR_DIM,
                 3 => self.pen.attrs |= ATTR_ITALIC,
-                4 => self.pen.attrs |= ATTR_UNDERLINE,
+                // Bare SGR 4 always means a plain single underline, even if a
+                // colon style was left over from an earlier `4:N` without an
+                // intervening `24` reset (matches xterm/kitty behavior).
+                4 => self.pen.attrs = UnderlineStyle::Straight.pack_into(self.pen.attrs | ATTR_UNDERLINE),
+                // Colon sub-parameter form of SGR 4 (see `parse_sgr_params`):
+                // `4:0` turns underline off, `4:1..=4:5` sets the style.
+                4000..=4005 => {
+                    let style = params[i] - 4000;
+                    if style == 0 {
+                        self.pen.attrs &= !ATTR_UNDERLINE;
+                    } else {
+                        let style = match style {
+                            2 => UnderlineStyle::Double,
+                            3 => UnderlineStyle::Curly,
+                            4 => UnderlineStyle::Dotted,
+                            5 => UnderlineStyle::Dashed,
+                            _ => UnderlineStyle::Straight,
+                        };
+                        self.pen.attrs = style.pack_into(self.pen.attrs | ATTR_UNDERLINE);
+                    }
+                }
                 // 5 (slow) and 6 (rapid) blink both map to our single blink bit.
                 5 | 6 => self.pen.attrs |= ATTR_BLINK,
                 7 => self.pen.attrs |= ATTR_REVERSE,
@@ -973,7 +1090,7 @@ impl AnsiParser {
                 // Reset text attributes. 22 clears both bold and dim.
                 22 => self.pen.attrs &= !(ATTR_BOLD | ATTR_DIM),
                 23 => self.pen.attrs &= !ATTR_ITALIC,
-                24 => self.pen.attrs &= !ATTR_UNDERLINE,
+                24 => self.pen.attrs = UnderlineStyle::Straight.pack_into(self.pen.attrs & !ATTR_UNDERLINE),
                 25 => self.pen.attrs &= !ATTR_BLINK,
                 27 => self.pen.attrs &= !ATTR_REVERSE,
                 28 => self.pen.attrs &= !ATTR_HIDDEN,
@@ -995,6 +1112,17 @@ impl AnsiParser {
                     }
                 }
                 49 => self.pen.bg = self.palette.bg,
+                // 58/59 — set/reset the underline color independent of `fg`
+                // (colon `58:2:r:g:b`/`58:5:n` and semicolon `58;2;r;g;b` both
+                // land here identically; see `palette.extended`).
+                58 => {
+                    if let Some((color, consumed)) = self.palette.extended(&params[i + 1..]) {
+                        self.pen.underline_color = color;
+                        self.pen.attrs |= ATTR_UNDERLINE_COLOR;
+                        i += consumed;
+                    }
+                }
+                59 => self.pen.attrs &= !ATTR_UNDERLINE_COLOR,
                 90..=97 => self.pen.fg = self.palette.index(8 + (params[i] - 90)),
                 100..=107 => self.pen.bg = self.palette.index(8 + (params[i] - 100)),
                 _ => {}
