@@ -19,7 +19,10 @@ the per-layer scorecard and backlog live in
 the narrative design synthesis in
 [`docs/research/terminal-stack-synthesis.md`](docs/research/terminal-stack-synthesis.md),
 and the implemented-feature catalog (per-feature notes + test names) in
-[`docs/FEATURES.md`](docs/FEATURES.md).
+[`docs/FEATURES.md`](docs/FEATURES.md). A competitive audit against kitty,
+Ghostty, WezTerm, Alacritty, Windows Terminal, and peers — 28 capabilities
+evaluated, 27 recommended and sequenced, 1 explicitly rejected — lives in
+[`docs/research/capability-assessment-2026.md`](docs/research/capability-assessment-2026.md).
 
 > **Platform support.** Unix (Linux/macOS) is the primary, fully exercised
 > target. The Windows ConPTY backend has been run and verified on Windows 11
