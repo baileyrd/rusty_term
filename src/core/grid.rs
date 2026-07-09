@@ -34,6 +34,12 @@ const PROMPT_MARKS_MAX: usize = 1024;
 /// than growing without bound — no real app nests this deep.
 const TITLE_STACK_MAX: usize = 64;
 
+/// Maximum depth of the Kitty keyboard protocol's enhancement-flag stack
+/// (`CSI > flags u` pushes). Real apps push at most a handful of levels
+/// (Neovim pushes/pops once around its own event loop); bounded against a
+/// runaway script the same way [`TITLE_STACK_MAX`] is.
+const KITTY_FLAGS_STACK_MAX: usize = 16;
+
 /// Maximum number of distinct hyperlink URIs interned from OSC 8. Past this,
 /// further links are dropped (rendered as plain text) rather than growing the
 /// table without bound.
@@ -149,6 +155,13 @@ pub struct Grid {
     /// (vim, tmux) set a working title and hand the caller's back on exit.
     /// Bounded by [`TITLE_STACK_MAX`] against a runaway script.
     title_stack: Vec<String>,
+    /// Kitty keyboard protocol enhancement-flag stack (`CSI > flags u` push,
+    /// `CSI < N u` pop, `CSI = flags ; mode u` set). The top entry (`0` when
+    /// empty — legacy encoding) is what the windowed front-end's own key
+    /// encoder (`gui/input.rs`) consults; TUI mode has a real host to relay
+    /// these sequences to instead and never reads this. Bounded by
+    /// [`KITTY_FLAGS_STACK_MAX`] against a runaway script.
+    kitty_flags_stack: Vec<u8>,
     /// Working directory last reported by the child via OSC 7 (typically a
     /// `file://host/path` URI). Captured for future use (e.g. "open new tab in
     /// the same directory"); empty until reported.
@@ -210,6 +223,12 @@ pub struct Grid {
     /// mode it is also relayed to the host; the windowed front-end reads it to
     /// decide whether to wrap pasted text in `ESC[200~` / `ESC[201~`.
     pub bracketed_paste: bool,
+    /// Whether DECCKM (application cursor keys, DEC `?1`) is enabled by the
+    /// child. In TUI mode the mode is also relayed to the host, which does
+    /// its own arrow-key encoding; the windowed front-end has no host to
+    /// relay to, so its native key encoder reads this directly to choose
+    /// `CSI` (normal) vs `SS3` (application) arrow sequences.
+    pub app_cursor_keys: bool,
     /// Mouse reporting enabled by the child (DECSET `?1000`/`?1002`/`?1003`),
     /// plus extended-format bits (`?1006`/`?1015`/`?1016`). The window backend
     /// uses this to route clicks/drags/scrolls back to the child as encoded
@@ -790,6 +809,7 @@ impl Grid {
             epoch: 0,
             title: String::new(),
             title_stack: Vec::new(),
+            kitty_flags_stack: Vec::new(),
             cwd: String::new(),
             scrollback: VecDeque::new(),
             scrollback_max: SCROLLBACK_MAX,
@@ -810,6 +830,7 @@ impl Grid {
             sync_output: false,
             sync_output_since: None,
             bracketed_paste: false,
+            app_cursor_keys: false,
             clipboard_set: None,
             clipboard_query: false,
             notifications: Vec::new(),
@@ -939,6 +960,50 @@ impl Grid {
         if let Some(t) = self.title_stack.pop() {
             self.title = t;
         }
+    }
+
+    /// The Kitty keyboard protocol enhancement flags currently in effect —
+    /// the top of [`Self::kitty_flags_stack`], or `0` (legacy encoding) when
+    /// nothing has pushed an entry. Consulted by the windowed front-end's own
+    /// key encoder.
+    pub(crate) fn kitty_keyboard_flags(&self) -> u8 {
+        self.kitty_flags_stack.last().copied().unwrap_or(0)
+    }
+
+    /// Push a new enhancement-flag entry (`CSI > flags u`), inheriting
+    /// nothing from the previous top — a client that wants to extend it reads
+    /// the current flags via `CSI ? u` first, as the spec expects. Silently
+    /// drops the push once [`KITTY_FLAGS_STACK_MAX`] is reached.
+    pub(crate) fn push_kitty_flags(&mut self, flags: u8) {
+        if self.kitty_flags_stack.len() < KITTY_FLAGS_STACK_MAX {
+            self.kitty_flags_stack.push(flags);
+        }
+    }
+
+    /// Pop `n` enhancement-flag entries (`CSI < n u`, default `n=1`). Popping
+    /// more than the stack holds just empties it (back to legacy encoding).
+    pub(crate) fn pop_kitty_flags(&mut self, n: usize) {
+        for _ in 0..n.max(1) {
+            if self.kitty_flags_stack.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Set the current enhancement flags (`CSI = flags ; mode u`): mode `1`
+    /// (default) replaces them, `2` ORs `flags` in, `3` clears `flags`' bits.
+    /// Pushes a fresh (`0`) entry first if the stack is empty, since there's
+    /// no existing top to modify.
+    pub(crate) fn set_kitty_flags(&mut self, flags: u8, mode: u8) {
+        if self.kitty_flags_stack.is_empty() {
+            self.kitty_flags_stack.push(0);
+        }
+        let top = self.kitty_flags_stack.last_mut().expect("just ensured non-empty");
+        *top = match mode {
+            2 => *top | flags,
+            3 => *top & !flags,
+            _ => flags,
+        };
     }
 
     /// Enter/leave a synchronized-output window (DEC `?2026`), set by the
@@ -1932,6 +1997,8 @@ impl Grid {
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.app_cursor_keys = false;
+        self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
         self.sync_output = false;
@@ -1956,6 +2023,8 @@ impl Grid {
         self.saved_cursor = (0, 0);
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.app_cursor_keys = false;
+        self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
         self.sync_output = false;

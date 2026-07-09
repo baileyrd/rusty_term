@@ -8,11 +8,25 @@ pub struct MousePoint {
     pub row: usize,
 }
 
+/// Which physical button an event concerns. Only the three SGR mouse
+/// protocol models (xterm's button field): left/middle/right — side buttons
+/// and anything else have no encoding and are simply not reported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseButtonKind {
+    #[default]
+    Left,
+    Middle,
+    Right,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MouseEventKind {
     Press,
     Release,
-    Move,
+    /// Pointer motion. `dragging` is whether a button is currently held —
+    /// distinguishes a `?1002` (button-event) drag from a `?1003` (any-event)
+    /// idle hover, and picks which button number a drag reports.
+    Move { dragging: bool },
     Scroll { lines: isize },
 }
 
@@ -20,6 +34,7 @@ pub enum MouseEventKind {
 pub struct MouseEvent {
     pub point: MousePoint,
     pub kind: MouseEventKind,
+    pub button: MouseButtonKind,
     pub shift: bool,
     pub alt: bool,
     pub ctrl: bool,
@@ -29,7 +44,8 @@ impl MouseEvent {
     pub fn new_point(col: usize, row: usize) -> Self {
         Self {
             point: MousePoint { col, row },
-            kind: MouseEventKind::Move,
+            kind: MouseEventKind::Move { dragging: false },
+            button: MouseButtonKind::Left,
             shift: false,
             alt: false,
             ctrl: false,
@@ -38,6 +54,19 @@ impl MouseEvent {
 
     pub fn with_button(mut self, pressed: bool) -> Self {
         self.kind = if pressed { MouseEventKind::Press } else { MouseEventKind::Release };
+        self
+    }
+
+    /// Set which physical button this event concerns (default `Left`).
+    pub fn with_button_kind(mut self, button: MouseButtonKind) -> Self {
+        self.button = button;
+        self
+    }
+
+    /// Mark this as pointer motion; `dragging` is whether a button is
+    /// currently held (see [`MouseEventKind::Move`]).
+    pub fn with_move(mut self, dragging: bool) -> Self {
+        self.kind = MouseEventKind::Move { dragging };
         self
     }
 
@@ -68,21 +97,34 @@ impl SgrEncoder {
         if self.base == 0 {
             return;
         }
-        let MouseEvent { point, kind, shift, alt, ctrl, .. } = e;
+        let MouseEvent { point, kind, button, shift, alt, ctrl } = e;
         let col = point.col.saturating_add(1);
         let row = point.row.saturating_add(1);
+        let btn = match button {
+            MouseButtonKind::Left => 0,
+            MouseButtonKind::Middle => 1,
+            MouseButtonKind::Right => 2,
+        };
 
-        let (cb, command) = match (self.base, kind) {
-            (1000 | 1002, MouseEventKind::Press) => (0, b'M'),
-            (1000 | 1002, MouseEventKind::Release) => (3, b'm'),
-            (1000 | 1002, MouseEventKind::Move) => (32, b'M'),
-            (1003, MouseEventKind::Press) => (0, b'M'),
-            (1003, MouseEventKind::Release) => (3, b'm'),
-            (1003, MouseEventKind::Move) => (32, b'M'),
-            (_, MouseEventKind::Scroll { lines: 0 }) => return,
-            (_, MouseEventKind::Scroll { lines }) if lines > 0 => (64, b'M'),
-            (_, MouseEventKind::Scroll { lines }) if lines < 0 => (65, b'M'),
-            _ => return,
+        let (cb, command) = match kind {
+            MouseEventKind::Press => (btn, b'M'),
+            MouseEventKind::Release => (3, b'm'),
+            MouseEventKind::Move { dragging } => {
+                // `?1000` (click-only) never reports motion; `?1002`
+                // (button-event) only while a button is held; `?1003`
+                // (any-event) reports every motion, idle or dragging. A
+                // dragging motion reports the held button (xterm's "add 32
+                // to the button number"); an idle `?1003` hover reports the
+                // release code 3 + 32 = 35 (xterm's "no button" motion code).
+                if self.base == 1000 || (self.base == 1002 && !dragging) {
+                    return;
+                }
+                (32 + if dragging { btn } else { 3 }, b'M')
+            }
+            MouseEventKind::Scroll { lines: 0 } => return,
+            MouseEventKind::Scroll { lines } if lines > 0 => (64, b'M'),
+            MouseEventKind::Scroll { lines } if lines < 0 => (65, b'M'),
+            MouseEventKind::Scroll { .. } => return,
         };
 
         let mut flags = 0u8;
@@ -147,5 +189,58 @@ mod tests {
         let mut out = Vec::new();
         enc(0).write(MouseEvent::new_point(0, 0).with_button(true), &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn right_and_middle_buttons_encode_their_own_number() {
+        let mut right = Vec::new();
+        enc(1000)
+            .write(MouseEvent::new_point(0, 0).with_button(true).with_button_kind(MouseButtonKind::Right), &mut right);
+        assert_eq!(right, b"\x1b[<2;1;1M");
+        let mut middle = Vec::new();
+        enc(1000)
+            .write(MouseEvent::new_point(0, 0).with_button(true).with_button_kind(MouseButtonKind::Middle), &mut middle);
+        assert_eq!(middle, b"\x1b[<1;1;1M");
+    }
+
+    #[test]
+    fn mode_1000_never_reports_motion() {
+        let mut out = Vec::new();
+        enc(1000).write(MouseEvent::new_point(0, 0).with_move(true), &mut out);
+        assert!(out.is_empty());
+        let mut out2 = Vec::new();
+        enc(1000).write(MouseEvent::new_point(0, 0).with_move(false), &mut out2);
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn mode_1002_reports_motion_only_while_dragging() {
+        let mut idle = Vec::new();
+        enc(1002).write(MouseEvent::new_point(0, 0).with_move(false), &mut idle);
+        assert!(idle.is_empty(), "no button held: ?1002 stays quiet");
+
+        let mut dragging = Vec::new();
+        enc(1002).write(
+            MouseEvent::new_point(4, 2).with_move(true).with_button_kind(MouseButtonKind::Left),
+            &mut dragging,
+        );
+        // 32 (motion) + 0 (left) = 32.
+        assert_eq!(dragging, b"\x1b[<32;5;3M");
+    }
+
+    #[test]
+    fn mode_1003_reports_idle_hover_and_drag_motion() {
+        let mut idle = Vec::new();
+        enc(1003).write(MouseEvent::new_point(0, 0).with_move(false), &mut idle);
+        // 32 (motion) + 3 (no button) = 35.
+        assert_eq!(idle, b"\x1b[<35;1;1M");
+
+        let mut dragging = Vec::new();
+        enc(1003).write(
+            MouseEvent::new_point(0, 0).with_move(true).with_button_kind(MouseButtonKind::Right),
+            &mut dragging,
+        );
+        // 32 (motion) + 2 (right) = 34.
+        assert_eq!(dragging, b"\x1b[<34;1;1M");
     }
 }

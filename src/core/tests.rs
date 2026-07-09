@@ -1051,6 +1051,55 @@ fn xtpushtitle_and_xtpoptitle_round_trip() {
 }
 
 #[test]
+fn kitty_keyboard_push_pop_and_query_round_trip() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert_eq!(g.kitty_keyboard_flags(), 0);
+    p.advance(&mut g, b"\x1b[?u"); // query with nothing pushed
+    assert_eq!(p.take_responses(), b"\x1b[?0u");
+
+    p.advance(&mut g, b"\x1b[>1u"); // push disambiguate
+    assert_eq!(g.kitty_keyboard_flags(), 1);
+    p.advance(&mut g, b"\x1b[?u");
+    assert_eq!(p.take_responses(), b"\x1b[?1u");
+
+    p.advance(&mut g, b"\x1b[>5u"); // push disambiguate|report-alternate-keys
+    assert_eq!(g.kitty_keyboard_flags(), 5);
+
+    p.advance(&mut g, b"\x1b[<u"); // pop (default 1): back to the first push
+    assert_eq!(g.kitty_keyboard_flags(), 1);
+    p.advance(&mut g, b"\x1b[<u"); // pop again: stack empty, legacy encoding
+    assert_eq!(g.kitty_keyboard_flags(), 0);
+    p.advance(&mut g, b"\x1b[<5u"); // popping past empty is a harmless no-op
+    assert_eq!(g.kitty_keyboard_flags(), 0);
+}
+
+#[test]
+fn kitty_keyboard_set_modes_replace_or_or_or_clear() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[=1;1u"); // mode 1 (default): replace
+    assert_eq!(g.kitty_keyboard_flags(), 1);
+    p.advance(&mut g, b"\x1b[=4;2u"); // mode 2: OR in
+    assert_eq!(g.kitty_keyboard_flags(), 5);
+    p.advance(&mut g, b"\x1b[=1;3u"); // mode 3: clear those bits
+    assert_eq!(g.kitty_keyboard_flags(), 4);
+    p.advance(&mut g, b"\x1b[=2u"); // mode omitted defaults to 1 (replace)
+    assert_eq!(g.kitty_keyboard_flags(), 2);
+}
+
+#[test]
+fn kitty_keyboard_relayed_to_host_and_cleared_by_ris() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[>1u");
+    assert_eq!(g.take_host_out(), b"\x1b[>1u");
+    assert_eq!(g.kitty_keyboard_flags(), 1);
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.kitty_keyboard_flags(), 0);
+}
+
+#[test]
 fn osc22_sets_and_clears_cursor_icon_request() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
@@ -1143,10 +1192,14 @@ fn decrqm_reports_known_dec_private_modes_and_unknown_as_not_recognized() {
     assert_eq!(p.take_responses(), b"\x1b[?2026;2$y");
     p.advance(&mut g, b"\x1b[?2026h\x1b[?2026$p");
     assert_eq!(p.take_responses(), b"\x1b[?2026;1$y");
-    // A mode we don't track state for (e.g. DECCKM, relayed to the host only)
-    // is answered honestly rather than guessed.
-    p.advance(&mut g, b"\x1b[?1$p");
-    assert_eq!(p.take_responses(), b"\x1b[?1;0$y");
+    p.advance(&mut g, b"\x1b[?1$p"); // DECCKM, default off
+    assert_eq!(p.take_responses(), b"\x1b[?1;2$y");
+    p.advance(&mut g, b"\x1b[?1h\x1b[?1$p");
+    assert_eq!(p.take_responses(), b"\x1b[?1;1$y");
+    // A mode we genuinely don't track state for (e.g. focus reporting,
+    // relayed to the host only) is answered honestly rather than guessed.
+    p.advance(&mut g, b"\x1b[?1004$p");
+    assert_eq!(p.take_responses(), b"\x1b[?1004;0$y");
 }
 
 #[test]
@@ -2049,6 +2102,23 @@ fn sgr_mouse_and_bracketed_paste_are_relayed() {
     assert_eq!(g.take_host_out(), b"\x1b[?1006h");
     p.advance(&mut g, b"\x1b[?2004h"); // bracketed paste
     assert_eq!(g.take_host_out(), b"\x1b[?2004h");
+}
+#[test]
+fn decckm_tracked_for_window_backend_and_relayed_and_reset_by_ris() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.app_cursor_keys);
+    // Tracked into the grid (for the windowed front-end's own key encoder,
+    // which has no host to relay to) *and* still relayed to the host (whose
+    // own key encoder needs to follow it too, in TUI mode).
+    p.advance(&mut g, b"\x1b[?1h");
+    assert_eq!(g.take_host_out(), b"\x1b[?1h");
+    assert!(g.app_cursor_keys);
+    p.advance(&mut g, b"\x1b[?1l");
+    assert_eq!(g.take_host_out(), b"\x1b[?1l");
+    assert!(!g.app_cursor_keys);
+    p.advance(&mut g, b"\x1b[?1h\x1bc"); // RIS clears it back to normal
+    assert!(!g.app_cursor_keys);
 }
 #[test]
 fn mouse_modes_tracked_for_window_backend() {
