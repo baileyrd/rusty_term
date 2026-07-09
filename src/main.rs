@@ -94,6 +94,9 @@ fn main() -> Result<(), std::io::Error> {
     } else if args.iter().any(|a| a == "--maximized") {
         config.launch_mode = Some(LaunchMode::Maximized);
     }
+    if let Some(v) = flag_value(args, "--opacity").and_then(|v| v.parse::<f32>().ok()) {
+        config.opacity = Some(v.clamp(0.0, 1.0));
+    }
     if let Some((prog, cmd_args)) = command {
         config.shell = Some(prog);
         config.command_args = cmd_args;

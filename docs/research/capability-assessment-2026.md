@@ -357,6 +357,23 @@ Architectural rather than protocol work — both items touch the window/App
 model in `gui/window.rs`, not just the parser.
 
 ### C13 — Multiple top-level OS windows
+**Status: assessed, deferred — see the note at the end of this document.**
+Investigating the actual change confirmed the original sizing was
+optimistic: `src/gui/window.rs` is a 2,270+ line `ApplicationHandler` impl
+built entirely around one implicit window — `window_event`'s own `WindowId`
+parameter is prefixed `_id` (unused) because every one of ~80 references to
+`self.window`/`self.tabs`/`self.active`/`self.renderer` (and everything
+downstream: mouse hit-testing, IME, clipboard, chrome hit-testing, resize,
+drag-resize, every keybind) assumes a single window's worth of state.
+Supporting a second independent window means either keying all of that
+behind a `HashMap<WindowId, …>` or splitting `App` into a shared-backend
+part and a per-window part threaded through every method — a rewrite of the
+file's core data model, not an additive feature. Attempting it in the time
+budget of one wave risks regressing mouse/keyboard/IME/resize handling that
+currently works and is well covered by tests, for a feature I have no
+windowing environment here to verify end-to-end. Left for a dedicated pass
+with its own design + review, same call as C08/C09's GPU pipeline gap.
+
 **Current.** The `App` struct holds a single `window: Option<Arc<Window>>`
 and one `winit::EventLoop`; the model is one OS window with tabs and splits
 inside it. There's no "open a second independent window" action.
@@ -368,10 +385,35 @@ config but owning its own tab set.
 **Why it matters.** `kitty` · `WezTerm` · `Ghostty` · `Alacritty`. Every
 major GUI competitor supports independent windows.
 
-**Size** M · **Deps** `gui` feature; touches the winit `ApplicationHandler`
-lifecycle, the largest architectural change among the recommended items.
+**Size** M, revised to **L** after the investigation above · **Deps** `gui`
+feature; touches the winit `ApplicationHandler` lifecycle, the largest
+architectural change among the recommended items.
 
 ### C14 — Background opacity + blur
+**Status: partially done — GPU renderer only, blur deferred.** A `[window]
+opacity` config key and `--opacity` CLI flag (`src/config.rs`, `src/main.rs`)
+set `Config::opacity` (`0.0`-`1.0`); the windowed front-end requests a
+transparent surface (`WindowAttributes::with_transparent`) when it's below
+`1.0`. `GpuCore` (`src/gui/gpu.rs`) negotiates `CompositeAlphaMode::
+PostMultiplied` from the surface's actual capabilities when offered, and its
+WGSL fragment shader scales every pixel's alpha by the configured opacity
+uniformly (cursor and underline/strike stripes included) — validated by
+parsing+validating the shader with `naga` (no GPU adapter in this sandbox to
+render-test against, so the real on-screen compositing couldn't be visually
+confirmed). Deliberately **not** `PreMultiplied`: the shader doesn't
+premultiply RGB, so picking that mode would composite wrong (a bright halo)
+rather than just staying opaque, so `Opaque` is the fallback instead — a
+correctness choice over a broader-but-wrong one. Two things are explicitly
+**not** done: the CPU (`softbuffer`) renderer stays fully opaque regardless
+of the setting — `softbuffer` 0.4's buffer format has no alpha channel
+anywhere in its source (confirmed by inspection), so this isn't a bolt-on,
+it needs a different presentation path entirely; and platform blur (macOS
+`NSVisualEffectView`, KDE's blur-behind X11 property) isn't implemented at
+all — it needs unsafe platform-specific FFI outside winit's cross-platform
+surface, on platforms this sandbox has no way to build or test against, so
+writing it blind was judged too likely to be subtly wrong (or to just not
+compile on the target OS) to be worth shipping unverified.
+
 **Current.** Both renderers paint fully opaque; no config key or CLI flag
 for window transparency exists.
 

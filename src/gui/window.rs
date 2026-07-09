@@ -1418,6 +1418,17 @@ impl App<'_> {
         }
     }
 
+    /// Push the configured window opacity (`[window] opacity` / `--opacity`)
+    /// to the current renderer. Only the GPU renderer honors it (see
+    /// `Renderer::set_opacity`'s default no-op); called whenever the renderer
+    /// is (re)built, since a fresh one starts back at fully opaque.
+    fn apply_opacity(&mut self) {
+        let opacity = self.config.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        if let Some(r) = &mut self.renderer {
+            r.set_opacity(opacity);
+        }
+    }
+
     /// Rebuild the glyph cache at `px` / `ligatures`, re-fit the grid to the new
     /// cell size, and rebuild the renderer (the GPU atlas is font-bound).
     fn rebuild_font(&mut self, px: f32, ligatures: bool) {
@@ -1449,6 +1460,7 @@ impl App<'_> {
             if let Some(r) = self.make_renderer(window.clone()) {
                 self.renderer = Some(r);
             }
+            self.apply_opacity();
             let size = window.inner_size();
             self.apply_size(size.width, size.height);
         }
@@ -1653,9 +1665,14 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         // `--title` (or a config `title` key) seeds the initial title; the
         // child's own OSC 0/2 still wins once it emits one (see the per-frame
         // `set_title` above).
+        // Only request a transparent (alpha-capable) surface when opacity is
+        // actually configured below 1.0 — an unnecessarily transparent
+        // window can cost a compositor extra work for no visible benefit.
+        let transparent = self.config.opacity.is_some_and(|o| o < 1.0);
         let attrs = Window::default_attributes()
             .with_title(self.config.title.as_deref().unwrap_or("rusty_term"))
             .with_decorations(false)
+            .with_transparent(transparent)
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
         // Keep the DWM drop shadow so the borderless window still reads as
         // raised above the desktop.
@@ -1687,6 +1704,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 return;
             }
         }
+        self.apply_opacity();
         window.request_redraw();
     }
 

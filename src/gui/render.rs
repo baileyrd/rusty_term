@@ -38,6 +38,12 @@ pub(crate) trait Renderer {
         height: u32,
         divider: u32,
     );
+
+    /// Set the window background opacity (`[window] opacity`), `0.0`-`1.0`.
+    /// A no-op by default: the CPU (`softbuffer`) presentation path has no
+    /// alpha channel to composite through, so only the GPU renderer overrides
+    /// this — see `GpuRenderer`'s impl and `GpuCore::alpha_mode`.
+    fn set_opacity(&mut self, _opacity: f32) {}
 }
 
 /// CPU compositor presented through `softbuffer`.
