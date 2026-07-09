@@ -48,6 +48,12 @@ pub struct Config {
     pub title: Option<String>,
     /// Initial window state (windowed front-end only).
     pub launch_mode: Option<LaunchMode>,
+    /// Window background opacity, `0.0` (fully transparent) to `1.0` (opaque,
+    /// the default). Windowed front-end only, and only the GPU (`gui-gpu`)
+    /// renderer honors it — the CPU renderer's `softbuffer` presentation path
+    /// has no alpha channel to composite through, so it stays fully opaque
+    /// regardless of this setting (see `gui::gpu`'s uniform buffer).
+    pub opacity: Option<f32>,
     /// Scrollback line cap (overrides [`crate::core::SCROLLBACK_MAX`]).
     pub scrollback: Option<usize>,
     /// Initial window size in cells (windowed front-end only; the TUI always
@@ -138,6 +144,7 @@ impl Config {
 # font-size = 18
 # ligatures = false        # disable programming-font ligatures (default on)
 # launch_mode = "maximized" # or "fullscreen"
+# opacity = 0.9            # 0.0-1.0; GPU renderer (--features gui-gpu) only
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -549,6 +556,17 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             }
             cfg.font_size = Some(px as f32);
         }
+        ("window", "opacity") => {
+            let v = match value {
+                Value::Float(f) => f,
+                Value::Int(i) => i as f64,
+                _ => return Err(format!("{key}: expected a number")),
+            };
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("{key}: {v} out of range (0.0-1.0)"));
+            }
+            cfg.opacity = Some(v as f32);
+        }
         ("colors", "foreground") => cfg.theme.fg = expect_color(key, value)?,
         ("colors", "background") => cfg.theme.bg = expect_color(key, value)?,
         ("colors", "cursor") => cfg.theme.cursor = expect_color(key, value)?,
@@ -885,6 +903,22 @@ color15 = "ffffff"
         let (cfg3, warns3) = parse("[window]\nlaunch_mode = \"bogus\"\n");
         assert_eq!(cfg3.launch_mode, None);
         assert_eq!(warns3.len(), 1);
+    }
+
+    #[test]
+    fn opacity_key_parses_int_and_float_and_rejects_out_of_range() {
+        let (cfg, warns) = parse("[window]\nopacity = 0.85\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.opacity, Some(0.85));
+        let (cfg2, warns2) = parse("[window]\nopacity = 1\n");
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert_eq!(cfg2.opacity, Some(1.0));
+        let (cfg3, warns3) = parse("[window]\nopacity = 1.5\n");
+        assert_eq!(cfg3.opacity, None);
+        assert_eq!(warns3.len(), 1);
+        let (cfg4, warns4) = parse("[window]\nopacity = -0.1\n");
+        assert_eq!(cfg4.opacity, None);
+        assert_eq!(warns4.len(), 1);
     }
 
     #[test]

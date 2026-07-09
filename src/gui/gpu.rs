@@ -30,7 +30,7 @@ use super::render::Renderer;
 const SLOTS_PER_ROW: u32 = 32;
 
 const SHADER: &str = r#"
-struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, slots_per_row: u32 };
+struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, slots_per_row: u32, opacity: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(2) var atlas_smp: sampler;
@@ -88,48 +88,56 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     return out;
 }
 
+// Scale a color's alpha by the window's configured opacity (`u.opacity`,
+// straight/unmultiplied — the surface's alpha mode is negotiated to match,
+// see `GpuCore::alpha_mode`). Applied at every fragment return so opacity
+// affects the whole frame uniformly, cursor/decoration stripes included.
+fn opacify(c: vec4<f32>) -> vec4<f32> {
+    return vec4(c.rgb, c.a * u.opacity);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let a = textureSample(atlas_tex, atlas_smp, in.uv).r;
     let base = mix(in.bg, in.fg, a);
     // curs: 0 none/block (block uses the fg/bg swap); 2 underline, 3 bar.
-    if (in.curs == 2u && in.local.y >= 0.85) { return in.ccol; }
-    if (in.curs == 3u && in.local.x <= 0.12) { return in.ccol; }
+    if (in.curs == 2u && in.local.y >= 0.85) { return opacify(in.ccol); }
+    if (in.curs == 3u && in.local.x <= 0.12) { return opacify(in.ccol); }
     // deco: bit 3 (8) strikethrough; bits 0-2 underline style (0 = none, per
     // UnderlineStyle::pack_into's 1-5 encoding). Drawn as thin stripes near
     // the cell's bottom (underline) or vertical middle (strike), matching the
     // CPU rasterizer's `draw_underline`/`draw_strike`.
     if ((in.deco & 8u) != 0u && in.local.y >= 0.45 && in.local.y < 0.55) {
-        return in.dcol;
+        return opacify(in.dcol);
     }
     let style = in.deco & 7u;
     if (style != 0u) {
         let thick = 0.08;
         let bottom = 1.0 - thick - 0.05;
         if (style == 1u && in.local.y >= bottom && in.local.y < bottom + thick) {
-            return in.dcol;
+            return opacify(in.dcol);
         }
         if (style == 2u && ((in.local.y >= bottom && in.local.y < bottom + thick)
             || (in.local.y >= bottom - 2.0 * thick && in.local.y < bottom - thick))) {
-            return in.dcol;
+            return opacify(in.dcol);
         }
         if (style == 3u) {
             let amp = 0.06;
             let y = bottom + sin(in.local.x * 6.283185) * amp;
             if (in.local.y >= y - thick * 0.5 && in.local.y < y + thick * 0.5) {
-                return in.dcol;
+                return opacify(in.dcol);
             }
         }
         if (style == 4u && in.local.y >= bottom && in.local.y < bottom + thick
             && fract(in.local.x * 6.0) < 0.5) {
-            return in.dcol;
+            return opacify(in.dcol);
         }
         if (style == 5u && in.local.y >= bottom && in.local.y < bottom + thick
             && fract(in.local.x * 3.0) < 0.6) {
-            return in.dcol;
+            return opacify(in.dcol);
         }
     }
-    return base;
+    return opacify(base);
 }
 "#;
 
@@ -156,7 +164,13 @@ struct Uniforms {
     screen: [f32; 2],
     cell: [f32; 2],
     slots_per_row: u32,
-    _pad: [u32; 3],
+    /// Window background opacity (`[window] opacity` config key), `0.0`-`1.0`.
+    /// Multiplies every fragment's alpha; only visible when the surface was
+    /// actually configured for straight-alpha compositing (see
+    /// `GpuCore::alpha_mode`) — otherwise the compositor ignores it and the
+    /// window stays opaque regardless.
+    opacity: f32,
+    _pad: [u32; 2],
 }
 
 /// Target-agnostic GPU compositor: device, pipeline, and glyph atlas.
@@ -173,6 +187,19 @@ pub(crate) struct GpuCore {
     next_slot: u32,
     /// The color format render targets must use.
     pub(crate) format: wgpu::TextureFormat,
+    /// The composite-alpha mode negotiated at surface creation:
+    /// `PostMultiplied` (straight, unmultiplied alpha — what the fragment
+    /// shader's `opacify` produces) when the surface/platform offers it, else
+    /// `Opaque`. Deliberately never `PreMultiplied`: the shader doesn't
+    /// premultiply, so picking that mode would composite wrong (a bright
+    /// halo) rather than just not being transparent — `Opaque` degrades
+    /// gracefully instead. `None` for the headless (no real surface) test
+    /// path, which has no compositor to negotiate with.
+    pub(crate) alpha_mode: Option<wgpu::CompositeAlphaMode>,
+    /// Window background opacity in effect (`[window] opacity`), `0.0`-`1.0`.
+    /// Set via [`Self::set_opacity`]; only visible when `alpha_mode` is
+    /// `Some(PostMultiplied)`.
+    opacity: f32,
 }
 
 impl GpuCore {
@@ -203,16 +230,25 @@ impl GpuCore {
         ))
         .ok()?;
 
-        let format = match compatible_surface {
+        let (format, alpha_mode) = match compatible_surface {
             Some(surface) => {
                 let caps = surface.get_capabilities(&adapter);
-                caps.formats
+                let format = caps
+                    .formats
                     .iter()
                     .copied()
                     .find(|f| !f.is_srgb())
-                    .unwrap_or(caps.formats[0])
+                    .unwrap_or(caps.formats[0]);
+                // Prefer straight (unmultiplied) alpha compositing when the
+                // platform offers it — the only mode the shader's `opacify`
+                // produces correct output for. See `GpuCore::alpha_mode`.
+                let alpha_mode = caps
+                    .alpha_modes
+                    .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+                    .then_some(wgpu::CompositeAlphaMode::PostMultiplied);
+                (format, alpha_mode)
             }
-            None => wgpu::TextureFormat::Rgba8Unorm,
+            None => (wgpu::TextureFormat::Rgba8Unorm, None),
         };
 
         let (cell_w, cell_h) = font.cell_size();
@@ -334,6 +370,8 @@ impl GpuCore {
             slots: HashMap::new(),
             next_slot: 0,
             format,
+            alpha_mode,
+            opacity: 1.0,
         };
         // Reserve slot 0 for the blank tile (space / overflow fallback).
         core.ensure_slot(' ', Style::Regular, font);
@@ -373,6 +411,13 @@ impl GpuCore {
         slot
     }
 
+    /// Set the window background opacity (`[window] opacity`), clamped to
+    /// `0.0..=1.0`. A no-op visually unless `alpha_mode` negotiated straight
+    /// alpha compositing — see [`Self::alpha_mode`].
+    pub(crate) fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
+    }
+
     /// Render `grid` into `view` (a surface frame or an offscreen texture).
     /// A non-empty `chrome` row is drawn as cell row 0 with the grid shifted
     /// one row down (see [`Renderer::render`]).
@@ -392,7 +437,8 @@ impl GpuCore {
             screen: [width.max(1) as f32, height.max(1) as f32],
             cell: [self.cell_w as f32, self.cell_h as f32],
             slots_per_row: SLOTS_PER_ROW,
-            _pad: [0; 3],
+            opacity: self.opacity,
+            _pad: [0; 2],
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -532,7 +578,8 @@ impl GpuCore {
             screen: [width.max(1) as f32, height.max(1) as f32],
             cell: [self.cell_w as f32, self.cell_h as f32],
             slots_per_row: SLOTS_PER_ROW,
-            _pad: [0; 3],
+            opacity: self.opacity,
+            _pad: [0; 2],
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         let mut instances = Vec::new();
@@ -685,7 +732,7 @@ impl Renderer for GpuRenderer {
                     height,
                     present_mode: wgpu::PresentMode::Fifo,
                     desired_maximum_frame_latency: 2,
-                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    alpha_mode: self.core.alpha_mode.unwrap_or(wgpu::CompositeAlphaMode::Auto),
                     view_formats: vec![],
                 },
             );
@@ -697,6 +744,10 @@ impl Renderer for GpuRenderer {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.core.render_panes(&view, width, height, panes, chrome, font, divider);
         frame.present();
+    }
+
+    fn set_opacity(&mut self, opacity: f32) {
+        self.core.set_opacity(opacity);
     }
 }
 
@@ -723,6 +774,30 @@ mod tests {
         };
         assert!(core.cell_w > 0 && core.cell_h > 0);
         assert_eq!(core.format, wgpu::TextureFormat::Rgba8Unorm);
+        // No compatible_surface (headless/test path): nothing to negotiate
+        // alpha compositing with.
+        assert_eq!(core.alpha_mode, None);
+    }
+
+    #[test]
+    fn set_opacity_clamps_to_unit_range() {
+        let Some(bytes) = super::super::font::load_default_font(None) else {
+            eprintln!("no system font; skipping GPU core test");
+            return;
+        };
+        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(mut core) = GpuCore::new(&instance, None, &mut font) else {
+            eprintln!("no wgpu adapter; skipping GPU core test");
+            return;
+        };
+        assert_eq!(core.opacity, 1.0);
+        core.set_opacity(0.5);
+        assert_eq!(core.opacity, 0.5);
+        core.set_opacity(-1.0);
+        assert_eq!(core.opacity, 0.0);
+        core.set_opacity(2.0);
+        assert_eq!(core.opacity, 1.0);
     }
 
     /// Full render-to-texture + readback: a blank blue cell should read back as
