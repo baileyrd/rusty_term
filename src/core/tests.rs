@@ -1210,8 +1210,12 @@ fn decrqm_reports_ansi_irm_and_unknown_modes() {
     assert_eq!(p.take_responses(), b"\x1b[4;2$y");
     p.advance(&mut g, b"\x1b[4h\x1b[4$p");
     assert_eq!(p.take_responses(), b"\x1b[4;1$y");
-    p.advance(&mut g, b"\x1b[20$p"); // LNM: not modeled yet
-    assert_eq!(p.take_responses(), b"\x1b[20;0$y");
+    p.advance(&mut g, b"\x1b[20$p"); // LNM, default off
+    assert_eq!(p.take_responses(), b"\x1b[20;2$y");
+    p.advance(&mut g, b"\x1b[20h\x1b[20$p");
+    assert_eq!(p.take_responses(), b"\x1b[20;1$y");
+    p.advance(&mut g, b"\x1b[9999$p"); // a genuinely unmodeled mode
+    assert_eq!(p.take_responses(), b"\x1b[9999;0$y");
 }
 
 #[test]
@@ -2262,6 +2266,94 @@ fn alt_scroll_mode_tracked_relayed_and_reset_by_ris() {
     assert!(!g.alt_scroll);
     p.advance(&mut g, b"\x1b[?1007h\x1bc"); // RIS clears it back to normal
     assert!(!g.alt_scroll);
+}
+#[test]
+fn lnm_reset_lf_moves_down_only_set_also_returns_to_column_0() {
+    let mut g = Grid::new(10, 5);
+    let mut p = AnsiParser::new();
+    assert!(!g.line_feed_new_line);
+    p.advance(&mut g, b"abc\n"); // reset (default): LF doesn't touch the column
+    assert_eq!(g.cursor, (3, 1));
+
+    p.advance(&mut g, b"\x1b[20h"); // LNM set
+    assert!(g.line_feed_new_line);
+    p.advance(&mut g, b"de\n"); // now LF also carriage-returns
+    assert_eq!(g.cursor, (0, 2));
+
+    p.advance(&mut g, b"\x1b[20l"); // LNM reset again
+    p.advance(&mut g, b"fgh\n");
+    assert_eq!(g.cursor, (3, 3));
+}
+
+#[test]
+fn lnm_reset_by_ris() {
+    let mut g = Grid::new(10, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[20h");
+    assert!(g.line_feed_new_line);
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert!(!g.line_feed_new_line);
+}
+
+#[test]
+fn decera_erases_a_rectangle_in_default_colors_leaving_the_rest_untouched() {
+    let mut g = parse(b"AAAA\r\nAAAA\r\nAAAA\r\nAAAA", 4, 4);
+    // DECERA rows 2..=3, cols 2..=3 (1-based) = 0-based rows 1..=2, cols 1..=2.
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[2;2;3;3$z");
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "A  A");
+    assert_eq!(row_text(&g, 2), "A  A");
+    assert_eq!(row_text(&g, 3), "AAAA");
+}
+
+#[test]
+fn decfra_fills_a_rectangle_with_the_given_character() {
+    let mut g = Grid::new(4, 3);
+    let mut p = AnsiParser::new();
+    // Fill rows 1..=2, cols 1..=4 (whole width) with 'x' (code point 120).
+    p.advance(&mut g, b"\x1b[120;1;1;2;4$x");
+    assert_eq!(row_text(&g, 0), "xxxx");
+    assert_eq!(row_text(&g, 1), "xxxx");
+    assert_eq!(row_text(&g, 2), "    ");
+}
+
+#[test]
+fn decfra_uses_the_current_pen_colors() {
+    let g = parse(b"\x1b[31m\x1b[120;1;1;1;1$x", 4, 3);
+    assert_eq!(g.cells[0].ch, 'x');
+    assert_ne!(g.cells[0].fg, DEFAULT_FG); // took the red pen, not the default
+}
+
+#[test]
+fn deccra_copies_a_rectangle_to_a_new_location() {
+    let mut g = parse(b"AB\r\nCD", 4, 4);
+    let mut p = AnsiParser::new();
+    // Copy the 2x2 block at (1,1)-(2,2) to destination (3,3) (1-based).
+    p.advance(&mut g, b"\x1b[1;1;2;2;1;3;3;1$v");
+    assert_eq!(&row_text(&g, 2)[2..4], "AB");
+    assert_eq!(&row_text(&g, 3)[2..4], "CD");
+    // Source is untouched by a copy.
+    assert_eq!(row_text(&g, 0).trim_end(), "AB");
+    assert_eq!(row_text(&g, 1).trim_end(), "CD");
+}
+
+#[test]
+fn deccra_handles_overlapping_source_and_destination_without_corruption() {
+    // Shift a 1-row strip one column right, onto itself: "ABCD" -> "AABC".
+    let mut g = parse(b"ABCD", 4, 1);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[1;1;1;3;1;1;2;1$v"); // copy cols 1-3 to start at col 2
+    assert_eq!(row_text(&g, 0), "AABC");
+}
+
+#[test]
+fn rect_ops_ignore_inverted_or_out_of_range_bounds() {
+    let mut g = parse(b"AAAA\r\nAAAA", 4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[3;1;1;1$z"); // top > bottom: no-op
+    assert_eq!(row_text(&g, 0), "AAAA");
+    assert_eq!(row_text(&g, 1), "AAAA");
 }
 #[test]
 fn mouse_modes_tracked_for_window_backend() {

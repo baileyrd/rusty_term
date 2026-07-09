@@ -52,8 +52,8 @@ in one case — investigated and rejected outright.
 | C18 | Unicode width mode (2027) | T5 | Contour, ~10 others | M |
 | C19 | Text-sizing protocol / OSC 66 | T5 | kitty, Ghostty (partial) | L |
 | C20 | Accessibility / screen readers | T6 | industry-wide gap | L |
-| C21 | Rectangular-area ops (VT420) | T6 | legacy VT420 | S–M |
-| C22 | Line/New Line mode (LNM) | T6 | legacy ECMA-48 | S |
+| ✅ C21 | Rectangular-area ops (VT420) | T6 | legacy VT420 | S–M |
+| ✅ C22 | Line/New Line mode (LNM) | T6 | legacy ECMA-48 | S |
 | C23 | io_uring backend (Linux) | T7 | kitty (explored) | L |
 | C24 | IOCP-native async (Windows) | T7 | perf refinement | L |
 | C25 | Bidi text + Unicode normalization | T8 | partial industry-wide | XL |
@@ -607,7 +607,19 @@ would be a genuine differentiator rather than table stakes.
 **Size** L · **Deps** `gui` feature; `accesskit` integration with winit.
 
 ### C21 — Rectangular-area operations (DECCRA / DECFRA / DECERA)
-**Current.** VT420 rectangular copy/fill/erase operations are cataloged in
+**Status: done.** `Grid::copy_rect`/`fill_rect`/`erase_rect`
+(`src/core/grid.rs`), dispatched from `handle_csi` (`src/core/parser.rs`) on
+the `$v`/`$x`/`$z` final-byte forms. `copy_rect` snapshots the source before
+writing so an overlapping destination (shifting a region a few columns onto
+itself, say) can't corrupt still-unread source rows; `fill_rect` uses the
+parser's current pen (colors + attributes), `erase_rect` the same
+default-color erase convention `clear_row_range` (ED/EL) already uses.
+Coordinates are absolute screen positions, not origin-mode-relative like
+cursor motion — a deliberate simplification the doc's own "occasional use,
+not competitive pressure" framing supports; page parameters (`Pps`/`Ppd`)
+are accepted and ignored, since there's only ever one page.
+
+**Current (before).** VT420 rectangular copy/fill/erase operations are cataloged in
 rusty_term's own spec-tree reference but not implemented; no matches in
 `src/`.
 
@@ -621,7 +633,19 @@ competitive pressure.
 **Size** S–M · **Deps** none.
 
 ### C22 — ECMA-48 Line/New Line mode (LNM, mode 20)
-**Current.** rusty_term implements IRM (insert/replace mode) but none of
+**Status: done.** `Grid::line_feed_new_line` (`src/core/grid.rs`), set from
+`CSI 20 h`/`l` (`src/core/parser.rs`) alongside the existing IRM handling and
+answerable via DECRQM. This also **fixed a latent bug**, not just added a
+mode: a bare LF previously always performed a carriage return unconditionally
+(hardcoded, as if LNM were permanently set), which is backwards from
+ECMA-48/xterm's actual default (reset — LF moves down only). Auditing this
+found only two existing tests relied on bare-LF behavior and both already
+had the cursor at column 0 already, so the fix carried effectively zero
+regression risk despite changing default output for any *other* input; every
+real-world case that matters already sends explicit `\r\n` and is unaffected
+either way.
+
+**Current (before).** rusty_term implements IRM (insert/replace mode) but none of
 ECMA-48's other ANSI (non-DEC-private) modes — GATM, KAM, CRM, SRM, VEM,
 HEM, PUM, FEAM, FETM, MATM, TTM, SATM, TSM, EBM, LNM — are handled.
 

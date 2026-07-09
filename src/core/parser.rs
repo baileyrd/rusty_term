@@ -567,7 +567,11 @@ impl AnsiParser {
                 self.last_char = None;
             }
             b'\n' => {
-                g.carriage_return();
+                // LNM (ANSI mode 20): reset (the default) means a bare LF
+                // only moves down; set additionally returns to column 0.
+                if g.line_feed_new_line {
+                    g.carriage_return();
+                }
                 g.newline();
                 self.last_char = None;
             }
@@ -806,6 +810,13 @@ impl AnsiParser {
                     2
                 }
             }
+            20 => {
+                if g.line_feed_new_line {
+                    1
+                } else {
+                    2
+                }
+            }
             _ => 0,
         };
         self.responses.extend_from_slice(format!("\x1b[{mode};{status}$y").as_bytes());
@@ -959,16 +970,56 @@ impl AnsiParser {
             }
             b'h' | b'l' => {
                 // ANSI (non-private) mode set/reset. Only IRM (mode 4 —
-                // insert/replace) is modeled; other ANSI modes are ignored.
+                // insert/replace) and LNM (mode 20 — line/new-line) are
+                // modeled; the rest of ECMA-48's ANSI mode family (GATM, KAM,
+                // CRM, …) are vestigial even in xterm and left unimplemented.
                 let set = cmd == b'h';
-                if params.iter().flatten().any(|&m| m == 4) {
-                    g.insert_mode = set;
+                for param in params.iter().flatten().copied() {
+                    match param {
+                        4 => g.insert_mode = set,
+                        20 => g.line_feed_new_line = set,
+                        _ => {}
+                    }
                 }
             }
             // DECRQM, ANSI (non-private) form (`CSI Ps $ p`) — report whether
             // standard mode `Ps` is set/reset via DECRPM (`CSI Ps ; Pv $ y`).
             b'p' if self.csi_intermediate == b'$' => {
                 self.report_ansi_mode(g, p(0, 0));
+            }
+            // DECCRA — copy rectangular area: `CSI Pts;Pls;Pbs;Prs;Pps;Ptd;
+            // Pld;Ppd $ v`. `Pps`/`Ppd` (source/destination page) are ignored
+            // — there's only ever one page. Absolute screen coordinates, not
+            // origin-mode-relative (unlike cursor motion).
+            b'v' if self.csi_intermediate == b'$' => {
+                let top = p(0, 1).saturating_sub(1);
+                let left = p(1, 1).saturating_sub(1);
+                let bottom = p(2, g.rows).saturating_sub(1);
+                let right = p(3, g.cols).saturating_sub(1);
+                let dst_top = p(5, 1).saturating_sub(1);
+                let dst_left = p(6, 1).saturating_sub(1);
+                g.copy_rect(top, left, bottom, right, dst_top, dst_left);
+            }
+            // DECFRA — fill rectangular area with character `Pch` (a decimal
+            // code point), in the pen's current attributes: `CSI Pch;Pt;Pl;
+            // Pb;Pr $ x`.
+            b'x' if self.csi_intermediate == b'$' => {
+                if let Some(ch) = char::from_u32(p(0, 32) as u32) {
+                    let top = p(1, 1).saturating_sub(1);
+                    let left = p(2, 1).saturating_sub(1);
+                    let bottom = p(3, g.rows).saturating_sub(1);
+                    let right = p(4, g.cols).saturating_sub(1);
+                    g.fill_rect(ch, self.pen, top, left, bottom, right);
+                }
+            }
+            // DECERA — erase rectangular area (blank in the default colors,
+            // same convention as ED/EL): `CSI Pt;Pl;Pb;Pr $ z`.
+            b'z' if self.csi_intermediate == b'$' => {
+                let top = p(0, 1).saturating_sub(1);
+                let left = p(1, 1).saturating_sub(1);
+                let bottom = p(2, g.rows).saturating_sub(1);
+                let right = p(3, g.cols).saturating_sub(1);
+                g.erase_rect(top, left, bottom, right);
             }
             b'p' if self.csi_intermediate == b'!' => {
                 // DECSTR — soft terminal reset (`CSI ! p`).

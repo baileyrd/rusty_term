@@ -261,6 +261,13 @@ pub struct Grid {
     /// of browsing rusty_term's own scrollback — lets the wheel drive `less`/
     /// `man`/other pagers that never registered native mouse support.
     pub alt_scroll: bool,
+    /// Whether ECMA-48 Line/New Line mode (LNM, ANSI mode `20`) is enabled.
+    /// Reset (the default, matching xterm) means a bare LF only moves the
+    /// cursor down a line; set means it also returns to column 0, as if it
+    /// were a CR+LF. Most programs send an explicit `\r\n` and never depend
+    /// on this, but some legacy line-oriented tools assume the reset
+    /// behavior and manage the column themselves.
+    pub(crate) line_feed_new_line: bool,
     /// Mouse reporting enabled by the child (DECSET `?1000`/`?1002`/`?1003`),
     /// plus extended-format bits (`?1006`/`?1015`/`?1016`). The window backend
     /// uses this to route clicks/drags/scrolls back to the child as encoded
@@ -900,6 +907,7 @@ impl Grid {
             bracketed_paste: false,
             app_cursor_keys: false,
             alt_scroll: false,
+            line_feed_new_line: false,
             clipboard_set: None,
             clipboard_query: false,
             notifications: Vec::new(),
@@ -1577,6 +1585,89 @@ impl Grid {
         self.dirty[y] = true;
     }
 
+    /// DECERA — blank the rectangle `[top, bottom] × [left, right]` (0-based,
+    /// inclusive) in the default colors, the same erase convention
+    /// [`Self::clear_row_range`] uses. Out-of-range or inverted bounds
+    /// (`top > bottom`, `left > right`) are a no-op rather than panicking —
+    /// a malformed sequence from the child shouldn't crash the terminal.
+    pub(crate) fn erase_rect(&mut self, top: usize, left: usize, bottom: usize, right: usize) {
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || top >= self.rows || left >= self.cols {
+            return;
+        }
+        let blank = self.erase_cell();
+        for y in top..=bottom {
+            let base = y * self.cols;
+            self.cells[base + left..=base + right].fill(blank);
+            self.dirty[y] = true;
+        }
+    }
+
+    /// DECFRA — fill the rectangle `[top, bottom] × [left, right]` (0-based,
+    /// inclusive) with `ch` in `pen`'s current colors/attributes. Same
+    /// bounds handling as [`Self::erase_rect`].
+    pub(crate) fn fill_rect(&mut self, ch: char, pen: Pen, top: usize, left: usize, bottom: usize, right: usize) {
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || top >= self.rows || left >= self.cols {
+            return;
+        }
+        let cell = Cell {
+            ch,
+            cluster: 0,
+            fg: pen.fg,
+            bg: pen.bg,
+            flags: pen.attrs,
+            link: 0,
+            underline_color: pen.underline_color,
+        };
+        for y in top..=bottom {
+            let base = y * self.cols;
+            self.cells[base + left..=base + right].fill(cell);
+            self.dirty[y] = true;
+        }
+    }
+
+    /// DECCRA — copy the rectangle `[top, bottom] × [left, right]` (0-based,
+    /// inclusive) to a destination whose top-left corner is `(dst_top,
+    /// dst_left)`; both footprints are independently clamped to the grid
+    /// (a destination near an edge copies only the portion that fits).
+    /// Snapshots the source before writing, so an overlapping destination
+    /// (shifting a rectangle down-and-right onto itself, say) can't corrupt
+    /// still-unread source rows.
+    pub(crate) fn copy_rect(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        dst_top: usize,
+        dst_left: usize,
+    ) {
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || top >= self.rows || left >= self.cols {
+            return;
+        }
+        if dst_top >= self.rows || dst_left >= self.cols {
+            return;
+        }
+        let h = (bottom - top + 1).min(self.rows - dst_top);
+        let w = (right - left + 1).min(self.cols - dst_left);
+        let mut buf = Vec::with_capacity(h * w);
+        for y in 0..h {
+            let base = (top + y) * self.cols;
+            buf.extend_from_slice(&self.cells[base + left..base + left + w]);
+        }
+        for y in 0..h {
+            let src = y * w;
+            let base = (dst_top + y) * self.cols;
+            self.cells[base + dst_left..base + dst_left + w].copy_from_slice(&buf[src..src + w]);
+            self.dirty[dst_top + y] = true;
+        }
+    }
+
     /// Blank every cell and home the cursor (used by `CSI 2 J`).
     pub(crate) fn clear_all(&mut self) {
         let blank = self.erase_cell();
@@ -2170,6 +2261,7 @@ impl Grid {
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
         self.alt_scroll = false;
+        self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
@@ -2197,6 +2289,7 @@ impl Grid {
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
         self.alt_scroll = false;
+        self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
