@@ -30,6 +30,32 @@ const SYNC_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 /// marks are dropped once exceeded — far more than any real session needs.
 const PROMPT_MARKS_MAX: usize = 1024;
 
+/// Maximum number of foldable command-output blocks (OSC 133/633's C..D
+/// range) retained. Older blocks are dropped once exceeded, the same
+/// generous-but-bounded pattern as [`PROMPT_MARKS_MAX`].
+///
+/// Not itself feature-gated (unlike the `Grid` fields it bounds) because
+/// [`reflow_history`] — which always compiles, TUI included — needs to name
+/// [`CommandBlock`] to thread fold state through a resize the same way it
+/// does prompt marks; the fields that actually populate it stay behind
+/// `test`/`gui`, so this is dead weight only in a TUI-only build, not a
+/// capability leak.
+const FOLD_BLOCKS_MAX: usize = 1024;
+
+/// One finished command's output range in absolute logical lines (`start` at
+/// its OSC C, `end` at its matching D — a half-open `[start, end)`), and
+/// whether the windowed front-end's scrollback view currently collapses it to
+/// one summary line. The range only tracks *state*; painting the collapsed
+/// summary and expanding it back on click/keybind is renderer work that
+/// consumes this, not modeled here. See [`FOLD_BLOCKS_MAX`] for why this type
+/// itself isn't feature-gated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommandBlock {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) folded: bool,
+}
+
 /// Maximum depth of the XTPUSHTITLE stack. Further pushes are dropped rather
 /// than growing without bound — no real app nests this deep.
 const TITLE_STACK_MAX: usize = 64;
@@ -229,6 +255,12 @@ pub struct Grid {
     /// relay to, so its native key encoder reads this directly to choose
     /// `CSI` (normal) vs `SS3` (application) arrow sequences.
     pub app_cursor_keys: bool,
+    /// Whether alternate scroll mode (DEC `?1007`) is enabled. When on *and*
+    /// the alternate screen is active, the windowed front-end translates
+    /// mouse-wheel scrolling to Up/Down (or Page Up/Down) key presses instead
+    /// of browsing rusty_term's own scrollback — lets the wheel drive `less`/
+    /// `man`/other pagers that never registered native mouse support.
+    pub alt_scroll: bool,
     /// Mouse reporting enabled by the child (DECSET `?1000`/`?1002`/`?1003`),
     /// plus extended-format bits (`?1006`/`?1015`/`?1016`). The window backend
     /// uses this to route clicks/drags/scrolls back to the child as encoded
@@ -306,6 +338,17 @@ pub struct Grid {
     /// of shell prompt starts reported via OSC 133;A, kept sorted. Powers
     /// prompt-to-prompt scrollback navigation. Bounded by [`PROMPT_MARKS_MAX`].
     prompt_marks: Vec<usize>,
+    /// Absolute logical line (`scrollback.len() + cursor row`) where the
+    /// running command's output began (OSC 133/633;C), pending the matching
+    /// `D` to close it into a [`CommandBlock`] — independent of the `l13`
+    /// feature's own (separately tracked) capture-for-MCP anchor.
+    #[cfg(any(test, feature = "gui"))]
+    fold_pending_start: Option<usize>,
+    /// Finished commands' output ranges (OSC 133/633;C..D), foldable to one
+    /// summary line in the windowed front-end's scrollback view. Bounded by
+    /// [`FOLD_BLOCKS_MAX`]; remapped across a resize like a prompt mark.
+    #[cfg(any(test, feature = "gui"))]
+    fold_blocks: Vec<CommandBlock>,
     /// Structured side-channel (L13) session state: the resource subscriptions a
     /// connected client has registered for change notifications. Carried here
     /// because it must outlive any single channel OSC and ride alongside the grid
@@ -497,6 +540,11 @@ struct Reflowed {
     /// Remapped command-capture anchor; only consumed under the `l13` feature.
     #[cfg_attr(not(feature = "l13"), allow(dead_code))]
     command_start: Option<usize>,
+    /// Remapped fold-block state; only consumed under `test`/`gui`.
+    #[cfg_attr(not(any(test, feature = "gui")), allow(dead_code))]
+    fold_pending_start: Option<usize>,
+    #[cfg_attr(not(any(test, feature = "gui")), allow(dead_code))]
+    fold_blocks: Vec<CommandBlock>,
 }
 
 /// Re-wrap the combined history `scrollback ++ screen` into `new_cols`×`new_rows`.
@@ -521,6 +569,8 @@ fn reflow_history(
     cursor: (usize, usize),
     prompt_marks: &[usize],
     command_start: Option<usize>,
+    fold_pending_start: Option<usize>,
+    fold_blocks: &[CommandBlock],
     new_cols: usize,
     new_rows: usize,
     blank: Cell,
@@ -724,6 +774,22 @@ fn reflow_history(
         new_marks.drain(0..new_marks.len() - PROMPT_MARKS_MAX);
     }
     let new_command_start = command_start.and_then(remap);
+    let new_fold_pending_start = fold_pending_start.and_then(remap);
+    // `end` is exclusive; remap the block's last physical row and step one
+    // past it, so a block ending exactly at a dropped/merged boundary still
+    // remaps instead of vanishing. A block that no longer spans any rows
+    // (start == end after remapping) is dropped — nothing left to fold.
+    let mut new_fold_blocks: Vec<CommandBlock> = fold_blocks
+        .iter()
+        .filter_map(|b| {
+            let start = remap(b.start)?;
+            let end = remap(b.end.saturating_sub(1))? + 1;
+            (start < end).then_some(CommandBlock { start, end, folded: b.folded })
+        })
+        .collect();
+    if new_fold_blocks.len() > FOLD_BLOCKS_MAX {
+        new_fold_blocks.drain(0..new_fold_blocks.len() - FOLD_BLOCKS_MAX);
+    }
 
     Reflowed {
         scrollback: new_scrollback,
@@ -733,6 +799,8 @@ fn reflow_history(
         cursor: (cx, cy),
         prompt_marks: new_marks,
         command_start: new_command_start,
+        fold_pending_start: new_fold_pending_start,
+        fold_blocks: new_fold_blocks,
     }
 }
 
@@ -831,6 +899,7 @@ impl Grid {
             sync_output_since: None,
             bracketed_paste: false,
             app_cursor_keys: false,
+            alt_scroll: false,
             clipboard_set: None,
             clipboard_query: false,
             notifications: Vec::new(),
@@ -851,6 +920,10 @@ impl Grid {
             line_attrs: vec![LineAttr::Single; rows],
             wrapped: vec![false; rows],
             prompt_marks: Vec::new(),
+            #[cfg(any(test, feature = "gui"))]
+            fold_pending_start: None,
+            #[cfg(any(test, feature = "gui"))]
+            fold_blocks: Vec::new(),
             #[cfg(feature = "l13")]
             channel: rusty_term_l13::ChannelState::default(),
             status_line: None,
@@ -1169,6 +1242,13 @@ impl Grid {
                 #[cfg(feature = "l13")]
                 if let Some(s) = &mut self.command_start {
                     *s = s.saturating_sub(1);
+                }
+                #[cfg(any(test, feature = "gui"))]
+                {
+                    if let Some(s) = &mut self.fold_pending_start {
+                        *s = s.saturating_sub(1);
+                    }
+                    self.evict_fold_blocks();
                 }
             }
             #[cfg(any(test, feature = "gui"))]
@@ -1502,6 +1582,13 @@ impl Grid {
             if let Some(s) = &mut self.command_start {
                 *s = s.saturating_sub(1);
             }
+            #[cfg(any(test, feature = "gui"))]
+            {
+                if let Some(s) = &mut self.fold_pending_start {
+                    *s = s.saturating_sub(1);
+                }
+                self.evict_fold_blocks();
+            }
         }
         self.view_offset = self.view_offset.min(self.scrollback.len());
     }
@@ -1580,6 +1667,10 @@ impl Grid {
         let cmd_start = self.command_start;
         #[cfg(not(feature = "l13"))]
         let cmd_start: Option<usize> = None;
+        #[cfg(any(test, feature = "gui"))]
+        let (fold_start, fold_blocks) = (self.fold_pending_start, self.fold_blocks.clone());
+        #[cfg(not(any(test, feature = "gui")))]
+        let (fold_start, fold_blocks): (Option<usize>, Vec<CommandBlock>) = (None, Vec::new());
         if self.primary.is_none() {
             let r = reflow_history(
                 &self.scrollback,
@@ -1591,6 +1682,8 @@ impl Grid {
                 self.cursor,
                 &self.prompt_marks,
                 cmd_start,
+                fold_start,
+                &fold_blocks,
                 cols,
                 rows,
                 blank,
@@ -1606,6 +1699,11 @@ impl Grid {
             {
                 self.command_start = r.command_start;
             }
+            #[cfg(any(test, feature = "gui"))]
+            {
+                self.fold_pending_start = r.fold_pending_start;
+                self.fold_blocks = r.fold_blocks;
+            }
             self.saved_cursor = clamp(self.saved_cursor);
         } else {
             let primary = self.primary.take().expect("primary present");
@@ -1619,6 +1717,8 @@ impl Grid {
                 primary.cursor,
                 &self.prompt_marks,
                 cmd_start,
+                fold_start,
+                &fold_blocks,
                 cols,
                 rows,
                 blank,
@@ -1629,6 +1729,11 @@ impl Grid {
             #[cfg(feature = "l13")]
             {
                 self.command_start = r.command_start;
+            }
+            #[cfg(any(test, feature = "gui"))]
+            {
+                self.fold_pending_start = r.fold_pending_start;
+                self.fold_blocks = r.fold_blocks;
             }
             self.primary = Some(SavedScreen {
                 cells: r.cells,
@@ -1993,11 +2098,17 @@ impl Grid {
         self.scroll_bottom = self.rows.saturating_sub(1);
         self.scrollback.clear();
         self.prompt_marks.clear();
+        #[cfg(any(test, feature = "gui"))]
+        {
+            self.fold_pending_start = None;
+            self.fold_blocks.clear();
+        }
         self.view_offset = 0;
         self.tab_stops = default_tab_stops(self.cols);
         self.cursor_visible = true;
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
+        self.alt_scroll = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
@@ -2024,6 +2135,7 @@ impl Grid {
         self.cursor_visible = true;
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
+        self.alt_scroll = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
         self.cursor_icon = None;
@@ -2112,6 +2224,57 @@ impl Grid {
         if let Some(start) = self.command_start.take() {
             self.last_command_output = Some(self.capture_command_output(start));
         }
+    }
+
+    /// Begin tracking a command's output for folding (OSC 133/633;C): anchor
+    /// the output start at the current cursor line, closed into a
+    /// [`CommandBlock`] at the matching `D`. Independent of the `l13`
+    /// feature's own (separately anchored) output capture.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn fold_output_begin(&mut self) {
+        self.fold_pending_start = Some(self.scrollback.len() + self.cursor.1);
+    }
+
+    /// A command finished (OSC 133/633;D): close the pending fold block from
+    /// its `C` anchor to the current cursor line, unfolded by default (a
+    /// no-op if `C` was never seen — e.g. a shell that only ever sends `D`).
+    /// Silently drops the block once [`FOLD_BLOCKS_MAX`] is reached.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn fold_output_end(&mut self) {
+        let Some(start) = self.fold_pending_start.take() else { return };
+        let end = self.scrollback.len() + self.cursor.1;
+        if start < end && self.fold_blocks.len() < FOLD_BLOCKS_MAX {
+            self.fold_blocks.push(CommandBlock { start, end, folded: false });
+        }
+    }
+
+    /// Toggle the fold state of whichever command block contains absolute
+    /// logical line `line`, returning whether one was found. The API a
+    /// future click-on-summary-line or keybind-at-cursor interaction would
+    /// call; not yet wired to one (see [`Self::fold_blocks`]).
+    #[cfg(any(test, feature = "gui"))]
+    #[allow(dead_code)] // exercised by tests; the viewport-rendering consumer is future work
+    pub(crate) fn toggle_fold_at(&mut self, line: usize) -> bool {
+        match self.fold_blocks.iter_mut().find(|b| (b.start..b.end).contains(&line)) {
+            Some(b) => {
+                b.folded = !b.folded;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The command blocks tracked for folding, in the order their `C` marks
+    /// arrived. The state a viewport compositor would read to actually
+    /// collapse a folded block's rows to one summary line — that render-path
+    /// integration (`viewport_cell`/`snapshot_viewport`'s row math, plus
+    /// selection/search/click-hit-testing all keying off the same rows) is
+    /// deferred; this method exists so the data model that will feed it is
+    /// already tested and correct across scroll/resize/RIS.
+    #[cfg(any(test, feature = "gui"))]
+    #[allow(dead_code)] // exercised by tests; the viewport-rendering consumer is future work
+    pub(crate) fn fold_blocks(&self) -> &[CommandBlock] {
+        &self.fold_blocks
     }
 
     /// Join the cell rows in the absolute line range `[start, cursor line)` into
@@ -2358,6 +2521,18 @@ impl Grid {
         self.prompt_marks.retain(|&l| l != 0);
         for l in &mut self.prompt_marks {
             *l -= 1;
+        }
+    }
+
+    /// One scrollback line was evicted from the front: every fold block's
+    /// range shifts down by one; a block entirely on the evicted line (`end
+    /// == 1`, i.e. `[0, 1)`) is dropped outright rather than left empty.
+    #[cfg(any(test, feature = "gui"))]
+    fn evict_fold_blocks(&mut self) {
+        self.fold_blocks.retain(|b| b.end > 1);
+        for b in &mut self.fold_blocks {
+            b.start = b.start.saturating_sub(1);
+            b.end -= 1;
         }
     }
 

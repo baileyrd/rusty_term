@@ -1685,6 +1685,133 @@ fn osc_133_marks_cleared_on_ris() {
 }
 
 #[test]
+fn fold_block_opens_on_c_and_closes_on_d_unfolded_by_default() {
+    let mut g = Grid::new(80, 2);
+    let mut p = AnsiParser::new();
+    assert!(g.fold_blocks().is_empty());
+    p.advance(&mut g, b"\x1b]133;C\x07output line\r\n");
+    assert!(g.fold_blocks().is_empty(), "still pending until D");
+    p.advance(&mut g, b"\x1b]133;D;0\x07");
+    let blocks = g.fold_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0].start < blocks[0].end);
+    assert!(!blocks[0].folded);
+}
+
+#[test]
+fn fold_block_toggle_finds_the_block_containing_a_line_only() {
+    let mut g = Grid::new(80, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07line1\r\nline2\r\n");
+    p.advance(&mut g, b"\x1b]133;D\x07");
+    let (start, end) = {
+        let b = g.fold_blocks()[0];
+        (b.start, b.end)
+    };
+    assert!(g.toggle_fold_at(start));
+    assert!(g.fold_blocks()[0].folded);
+    assert!(g.toggle_fold_at(start)); // toggling again flips it back
+    assert!(!g.fold_blocks()[0].folded);
+    assert!(!g.toggle_fold_at(end), "end is exclusive: one past the block");
+}
+
+#[test]
+fn fold_block_d_without_c_is_a_no_op() {
+    let mut g = Grid::new(80, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;D;0\x07");
+    assert!(g.fold_blocks().is_empty());
+}
+
+#[test]
+fn fold_block_second_c_before_d_replaces_the_pending_start() {
+    let mut g = Grid::new(80, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07discarded\r\n");
+    p.advance(&mut g, b"\x1b]133;C\x07kept\r\n"); // supersedes the first C
+    p.advance(&mut g, b"\x1b]133;D\x07");
+    assert_eq!(g.fold_blocks().len(), 1);
+}
+
+#[test]
+fn fold_blocks_shift_with_scrollback_eviction_and_stale_block_is_dropped() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07old\r\n\x1b]133;D\x07"); // a block anchored at line 0
+    // Overflow the scrollback so the oldest line — and the block entirely on
+    // it — is evicted, the same eviction `osc_133_oldest_mark_evicts_from_history`
+    // exercises for prompt marks.
+    for _ in 0..(SCROLLBACK_MAX + 10) {
+        p.advance(&mut g, b"y\r\n");
+    }
+    assert!(g.fold_blocks().is_empty(), "the old block's line scrolled off the cap");
+
+    // A block opened after the overflow survives further eviction, shifted
+    // down by exactly the one line that scrolls off per iteration.
+    p.advance(&mut g, b"\x1b]133;C\x07new\r\n\x1b]133;D\x07");
+    let before = g.fold_blocks()[0];
+    p.advance(&mut g, b"z\r\n"); // one more line scrolls into (and off) history
+    let after = g.fold_blocks()[0];
+    assert_eq!(after.start, before.start.saturating_sub(1));
+    assert_eq!(after.end, before.end.saturating_sub(1));
+}
+
+#[test]
+fn fold_blocks_cleared_on_ris() {
+    let mut g = Grid::new(80, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07x\r\n\x1b]133;D\x07");
+    assert_eq!(g.fold_blocks().len(), 1);
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert!(g.fold_blocks().is_empty());
+}
+
+#[test]
+fn fold_blocks_survive_a_resize_reflow() {
+    let mut g = Grid::new(80, 10);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07a line of output\r\nanother line\r\n");
+    p.advance(&mut g, b"\x1b]133;D\x07");
+    assert_eq!(g.fold_blocks().len(), 1);
+    g.resize(40, 10); // narrower: forces a rewrap
+    assert_eq!(g.fold_blocks().len(), 1, "block survives the reflow");
+    let b = g.fold_blocks()[0];
+    assert!(b.start < b.end);
+}
+
+#[test]
+fn osc_633_prompt_mark_matches_133() {
+    let mut g = Grid::new(4, 2);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]633;A\x07old\r\n");
+    p.advance(&mut g, b"y\r\n");
+    assert!(g.scroll_to_prev_prompt());
+}
+
+#[test]
+fn osc_633_reports_cwd_via_p_property() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert_eq!(g.cwd, "");
+    p.advance(&mut g, b"\x1b]633;P;Cwd=/home/user/project\x07");
+    assert_eq!(g.cwd, "/home/user/project");
+    // An unrecognized property is ignored rather than clobbering cwd.
+    p.advance(&mut g, b"\x1b]633;P;IsWindows=False\x07");
+    assert_eq!(g.cwd, "/home/user/project");
+}
+
+#[test]
+fn osc_633_command_lifecycle_and_unknown_subcommands_are_harmless() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // B (prompt end) and E (command-line report) aren't modeled; well-formed
+    // but otherwise a no-op, same as their 133 counterparts.
+    p.advance(&mut g, b"\x1b]633;B\x07\x1b]633;E;ls -la\x07");
+    p.advance(&mut g, b"echo hi");
+    assert_eq!(g.cells[0].ch, 'e'); // the OSC didn't leak into the grid
+}
+
+#[test]
 fn sgr_sets_text_attribute_bits() {
     let g = parse(b"\x1b[1mA\x1b[4mB", 80, 24);
     assert_ne!(g.cells[0].flags & ATTR_BOLD, 0); // A is bold
@@ -2119,6 +2246,22 @@ fn decckm_tracked_for_window_backend_and_relayed_and_reset_by_ris() {
     assert!(!g.app_cursor_keys);
     p.advance(&mut g, b"\x1b[?1h\x1bc"); // RIS clears it back to normal
     assert!(!g.app_cursor_keys);
+}
+#[test]
+fn alt_scroll_mode_tracked_relayed_and_reset_by_ris() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.alt_scroll);
+    p.advance(&mut g, b"\x1b[?1007h");
+    assert_eq!(g.take_host_out(), b"\x1b[?1007h");
+    assert!(g.alt_scroll);
+    p.advance(&mut g, b"\x1b[?1007$p"); // DECRQM sees the tracked state too
+    assert_eq!(p.take_responses(), b"\x1b[?1007;1$y");
+    p.advance(&mut g, b"\x1b[?1007l");
+    assert_eq!(g.take_host_out(), b"\x1b[?1007l");
+    assert!(!g.alt_scroll);
+    p.advance(&mut g, b"\x1b[?1007h\x1bc"); // RIS clears it back to normal
+    assert!(!g.alt_scroll);
 }
 #[test]
 fn mouse_modes_tracked_for_window_backend() {

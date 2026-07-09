@@ -720,6 +720,7 @@ impl AnsiParser {
                 // itself. (TUI mode relays above and never reads these.)
                 match param {
                     1 => g.app_cursor_keys = set,
+                    1007 => g.alt_scroll = set,
                     2004 => g.bracketed_paste = set,
                     1000 | 1002 | 1003 => {
                         g.mouse_modes.base = if set {
@@ -782,6 +783,7 @@ impl AnsiParser {
             1006 => g.mouse_modes.extended & 2 != 0,
             1015 => g.mouse_modes.extended & 4 != 0,
             1016 => g.mouse_modes.extended & 8 != 0,
+            1007 => g.alt_scroll,
             2004 => g.bracketed_paste,
             2026 => g.sync_output_active(),
             _ => {
@@ -1162,11 +1164,12 @@ impl AnsiParser {
 /// - `1000`/`1002`/`1003` — X11 mouse: click, button-event (drag), any-event
 /// - `1004` — focus in/out reporting
 /// - `1005`/`1006`/`1015`/`1016` — extended mouse coordinate encodings
+/// - `1007` — alternate scroll mode (wheel → arrow keys in the alt screen)
 /// - `2004` — bracketed paste
 fn is_host_input_mode(param: usize) -> bool {
     matches!(
         param,
-        1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 | 1016 | 2004
+        1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004
     )
 }
 
