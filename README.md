@@ -279,10 +279,9 @@ against a narrow `TerminalState` trait rather than this repo's `Grid` type
 directly — independently buildable and unit-tested with no dependency on
 `rusty_term` itself (`cargo test -p rusty_term_l13`); `Grid` implements the
 trait as a thin delegation layer (`src/core/grid.rs`). It reuses the JSON-RPC
-model and LSP types from `rusty_lsp`, pinned as a `git` dependency (a specific
-commit for now — `rusty_lsp` hasn't cut a tagged release yet) rather than a
-local path, so building `--features l13` needs network access but no sibling
-checkout.
+model and LSP types from `rusty_lsp`, pinned as a `git` dependency (tag
+`v0.1.0`) rather than a local path, so building `--features l13` needs
+network access but no sibling checkout.
 
 ## Repository layout
 
