@@ -84,7 +84,7 @@ Legend: `[x]` implemented · `[~]` partial / relayed · `[ ]` not implemented.
 
 ## Appendix C — Minimum Viable Modern Terminal
 
-- [x] **OS interface** — POSIX.1 (`libc`) + Windows ConPTY (`windows-sys`). Hand-rolled, not `portable-pty`. The Windows path is **run & verified on Windows 11** (build 26200): shell spawn, child `TERM`/`COLORTERM` env, bidirectional relay, and OSC title capture; host resize propagation is a known gap (no `SIGWINCH` equivalent wired; `src/backend/windows.rs`).
+- [x] **OS interface** — POSIX.1 (`libc`) + Windows ConPTY (`windows-sys`). Hand-rolled, not `portable-pty`. The Windows path is **run & verified on Windows 11** (build 26200): shell spawn, child `TERM`/`COLORTERM` env, bidirectional relay, OSC title capture, and host resize propagation (polled — there is no `SIGWINCH` equivalent; `resize_poll` in `src/runtime/tokio_rt.rs`) all work.
 - [x] **PTY** — Unix98 `openpty` + fork/exec/`TIOCSCTTY` (`src/backend/unix.rs:41`); `CreatePseudoConsole` (`src/backend/windows.rs`).
 - [x] **Line discipline** — host raw mode via `cfmakeraw` + `VMIN=1/VTIME=0`, exact save/restore (`src/backend/unix.rs:88`). Complete for a PTY emulator: the cooked-mode line discipline (echo, canonical editing, signal chars, CR/LF) is the **kernel's** `N_TTY` on the PTY slave, configured by the child — not the emulator's to implement.
 - [x] **Encoding** — UTF-8 decode + UAX #11 width + **UAX #29 grapheme clustering** (`unicode-segmentation`; ZWJ emoji, skin tones, unbounded combining via interned clusters, `src/core/grid.rs`).
