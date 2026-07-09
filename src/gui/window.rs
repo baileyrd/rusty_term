@@ -240,6 +240,10 @@ fn reader_loop(
                 if !response.is_empty() {
                     let _ = replies.write(&response);
                 }
+                // Always signal, even mid synchronized-output window: the
+                // `Redraw` handler itself checks `sync_output_active` and
+                // skips painting, so the proxy's liveness (this send failing
+                // signals the window closed) is still checked every chunk.
                 if proxy.send_event(UserEvent::Redraw(id)).is_err() {
                     break; // loop gone
                 }
@@ -320,6 +324,7 @@ impl App<'_> {
         if let Some(max) = self.config.scrollback {
             g.set_scrollback_max(max);
         }
+        g.cell_px = Some((self.cell_w as u16, self.cell_h as u16));
         g.apply_theme(&self.theme);
         g.set_default_cursor(
             self.config.cursor_style.unwrap_or_default(),
@@ -1399,6 +1404,13 @@ impl App<'_> {
         self.font_px = px;
         self.config.font_size = Some(px);
         self.config.ligatures = Some(ligatures);
+        // Keep every pane's XTWINOPS pixel-size answer (14t/16t) current.
+        let cell_px = Some((self.cell_w as u16, self.cell_h as u16));
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                pane.grid.lock().cell_px = cell_px;
+            }
+        }
         if let Some(window) = self.window.clone() {
             if let Some(r) = self.make_renderer(window.clone()) {
                 self.renderer = Some(r);
@@ -1729,7 +1741,9 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
-                // The edge band shows a resize cursor; everywhere else default.
+                // The edge band shows a resize cursor; over pane content (below
+                // the chrome bar) the child's OSC 22 request wins if it made
+                // one; everywhere else (the chrome bar itself) default.
                 let icon = match self.resize_zone(position.x, position.y) {
                     Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
                         CursorIcon::NwseResize
@@ -1739,6 +1753,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     }
                     Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
                     Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+                    None if (position.y.max(0.0) as usize) >= self.cell_h => self
+                        .pane()
+                        .and_then(|p| p.grid.lock().cursor_icon.as_deref().and_then(parse_cursor_icon))
+                        .unwrap_or(CursorIcon::Default),
                     None => CursorIcon::Default,
                 };
                 if let Some(window) = &self.window {
@@ -1806,9 +1824,16 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             UserEvent::Redraw(id) => {
                 self.service_clipboard(id);
                 self.service_notifications(id);
+                // A synchronized-output window on this pane suppresses the
+                // repaint until it closes (or times out), so a multi-write
+                // frame update never paints half-drawn.
+                let syncing = self
+                    .pane_by_id_mut(id)
+                    .is_some_and(|p| p.grid.lock().sync_output_active());
                 // Output on a background tab doesn't repaint; its bar label
                 // refreshes with the next frame the active tab causes.
-                if self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
+                if !syncing
+                    && self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
                     && let Some(window) = &self.window
                 {
                     window.request_redraw();
@@ -1900,6 +1925,38 @@ fn path_from_file_uri(uri: &str) -> Option<std::path::PathBuf> {
     {
         Some(std::path::PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()))
     }
+}
+
+/// Map an OSC 22-requested pointer shape — a CSS `cursor` keyword, the
+/// convention Kitty and others use — to a winit cursor icon. `None` for a
+/// name we don't recognize (the child's own concern; we just fall back to
+/// the default arrow rather than guessing).
+fn parse_cursor_icon(name: &str) -> Option<CursorIcon> {
+    Some(match name {
+        "default" => CursorIcon::Default,
+        "pointer" => CursorIcon::Pointer,
+        "text" => CursorIcon::Text,
+        "wait" => CursorIcon::Wait,
+        "progress" => CursorIcon::Progress,
+        "crosshair" => CursorIcon::Crosshair,
+        "move" => CursorIcon::Move,
+        "not-allowed" => CursorIcon::NotAllowed,
+        "grab" => CursorIcon::Grab,
+        "grabbing" => CursorIcon::Grabbing,
+        "help" => CursorIcon::Help,
+        "cell" => CursorIcon::Cell,
+        "copy" => CursorIcon::Copy,
+        "alias" => CursorIcon::Alias,
+        "context-menu" => CursorIcon::ContextMenu,
+        "vertical-text" => CursorIcon::VerticalText,
+        "no-drop" => CursorIcon::NoDrop,
+        "all-scroll" => CursorIcon::AllScroll,
+        "zoom-in" => CursorIcon::ZoomIn,
+        "zoom-out" => CursorIcon::ZoomOut,
+        "col-resize" => CursorIcon::ColResize,
+        "row-resize" => CursorIcon::RowResize,
+        _ => return None,
+    })
 }
 
 /// Raise an OS desktop notification (OSC 9/777), per-platform with no extra

@@ -1,8 +1,8 @@
 //! OSC (Operating System Command) dispatch (L08).
 //!
 //! Acts on a completed OSC string collected by the parser: window title (0/2),
-//! icon name (1), working directory (7), hyperlinks (8), clipboard (52), desktop
-//! notifications (9/777), and the
+//! icon name (1), working directory (7), hyperlinks (8), mouse pointer shape
+//! (22), clipboard (52), desktop notifications (9/777), and the
 //! color controls — palette (4/104) and the default fg/bg/cursor (10/11/12 and
 //! their resets 110/111/112). Color *query* (`?`) forms reply to the child via
 //! the parser's response buffer; sets mutate the shared [`Palette`], and default
@@ -49,6 +49,16 @@ pub(crate) fn dispatch(
         "1" => {
             if text.is_some() {
                 forward_to_host(osc_buffer, g);
+            }
+        }
+        // 22 requests a mouse pointer shape, as a CSS `cursor` keyword — the
+        // convention Kitty and others use. The windowed front-end maps it to a
+        // platform cursor icon while the pointer is over pane content; TUI mode
+        // has no pointer of its own, so this is a no-op there (harmlessly
+        // ignored, the graceful-degradation path for an unaware terminal).
+        "22" => {
+            if let Some(text) = text {
+                g.cursor_icon = (!text.is_empty()).then(|| text.to_string());
             }
         }
         // 7 reports the working directory (usually a file:// URI).

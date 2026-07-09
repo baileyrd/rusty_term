@@ -5,6 +5,10 @@ Ghostty, WezTerm, Alacritty, Windows Terminal, Konsole/VTE, iTerm2, Contour,
 and Warp. 28 items evaluated — 27 recommended, 1 explicitly considered and
 rejected.
 
+**Status:** implementation follows the suggested sequencing. Done items are
+marked ✅ below and in the summary table; each carries a `Status: done` line
+under its own heading naming the commit/PR.
+
 ## How this was built
 
 rusty_term's own capability docs
@@ -28,13 +32,13 @@ in one case — investigated and rejected outright.
 
 | ID | Capability | Tier | Notable adopters | Size |
 |---|---|---|---|---|
-| C01 | Synchronized output (mode 2026) | T1 | kitty, Ghostty, Windows Terminal | M |
+| ✅ C01 | Synchronized output (mode 2026) | T1 | kitty, Ghostty, Windows Terminal | M |
 | C02 | Undercurl + colored underlines | T1 | kitty, VTE, Alacritty, iTerm2 | M |
 | C03 | Kitty keyboard protocol (native GUI) | T1 | kitty, WezTerm, Ghostty, +5 more | M–L |
-| C04 | OSC 22 pointer shape | T1 | xterm, kitty | S |
-| C05 | Window title stack | T1 | xterm, VTE | S |
+| ✅ C04 | OSC 22 pointer shape | T1 | xterm, kitty | S |
+| ✅ C05 | Window title stack | T1 | xterm, VTE | S |
 | C06 | DECRQM mode query | T1 | xterm, kitty | S–M |
-| C07 | XTWINOPS pixel-size queries | T1 | xterm, kitty, WezTerm | S |
+| ✅ C07 | XTWINOPS pixel-size queries | T1 | xterm, kitty, WezTerm | S |
 | C08 | GPU renderer ligatures | T2 | internal parity | L |
 | C09 | GPU renderer image protocols | T2 | internal parity | L |
 | C10 | GUI mouse motion + buttons | T2 | internal parity | M |
@@ -67,7 +71,12 @@ the field that its absence reads as a compatibility bug rather than a
 missing extra.
 
 ### C01 — Synchronized output (DEC private mode 2026)
-**Current.** No matches anywhere in `src/`. The grid renders whatever
+**Status: done.** `Grid::set_sync_output`/`sync_output_active` (`src/core/grid.rs`),
+wired in the parser's DECSET/DECRST handler and gating the render-trigger
+call sites in `src/runtime/tokio_rt.rs` (both Unix and Windows) and
+`src/gui/window.rs`'s `Redraw` handler. Includes the timeout safety valve.
+
+**Current (before).** No matches anywhere in `src/`. The grid renders whatever
 partial state exists mid-update in both TUI passthrough and native GUI mode
 — full-screen apps (vim, htop, tig) doing a fast multi-line redraw can show
 visible tearing.
@@ -125,7 +134,12 @@ apps use for hold-to-repeat behavior.
 **Size** M–L · **Deps** `gui` feature.
 
 ### C04 — OSC 22 (mouse pointer/cursor shape)
-**Current.** No matches anywhere in `src/`.
+**Status: done.** `Grid::cursor_icon` (`src/core/grid.rs`), set by `osc.rs`'s
+OSC 22 handler, mapped from CSS `cursor` keywords to `winit::CursorIcon` by
+`parse_cursor_icon` and applied in the `CursorMoved` handler
+(`src/gui/window.rs`) whenever the pointer is over pane content.
+
+**Current (before).** No matches anywhere in `src/`.
 
 **Target.** Let the child set the OS mouse cursor icon over the window
 (e.g. an editor requesting an I-beam instead of a pointer) via OSC 22; map
@@ -139,7 +153,11 @@ payoff — the plumbing to change the cursor already exists in the codebase.
 **Size** S · **Deps** `gui` feature.
 
 ### C05 — Window title stack (XTPUSHTITLE / XTPOPTITLE)
-**Current.** No matches for `CSI 22t` / `CSI 23t`; `window.rs` only ever
+**Status: done.** `Grid::push_title`/`pop_title` (`src/core/grid.rs`), bounded
+by `TITLE_STACK_MAX`, dispatched from the parser's `CSI t` handler
+(`src/core/parser.rs`) on sub-params 22/23.
+
+**Current (before).** No matches for `CSI 22t` / `CSI 23t`; `window.rs` only ever
 reads the latest `g.title`, with no memory of what it was before.
 
 **Target.** A small stack on `Grid`, pushed on `CSI 22;0/1/2t` and popped on
@@ -170,7 +188,12 @@ output (C01) and bracketed paste — instead of assuming support and hoping.
 synchronized-output state worth reporting.
 
 ### C07 — XTWINOPS pixel-size queries (CSI 14t / 16t / 18t)
-**Current.** No matches for the `CSI t` window-manipulation family. Apps
+**Status: done.** `Grid::cell_px` (`src/core/grid.rs`), set by the GUI
+backend at pane creation and on every font rebuild (`src/gui/window.rs`);
+`18t` (always answerable from `cols`/`rows`) works in TUI mode too, `14t`/`16t`
+decline gracefully when `cell_px` is `None` (TUI, or before the first frame).
+
+**Current (before).** No matches for the `CSI t` window-manipulation family. Apps
 that need to size an image precisely have no way to ask "how many pixels is
 one cell?"
 

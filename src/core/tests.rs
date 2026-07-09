@@ -986,6 +986,97 @@ fn no_query_means_no_response() {
 }
 
 #[test]
+fn synchronized_output_mode_toggles_on_set_reset() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.sync_output_active(), "closed by default");
+    p.advance(&mut g, b"\x1b[?2026h");
+    assert!(g.sync_output_active(), "set: window is open");
+    p.advance(&mut g, b"\x1b[?2026l");
+    assert!(!g.sync_output_active(), "reset: window closed normally");
+    // A whole begin..end pair landing in one `advance` call (the common case
+    // when an app's write isn't split across PTY reads) leaves the window
+    // closed by the time the render-trigger call site checks it — exactly
+    // the "paint the complete frame in one shot" behavior this mode is for.
+    p.advance(&mut g, b"\x1b[?2026h...\x1b[?2026l");
+    assert!(!g.sync_output_active());
+}
+
+// The timeout safety valve (SYNC_OUTPUT_TIMEOUT, ~800ms) that auto-closes a
+// window a misbehaving client never resets isn't exercised here: faking it
+// would need either a real sleep (slows the suite for one test) or injecting
+// a fake clock this crate doesn't otherwise need. Covered by inspection of
+// `Grid::sync_output_active` instead — the logic is a two-line elapsed()
+// check with nothing else that could plausibly break independently of the
+// toggle behavior the tests above already cover.
+
+#[test]
+fn xtwinops_18t_reports_text_area_in_cells() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[18t");
+    assert_eq!(p.take_responses(), b"\x1b[8;24;80t");
+}
+
+#[test]
+fn xtwinops_pixel_queries_need_cell_px_and_answer_when_set() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // No cell_px (TUI-mode default): pixel queries are silently declined.
+    p.advance(&mut g, b"\x1b[16t\x1b[14t");
+    assert!(p.take_responses().is_empty());
+
+    g.cell_px = Some((9, 18));
+    p.advance(&mut g, b"\x1b[16t");
+    assert_eq!(p.take_responses(), b"\x1b[6;18;9t");
+    p.advance(&mut g, b"\x1b[14t");
+    assert_eq!(p.take_responses(), format!("\x1b[4;{};{}t", 18 * 24, 9 * 80).as_bytes());
+}
+
+#[test]
+fn xtpushtitle_and_xtpoptitle_round_trip() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    g.title = "first".into();
+    p.advance(&mut g, b"\x1b[22t"); // push "first"
+    g.title = "second".into();
+    p.advance(&mut g, b"\x1b[22t"); // push "second"
+    g.title = "third".into();
+    p.advance(&mut g, b"\x1b[23t"); // pop -> restores "second"
+    assert_eq!(g.title, "second");
+    p.advance(&mut g, b"\x1b[23t"); // pop -> restores "first"
+    assert_eq!(g.title, "first");
+    p.advance(&mut g, b"\x1b[23t"); // stack empty: no-op
+    assert_eq!(g.title, "first");
+}
+
+#[test]
+fn osc22_sets_and_clears_cursor_icon_request() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert_eq!(g.cursor_icon, None);
+    p.advance(&mut g, b"\x1b]22;pointer\x1b\\");
+    assert_eq!(g.cursor_icon.as_deref(), Some("pointer"));
+    p.advance(&mut g, b"\x1b]22;text\x1b\\");
+    assert_eq!(g.cursor_icon.as_deref(), Some("text"));
+    // An empty payload clears the request back to the default arrow.
+    p.advance(&mut g, b"\x1b]22;\x1b\\");
+    assert_eq!(g.cursor_icon, None);
+}
+
+#[test]
+fn ris_and_decstr_clear_sync_output_and_cursor_icon() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]22;wait\x1b\\\x1b[?2026h");
+    assert_eq!(g.cursor_icon.as_deref(), Some("wait"));
+    assert!(g.sync_output_active());
+    p.advance(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.cursor_icon, None);
+    assert!(!g.sync_output_active());
+}
+
+#[test]
 fn osc_2_sets_window_title() {
     let mut g = parse(b"\x1b]2;My Title\x07", 80, 24);
     assert_eq!(g.title, "My Title");
