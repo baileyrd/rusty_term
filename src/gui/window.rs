@@ -28,10 +28,10 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
-use crate::config::Config;
+use crate::config::{Config, LaunchMode};
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseEvent, SgrEncoder};
@@ -1602,6 +1602,13 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs.with_undecorated_shadow(true)
+        };
+        // `--maximized` / `--fullscreen` (or a `[window] launch_mode` config
+        // key); unset leaves the normal windowed default.
+        let attrs = match self.config.launch_mode {
+            Some(LaunchMode::Maximized) => attrs.with_maximized(true),
+            Some(LaunchMode::Fullscreen) => attrs.with_fullscreen(Some(Fullscreen::Borderless(None))),
+            None => attrs,
         };
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
