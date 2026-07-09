@@ -7,8 +7,9 @@
 //! their resets 110/111/112). Color *query* (`?`) forms reply to the child via
 //! the parser's response buffer; sets mutate the shared [`Palette`], and default
 //! fg/bg changes are mirrored into the grid so cleared regions pick up a new
-//! background. Other OSC codes (133, …) are recognized as well-formed and
-//! ignored for now.
+//! background, and shell-integration command-lifecycle marks (133, and 633 —
+//! VS Code's superset of it). Other OSC codes are recognized as well-formed
+//! and ignored for now.
 
 use super::cell::Pen;
 use super::color::{Palette, format_color_spec, parse_color_spec};
@@ -181,18 +182,31 @@ pub(crate) fn dispatch(
         "133" => {
             if let Some(text) = text {
                 let mut parts = text.split(';');
-                match parts.next() {
-                    Some("A") => g.mark_prompt(),
+                if let Some(sub) = parts.next() {
+                    mark_command_lifecycle(sub, &mut parts, g, responses);
+                }
+            }
+        }
+        // 633 (VS Code shell integration) is a superset of 133: the same
+        // A/B/C/D command-lifecycle letters have identical effects (VS Code's
+        // own docs describe 633 as "a superset of the FinalTerm shell
+        // integration sequences"), plus VS Code-specific property reports we
+        // selectively honor — `P;Cwd=<path>` mirrors OSC 7's cwd tracking, the
+        // one property with an existing surface to update. Other 633
+        // subcommands (command-line text, IsWindows hints, …) are recognized
+        // as well-formed and ignored.
+        "633" => {
+            if let Some(text) = text {
+                let mut parts = text.split(';');
+                if let Some(sub) = parts.next()
+                    && !mark_command_lifecycle(sub, &mut parts, g, responses)
+                    && sub == "P"
+                    && let Some(cwd) = parts.next().and_then(|p| p.strip_prefix("Cwd="))
+                    && g.cwd != cwd
+                {
+                    g.cwd = cwd.to_string();
                     #[cfg(feature = "l13")]
-                    Some("C") => g.command_output_begin(),
-                    #[cfg(feature = "l13")]
-                    Some("D") => {
-                        let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
-                        g.command_finished(exit);
-                        rusty_term_l13::notify_command_finished(g, exit, responses);
-                        rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_COMMAND, responses);
-                    }
-                    _ => {}
+                    rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_CWD, responses);
                 }
             }
         }
@@ -204,6 +218,51 @@ pub(crate) fn dispatch(
             }
         }
         _ => {}
+    }
+}
+
+/// Apply the command-lifecycle mark `sub` (`A` prompt start, `C` command
+/// output start, `D[;exit]` command end) shared by OSC 133 and OSC 633's
+/// superset of it. `parts` is the remaining `;`-separated fields after `sub`
+/// (only `D` consumes one, for the exit code, under `l13`). Returns whether
+/// `sub` was one of these letters, so a 633-specific fallback (its `P`
+/// property reports) only runs for subcommands that aren't already a
+/// lifecycle mark. `C`/`D` drive two independent consumers: the `l13`
+/// feature's command-output capture (for the `terminal://command` MCP
+/// resource) and, under `gui`, the fold-block range tracked for the
+/// scrollback-folding feature — neither depends on the other being enabled.
+#[cfg_attr(not(feature = "l13"), allow(unused_variables, clippy::ptr_arg))]
+fn mark_command_lifecycle(
+    sub: &str,
+    parts: &mut std::str::Split<'_, char>,
+    g: &mut Grid,
+    responses: &mut Vec<u8>,
+) -> bool {
+    match sub {
+        "A" => {
+            g.mark_prompt();
+            true
+        }
+        "C" => {
+            #[cfg(feature = "l13")]
+            g.command_output_begin();
+            #[cfg(any(test, feature = "gui"))]
+            g.fold_output_begin();
+            true
+        }
+        "D" => {
+            #[cfg(feature = "l13")]
+            {
+                let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
+                g.command_finished(exit);
+                rusty_term_l13::notify_command_finished(g, exit, responses);
+                rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_COMMAND, responses);
+            }
+            #[cfg(any(test, feature = "gui"))]
+            g.fold_output_end();
+            true
+        }
+        _ => false,
     }
 }
 

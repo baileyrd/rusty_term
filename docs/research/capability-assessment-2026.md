@@ -46,8 +46,8 @@ in one case — investigated and rejected outright.
 | C12 | iTerm2 geometry hints + formats | T2 | iTerm2 spec | M |
 | C13 | Multiple top-level windows | T3 | kitty, WezTerm, Ghostty, Alacritty | M |
 | C14 | Background opacity + blur | T3 | kitty, WezTerm, Alacritty, Ghostty | M |
-| C15 | OSC 633 (VS Code superset) | T4 | VS Code | S–M |
-| C16 | Alternate scroll mode (1007) | T4 | xterm, Alacritty, kitty | S |
+| ✅ C15 | OSC 633 (VS Code superset) | T4 | VS Code | S–M |
+| ✅ C16 | Alternate scroll mode (1007) | T4 | xterm, Alacritty, kitty | S |
 | C17 | Command-output folding (OSC 133) | T4 | Warp-inspired | M |
 | C18 | Unicode width mode (2027) | T5 | Contour, ~10 others | M |
 | C19 | Text-sizing protocol / OSC 66 | T5 | kitty, Ghostty (partial) | L |
@@ -393,7 +393,14 @@ Natural extensions of ground rusty_term already covers well — OSC 133 and
 the L13 side-channel both suggest immediate next moves.
 
 ### C15 — OSC 633 (VS Code shell-integration superset)
-**Current.** rusty_term implements OSC 133 (prompt marks, command
+**Status: done.** `src/core/osc.rs`'s `"633"` case shares the exact same
+`A`/`C`/`D` command-lifecycle handling as `"133"` (factored into
+`mark_command_lifecycle`), plus 633's `P;Cwd=<path>` property report, which
+mirrors OSC 7's cwd tracking. Other 633 subcommands (command-line text
+report, `IsWindows` hint, …) are recognized as well-formed and ignored, same
+as 133's untracked `B`.
+
+**Current (before).** rusty_term implements OSC 133 (prompt marks, command
 lifecycle, scrollback nav) in full. OSC 633 is explicitly named as an open
 item in the repo's own docs ("Still open (intentional long-tail): OSC
 633").
@@ -409,7 +416,14 @@ first.
 implementation in `src/core/osc.rs`.
 
 ### C16 — Alternate scroll mode (DEC private mode 1007)
-**Current.** No matches found. Mouse-wheel scroll always maps to
+**Status: done.** `Grid::alt_scroll` (`src/core/grid.rs`) tracks the mode
+alongside the existing host relay; `window.rs`'s wheel handler checks it
+(after mouse-tracking reporting, which still wins if the app also enabled
+it) and, when on and the alternate screen is active, sends repeated
+DECCKM-aware Up/Down key presses instead of browsing rusty_term's own
+scrollback.
+
+**Current (before).** No matches found. Mouse-wheel scroll always maps to
 scrollback navigation; there's no translation to arrow-key presses inside
 the alternate screen.
 
@@ -424,7 +438,28 @@ support.
 **Size** S · **Deps** none — small, self-contained.
 
 ### C17 — Command-output folding via OSC 133 marks
-**Current.** rusty_term already tracks prompt starts (OSC 133;A) and
+**Status: partially done — data model landed, render-path integration
+deferred.** `Grid::fold_blocks`/`fold_output_begin`/`fold_output_end`/
+`toggle_fold_at` (`src/core/grid.rs`) track each finished command's output
+as a `CommandBlock { start, end, folded }` range in absolute logical lines,
+independent of the `l13` feature's own (separately anchored) capture. The
+range correctly shifts and drops blocks across scrollback eviction and rides
+a resize reflow the same way prompt marks do (`reflow_history` now remaps
+fold state too) — verified by dedicated tests, including one that resizes a
+grid with an open fold block. What's **not** done: actually collapsing a
+folded block's rows to one summary line on screen. Tracing through this
+revealed the real scope is bigger than "S–M": `viewport_cell` and
+`snapshot_viewport` (`src/core/grid.rs`) use a strict, uniform row↔logical-
+line mapping that selection, search, and click-hit-testing (`cell_in_focused`
+in `src/gui/window.rs`) all also key off directly. Making folded rows
+disappear from that mapping without silently breaking those — which are
+well-tested, currently-correct subsystems — needs a dedicated pass through
+all of them, not a bolt-on. Rather than risk a rushed, partially-correct
+integration, the toggle API and data model are shipped now (real,
+independently useful, thoroughly tested infrastructure) and the rendering
+consumer is left as clearly-scoped future work.
+
+**Current (before).** rusty_term already tracks prompt starts (OSC 133;A) and
 command boundaries (133;C/D) for scrollback navigation, but doesn't use
 those marks for anything beyond jumping between them.
 
@@ -436,8 +471,9 @@ what Warp calls "command blocks," built on marks rusty_term already has.
 differentiating without committing to Warp's whole reimagining of the
 terminal as a structured log.
 
-**Size** M · **Deps** `gui` feature (folding is a rendering/interaction
-concept; TUI passthrough has no natural place to put a fold toggle).
+**Size** M, revised to **M–L** once the render-path scope above came into
+focus · **Deps** `gui` feature (folding is a rendering/interaction concept;
+TUI passthrough has no natural place to put a fold toggle).
 
 ---
 

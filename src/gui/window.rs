@@ -1062,6 +1062,35 @@ impl App<'_> {
         url.is_some_and(|u| open_url(&u))
     }
 
+    /// Whether alternate scroll mode (`?1007`) should intercept wheel input
+    /// for the focused pane right now: the mode is on *and* its alternate
+    /// screen is active (mode 1007 only ever applies there — the primary
+    /// screen keeps browsing rusty_term's own scrollback, same as xterm).
+    fn alt_scroll_active(&self) -> bool {
+        self.pane().is_some_and(|p| {
+            let g = p.grid.lock();
+            g.alt_scroll && g.in_alt_screen()
+        })
+    }
+
+    /// Translate a wheel scroll into repeated Up/Down (DECCKM-aware) key
+    /// presses for alternate scroll mode (`?1007`), so the wheel drives a
+    /// pager (`less`, `man`, …) that never registered native mouse support.
+    fn send_alt_scroll_keys(&mut self, lines: isize) {
+        let app_cursor = self.pane().is_some_and(|p| p.grid.lock().app_cursor_keys);
+        let seq: &[u8] = match (lines >= 0, app_cursor) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        if let Some(p) = self.pane_mut() {
+            for _ in 0..lines.unsigned_abs() {
+                let _ = p.writer.write(seq);
+            }
+        }
+    }
+
     /// Browse the active tab's scrollback: move the viewport by `lines`
     /// (positive = up into history, negative = back toward the live bottom),
     /// clamped to the available history. Repaints if the view actually moved.
@@ -1865,6 +1894,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if self.report_mouse(|c, r| {
                     MouseEvent::new_point(c, r).with_scroll(lines).with_modifiers(sh, al, ct)
                 }) {
+                    return;
+                }
+                if self.alt_scroll_active() {
+                    self.send_alt_scroll_keys(lines);
                     return;
                 }
                 self.scroll_active(lines);
