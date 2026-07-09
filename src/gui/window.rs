@@ -520,7 +520,8 @@ impl App<'_> {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         if let Some(p) = tab.focused() {
             let g = p.grid.lock();
-            window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
+            let fallback = self.config.title.as_deref().unwrap_or("rusty_term");
+            window.set_title(if g.title.is_empty() { fallback } else { &g.title });
         }
         // Lock each pane's grid for the frame, then hand the renderer offset views
         // (the chrome bar occupies screen row 0, so panes start at row 1).
@@ -1588,8 +1589,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         let width = (self.cols as usize * self.cell_w) as u32;
         // One extra cell row on top for the chrome bar.
         let height = ((self.rows as usize + 1) * self.cell_h) as u32;
+        // `--title` (or a config `title` key) seeds the initial title; the
+        // child's own OSC 0/2 still wins once it emits one (see the per-frame
+        // `set_title` above).
         let attrs = Window::default_attributes()
-            .with_title("rusty_term")
+            .with_title(self.config.title.as_deref().unwrap_or("rusty_term"))
             .with_decorations(false)
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
         // Keep the DWM drop shadow so the borderless window still reads as

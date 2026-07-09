@@ -43,8 +43,8 @@ pub struct Config {
     /// Starting directory for the child shell (`--cwd`/`--starting-directory`).
     /// CLI-only, same reasoning as `command_args`.
     pub cwd: Option<PathBuf>,
-    /// Initial window title seed (`--title`); child OSC 0/2 still wins once
-    /// emitted. CLI-only.
+    /// Initial window title seed (`--title` CLI flag or a top-level `title`
+    /// config key); child OSC 0/2 still wins once emitted.
     pub title: Option<String>,
     /// Initial window state (windowed front-end only).
     pub launch_mode: Option<LaunchMode>,
@@ -564,6 +564,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
         ("", "cursor_blink") => cfg.cursor_blink = Some(expect_bool(key, value)?),
+        ("", "title") => cfg.title = Some(expect_str(key, value)?),
         ("keys", k) => {
             let action =
                 parse_action(k).ok_or_else(|| format!("unknown [keys] action `{k}`"))?;
@@ -862,6 +863,26 @@ color15 = "ffffff"
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.cursor_style, Some(CursorShape::Bar));
         assert_eq!(cfg.cursor_blink, Some(true));
+    }
+
+    #[test]
+    fn title_key_parses() {
+        let (cfg, warns) = parse("title = \"naner: dev\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.title.as_deref(), Some("naner: dev"));
+    }
+
+    #[test]
+    fn launch_mode_key_parses_and_warns_on_unknown() {
+        let (cfg, warns) = parse("[window]\nlaunch_mode = \"maximized\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.launch_mode, Some(LaunchMode::Maximized));
+        let (cfg2, warns2) = parse("[window]\nlaunch_mode = \"full\"\n");
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert_eq!(cfg2.launch_mode, Some(LaunchMode::Fullscreen));
+        let (cfg3, warns3) = parse("[window]\nlaunch_mode = \"bogus\"\n");
+        assert_eq!(cfg3.launch_mode, None);
+        assert_eq!(warns3.len(), 1);
     }
 
     #[test]
