@@ -11,8 +11,6 @@ use super::cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
     ATTR_UNDERLINE, Pen,
 };
-#[cfg(feature = "l13")]
-use super::channel;
 use super::charset::Charset;
 use super::color::Palette;
 use super::grid::{CursorShape, Grid, LineAttr, alt_mode};
@@ -540,8 +538,8 @@ impl AnsiParser {
     /// private OSC code (`OSC 5379 ; …`); everything else goes to [`osc::dispatch`].
     fn finish_osc(&mut self, g: &mut Grid) {
         #[cfg(feature = "l13")]
-        if let Some(payload) = self.osc_buffer.strip_prefix(channel::OSC_PREFIX) {
-            channel::handle(payload, g, &mut self.responses);
+        if let Some(payload) = self.osc_buffer.strip_prefix(rusty_term_l13::OSC_PREFIX) {
+            rusty_term_l13::handle(payload, g, &mut self.responses);
             return;
         }
         osc::dispatch(

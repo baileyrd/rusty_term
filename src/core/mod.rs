@@ -17,8 +17,6 @@
 
 mod base64;
 mod cell;
-#[cfg(feature = "l13")]
-mod channel;
 mod charset;
 mod color;
 mod grid;

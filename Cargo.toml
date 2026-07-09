@@ -1,3 +1,6 @@
+[workspace]
+members = ["l13"]
+
 [package]
 name = "rusty_term"
 version = "0.1.0"
@@ -12,10 +15,11 @@ default = []
 # The runtime is always tokio (a single async reactor on every platform); see
 # `src/runtime`. It is a hard dependency rather than a feature.
 # L13 structured side-channel: a private-OSC JSON-RPC transport that hosts the
-# adjacent protocols (MCP, plus LSP/ACP negotiation). Pulls the local rusty_lsp
-# crate for its JSON-RPC 2.0 model + LSP types, and serde_json for payloads.
+# adjacent protocols (MCP, plus LSP/ACP negotiation). Lives in its own crate
+# (`l13/`) addressed against a narrow `TerminalState` trait, not `Grid`
+# directly — independently buildable/testable, not welded to this binary.
 # Opt-in so the default terminal stays lean.
-l13 = ["dep:rusty_lsp", "dep:serde_json"]
+l13 = ["dep:rusty_term_l13"]
 # Native window backend (the tcore-font/tcore-app fork): a standalone window
 # instead of rendering into a host terminal. winit for windowing/input,
 # softbuffer for CPU presentation, ab_glyph for glyph rasterization.
@@ -36,8 +40,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "macros",
 ] }
-rusty_lsp = { path = "../rusty_lsp", optional = true }
-serde_json = { version = "1", optional = true }
+rusty_term_l13 = { path = "l13", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 # Reading the font's GSUB table for ligature shaping. Already in the tree via
 # ab_glyph -> owned_ttf_parser, so this adds no new compiled crate; we only

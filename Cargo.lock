@@ -1587,6 +1587,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rusty_lsp"
 version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_lsp?rev=2b0a52818c857500941602dfd852651cbda137a4#2b0a52818c857500941602dfd852651cbda137a4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1603,8 +1604,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "pollster",
- "rusty_lsp",
- "serde_json",
+ "rusty_term_l13",
  "softbuffer",
  "tokio",
  "ttf-parser",
@@ -1613,6 +1613,14 @@ dependencies = [
  "wgpu",
  "windows-sys 0.59.0",
  "winit",
+]
+
+[[package]]
+name = "rusty_term_l13"
+version = "0.1.0"
+dependencies = [
+ "rusty_lsp",
+ "serde_json",
 ]
 
 [[package]]

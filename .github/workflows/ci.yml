@@ -36,13 +36,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev
-      # Linted/tested against the `gui` feature (a superset of default) rather
-      # than also against bare default: gui-only helpers (settings-page I/O)
-      # are legitimately unused when compiled without it, which trips
-      # clippy's dead-code lint under `-D warnings` for no real bug. `l13` is
-      # excluded — it pulls the sibling `rusty_lsp` checkout (G9), not
-      # available here.
-      - name: Clippy (gui feature)
-        run: cargo clippy --all-targets --features gui -- -D warnings
-      - name: Test (gui feature)
-        run: cargo test --features gui
+      # Linted/tested against gui+l13 together (a superset of default) rather
+      # than also against bare default: gui/l13-only helpers (settings-page
+      # I/O, the L13 side-channel) are legitimately unused when compiled
+      # without their feature, which trips clippy's dead-code lint under
+      # `-D warnings` for no real bug. l13 now resolves `rusty_lsp` over git
+      # (see l13/Cargo.toml) rather than a local sibling checkout, so it needs
+      # no special-casing here anymore — just network access, which this
+      # runner has.
+      - name: Clippy (gui + l13 features)
+        run: cargo clippy --all-targets --features gui,l13 -- -D warnings
+      - name: Test (gui + l13 features)
+        run: cargo test --features gui,l13
+      - name: Test (rusty_term_l13 crate, standalone)
+        run: cargo test -p rusty_term_l13
