@@ -34,7 +34,7 @@ use crate::backend::{Backend, BackendHandle};
 use crate::config::{Config, LaunchMode};
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use crate::keymap::{Action, Chord};
-use crate::gui::mouse::{MouseEvent, SgrEncoder};
+use crate::gui::mouse::{MouseButtonKind, MouseEvent, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
 use super::layout::{Dir, Layout, Rect};
 use super::render::{CpuRenderer, PaneFrame, Renderer};
@@ -199,6 +199,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         clipboard: arboard::Clipboard::new().ok(),
         mouse_pos: (0.0, 0.0),
         selecting: false,
+        mouse_button_down: None,
         sel_anchor: None,
         hits: Vec::new(),
         last_strip_click: None,
@@ -284,6 +285,10 @@ struct App<'a> {
     mouse_pos: (f64, f64),
     /// Whether the left button is held (a drag-selection is in progress).
     selecting: bool,
+    /// Physical button currently held, if any — drives `?1002` drag-motion
+    /// reporting (which button to report) and whether `?1002` reports motion
+    /// at all (only while a button is down; `?1003` reports regardless).
+    mouse_button_down: Option<MouseButtonKind>,
     /// Cell where the current drag-selection began.
     sel_anchor: Option<(usize, usize)>,
     /// Per-cell click actions for the chrome bar, rebuilt with each layout.
@@ -1703,7 +1708,16 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
                     return;
                 }
-                if let Some(bytes) = super::input::encode(&event.logical_key, self.mods, false) {
+                let (app_cursor, kitty_flags) = self
+                    .pane()
+                    .map(|p| {
+                        let g = p.grid.lock();
+                        (g.app_cursor_keys, g.kitty_keyboard_flags())
+                    })
+                    .unwrap_or_default();
+                if let Some(bytes) =
+                    super::input::encode(&event.logical_key, self.mods, app_cursor, kitty_flags)
+                {
                     if let Some(p) = self.pane_mut() {
                         let _ = p.writer.write(&bytes);
                     }
@@ -1772,30 +1786,70 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         window.request_redraw();
                     }
                 }
+                // Motion reporting (`?1002` while a button is held, `?1003`
+                // regardless) is independent of the local drag-selection
+                // above — both can be active at once, same as other
+                // terminals that don't force Shift to bypass app mouse mode.
+                let (sh, al, ct) =
+                    (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                let dragging = self.mouse_button_down.is_some();
+                let button = self.mouse_button_down.unwrap_or_default();
+                self.report_mouse(|c, r| {
+                    MouseEvent::new_point(c, r)
+                        .with_move(dragging)
+                        .with_button_kind(button)
+                        .with_modifiers(sh, al, ct)
+                });
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    // Ctrl+click follows an OSC 8 hyperlink under the pointer,
-                    // suppressing selection and mouse reporting for that click.
-                    if self.mods.control_key() && self.open_link_under_pointer() {
-                        return;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some(kind) = (match button {
+                    MouseButton::Left => Some(MouseButtonKind::Left),
+                    MouseButton::Middle => Some(MouseButtonKind::Middle),
+                    MouseButton::Right => Some(MouseButtonKind::Right),
+                    _ => None, // no SGR encoding for side/other buttons
+                }) else {
+                    return;
+                };
+                match state {
+                    ElementState::Pressed => {
+                        // Ctrl+click follows an OSC 8 hyperlink under the
+                        // pointer, suppressing selection and mouse reporting
+                        // for that click. Left-button only: the resize/chrome/
+                        // selection semantics in `on_left_press` are as well.
+                        if kind == MouseButtonKind::Left {
+                            if self.mods.control_key() && self.open_link_under_pointer() {
+                                return;
+                            }
+                            self.on_left_press(event_loop);
+                        }
+                        self.mouse_button_down = Some(kind);
+                        let (sh, al, ct) =
+                            (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                        self.report_mouse(|c, r| {
+                            MouseEvent::new_point(c, r)
+                                .with_button(true)
+                                .with_button_kind(kind)
+                                .with_modifiers(sh, al, ct)
+                        });
                     }
-                    self.on_left_press(event_loop);
-                    let (sh, al, ct) =
-                        (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
-                    self.report_mouse(|c, r| {
-                        MouseEvent::new_point(c, r).with_button(true).with_modifiers(sh, al, ct)
-                    });
+                    ElementState::Released => {
+                        if kind == MouseButtonKind::Left {
+                            self.selecting = false;
+                        }
+                        if self.mouse_button_down == Some(kind) {
+                            self.mouse_button_down = None;
+                        }
+                        let (sh, al, ct) =
+                            (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                        self.report_mouse(|c, r| {
+                            MouseEvent::new_point(c, r)
+                                .with_button(false)
+                                .with_button_kind(kind)
+                                .with_modifiers(sh, al, ct)
+                        });
+                    }
                 }
-                ElementState::Released => {
-                    self.selecting = false;
-                    let (sh, al, ct) =
-                        (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
-                    self.report_mouse(|c, r| {
-                        MouseEvent::new_point(c, r).with_button(false).with_modifiers(sh, al, ct)
-                    });
-                }
-            },
+            }
             // Wheel up browses into scrollback history, wheel down back toward
             // the live bottom. A notch is `WHEEL_LINES`; trackpads report pixels.
             WindowEvent::MouseWheel { delta, .. } => {

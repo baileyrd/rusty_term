@@ -34,15 +34,15 @@ in one case — investigated and rejected outright.
 |---|---|---|---|---|
 | ✅ C01 | Synchronized output (mode 2026) | T1 | kitty, Ghostty, Windows Terminal | M |
 | ✅ C02 | Undercurl + colored underlines | T1 | kitty, VTE, Alacritty, iTerm2 | M |
-| C03 | Kitty keyboard protocol (native GUI) | T1 | kitty, WezTerm, Ghostty, +5 more | M–L |
+| ✅ C03 | Kitty keyboard protocol (native GUI) | T1 | kitty, WezTerm, Ghostty, +5 more | M–L |
 | ✅ C04 | OSC 22 pointer shape | T1 | xterm, kitty | S |
 | ✅ C05 | Window title stack | T1 | xterm, VTE | S |
 | ✅ C06 | DECRQM mode query | T1 | xterm, kitty | S–M |
 | ✅ C07 | XTWINOPS pixel-size queries | T1 | xterm, kitty, WezTerm | S |
 | C08 | GPU renderer ligatures | T2 | internal parity | L |
 | C09 | GPU renderer image protocols | T2 | internal parity | L |
-| C10 | GUI mouse motion + buttons | T2 | internal parity | M |
-| C11 | GUI DECCKM tracking | T2 | internal parity | S |
+| ✅ C10 | GUI mouse motion + buttons | T2 | internal parity | M |
+| ✅ C11 | GUI DECCKM tracking | T2 | internal parity | S |
 | C12 | iTerm2 geometry hints + formats | T2 | iTerm2 spec | M |
 | C13 | Multiple top-level windows | T3 | kitty, WezTerm, Ghostty, Alacritty | M |
 | C14 | Background opacity + blur | T3 | kitty, WezTerm, Alacritty, Ghostty | M |
@@ -129,7 +129,23 @@ silently degrade to plain underlines.
 **Size** M · **Deps** none.
 
 ### C03 — Kitty keyboard protocol (native GUI backend)
-**Current.** TUI mode correctly *relays* the Kitty keyboard protocol and
+**Status: partially done.** `Grid::kitty_flags_stack` (`src/core/grid.rs`)
+implements the full push/pop/set/query state machine (`CSI > flags u` /
+`CSI < n u` / `CSI = flags ; mode u` / `CSI ? u`), applied from
+`handle_private_csi` (`src/core/parser.rs`) alongside the existing host
+relay. `gui/input.rs`'s key encoder reads the current flags and, when bit 1
+(disambiguate escape codes) is set, encodes Escape/Enter/Tab/Backspace and
+Ctrl+letter combinations as `CSI u` instead of their legacy (ambiguous)
+bytes — covering the enhancement level the overwhelming majority of clients
+actually request (Neovim's default `kitty_keyboard_protocol`, etc.). Bits 2/4/16
+(event-type, alternate-key, and associated-text reporting) are **not**
+implemented: they need release/repeat key events and IME-layout data that
+aren't plumbed through the native window's input path today, and a client
+that requests them gets the disambiguated-but-legacy-shaped encoding rather
+than a fabricated answer. Widening this further is future work, tracked as
+a known gap rather than silently claimed.
+
+**Current (before).** TUI mode correctly *relays* the Kitty keyboard protocol and
 xterm `modifyOtherKeys` to the host terminal (`src/core/parser.rs`,
 `handle_private_csi`) — appropriate, since TUI mode is a passthrough. But
 `src/gui/input.rs`'s own native key encoding has no progressive-enhancement
@@ -277,7 +293,15 @@ worse experience for one of rusty_term's headline investments.
 **Size** L · **Deps** `gui-gpu` feature.
 
 ### C10 — Native GUI: mouse motion reporting + right/middle buttons
-**Current.** `docs/FEATURES.md` #2 explicitly flags this as "not yet": the
+**Status: done.** `gui/mouse.rs`'s `MouseEvent`/`SgrEncoder` gained a
+`MouseButtonKind` (left/middle/right) and a `Move { dragging }` event kind;
+`window.rs` now matches all three `winit::MouseButton`s (not just `Left`) and
+reports `CursorMoved` through the encoder — `?1000` stays click-only, `?1002`
+reports motion only while a button is held, `?1003` reports every motion
+(idle hover uses xterm's "no button" motion code, a held button reports its
+number).
+
+**Current (before).** `docs/FEATURES.md` #2 explicitly flags this as "not yet": the
 native GUI backend reports click/release/scroll but not
 motion-while-button-held (`?1002`) or all-motion (`?1003`), and doesn't
 report right/middle clicks.
@@ -291,7 +315,12 @@ managers, and Neovim mouse mode all depend on motion reporting.
 **Size** M · **Deps** `gui` feature.
 
 ### C11 — Native GUI: DECCKM application-cursor tracking
-**Current.** `implementation-status.md` flags that `gui/input.rs`'s key
+**Status: done.** `Grid::app_cursor_keys` (`src/core/grid.rs`), set from
+`handle_private_csi` on DEC mode `1` alongside the existing host relay;
+`window.rs` reads it from the focused pane's grid on every key press instead
+of a hardcoded `false`.
+
+**Current (before).** `implementation-status.md` flags that `gui/input.rs`'s key
 encoding hardcodes `app_cursor=false` rather than tracking the mode the
 running app actually set.
 

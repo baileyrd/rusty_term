@@ -649,11 +649,16 @@ impl AnsiParser {
         }
         // Kitty keyboard protocol (`CSI > flags u` push, `= flags ; mode u` set,
         // `< n u` pop, `? u` query) and the xterm key-modifier resources /
-        // modifyOtherKeys (`CSI > Pp ; Pv m`) are input-generating: relay them
-        // verbatim so a capable host performs the enhanced key encoding and
-        // answers the query — the same delegation as mouse/paste. Native
-        // encoding isn't possible here; we receive the host's already-encoded
-        // bytes, not key-press events.
+        // modifyOtherKeys (`CSI > Pp ; Pv m`) are input-generating, so in TUI
+        // mode they're relayed verbatim to the host, which does the real key
+        // encoding. The Kitty forms are *also* applied to `Grid`'s own
+        // enhancement-flag stack (`push_kitty_flags`/etc.), which the windowed
+        // front-end's native key encoder (`gui/input.rs`) reads directly since
+        // it has no host to relay to. A query (`? u`) is answered locally from
+        // that tracked state too — the one case where TUI mode could in
+        // principle see a reply both from us and (redundantly) relayed back
+        // from a kitty-protocol-aware host; harmless duplication in practice
+        // since a well-formed `CSI ? flags u` reply is idempotent to parse.
         let kitty_keyboard = cmd == b'u' && matches!(self.csi_marker, b'>' | b'<' | b'=' | b'?');
         let modify_keys = cmd == b'm' && self.csi_marker == b'>';
         if kitty_keyboard || modify_keys {
@@ -662,6 +667,20 @@ impl AnsiParser {
             g.host_out.push(self.csi_marker);
             g.host_out.extend_from_slice(self.param_buffer.as_bytes());
             g.host_out.push(cmd);
+            if kitty_keyboard {
+                let params = self.parse_params();
+                let p = |i: usize, default: usize| params.get(i).copied().flatten().unwrap_or(default);
+                match self.csi_marker {
+                    b'>' => g.push_kitty_flags(p(0, 0) as u8),
+                    b'<' => g.pop_kitty_flags(p(0, 1)),
+                    b'=' => g.set_kitty_flags(p(0, 0) as u8, p(1, 1) as u8),
+                    b'?' => {
+                        let flags = g.kitty_keyboard_flags();
+                        self.responses.extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
         // DECRQM (`CSI ? Ps $ p`) — report whether DEC private mode `Ps` is
@@ -700,6 +719,7 @@ impl AnsiParser {
                 // host to relay to and must wrap pastes / encode mouse events
                 // itself. (TUI mode relays above and never reads these.)
                 match param {
+                    1 => g.app_cursor_keys = set,
                     2004 => g.bracketed_paste = set,
                     1000 | 1002 | 1003 => {
                         g.mouse_modes.base = if set {
@@ -747,11 +767,12 @@ impl AnsiParser {
     /// Answer a DEC private DECRQM query (`CSI ? Ps $ p`) with a DECRPM report
     /// (`CSI ? Ps ; Pv $ y`). `Pv` is `1` set, `2` reset, or `0` "not
     /// recognized" — used honestly for modes this terminal only relays to the
-    /// host and doesn't track state for itself (DECCKM, focus reporting),
-    /// rather than guessing. Never reports the "permanently set/reset" `3`/`4`
-    /// forms — nothing here is locked.
+    /// host and doesn't track state for itself (focus reporting), rather than
+    /// guessing. Never reports the "permanently set/reset" `3`/`4` forms —
+    /// nothing here is locked.
     fn report_dec_mode(&mut self, g: &mut Grid, mode: usize) {
         let set = match mode {
+            1 => g.app_cursor_keys,
             6 => g.origin_mode,
             7 => g.autowrap,
             25 => g.cursor_visible,
