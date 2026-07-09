@@ -613,7 +613,8 @@ impl AnsiParser {
 
     /// Handle a private CSI sequence (one carrying a `?`/`<`/`=`/`>` marker).
     ///
-    /// Alternate-screen DEC modes are acted upon internally. Input-generating
+    /// Alternate-screen DEC modes are acted upon internally, as is
+    /// synchronized output (`2026`, [`Grid::set_sync_output`]). Input-generating
     /// modes (mouse, focus, bracketed paste, and the Kitty keyboard / xterm
     /// modifyOtherKeys protocols) are *relayed* to the host terminal so it
     /// produces the corresponding input — see [`is_host_input_mode`].
@@ -722,6 +723,11 @@ impl AnsiParser {
             } else if param == 6 {
                 // DECOM — origin mode; toggling it homes the cursor.
                 g.set_origin_mode(set);
+            } else if param == 2026 {
+                // Synchronized output: suppress render-loop wakeups until the
+                // matching reset (or a timeout) so a multi-write frame update
+                // never paints half-drawn. See Grid::sync_output_active.
+                g.set_sync_output(set);
             }
         }
     }
@@ -895,6 +901,36 @@ impl AnsiParser {
                     self.responses
                         .extend_from_slice(format!("\x1b[{};{}R", cy + 1, cx + 1).as_bytes());
                 }
+                _ => {}
+            },
+            // XTWINOPS (`CSI Ps ; Ps ; Ps t`) — only the sub-forms rusty_term
+            // has a real answer for; others (iconify, move, resize, raise,
+            // …) are consumed as no-ops rather than leaking as text.
+            b't' => match p(0, 0) {
+                18 => {
+                    // Report the text-area size in characters: CSI 8;rows;cols t.
+                    self.responses
+                        .extend_from_slice(format!("\x1b[8;{};{}t", g.rows, g.cols).as_bytes());
+                }
+                16 => {
+                    // Report one cell's size in pixels: CSI 6;height;width t.
+                    // No answer in TUI mode (or before the first GUI frame) —
+                    // there are no real pixels here to report.
+                    if let Some((cw, ch)) = g.cell_px {
+                        self.responses
+                            .extend_from_slice(format!("\x1b[6;{ch};{cw}t").as_bytes());
+                    }
+                }
+                14 => {
+                    // Report the text-area size in pixels: CSI 4;height;width t.
+                    if let Some((cw, ch)) = g.cell_px {
+                        let w = cw as usize * g.cols;
+                        let h = ch as usize * g.rows;
+                        self.responses.extend_from_slice(format!("\x1b[4;{h};{w}t").as_bytes());
+                    }
+                }
+                22 => g.push_title(), // XTPUSHTITLE (sub-param ignored — one title, not icon+title)
+                23 => g.pop_title(),  // XTPOPTITLE
                 _ => {}
             },
             _ => {}

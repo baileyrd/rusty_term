@@ -249,15 +249,18 @@ async fn run_async(
                 };
                 match guard.try_io(|inner| read_nonblocking(inner.as_raw_fd())) {
                     Ok(Ok(data)) if !data.is_empty() => {
-                        let responses = {
+                        let (responses, should_notify) = {
                             let mut g = grid.lock();
                             let mut parser = parser.lock();
                             parser.advance(&mut g, &data);
                             g.epoch += 1;
-                            parser.take_responses()
+                            (parser.take_responses(), !g.sync_output_active())
                         };
-                        // New output landed in the grid — ask for a repaint.
-                        frame.notify_one();
+                        // New output landed in the grid — ask for a repaint,
+                        // unless a synchronized-output window is suppressing it.
+                        if should_notify {
+                            frame.notify_one();
+                        }
                         if !responses.is_empty() && write_all(&master, &responses).await.is_err() {
                             break;
                         }
@@ -571,14 +574,16 @@ async fn run_async(
             data = out_rx.recv() => {
                 match data {
                     Some(data) => {
-                        let responses = {
+                        let (responses, should_notify) = {
                             let mut g = grid.lock();
                             let mut parser = parser.lock();
                             parser.advance(&mut g, &data);
                             g.epoch += 1;
-                            parser.take_responses()
+                            (parser.take_responses(), !g.sync_output_active())
                         };
-                        frame.notify_one();
+                        if should_notify {
+                            frame.notify_one();
+                        }
                         if !responses.is_empty() {
                             let _ = in_tx.send(responses);
                         }

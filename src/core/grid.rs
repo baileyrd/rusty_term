@@ -19,9 +19,20 @@ use super::sixel::SixelImage;
 /// [`Grid::set_scrollback_max`] (the `scrollback` config key).
 pub const SCROLLBACK_MAX: usize = 10_000;
 
+/// How long a synchronized-output window (DEC `?2026`) may stay open before
+/// [`Grid::sync_output_active`] gives up on it and lets the render loop
+/// resume painting anyway. Generous enough that a real frame update finishes
+/// well within it; short enough that a misbehaving or crashed client can't
+/// freeze the display for long.
+const SYNC_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// Maximum number of prompt marks (OSC 133;A) retained for navigation. Older
 /// marks are dropped once exceeded — far more than any real session needs.
 const PROMPT_MARKS_MAX: usize = 1024;
+
+/// Maximum depth of the XTPUSHTITLE stack. Further pushes are dropped rather
+/// than growing without bound — no real app nests this deep.
+const TITLE_STACK_MAX: usize = 64;
 
 /// Maximum number of distinct hyperlink URIs interned from OSC 8. Past this,
 /// further links are dropped (rendered as plain text) rather than growing the
@@ -133,6 +144,11 @@ pub struct Grid {
     /// Window title last set by the child via OSC 0/2. The renderer forwards
     /// changes to the host terminal's title bar; empty until the child sets one.
     pub title: String,
+    /// Titles saved by `CSI 22 t` (XTPUSHTITLE), most-recently-pushed last;
+    /// `CSI 23 t` (XTPOPTITLE) restores from here. Lets a full-screen app
+    /// (vim, tmux) set a working title and hand the caller's back on exit.
+    /// Bounded by [`TITLE_STACK_MAX`] against a runaway script.
+    title_stack: Vec<String>,
     /// Working directory last reported by the child via OSC 7 (typically a
     /// `file://host/path` URI). Captured for future use (e.g. "open new tab in
     /// the same directory"); empty until reported.
@@ -181,6 +197,15 @@ pub struct Grid {
     /// renderer shows/hides the host cursor accordingly — independent of the
     /// separate hide it applies while browsing scrollback.
     pub cursor_visible: bool,
+    /// Whether the child has an active synchronized-output window open (DEC
+    /// `?2026`, `CSI ?2026h` .. `CSI ?2026l`): while true, render-loop wakeups
+    /// are suppressed so a multi-write frame update never paints half-drawn.
+    /// See [`Grid::sync_output_active`] for the read side (which also expires
+    /// a window that's been open too long).
+    sync_output: bool,
+    /// When `sync_output` was last set, for the timeout in
+    /// [`Grid::sync_output_active`]. `None` when `sync_output` is false.
+    sync_output_since: Option<std::time::Instant>,
     /// Whether bracketed paste (DEC `?2004`) is enabled by the child. In TUI
     /// mode it is also relayed to the host; the windowed front-end reads it to
     /// decide whether to wrap pasted text in `ESC[200~` / `ESC[201~`.
@@ -190,6 +215,18 @@ pub struct Grid {
     /// uses this to route clicks/drags/scrolls back to the child as encoded
     /// input bytes instead of handling them locally.
     pub mouse_modes: MouseModes,
+    /// One cell's size in physical pixels `(width, height)`, set by the
+    /// windowed front-end from its font metrics; `None` in TUI mode (no real
+    /// pixels are ours to report) or before the first frame. Answers XTWINOPS
+    /// `14t`/`16t` pixel-size queries — `18t` (text-area size in *cells*)
+    /// needs only `cols`/`rows`, always known.
+    pub cell_px: Option<(u16, u16)>,
+    /// Mouse pointer shape last requested by the child via OSC 22, as a CSS
+    /// `cursor` keyword (`"text"`, `"pointer"`, …); `None` means the default
+    /// arrow. Read (not drained — it's persistent state, not a one-shot
+    /// event) by the windowed front-end while the pointer is over pane
+    /// content. TUI mode has no pointer of its own to change.
+    pub cursor_icon: Option<String>,
     /// Text the child asked to place on the system clipboard via OSC 52 set,
     /// pending pickup by the window backend (which owns the clipboard); `None`
     /// when nothing is pending. The TUI relays OSC 52 to the host and ignores it.
@@ -744,6 +781,7 @@ impl Grid {
             primary: None,
             epoch: 0,
             title: String::new(),
+            title_stack: Vec::new(),
             cwd: String::new(),
             scrollback: VecDeque::new(),
             scrollback_max: SCROLLBACK_MAX,
@@ -761,12 +799,16 @@ impl Grid {
             current_link: 0,
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
+            sync_output: false,
+            sync_output_since: None,
             bracketed_paste: false,
             clipboard_set: None,
             clipboard_query: false,
             notifications: Vec::new(),
             ime_preedit: String::new(),
             mouse_modes: MouseModes::default(),
+            cell_px: None,
+            cursor_icon: None,
             autowrap: true,
             origin_mode: false,
             insert_mode: false,
@@ -872,6 +914,46 @@ impl Grid {
     pub(crate) fn set_origin_mode(&mut self, on: bool) {
         self.origin_mode = on;
         self.cursor = self.home_position();
+    }
+
+    /// Push the current window title onto a stack (XTPUSHTITLE, `CSI 22 t`),
+    /// restorable via [`Grid::pop_title`]. Silently drops the push once
+    /// [`TITLE_STACK_MAX`] is reached rather than growing without bound.
+    pub(crate) fn push_title(&mut self) {
+        if self.title_stack.len() < TITLE_STACK_MAX {
+            self.title_stack.push(self.title.clone());
+        }
+    }
+
+    /// Pop and restore the most recently pushed title (XTPOPTITLE, `CSI 23
+    /// t`). A no-op if the stack is empty.
+    pub(crate) fn pop_title(&mut self) {
+        if let Some(t) = self.title_stack.pop() {
+            self.title = t;
+        }
+    }
+
+    /// Enter/leave a synchronized-output window (DEC `?2026`), set by the
+    /// parser on `CSI ?2026h` / `CSI ?2026l`.
+    pub(crate) fn set_sync_output(&mut self, on: bool) {
+        self.sync_output = on;
+        self.sync_output_since = on.then(std::time::Instant::now);
+    }
+
+    /// Whether the render loop should suppress its wakeup right now because a
+    /// synchronized-output window is open. Auto-expires after
+    /// [`SYNC_OUTPUT_TIMEOUT`] so a misbehaving or crashed client that opens a
+    /// window and never closes it can't freeze the display indefinitely.
+    pub(crate) fn sync_output_active(&mut self) -> bool {
+        if !self.sync_output {
+            return false;
+        }
+        if self.sync_output_since.is_some_and(|t| t.elapsed() > SYNC_OUTPUT_TIMEOUT) {
+            self.sync_output = false;
+            self.sync_output_since = None;
+            return false;
+        }
+        true
     }
 
     /// Move the cursor to column 0 of the current row.
@@ -1835,6 +1917,9 @@ impl Grid {
         self.cursor_visible = true;
         self.bracketed_paste = false;
         self.mouse_modes = MouseModes::default();
+        self.cursor_icon = None;
+        self.sync_output = false;
+        self.sync_output_since = None;
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
@@ -1856,6 +1941,9 @@ impl Grid {
         self.cursor_visible = true;
         self.bracketed_paste = false;
         self.mouse_modes = MouseModes::default();
+        self.cursor_icon = None;
+        self.sync_output = false;
+        self.sync_output_since = None;
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
