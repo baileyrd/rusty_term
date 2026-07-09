@@ -197,7 +197,13 @@ async fn run_async(
     // `reader` owns the master fd + child and reaps it on drop; keeping it in
     // this top-level future means the child is reaped on every exit path.
     // Independent dups feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+    let reader = backend.spawn_shell(
+        init_cols,
+        init_rows,
+        config.shell.as_deref(),
+        &config.command_args,
+        config.cwd.as_deref(),
+    )?;
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;
@@ -424,7 +430,13 @@ async fn run_async(
 
     // `reader` owns the ConPTY + child and reaps it on drop; independent dups
     // feed the read, write, and resize paths.
-    let reader = backend.spawn_shell(init_cols, init_rows, config.shell.as_deref())?;
+    let reader = backend.spawn_shell(
+        init_cols,
+        init_rows,
+        config.shell.as_deref(),
+        &config.command_args,
+        config.cwd.as_deref(),
+    )?;
     let read_handle = reader.try_clone()?;
     let write_handle = reader.try_clone()?;
     let mut resizer = reader.try_clone()?;

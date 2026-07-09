@@ -22,12 +22,32 @@ use std::path::PathBuf;
 use crate::core::{CursorShape, Theme};
 use crate::keymap::{Keymap, parse_action, parse_chord};
 
+/// Initial window state (`--maximized` / `--fullscreen`, or a `[window]
+/// launch_mode` config key); `None` is the normal windowed default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchMode {
+    Maximized,
+    Fullscreen,
+}
+
 /// Parsed configuration with everything optional; `None` / the [`Theme`]
 /// defaults mean "keep the built-in behavior".
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// Shell command to spawn instead of `$SHELL` / `%COMSPEC%`.
     pub shell: Option<String>,
+    /// Explicit argv appended after `shell` (`--command`/`-e`/a trailing `--
+    /// prog arg...`), overriding any args embedded in `shell` itself. CLI-only
+    /// — a per-launch override, not a persisted config key.
+    pub command_args: Vec<String>,
+    /// Starting directory for the child shell (`--cwd`/`--starting-directory`).
+    /// CLI-only, same reasoning as `command_args`.
+    pub cwd: Option<PathBuf>,
+    /// Initial window title seed (`--title` CLI flag or a top-level `title`
+    /// config key); child OSC 0/2 still wins once emitted.
+    pub title: Option<String>,
+    /// Initial window state (windowed front-end only).
+    pub launch_mode: Option<LaunchMode>,
     /// Scrollback line cap (overrides [`crate::core::SCROLLBACK_MAX`]).
     pub scrollback: Option<usize>,
     /// Initial window size in cells (windowed front-end only; the TUI always
@@ -109,6 +129,7 @@ impl Config {
 # shell = "pwsh"           # or "wsl", "powershell", a full path, ...
 # scrollback = 10000       # history line cap; 0 disables
 # theme = "gruvbox-dark"   # see README for the preset list
+# title = "naner: dev"     # initial window title; child OSC 0/2 still wins
 
 # [window]                 # windowed (--gui) front-end only
 # cols = 120
@@ -116,6 +137,7 @@ impl Config {
 # font = "C:\\Windows\\Fonts\\CascadiaMono.ttf"
 # font-size = 18
 # ligatures = false        # disable programming-font ligatures (default on)
+# launch_mode = "maximized" # or "fullscreen"
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -508,6 +530,14 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.font_fallback = Some(PathBuf::from(expect_str(key, value)?))
         }
         ("window", "ligatures") => cfg.ligatures = Some(expect_bool(key, value)?),
+        ("window", "launch_mode") => {
+            let name = expect_str(key, value)?;
+            cfg.launch_mode = Some(match name.to_ascii_lowercase().as_str() {
+                "maximized" | "maximize" | "max" => LaunchMode::Maximized,
+                "fullscreen" | "full" => LaunchMode::Fullscreen,
+                _ => return Err(format!("unknown {key} `{name}` (maximized or fullscreen)")),
+            });
+        }
         ("window", "font_size") => {
             let px = match value {
                 Value::Float(f) => f,
@@ -536,6 +566,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
         ("", "cursor_blink") => cfg.cursor_blink = Some(expect_bool(key, value)?),
+        ("", "title") => cfg.title = Some(expect_str(key, value)?),
         ("keys", k) => {
             let action =
                 parse_action(k).ok_or_else(|| format!("unknown [keys] action `{k}`"))?;
@@ -834,6 +865,26 @@ color15 = "ffffff"
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.cursor_style, Some(CursorShape::Bar));
         assert_eq!(cfg.cursor_blink, Some(true));
+    }
+
+    #[test]
+    fn title_key_parses() {
+        let (cfg, warns) = parse("title = \"naner: dev\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.title.as_deref(), Some("naner: dev"));
+    }
+
+    #[test]
+    fn launch_mode_key_parses_and_warns_on_unknown() {
+        let (cfg, warns) = parse("[window]\nlaunch_mode = \"maximized\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.launch_mode, Some(LaunchMode::Maximized));
+        let (cfg2, warns2) = parse("[window]\nlaunch_mode = \"full\"\n");
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert_eq!(cfg2.launch_mode, Some(LaunchMode::Fullscreen));
+        let (cfg3, warns3) = parse("[window]\nlaunch_mode = \"bogus\"\n");
+        assert_eq!(cfg3.launch_mode, None);
+        assert_eq!(warns3.len(), 1);
     }
 
     #[test]

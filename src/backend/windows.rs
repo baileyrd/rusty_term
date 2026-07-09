@@ -9,7 +9,9 @@
 //!
 //! NOTE: run and verified on Windows 11 (build 26200) — shell spawn, child
 //! `TERM`/`COLORTERM`, bidirectional relay, and OSC title capture all work.
-//! Host resize propagation is a known gap (no `SIGWINCH` equivalent is wired).
+//! Host resize propagation also works: there is no `SIGWINCH` equivalent to
+//! wire, so `resize_poll` in `src/runtime/tokio_rt.rs` polls the console size
+//! on a timer and calls [`BackendHandle::set_winsize`] on change.
 
 use crate::backend::{Backend, BackendHandle};
 use parking_lot::Mutex;
@@ -45,6 +47,8 @@ impl Backend for WindowsBackend {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
     ) -> Result<Box<dyn BackendHandle>, std::io::Error> {
         use std::os::windows::ffi::OsStrExt;
 
@@ -131,10 +135,21 @@ impl Backend for WindowsBackend {
                 shell
             };
             // CreateProcessW needs a mutable, null-terminated wide command line.
-            let mut cmdline: Vec<u16> = std::ffi::OsStr::new(&shell)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
+            // `shell` may already carry its own args (CreateProcessW parses the
+            // whole string itself); explicit `args` — the caller's pre-split
+            // argv, e.g. a trailing `-- prog arg...` — are appended, each
+            // quoted so the child's argv parser splits them back out unchanged.
+            let mut cmdline: Vec<u16> = std::ffi::OsStr::new(&shell).encode_wide().collect();
+            for arg in args {
+                cmdline.push(' ' as u16);
+                push_quoted_arg(arg, &mut cmdline);
+            }
+            cmdline.push(0);
+
+            let cwd_wide: Option<Vec<u16>> = cwd.map(|p| {
+                p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+            });
+            let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
 
             let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
             let ok = CreateProcessW(
@@ -145,7 +160,7 @@ impl Backend for WindowsBackend {
                 0, // bInheritHandles = FALSE: handles flow via the pseudoconsole
                 EXTENDED_STARTUPINFO_PRESENT,
                 std::ptr::null(),
-                std::ptr::null(),
+                cwd_ptr,
                 &si.StartupInfo,
                 &mut pi,
             );
@@ -219,6 +234,41 @@ impl Backend for WindowsBackend {
             }
         }
     }
+}
+
+/// Appends `arg` to `out` (a wide command-line buffer), quoted per the
+/// MSVCRT/`CreateProcessW` argument rules — backslashes only escape when
+/// immediately followed by a quote — so the child's argv parser splits it
+/// back out unchanged. Mirrors the algorithm Windows itself documents.
+fn push_quoted_arg(arg: &str, out: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| c == ' ' || c == '\t' || c == '"');
+    if !needs_quotes {
+        out.extend(std::ffi::OsStr::new(arg).encode_wide());
+        return;
+    }
+    out.push(b'"' as u16);
+    let mut chars = arg.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut backslashes = 1;
+            while chars.peek() == Some(&'\\') {
+                chars.next();
+                backslashes += 1;
+            }
+            let doubled = matches!(chars.peek(), Some('"') | None);
+            for _ in 0..(if doubled { backslashes * 2 } else { backslashes }) {
+                out.push(b'\\' as u16);
+            }
+        } else if c == '"' {
+            out.push(b'\\' as u16);
+            out.push(b'"' as u16);
+        } else {
+            let mut buf = [0u16; 2];
+            out.extend(c.encode_utf16(&mut buf).iter());
+        }
+    }
+    out.push(b'"' as u16);
 }
 
 /// Owns the master side of a ConPTY: the pipe ends we read/write and the
@@ -398,5 +448,43 @@ impl Drop for WindowsHandle {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_quoted_arg;
+
+    fn quote(arg: &str) -> String {
+        let mut out = Vec::new();
+        push_quoted_arg(arg, &mut out);
+        String::from_utf16(&out).unwrap()
+    }
+
+    #[test]
+    fn plain_arg_is_unquoted() {
+        assert_eq!(quote("hi"), "hi");
+        assert_eq!(quote("-lc"), "-lc");
+    }
+
+    #[test]
+    fn spaces_and_empty_get_quoted() {
+        assert_eq!(quote("echo hi"), "\"echo hi\"");
+        assert_eq!(quote(""), "\"\"");
+    }
+
+    #[test]
+    fn embedded_quote_is_escaped() {
+        assert_eq!(quote(r#"say "hi""#), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn trailing_backslashes_before_closing_quote_are_doubled() {
+        assert_eq!(quote(r"C:\some dir\"), r#""C:\some dir\\""#);
+    }
+
+    #[test]
+    fn backslashes_not_before_a_quote_pass_through() {
+        assert_eq!(quote(r"C:\some\path"), r"C:\some\path");
     }
 }

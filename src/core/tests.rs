@@ -3408,10 +3408,7 @@ fn su_huge_count_clears_region_without_flooding_scrollback() {
 /// A distinctive test theme: dark-grey bg, off-white fg, red cursor, and a
 /// remapped ANSI red (index 1).
 fn test_theme() -> Theme {
-    let mut t = Theme::default();
-    t.fg = 0xd8d8d8;
-    t.bg = 0x1d1f21;
-    t.cursor = 0xff0000;
+    let mut t = Theme { fg: 0xd8d8d8, bg: 0x1d1f21, cursor: 0xff0000, ..Default::default() };
     t.palette16[1] = 0xcc6666;
     t
 }
@@ -3501,9 +3498,7 @@ fn retheme_recolors_existing_content() {
     let mut p = AnsiParser::with_theme(test_theme());
     p.advance(&mut g, b"hi\x1b[31mr");
     // Switch to a different theme: defaults and ANSI red follow.
-    let mut new = Theme::default();
-    new.fg = 0x111111;
-    new.bg = 0x222222;
+    let mut new = Theme { fg: 0x111111, bg: 0x222222, ..Default::default() };
     new.palette16[1] = 0x333333;
     let old = p.retheme(new);
     assert_eq!(old, test_theme(), "retheme returns the previous seed");
@@ -3545,8 +3540,7 @@ fn retheme_recolors_scrollback() {
         p.advance(&mut g, format!("l{i}\r\n").as_bytes());
     }
     assert!(!g.scrollback.is_empty());
-    let mut new = Theme::default();
-    new.fg = 0x999999;
+    let new = Theme { fg: 0x999999, ..Default::default() };
     let old = p.retheme(new);
     g.retheme(&old, &new);
     for line in &g.scrollback {

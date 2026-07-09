@@ -28,10 +28,10 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
-use crate::config::Config;
+use crate::config::{Config, LaunchMode};
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseEvent, SgrEncoder};
@@ -304,8 +304,15 @@ struct App<'a> {
 impl App<'_> {
     /// Spawn one shell sized `cols × rows`, wire its reader + exit-watcher
     /// threads (which signal by pane id), and return the pane.
-    fn new_pane(&mut self, cols: u16, rows: u16, shell: Option<&str>) -> Result<Pane, std::io::Error> {
-        let handle = self.backend.spawn_shell(cols, rows, shell)?;
+    fn new_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Pane, std::io::Error> {
+        let handle = self.backend.spawn_shell(cols, rows, shell, args, cwd)?;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -345,6 +352,18 @@ impl App<'_> {
         Ok(Pane { id, grid, parser, writer: handle })
     }
 
+    /// The active tab's focused pane's cwd, as last reported via OSC 7 —
+    /// `None` if it hasn't reported one yet (or there's no active tab). A new
+    /// tab/pane spawned from here starts in that directory instead of
+    /// wherever the launch `--cwd` pointed, so "open a new tab" follows where
+    /// the user actually navigated to.
+    fn focused_pane_cwd(&self) -> Option<std::path::PathBuf> {
+        let tab = self.tabs.get(self.active)?;
+        let pane = tab.focused()?;
+        let uri = pane.grid.lock().cwd.clone();
+        path_from_file_uri(&uri)
+    }
+
     /// Open a new tab (one full-area pane) and make it active.
     fn spawn_tab(&mut self) -> Result<(), std::io::Error> {
         self.spawn_tab_with(None)
@@ -355,7 +374,16 @@ impl App<'_> {
     /// shell-launcher menu (which passes a detected shell's path).
     fn spawn_tab_with(&mut self, shell: Option<String>) -> Result<(), std::io::Error> {
         let shell = shell.or_else(|| self.config.shell.clone());
-        let pane = self.new_pane(self.cols, self.rows, shell.as_deref())?;
+        // The launch-time `-- prog arg...` argv only applies when spawning
+        // that same configured shell; a shell picked fresh from the menu
+        // starts bare rather than replaying args meant for a different program.
+        let args: Vec<String> =
+            if shell == self.config.shell { self.config.command_args.clone() } else { Vec::new() };
+        // The focused pane's cwd wins (so a new tab follows where the user
+        // navigated to); the launch `--cwd` is only a fallback for the very
+        // first tab, before any pane has reported a cwd.
+        let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
+        let pane = self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref())?;
         let focus = pane.id;
         self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus });
         self.active = self.tabs.len() - 1;
@@ -369,7 +397,10 @@ impl App<'_> {
     /// focusing it. `dir` is the divider orientation.
     fn split_pane(&mut self, dir: Dir) {
         let shell = self.config.shell.clone();
-        let Ok(pane) = self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref()) else {
+        let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
+        let Ok(pane) =
+            self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref(), &[], cwd.as_deref())
+        else {
             return;
         };
         let new_id = pane.id;
@@ -504,7 +535,8 @@ impl App<'_> {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         if let Some(p) = tab.focused() {
             let g = p.grid.lock();
-            window.set_title(if g.title.is_empty() { "rusty_term" } else { &g.title });
+            let fallback = self.config.title.as_deref().unwrap_or("rusty_term");
+            window.set_title(if g.title.is_empty() { fallback } else { &g.title });
         }
         // Lock each pane's grid for the frame, then hand the renderer offset views
         // (the chrome bar occupies screen row 0, so panes start at row 1).
@@ -1572,8 +1604,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         let width = (self.cols as usize * self.cell_w) as u32;
         // One extra cell row on top for the chrome bar.
         let height = ((self.rows as usize + 1) * self.cell_h) as u32;
+        // `--title` (or a config `title` key) seeds the initial title; the
+        // child's own OSC 0/2 still wins once it emits one (see the per-frame
+        // `set_title` above).
         let attrs = Window::default_attributes()
-            .with_title("rusty_term")
+            .with_title(self.config.title.as_deref().unwrap_or("rusty_term"))
             .with_decorations(false)
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
         // Keep the DWM drop shadow so the borderless window still reads as
@@ -1582,6 +1617,13 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs.with_undecorated_shadow(true)
+        };
+        // `--maximized` / `--fullscreen` (or a `[window] launch_mode` config
+        // key); unset leaves the normal windowed default.
+        let attrs = match self.config.launch_mode {
+            Some(LaunchMode::Maximized) => attrs.with_maximized(true),
+            Some(LaunchMode::Fullscreen) => attrs.with_fullscreen(Some(Fullscreen::Borderless(None))),
+            None => attrs,
         };
         let Ok(window) = event_loop.create_window(attrs) else {
             event_loop.exit();
@@ -1822,6 +1864,44 @@ fn is_openable_url(url: &str) -> bool {
         .any(|p| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()))
 }
 
+/// The filesystem path out of an OSC 7 `file://[host]/path` URI, percent-
+/// decoded to raw bytes (so non-UTF8 path components round-trip on Unix).
+/// The host component (if any) is ignored — OSC 7 only ever reports the
+/// *local* shell's cwd, so a remote hostname there is not actionable. `None`
+/// for anything that isn't a `file://` URI with a path.
+fn path_from_file_uri(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = &rest[rest.find('/')?..];
+    let mut decoded: Vec<u8> = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = bytes.get(i + 1..i + 3)
+            && let Ok(hex) = std::str::from_utf8(hex)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if decoded.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(std::path::PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()))
+    }
+}
+
 /// Raise an OS desktop notification (OSC 9/777), per-platform with no extra
 /// crates (mirroring [`open_url`]). The untrusted title/body are passed as
 /// environment variables so they can't inject into the spawned PowerShell /
@@ -1913,7 +1993,10 @@ fn osc52_reply(text: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, put_text, shell_menu_items};
+    use super::{
+        Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, path_from_file_uri,
+        put_text, shell_menu_items,
+    };
     use crate::core::Cell;
 
     #[test]
@@ -1947,6 +2030,33 @@ mod tests {
         assert!(!is_openable_url("data:text/html,x"));
         assert!(!is_openable_url("https://")); // nothing after the scheme
         assert!(!is_openable_url("notaurl"));
+    }
+
+    #[test]
+    fn path_from_file_uri_strips_scheme_and_host() {
+        assert_eq!(
+            path_from_file_uri("file:///home/user/project"),
+            Some(std::path::PathBuf::from("/home/user/project"))
+        );
+        assert_eq!(
+            path_from_file_uri("file://myhost/home/user/project"),
+            Some(std::path::PathBuf::from("/home/user/project"))
+        );
+    }
+
+    #[test]
+    fn path_from_file_uri_percent_decodes() {
+        assert_eq!(
+            path_from_file_uri("file:///home/user/my%20project"),
+            Some(std::path::PathBuf::from("/home/user/my project"))
+        );
+    }
+
+    #[test]
+    fn path_from_file_uri_rejects_non_file_or_empty() {
+        assert_eq!(path_from_file_uri("https://example.com/path"), None);
+        assert_eq!(path_from_file_uri(""), None);
+        assert_eq!(path_from_file_uri("file://"), None);
     }
 
     #[test]

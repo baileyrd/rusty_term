@@ -3,6 +3,9 @@ name = "rusty_term"
 version = "0.1.0"
 edition = "2024"
 default-run = "rusty_term"
+license = "MIT"
+description = "A terminal emulator written from scratch in Rust, with a deliberately small dependency surface."
+repository = "https://github.com/baileyrd/rusty_term"
 
 [features]
 default = []

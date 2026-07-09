@@ -67,7 +67,7 @@ Implement OSC 9 and OSC 777 notification support.
 Fix host console size change detection and reflow in TUI/conhost mode.
 
 - **Status:** done (2026-06-07)
-- **Notes:** The Windows runtime polls the console size every 150ms (there is no SIGWINCH) and applies changes: `src/runtime/tokio_rt.rs` `resize_poll` -> `backend.terminal_size()` (`GetConsoleScreenBufferInfo`) -> `Grid::resize` + `set_winsize` (`ResizePseudoConsole`). The README's "known gap" caution is stale.
+- **Notes:** The Windows runtime polls the console size every 150ms (there is no SIGWINCH) and applies changes: `src/runtime/tokio_rt.rs` `resize_poll` -> `backend.terminal_size()` (`GetConsoleScreenBufferInfo`) -> `Grid::resize` + `set_winsize` (`ResizePseudoConsole`). The README and `docs/research/implementation-status.md` have both been corrected to match — neither calls this a gap anymore.
 
 ## 11. Font fallback + variants + ligatures
 Add font fallback chains, bold/italic variants, and optional ligature shaping.
