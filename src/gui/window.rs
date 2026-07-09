@@ -304,8 +304,15 @@ struct App<'a> {
 impl App<'_> {
     /// Spawn one shell sized `cols × rows`, wire its reader + exit-watcher
     /// threads (which signal by pane id), and return the pane.
-    fn new_pane(&mut self, cols: u16, rows: u16, shell: Option<&str>) -> Result<Pane, std::io::Error> {
-        let handle = self.backend.spawn_shell(cols, rows, shell)?;
+    fn new_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Pane, std::io::Error> {
+        let handle = self.backend.spawn_shell(cols, rows, shell, args, cwd)?;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -355,7 +362,13 @@ impl App<'_> {
     /// shell-launcher menu (which passes a detected shell's path).
     fn spawn_tab_with(&mut self, shell: Option<String>) -> Result<(), std::io::Error> {
         let shell = shell.or_else(|| self.config.shell.clone());
-        let pane = self.new_pane(self.cols, self.rows, shell.as_deref())?;
+        // The launch-time `-- prog arg...` argv only applies when spawning
+        // that same configured shell; a shell picked fresh from the menu
+        // starts bare rather than replaying args meant for a different program.
+        let args: Vec<String> =
+            if shell == self.config.shell { self.config.command_args.clone() } else { Vec::new() };
+        let cwd = self.config.cwd.clone();
+        let pane = self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref())?;
         let focus = pane.id;
         self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus });
         self.active = self.tabs.len() - 1;
@@ -369,7 +382,10 @@ impl App<'_> {
     /// focusing it. `dir` is the divider orientation.
     fn split_pane(&mut self, dir: Dir) {
         let shell = self.config.shell.clone();
-        let Ok(pane) = self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref()) else {
+        let cwd = self.config.cwd.clone();
+        let Ok(pane) =
+            self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref(), &[], cwd.as_deref())
+        else {
             return;
         };
         let new_id = pane.id;

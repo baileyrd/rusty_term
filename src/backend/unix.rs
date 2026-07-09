@@ -17,18 +17,49 @@ impl crate::backend::Backend for UnixBackend {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
     ) -> Result<Box<dyn crate::backend::BackendHandle>, std::io::Error> {
         // The configured shell wins; else honor the user's `$SHELL`, falling
-        // back to /bin/bash. Resolved in the parent (before fork) so the
-        // allocation never happens on the child's post-fork, pre-exec path,
-        // where only async-signal-safe work is sound. An interior NUL
-        // (impossible for a real path) falls back too.
+        // back to /bin/bash.
         let shell = shell
             .map(str::to_owned)
             .or_else(|| std::env::var("SHELL").ok())
             .filter(|s| !s.is_empty())
-            .and_then(|s| std::ffi::CString::new(s).ok())
-            .unwrap_or_else(|| std::ffi::CString::new("/bin/bash").unwrap());
+            .unwrap_or_else(|| "/bin/bash".to_string());
+
+        // Resolve program + argv: explicit `args` (the caller's pre-split
+        // argv, e.g. a trailing `-- prog arg...`) win outright — `shell` is
+        // then the bare program. With no explicit args, split any embedded
+        // args out of the `shell` string itself (a config `shell = "bash
+        // --login -i"`), matching how Windows' CreateProcessW already parses
+        // its whole command-line string.
+        let mut words: Vec<String> = if !args.is_empty() {
+            std::iter::once(shell.clone()).chain(args.iter().cloned()).collect()
+        } else {
+            split_shell_words(&shell)
+        };
+        if words.is_empty() {
+            words.push(shell.clone());
+        }
+        // CString allocation happens here in the parent, before fork, so the
+        // child's post-fork, pre-exec path (only async-signal-safe work is
+        // sound there) never allocates. An interior NUL (impossible for a
+        // real program/arg) falls back to /bin/bash bare.
+        let argv: Vec<std::ffi::CString> = words
+            .iter()
+            .map(|s| std::ffi::CString::new(s.as_str()))
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|_| vec![std::ffi::CString::new("/bin/bash").unwrap()]);
+        let program = argv[0].clone();
+
+        let cwd = cwd.map(|p| {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+        });
+        // An unrepresentable cwd (interior NUL, impossible for a real path)
+        // is treated the same as "not given" rather than failing the spawn.
+        let cwd = cwd.and_then(Result::ok);
 
         unsafe {
             // Seed the PTY with the initial window size so the child shell and
@@ -79,8 +110,16 @@ impl crate::backend::Backend for UnixBackend {
                 libc::close(slave_fd);
                 libc::close(master_fd);
 
-                let args = [shell.as_ptr(), std::ptr::null()];
-                libc::execvp(shell.as_ptr(), args.as_ptr());
+                if let Some(cwd) = &cwd
+                    && libc::chdir(cwd.as_ptr()) != 0
+                {
+                    libc::_exit(1);
+                }
+
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv.iter().map(|a| a.as_ptr()).collect();
+                argv_ptrs.push(std::ptr::null());
+                libc::execvp(program.as_ptr(), argv_ptrs.as_ptr());
 
                 // Only reached if exec failed.
                 libc::_exit(1);
@@ -136,6 +175,63 @@ impl crate::backend::Backend for UnixBackend {
             }
         }
     }
+}
+
+/// Splits a shell command string into a program + argv, honoring single and
+/// double quotes and backslash escapes — a small POSIX-subset word splitter
+/// (not a full shell grammar) sufficient for a config `shell = "bash --login
+/// -i"` style value. Windows needs no equivalent: `CreateProcessW` already
+/// parses the whole command-line string itself.
+fn split_shell_words(s: &str) -> Vec<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut has_cur = false;
+    let mut quote = Quote::None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Quote::None, ' ' | '\t') => {
+                if has_cur {
+                    words.push(std::mem::take(&mut cur));
+                    has_cur = false;
+                }
+            }
+            (Quote::None, '\'') => {
+                quote = Quote::Single;
+                has_cur = true;
+            }
+            (Quote::None, '"') => {
+                quote = Quote::Double;
+                has_cur = true;
+            }
+            (Quote::None, '\\') => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    has_cur = true;
+                }
+            }
+            (Quote::Single, '\'') => quote = Quote::None,
+            (Quote::Double, '"') => quote = Quote::None,
+            (Quote::Double, '\\') if matches!(chars.peek(), Some('\\') | Some('"')) => {
+                cur.push(chars.next().unwrap());
+                has_cur = true;
+            }
+            (_, c) => {
+                cur.push(c);
+                has_cur = true;
+            }
+        }
+    }
+    if has_cur {
+        words.push(cur);
+    }
+    words
 }
 
 /// Owns the master side of the PTY. The handle created by `spawn_shell` also
@@ -249,5 +345,37 @@ impl Drop for UnixHandle {
                 self.fd = -1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_shell_words;
+
+    #[test]
+    fn bare_program_is_a_single_word() {
+        assert_eq!(split_shell_words("zsh"), vec!["zsh"]);
+    }
+
+    #[test]
+    fn splits_on_whitespace() {
+        assert_eq!(split_shell_words("bash --login -i"), vec!["bash", "--login", "-i"]);
+        assert_eq!(split_shell_words("  bash   -i  "), vec!["bash", "-i"]);
+    }
+
+    #[test]
+    fn honors_quotes_and_escapes() {
+        assert_eq!(
+            split_shell_words(r#"bash -lc "echo hi there""#),
+            vec!["bash", "-lc", "echo hi there"]
+        );
+        assert_eq!(split_shell_words("bash -lc 'echo hi'"), vec!["bash", "-lc", "echo hi"]);
+        assert_eq!(split_shell_words(r"a\ b c"), vec!["a b", "c"]);
+    }
+
+    #[test]
+    fn empty_string_yields_no_words() {
+        assert!(split_shell_words("").is_empty());
+        assert!(split_shell_words("   ").is_empty());
     }
 }

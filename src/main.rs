@@ -10,6 +10,7 @@ mod runtime;
 mod shells;
 mod term;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -19,8 +20,40 @@ use crate::backend::Backend;
 use crate::backend::UnixBackend;
 #[cfg(windows)]
 use crate::backend::WindowsBackend;
-use crate::config::Config;
+use crate::config::{Config, LaunchMode};
 use crate::core::Grid;
+
+/// Splits CLI args at the first `--`, `-e`, or `--command` token: everything
+/// before is rusty_term's own flags; everything after is the child command to
+/// run (naner's `CustomShell.ExecutablePath` + `Arguments`) — `[program,
+/// args...]`. Keeping the child's tokens out of the "our flags" scan means a
+/// child argument that happens to read like one of our flags (even literally
+/// `--config`) is never misread as ours.
+fn split_command(args: &[String]) -> (&[String], Option<(String, Vec<String>)>) {
+    match args.iter().position(|a| a == "--" || a == "-e" || a == "--command") {
+        Some(pos) => {
+            let rest = &args[pos + 1..];
+            let command = rest.split_first().map(|(p, a)| (p.clone(), a.to_vec()));
+            (&args[..pos], command)
+        }
+        None => (args, None),
+    }
+}
+
+/// A `--flag value` or `--flag=value` CLI argument's value, first match wins.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let eq_prefix = format!("{name}=");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            return it.next().map(String::as_str);
+        }
+        if let Some(v) = a.strip_prefix(eq_prefix.as_str()) {
+            return Some(v);
+        }
+    }
+    None
+}
 
 fn main() -> Result<(), std::io::Error> {
     // Load the config file (`--config <path>` > `$RUSTY_TERM_CONFIG` > the
@@ -28,7 +61,8 @@ fn main() -> Result<(), std::io::Error> {
     // unreadable explicit path) go to stderr — visible with the TUI not yet
     // drawing and harmless behind a detached gui window — and never abort:
     // the terminal always starts, with defaults filling any gap.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let all_args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, command) = split_command(&all_args);
 
     // `--list-shells`: print what's installed and exit. Runs before config
     // loading so a broken config can't get in the way of the diagnostic.
@@ -37,9 +71,32 @@ fn main() -> Result<(), std::io::Error> {
         return Ok(());
     }
 
-    let (mut config, warnings) = Config::load(&args);
+    let (mut config, warnings) = Config::load(args);
     for w in &warnings {
         eprintln!("rusty_term: {w}");
+    }
+
+    // CLI-only overrides layered on top of the config file: `--cwd` /
+    // `--starting-directory` (G1), `--title` (G3), `--maximized` /
+    // `--fullscreen` (G6, fullscreen taking priority if both are given), and
+    // the trailing `-- prog arg...` / `-e` / `--command` child override (G2)
+    // — which replaces `shell` outright rather than merely supplying args, so
+    // it wins over both the config file and shell auto-detection below.
+    if let Some(dir) = flag_value(args, "--cwd").or_else(|| flag_value(args, "--starting-directory"))
+    {
+        config.cwd = Some(PathBuf::from(dir));
+    }
+    if let Some(title) = flag_value(args, "--title") {
+        config.title = Some(title.to_string());
+    }
+    if args.iter().any(|a| a == "--fullscreen") {
+        config.launch_mode = Some(LaunchMode::Fullscreen);
+    } else if args.iter().any(|a| a == "--maximized") {
+        config.launch_mode = Some(LaunchMode::Maximized);
+    }
+    if let Some((prog, cmd_args)) = command {
+        config.shell = Some(prog);
+        config.command_args = cmd_args;
     }
 
     // No shell configured: ask the detector for a better default than the

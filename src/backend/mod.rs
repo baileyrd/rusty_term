@@ -1,12 +1,19 @@
 pub trait Backend {
     /// Spawn the child shell on a new PTY sized to `cols`×`rows`. `shell`
     /// overrides the platform default (`$SHELL` / `%COMSPEC%`) when `Some` —
-    /// the `shell` config key.
+    /// the `shell` config key. `args` is explicit argv appended after `shell`
+    /// (the launcher's pre-split `ExecutablePath` + `Arguments`, e.g. a
+    /// trailing `-- prog arg...`); empty when the caller has none, in which
+    /// case a `shell` string carrying its own args (`"bash --login -i"`) is
+    /// still split and honored. `cwd` sets the child's initial working
+    /// directory, defaulting to this process's cwd when `None`.
     fn spawn_shell(
         &self,
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
     ) -> Result<Box<dyn BackendHandle>, std::io::Error>;
     fn set_raw_mode(&self, enabled: bool) -> Result<(), std::io::Error>;
     /// Best-effort query of the controlling terminal's size as `(cols, rows)`.

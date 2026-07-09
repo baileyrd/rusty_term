@@ -22,12 +22,32 @@ use std::path::PathBuf;
 use crate::core::{CursorShape, Theme};
 use crate::keymap::{Keymap, parse_action, parse_chord};
 
+/// Initial window state (`--maximized` / `--fullscreen`, or a `[window]
+/// launch_mode` config key); `None` is the normal windowed default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchMode {
+    Maximized,
+    Fullscreen,
+}
+
 /// Parsed configuration with everything optional; `None` / the [`Theme`]
 /// defaults mean "keep the built-in behavior".
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// Shell command to spawn instead of `$SHELL` / `%COMSPEC%`.
     pub shell: Option<String>,
+    /// Explicit argv appended after `shell` (`--command`/`-e`/a trailing `--
+    /// prog arg...`), overriding any args embedded in `shell` itself. CLI-only
+    /// — a per-launch override, not a persisted config key.
+    pub command_args: Vec<String>,
+    /// Starting directory for the child shell (`--cwd`/`--starting-directory`).
+    /// CLI-only, same reasoning as `command_args`.
+    pub cwd: Option<PathBuf>,
+    /// Initial window title seed (`--title`); child OSC 0/2 still wins once
+    /// emitted. CLI-only.
+    pub title: Option<String>,
+    /// Initial window state (windowed front-end only).
+    pub launch_mode: Option<LaunchMode>,
     /// Scrollback line cap (overrides [`crate::core::SCROLLBACK_MAX`]).
     pub scrollback: Option<usize>,
     /// Initial window size in cells (windowed front-end only; the TUI always
@@ -508,6 +528,14 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.font_fallback = Some(PathBuf::from(expect_str(key, value)?))
         }
         ("window", "ligatures") => cfg.ligatures = Some(expect_bool(key, value)?),
+        ("window", "launch_mode") => {
+            let name = expect_str(key, value)?;
+            cfg.launch_mode = Some(match name.to_ascii_lowercase().as_str() {
+                "maximized" | "maximize" | "max" => LaunchMode::Maximized,
+                "fullscreen" | "full" => LaunchMode::Fullscreen,
+                _ => return Err(format!("unknown {key} `{name}` (maximized or fullscreen)")),
+            });
+        }
         ("window", "font_size") => {
             let px = match value {
                 Value::Float(f) => f,
