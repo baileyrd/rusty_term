@@ -1,27 +1,19 @@
-mod backend;
-mod config;
-mod core;
+use rusty_term::{backend, config, core, runtime, shells, term};
 #[cfg(feature = "gui")]
-mod gui;
-mod input;
-mod keymap;
-mod render;
-mod runtime;
-mod shells;
-mod term;
+use rusty_term::gui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::backend::Backend;
+use backend::Backend;
 #[cfg(unix)]
-use crate::backend::UnixBackend;
+use backend::UnixBackend;
 #[cfg(windows)]
-use crate::backend::WindowsBackend;
-use crate::config::{Config, LaunchMode};
-use crate::core::Grid;
+use backend::WindowsBackend;
+use config::{Config, LaunchMode};
+use core::Grid;
 
 /// Splits CLI args at the first `--`, `-e`, or `--command` token: everything
 /// before is rusty_term's own flags; everything after is the child command to
