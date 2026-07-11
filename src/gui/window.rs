@@ -358,6 +358,7 @@ impl App<'_> {
             self.config.cursor_style.unwrap_or_default(),
             self.config.cursor_blink.unwrap_or(false),
         );
+        g.min_contrast = self.config.minimum_contrast.unwrap_or(1.0);
         let grid = Arc::new(Mutex::new(g));
         let parser = Arc::new(Mutex::new(AnsiParser::with_theme(self.theme)));
 
@@ -1658,12 +1659,22 @@ impl App<'_> {
     /// Recolor every tab to `new` (mirrors the config live-reload path) and
     /// repaint the chrome / window border.
     fn apply_theme_live(&mut self, new: Theme) {
-        for tab in &self.tabs {
-            for p in &tab.panes {
-                let mut g = p.grid.lock();
-                let old = p.parser.lock().retheme(new);
-                if old != new {
-                    g.retheme(&old, &new);
+        for tab in &mut self.tabs {
+            for p in &mut tab.panes {
+                let (report, changed) = {
+                    let mut g = p.grid.lock();
+                    let was_dark = g.appearance_is_dark();
+                    let old = p.parser.lock().retheme(new);
+                    if old != new {
+                        g.retheme(&old, &new);
+                    }
+                    let report = g.report_color_scheme && g.appearance_is_dark() != was_dark;
+                    (g.color_scheme_report(), report)
+                };
+                // Mode 2031: tell a subscribed child its world flipped
+                // light/dark (Neovim flips `background` off this).
+                if changed {
+                    let _ = p.writer.write(&report);
                 }
             }
         }
@@ -1671,6 +1682,25 @@ impl App<'_> {
         self.config.theme = new;
         if let Some(window) = &self.window {
             apply_chrome(window, &self.theme);
+        }
+    }
+
+    /// Resolve `theme = "auto"` against the OS appearance: `hint` is a live
+    /// `ThemeChanged` value, else the window's current report (dark when
+    /// unknown). Presets come from `theme_dark` / `theme_light`, defaulting
+    /// to the built-in default (dark) and Solarized Light.
+    fn auto_theme(&self, hint: Option<winit::window::Theme>) -> Theme {
+        let dark = !matches!(
+            hint.or_else(|| self.window.as_ref().and_then(|w| w.theme())),
+            Some(winit::window::Theme::Light)
+        );
+        if dark {
+            self.config.theme_dark.unwrap_or_default()
+        } else {
+            self.config
+                .theme_light
+                .or_else(|| crate::config::preset("solarized-light"))
+                .unwrap_or_default()
         }
     }
 
@@ -1915,6 +1945,12 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         if self.window.is_some() {
             return;
         }
+        // `theme = "auto"`: seed from the OS appearance if winit can tell us
+        // (falling back to dark); `ThemeChanged` keeps following it live.
+        if self.config.theme_auto {
+            self.theme = self.auto_theme(None);
+            self.config.theme = self.theme;
+        }
         let width = (self.cols as usize * self.cell_w) as u32;
         // One extra cell row on top for the chrome bar.
         let height = ((self.rows as usize + 1) * self.cell_h) as u32;
@@ -1967,6 +2003,15 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ThemeChanged(t) => {
+                if self.config.theme_auto {
+                    let new = self.auto_theme(Some(t));
+                    self.apply_theme_live(new);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::Focused(focused) => {
                 // Focus reporting (`?1004`): tell the focused pane's child it
                 // gained/lost focus, if it asked. Redraw either way — the

@@ -407,6 +407,19 @@ pub struct Grid {
     /// cleared (state `0` or unknown). The windowed front-end surfaces it in
     /// the tab strip; the TUI relays the sequence to the host.
     pub progress: Option<(u8, u8)>,
+    /// Whether the child asked for unsolicited color-scheme reports
+    /// (DEC mode 2031, Contour's dark/light extension): when the terminal's
+    /// appearance flips, it sends `CSI ? 997 ; 1|2 n`.
+    pub report_color_scheme: bool,
+    /// Minimum WCAG contrast ratio enforced between every cell's fg and bg
+    /// at render time (`minimum_contrast` config); `1.0` (default) disables.
+    /// Lives on the grid so both renderers read one knob without new
+    /// plumbing, like the cursor-style defaults.
+    pub min_contrast: f32,
+    /// In-flight multi-part OSC 99 notifications, keyed by the client's `i=`
+    /// identifier: `(id, title, body)` accumulating until a `d=1` (done)
+    /// part finalizes into [`Grid::notifications`]. Bounded.
+    notif99_pending: Vec<(String, String, String)>,
     /// When the running command's output began (OSC 133/633 `C`), for
     /// measuring how long a command ran (windowed front-end "command
     /// finished" notifications).
@@ -1084,6 +1097,9 @@ impl Grid {
             alt_scroll: false,
             bell: false,
             progress: None,
+            report_color_scheme: false,
+            min_contrast: 1.0,
+            notif99_pending: Vec::new(),
             #[cfg(any(test, feature = "gui"))]
             command_began: None,
             #[cfg(any(test, feature = "gui"))]
@@ -2487,6 +2503,8 @@ impl Grid {
     pub(crate) fn reset(&mut self) {
         self.bell = false;
         self.progress = None;
+        self.report_color_scheme = false;
+        self.notif99_pending.clear();
         self.primary = None; // leave the alternate screen if active
         self.cells = vec![self.erase_cell(); self.cols * self.rows];
         #[cfg(any(test, feature = "gui"))]
@@ -2638,6 +2656,58 @@ impl Grid {
     /// the output start at the current cursor line, closed into a
     /// [`CommandBlock`] at the matching `D`. Independent of the `l13`
     /// feature's own (separately anchored) output capture.
+    /// Whether the terminal currently presents as dark (background
+    /// luminance below mid), the answer to `DSR ?996n` and the payload of
+    /// mode-2031 reports. Derived from the live default background, so it
+    /// tracks theme changes with no extra state.
+    pub fn appearance_is_dark(&self) -> bool {
+        super::color::luminance(self.default_bg) < 0.5
+    }
+
+    /// The Contour color-scheme report (`CSI ? 997 ; 1|2 n`): `1` dark,
+    /// `2` light. Sent unsolicited on theme changes while mode 2031 is set,
+    /// and as the reply to `DSR ?996n`.
+    pub fn color_scheme_report(&self) -> Vec<u8> {
+        let kind = if self.appearance_is_dark() { 1 } else { 2 };
+        format!("\x1b[?997;{kind}n").into_bytes()
+    }
+
+    /// Accumulate one OSC 99 (kitty desktop notification) part. `id` is the
+    /// client's `i=` identifier ("" when absent), `part` is the decoded
+    /// payload for `p=title` / `p=body`, and `done` finalizes the
+    /// notification into [`Grid::notifications`]. Multi-part state is
+    /// bounded: a fifth concurrent id evicts the oldest.
+    pub(crate) fn notif99_part(&mut self, id: &str, title: bool, part: &str, done: bool) {
+        let idx = match self.notif99_pending.iter().position(|(i, _, _)| i == id) {
+            Some(i) => i,
+            None => {
+                if self.notif99_pending.len() >= 4 {
+                    self.notif99_pending.remove(0);
+                }
+                self.notif99_pending.push((id.to_string(), String::new(), String::new()));
+                self.notif99_pending.len() - 1
+            }
+        };
+        let slot = &mut self.notif99_pending[idx];
+        let field = if title { &mut slot.1 } else { &mut slot.2 };
+        if field.len() + part.len() <= 4096 {
+            field.push_str(part);
+        }
+        if done {
+            let (_, title, body) = self.notif99_pending.remove(idx);
+            if !title.is_empty() || !body.is_empty() {
+                // kitty semantics: a lone payload with no explicit body part
+                // is the title; surface it as the body when body is empty so
+                // the OS notification always has text.
+                if body.is_empty() {
+                    self.push_notification(String::new(), title);
+                } else {
+                    self.push_notification(title, body);
+                }
+            }
+        }
+    }
+
     /// Apply a ConEmu OSC `9;4` progress report. State `0` (or anything
     /// unrecognized) clears; percent clamps to 100. Indeterminate (`3`)
     /// carries no meaningful percent and stores 0.
