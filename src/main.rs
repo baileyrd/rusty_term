@@ -217,7 +217,7 @@ fn run_ctl(args: &[String]) -> std::io::Result<()> {
     {
         if args.is_empty() {
             eprintln!(
-                "usage: rusty_term ctl <new-tab|send-text|list-tabs|focus-tab|ping> [key=value]…"
+                "usage: rusty_term ctl <new-tab|new-window|quake|send-text|list-tabs|focus-tab|ping> [key=value]…"
             );
             return Err(std::io::Error::other("no control command"));
         }

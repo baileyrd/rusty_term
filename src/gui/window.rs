@@ -1,7 +1,14 @@
-//! The windowed front-end: a `winit` event loop driving a real OS window, with
-//! `softbuffer` CPU presentation.
+//! The windowed front-end: a `winit` event loop driving one or more real OS
+//! windows (C13), with `softbuffer` CPU presentation.
 //!
-//! The window is borderless (`decorations(false)`) and draws its own chrome: a
+//! [`App`] is a thin router owning a [`WindowState`] per open window: window
+//! events dispatch by `WindowId`, PTY wakeups by pane id (ids come from a
+//! shared counter so they're unique across windows). New windows open with
+//! Ctrl+Shift+N or `rusty_term ctl new-window`; `rusty_term ctl quake`
+//! toggles a dropdown "quake" window docked to the top of the monitor (G30).
+//! The loop exits when the last window closes.
+//!
+//! Each window is borderless (`decorations(false)`) and draws its own chrome: a
 //! one-cell-row bar across the top holding the session tabs, a `+` new-tab
 //! button, and the minimize/maximize/close caption buttons, all laid out as
 //! ordinary cells so both renderers composite it for free. Dragging the bar
@@ -187,19 +194,6 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         std::env::set_var("COLORTERM", "truecolor");
     }
 
-    let font_px = config.font_size.unwrap_or(FONT_PX);
-    let font_set = font::load_set(
-        config.font.as_deref(),
-        config.font_bold.as_deref(),
-        config.font_italic.as_deref(),
-        config.font_bold_italic.as_deref(),
-        config.font_fallback.as_deref(),
-    )
-    .ok_or("no monospace font found")?;
-    let ligatures = config.ligatures.unwrap_or(true);
-    let font = FontCache::new(font_set, font_px, ligatures).ok_or("font failed to parse")?;
-    let (cell_w, cell_h) = font.cell_size();
-
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -227,42 +221,18 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         backend,
         config: config.clone(),
         config_path,
-        tabs: Vec::new(),
-        active: 0,
-        next_id: 0,
         proxy,
-        font,
-        cell_w: cell_w.max(1),
-        cell_h: cell_h.max(1),
-        window: None,
-        renderer: None,
-        mods: ModifiersState::empty(),
-        cols: config.cols.unwrap_or(INIT_COLS),
-        rows: config.rows.unwrap_or(INIT_ROWS),
-        theme: config.theme,
-        clipboard: arboard::Clipboard::new().ok(),
-        mouse_pos: (0.0, 0.0),
-        selecting: false,
-        focused: true,
-        search_regex: false,
-        broadcast: false,
-        copy_mode: None,
-        last_grid_click: None,
-        click_streak: 0,
-        mouse_button_down: None,
-        sel_anchor: None,
-        hits: Vec::new(),
-        last_strip_click: None,
-        cursor_blink_on: true,
-        last_blink: Instant::now(),
-        searching: None,
+        next_id: std::rc::Rc::new(std::cell::Cell::new(0)),
         shells: crate::shells::detect_all(),
-        overlay: None,
-        font_px,
+        windows: Vec::new(),
+        focused_window: None,
     };
+    // The first window (its OS window comes with the loop's `resumed`).
+    // Building it up front surfaces font/shell errors before the loop runs.
+    let mut first = app.new_window_state(false)?;
     // A session file builds the initial tab set; otherwise one default shell
     // (more come from Ctrl+Shift+T / the + button either way).
-    let session = app.config.session.clone();
+    let session = first.config.session.clone();
     let mut opened = 0usize;
     if let Some(path) = &session {
         let (tabs, warns) = crate::config::load_session(path);
@@ -270,19 +240,20 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
             eprintln!("rusty_term: session: {w}");
         }
         for t in tabs {
-            if let Err(e) = app.spawn_session_tab(&t) {
+            if let Err(e) = first.spawn_session_tab(&t) {
                 eprintln!("rusty_term: session tab: {e}");
             } else {
                 opened += 1;
             }
         }
         if opened > 0 {
-            app.active = 0; // land on the session's first tab
+            first.active = 0; // land on the session's first tab
         }
     }
     if opened == 0 {
-        app.spawn_tab()?;
+        first.spawn_tab()?;
     }
+    app.windows.push(first);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -327,7 +298,11 @@ fn reader_loop(
     let _ = proxy.send_event(UserEvent::Exit(id));
 }
 
-struct App<'a> {
+/// One top-level OS window: its tabs/panes, renderer, chrome, and every bit
+/// of per-window UI state (selection, overlays, search, copy mode, …). The
+/// [`App`] router owns one of these per open window and dispatches winit
+/// events to the right one by `WindowId`.
+struct WindowState<'a> {
     /// Spawns the shell behind each new tab.
     backend: &'a dyn Backend,
     /// The effective config; refreshed on live reload so new tabs follow it.
@@ -337,8 +312,9 @@ struct App<'a> {
     tabs: Vec<Tab>,
     /// Index into `tabs` of the session being shown and fed input.
     active: usize,
-    /// Monotonic id source for tabs (ids outlive indices across closes).
-    next_id: u64,
+    /// Monotonic id source for panes, shared by every window so reader-thread
+    /// wakeups (`Redraw(id)`/`Exit(id)`) route unambiguously across windows.
+    next_id: std::rc::Rc<std::cell::Cell<u64>>,
     proxy: EventLoopProxy<UserEvent>,
     font: FontCache,
     cell_w: usize,
@@ -404,9 +380,20 @@ struct App<'a> {
     overlay: Option<Overlay>,
     /// Current font size in px, tracked so the settings page can rebuild it.
     font_px: f32,
+    /// Set when this window should close (last tab closed, × button, OS close
+    /// request); the [`App`] router drops it and exits the loop when none are
+    /// left.
+    closed: bool,
+    /// Set by `Action::NewWindow` (Ctrl+Shift+N); the router picks it up after
+    /// the event dispatch and opens a sibling window.
+    wants_new_window: bool,
+    /// Whether this is the quake (dropdown) window: borderless strip docked to
+    /// the top of the monitor, kept above other windows, toggled with
+    /// `rusty_term ctl quake`.
+    quake: bool,
 }
 
-impl App<'_> {
+impl WindowState<'_> {
     /// Spawn one shell sized `cols × rows`, wire its reader + exit-watcher
     /// threads (which signal by pane id), and return the pane.
     fn new_pane(
@@ -419,8 +406,8 @@ impl App<'_> {
         theme: Option<Theme>,
     ) -> Result<Pane, std::io::Error> {
         let handle = self.backend.spawn_shell(cols, rows, shell, args, cwd)?;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
 
         let theme = theme.unwrap_or(self.theme);
         let mut g = Grid::new(cols as usize, rows as usize);
@@ -498,6 +485,12 @@ impl App<'_> {
         use super::control::CtlCommand;
         match cmd {
             CtlCommand::Ping => "ok\n".to_string(),
+            // Window-level commands are handled by the App router before any
+            // per-window dispatch; reaching here is a routing bug, not user
+            // error, so answer with a stable diagnostic rather than panicking.
+            CtlCommand::NewWindow { .. } | CtlCommand::Quake => {
+                "err window-level command not routed\n".to_string()
+            }
             CtlCommand::NewTab { cwd, profile, shell } => {
                 let p = profile.as_deref().and_then(|n| self.config.profile(n)).cloned();
                 if profile.is_some() && p.is_none() {
@@ -848,14 +841,14 @@ impl App<'_> {
 
     /// Close pane `id`: collapse its split into the sibling, or close the whole
     /// tab when it was the last pane. Idempotent for stale exit events.
-    fn close_pane(&mut self, id: u64, event_loop: &ActiveEventLoop) {
+    fn close_pane(&mut self, id: u64) {
         let Some(ti) = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id)) else {
             return;
         };
         let tab = &mut self.tabs[ti];
         match tab.layout.close(id) {
             None => {
-                self.close_tab_at(ti, event_loop);
+                self.close_tab_at(ti);
                 return;
             }
             Some(next) => {
@@ -874,10 +867,10 @@ impl App<'_> {
 
     /// Remove the tab at `ti` (dropping all its panes). The last tab closes the
     /// window.
-    fn close_tab_at(&mut self, ti: usize, event_loop: &ActiveEventLoop) {
+    fn close_tab_at(&mut self, ti: usize) {
         self.tabs.remove(ti);
         if self.tabs.is_empty() {
-            event_loop.exit();
+            self.closed = true;
             return;
         }
         if ti < self.active {
@@ -1192,7 +1185,7 @@ impl App<'_> {
 
     /// Left button pressed: edge band starts a drag-resize, the chrome bar
     /// dispatches its hit action, anywhere else anchors a drag-selection.
-    fn on_left_press(&mut self, event_loop: &ActiveEventLoop) {
+    fn on_left_press(&mut self) {
         let (x, y) = self.mouse_pos;
         if let Some(dir) = self.resize_zone(x, y) {
             if let Some(window) = &self.window {
@@ -1201,7 +1194,7 @@ impl App<'_> {
             return;
         }
         if (y.max(0.0) as usize) < self.cell_h {
-            return self.on_bar_click(x, event_loop);
+            return self.on_bar_click(x);
         }
         if self.overlay.is_some() {
             return self.overlay_click(y);
@@ -1295,7 +1288,7 @@ impl App<'_> {
     }
 
     /// Dispatch a click on the chrome bar through the hit map.
-    fn on_bar_click(&mut self, x: f64, event_loop: &ActiveEventLoop) {
+    fn on_bar_click(&mut self, x: f64) {
         if self.hits.is_empty() {
             return; // no frame laid out yet
         }
@@ -1314,7 +1307,7 @@ impl App<'_> {
             Hit::CloseTab(i) => {
                 self.close_overlay();
                 if i < self.tabs.len() {
-                    self.close_tab_at(i, event_loop);
+                    self.close_tab_at(i);
                 }
             }
             Hit::NewTab => {
@@ -1333,7 +1326,7 @@ impl App<'_> {
             }
             Hit::Minimize => window.set_minimized(true),
             Hit::Maximize => window.set_maximized(!window.is_maximized()),
-            Hit::Close => event_loop.exit(),
+            Hit::Close => self.closed = true,
             Hit::Drag => {
                 let now = Instant::now();
                 if self
@@ -1487,7 +1480,7 @@ impl App<'_> {
     }
 
     /// Dispatch a terminal-owned [`Action`] resolved from the keymap.
-    fn run_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+    fn run_action(&mut self, action: Action) {
         match action {
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
@@ -1496,9 +1489,12 @@ impl App<'_> {
                     eprintln!("rusty_term: new tab: {e}");
                 }
             }
+            // Window creation needs the event loop, which lives above this
+            // per-window layer — flag it for the router to act on.
+            Action::NewWindow => self.wants_new_window = true,
             Action::CloseTab => {
                 if let Some(id) = self.tabs.get(self.active).map(|t| t.focus) {
-                    self.close_pane(id, event_loop);
+                    self.close_pane(id);
                 }
             }
             Action::NextTab => self.cycle_tab(true),
@@ -1905,7 +1901,7 @@ impl App<'_> {
     }
 }
 
-impl App<'_> {
+impl WindowState<'_> {
     /// Open the in-app settings page over the active tab, seeded from the live
     /// configuration. `Ctrl+,` and the dropdown's *Settings* entry route here.
     fn open_settings(&mut self) {
@@ -2400,16 +2396,17 @@ fn apply_chrome(window: &Window, theme: &Theme) {
     }
 }
 
-impl ApplicationHandler<UserEvent> for App<'_> {
-    /// Drive cursor blink: when the active tab's cursor blinks and is visible,
-    /// wake on a fixed interval to toggle its phase and repaint; otherwise wait
-    /// for the next real event (no idle wakeups).
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+impl WindowState<'_> {
+    /// Drive cursor blink + Kitty animations for this window: when the active
+    /// tab's cursor blinks and is visible, toggle its phase on a fixed
+    /// interval; while an animation plays, tick at the frame floor. Returns
+    /// the next wake deadline, or `None` when the window can sleep until a
+    /// real event (the router picks the earliest deadline across windows).
+    fn tick(&mut self, now: Instant) -> Option<Instant> {
         const BLINK: Duration = Duration::from_millis(530);
         /// Kitty animation tick — the floor gap is 40ms, so ticking at it
         /// hits every frame boundary within a frame's tolerance.
         const ANIM: Duration = Duration::from_millis(40);
-        let now = Instant::now();
         // Kitty graphics animations: advance every visible pane's playing
         // images; a frame change repaints.
         let mut animating = false;
@@ -2430,8 +2427,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         });
         if !blinking && !animating {
             self.cursor_blink_on = true;
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+            return None;
         }
         if blinking && now.duration_since(self.last_blink) >= BLINK {
             self.cursor_blink_on = !self.cursor_blink_on;
@@ -2440,13 +2436,15 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 window.request_redraw();
             }
         }
-        let next = if animating { now + ANIM } else { self.last_blink + BLINK };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        Some(if animating { now + ANIM } else { self.last_blink + BLINK })
     }
 
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    /// Create this state's OS window + renderer if it doesn't have one yet.
+    /// Returns whether the window is usable; `false` marks the state closed
+    /// (the router drops it).
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop) -> bool {
         if self.window.is_some() {
-            return;
+            return true;
         }
         // `theme = "auto"`: seed from the OS appearance if winit can tell us
         // (falling back to dark); `ThemeChanged` keeps following it live.
@@ -2477,15 +2475,35 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             attrs.with_undecorated_shadow(true)
         };
         // `--maximized` / `--fullscreen` (or a `[window] launch_mode` config
-        // key); unset leaves the normal windowed default.
-        let attrs = match self.config.launch_mode {
-            Some(LaunchMode::Maximized) => attrs.with_maximized(true),
-            Some(LaunchMode::Fullscreen) => attrs.with_fullscreen(Some(Fullscreen::Borderless(None))),
-            None => attrs,
+        // key); unset leaves the normal windowed default. The quake window
+        // instead docks to the top of the monitor: full monitor width, a
+        // configured fraction of its height, and kept above other windows so
+        // it drops over whatever has focus.
+        let quake_geom = self.quake.then(|| {
+            let mon = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
+            let (mw, mh, pos) = mon
+                .map(|m| (m.size().width, m.size().height, m.position()))
+                .unwrap_or((1920, 1080, winit::dpi::PhysicalPosition::new(0, 0)));
+            let frac = self.config.quake_height.unwrap_or(0.4).clamp(0.1, 1.0);
+            (mw.max(1), ((mh as f32 * frac) as u32).max(self.cell_h as u32 * 2), pos)
+        });
+        let attrs = if let Some((w, h, pos)) = quake_geom {
+            attrs
+                .with_inner_size(winit::dpi::PhysicalSize::new(w, h))
+                .with_position(pos)
+                .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+        } else {
+            match self.config.launch_mode {
+                Some(LaunchMode::Maximized) => attrs.with_maximized(true),
+                Some(LaunchMode::Fullscreen) => {
+                    attrs.with_fullscreen(Some(Fullscreen::Borderless(None)))
+                }
+                None => attrs,
+            }
         };
         let Ok(window) = event_loop.create_window(attrs) else {
-            event_loop.exit();
-            return;
+            self.closed = true;
+            return false;
         };
         let window = Arc::new(window);
         apply_chrome(&window, &self.theme);
@@ -2495,17 +2513,30 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         match self.make_renderer(window.clone()) {
             Some(r) => self.renderer = Some(r),
             None => {
-                event_loop.exit();
-                return;
+                self.window = None;
+                self.closed = true;
+                return false;
             }
         }
         self.apply_opacity();
         window.request_redraw();
+        true
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    /// This state's OS window id, once the window exists.
+    fn window_id(&self) -> Option<WindowId> {
+        self.window.as_ref().map(|w| w.id())
+    }
+
+    /// Whether pane `id` (a reader-thread wakeup tag) belongs to this window.
+    fn has_pane(&self, id: u64) -> bool {
+        self.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == id))
+    }
+
+    /// Handle one winit event addressed to this window.
+    fn on_window_event(&mut self, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.closed = true,
             WindowEvent::ThemeChanged(t) => {
                 if self.config.theme_auto {
                     let new = self.auto_theme(Some(t));
@@ -2606,7 +2637,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         key,
                     );
                     if let Some(action) = self.config.keys.action(chord) {
-                        self.run_action(action, event_loop);
+                        self.run_action(action);
                         return;
                     }
                 }
@@ -2746,7 +2777,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                             if self.mods.control_key() && self.open_link_under_pointer() {
                                 return;
                             }
-                            self.on_left_press(event_loop);
+                            self.on_left_press();
                         }
                         if kind == MouseButtonKind::Middle
                             && !self.pane().is_some_and(|p| p.grid.lock().mouse_modes.active())
@@ -2812,34 +2843,268 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::Redraw(id) => {
-                self.service_clipboard(id);
-                self.service_notifications(id);
-                self.service_alerts(id);
-                // A synchronized-output window on this pane suppresses the
-                // repaint until it closes (or times out), so a multi-write
-                // frame update never paints half-drawn.
-                let syncing = self
-                    .pane_by_id_mut(id)
-                    .is_some_and(|p| p.grid.lock().sync_output_active());
-                // Output on a background tab doesn't repaint; its bar label
-                // refreshes with the next frame the active tab causes.
-                if !syncing
-                    && self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
-                    && let Some(window) = &self.window
-                {
+    /// New PTY output arrived on pane `id`: service its host-side requests
+    /// (clipboard, notifications, alerts) and repaint if it's visible.
+    fn on_pane_output(&mut self, id: u64) {
+        self.service_clipboard(id);
+        self.service_notifications(id);
+        self.service_alerts(id);
+        // A synchronized-output window on this pane suppresses the
+        // repaint until it closes (or times out), so a multi-write
+        // frame update never paints half-drawn.
+        let syncing = self
+            .pane_by_id_mut(id)
+            .is_some_and(|p| p.grid.lock().sync_output_active());
+        // Output on a background tab doesn't repaint; its bar label
+        // refreshes with the next frame the active tab causes.
+        if !syncing
+            && self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+}
+
+/// The winit application: a set of top-level windows (C13), each a full
+/// [`WindowState`], plus what's needed to open new ones at runtime. Events
+/// route to the owning window by `WindowId` (window events) or pane id
+/// (reader-thread wakeups); the loop exits when the last window closes.
+struct App<'a> {
+    backend: &'a dyn Backend,
+    /// The launch config, template for every new window.
+    config: Config,
+    config_path: Option<std::path::PathBuf>,
+    proxy: EventLoopProxy<UserEvent>,
+    /// Shared pane-id source (see [`WindowState::next_id`]).
+    next_id: std::rc::Rc<std::cell::Cell<u64>>,
+    shells: Vec<crate::shells::DetectedShell>,
+    windows: Vec<WindowState<'a>>,
+    /// The window that last had OS focus — control-socket commands without a
+    /// window of their own (`new-tab`, `send-text`, …) act on it.
+    focused_window: Option<WindowId>,
+}
+
+impl<'a> App<'a> {
+    /// Build a [`WindowState`] from the launch config (its OS window comes
+    /// later via `ensure_window`). Each window owns its font, clipboard, and
+    /// config copy so per-window settings changes stay per-window.
+    fn new_window_state(&self, quake: bool) -> Result<WindowState<'a>, String> {
+        let font_px = self.config.font_size.unwrap_or(FONT_PX);
+        let font_set = font::load_set(
+            self.config.font.as_deref(),
+            self.config.font_bold.as_deref(),
+            self.config.font_italic.as_deref(),
+            self.config.font_bold_italic.as_deref(),
+            self.config.font_fallback.as_deref(),
+        )
+        .ok_or("no monospace font found")?;
+        let ligatures = self.config.ligatures.unwrap_or(true);
+        let font = FontCache::new(font_set, font_px, ligatures).ok_or("font failed to parse")?;
+        let (cell_w, cell_h) = font.cell_size();
+        Ok(WindowState {
+            backend: self.backend,
+            config: self.config.clone(),
+            config_path: self.config_path.clone(),
+            tabs: Vec::new(),
+            active: 0,
+            next_id: self.next_id.clone(),
+            proxy: self.proxy.clone(),
+            font,
+            cell_w: cell_w.max(1),
+            cell_h: cell_h.max(1),
+            window: None,
+            renderer: None,
+            mods: ModifiersState::empty(),
+            cols: self.config.cols.unwrap_or(INIT_COLS),
+            rows: self.config.rows.unwrap_or(INIT_ROWS),
+            theme: self.config.theme,
+            clipboard: arboard::Clipboard::new().ok(),
+            mouse_pos: (0.0, 0.0),
+            selecting: false,
+            focused: true,
+            search_regex: false,
+            broadcast: false,
+            copy_mode: None,
+            last_grid_click: None,
+            click_streak: 0,
+            mouse_button_down: None,
+            sel_anchor: None,
+            hits: Vec::new(),
+            last_strip_click: None,
+            cursor_blink_on: true,
+            last_blink: Instant::now(),
+            searching: None,
+            shells: self.shells.clone(),
+            overlay: None,
+            font_px,
+            closed: false,
+            wants_new_window: false,
+            quake,
+        })
+    }
+
+    /// Open a new top-level window at runtime: state, first tab, OS window.
+    /// `spawn` seeds the first tab (shell/cwd/theme); errors are reported,
+    /// not fatal — the existing windows keep running.
+    fn spawn_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        quake: bool,
+        shell: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        theme: Option<Theme>,
+    ) -> Result<(), String> {
+        let mut ws = self.new_window_state(quake)?;
+        ws.spawn_tab_opts(shell, &[], cwd, theme).map_err(|e| format!("spawn shell: {e}"))?;
+        if !ws.ensure_window(event_loop) {
+            return Err("could not create a window".into());
+        }
+        self.windows.push(ws);
+        Ok(())
+    }
+
+    /// The window that should act on window-less control commands: the
+    /// focused one, else the first non-quake one, else any.
+    fn control_target(&mut self) -> Option<&mut WindowState<'a>> {
+        let focused = self.focused_window;
+        if let Some(i) = self.windows.iter().position(|w| w.window_id() == focused && focused.is_some()) {
+            return self.windows.get_mut(i);
+        }
+        if let Some(i) = self.windows.iter().position(|w| !w.quake) {
+            return self.windows.get_mut(i);
+        }
+        self.windows.first_mut()
+    }
+
+    /// Toggle the quake window (G30): create it on first use, otherwise flip
+    /// its visibility, focusing it when shown.
+    fn toggle_quake(&mut self, event_loop: &ActiveEventLoop) -> String {
+        if let Some(ws) = self.windows.iter_mut().find(|w| w.quake) {
+            if let Some(window) = &ws.window {
+                let visible = window.is_visible().unwrap_or(true);
+                window.set_visible(!visible);
+                if !visible {
+                    window.focus_window();
                     window.request_redraw();
                 }
             }
-            UserEvent::Exit(id) => self.close_pane(id, event_loop),
-            UserEvent::ConfigChanged => self.reload_config(),
+            return "ok\n".to_string();
+        }
+        match self.spawn_window(event_loop, true, None, None, None) {
+            Ok(()) => "ok\n".to_string(),
+            Err(e) => format!("err {e}\n"),
+        }
+    }
+
+    /// Drop windows marked closed and open ones requested via
+    /// `Action::NewWindow`; exits the loop when no window remains.
+    fn reap_and_spawn(&mut self, event_loop: &ActiveEventLoop) {
+        let mut open = 0usize;
+        for i in 0..self.windows.len() {
+            if std::mem::take(&mut self.windows[i].wants_new_window) {
+                open += 1;
+            }
+        }
+        for _ in 0..open {
+            let cwd = self.control_target().and_then(|w| w.focused_pane_cwd());
+            if let Err(e) = self.spawn_window(event_loop, false, None, cwd, None) {
+                eprintln!("rusty_term: new window: {e}");
+            }
+        }
+        self.windows.retain(|w| !w.closed);
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App<'_> {
+    /// Drive cursor blink and Kitty animations across every window, waking at
+    /// the earliest deadline any of them needs (no idle wakeups otherwise).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let next = self.windows.iter_mut().filter_map(|w| w.tick(now)).min();
+        event_loop.set_control_flow(match next {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        for w in &mut self.windows {
+            w.ensure_window(event_loop);
+        }
+        self.reap_and_spawn(event_loop);
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let WindowEvent::Focused(gained) = event {
+            if gained {
+                self.focused_window = Some(id);
+            } else if self.focused_window == Some(id) {
+                self.focused_window = None;
+            }
+        }
+        if let Some(w) = self.windows.iter_mut().find(|w| w.window_id() == Some(id)) {
+            w.on_window_event(event);
+        }
+        self.reap_and_spawn(event_loop);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Redraw(id) => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.has_pane(id)) {
+                    w.on_pane_output(id);
+                }
+            }
+            UserEvent::Exit(id) => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.has_pane(id)) {
+                    w.close_pane(id);
+                }
+            }
+            UserEvent::ConfigChanged => {
+                for w in &mut self.windows {
+                    w.reload_config();
+                }
+            }
             UserEvent::Control(cmd, reply) => {
-                let text = self.handle_control(cmd);
+                use super::control::CtlCommand;
+                // Window-level commands are the router's; everything else
+                // acts on the focused window.
+                let text = match cmd {
+                    CtlCommand::NewWindow { cwd, profile, shell } => {
+                        let p = profile
+                            .as_deref()
+                            .and_then(|n| self.config.profile(n))
+                            .cloned();
+                        if profile.is_some() && p.is_none() {
+                            format!("err no profile named `{}`\n", profile.unwrap_or_default())
+                        } else {
+                            let p = p.unwrap_or_default();
+                            match self.spawn_window(
+                                event_loop,
+                                false,
+                                shell.or(p.shell),
+                                cwd.or(p.cwd),
+                                p.theme,
+                            ) {
+                                Ok(()) => "ok\n".to_string(),
+                                Err(e) => format!("err {e}\n"),
+                            }
+                        }
+                    }
+                    CtlCommand::Quake => self.toggle_quake(event_loop),
+                    cmd => match self.control_target() {
+                        Some(w) => w.handle_control(cmd),
+                        None => "err no window\n".to_string(),
+                    },
+                };
                 let _ = reply.send(text);
             }
         }
+        self.reap_and_spawn(event_loop);
     }
 }
 

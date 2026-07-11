@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 /// A shell found on this machine.
+#[derive(Clone)]
 pub struct DetectedShell {
     /// The friendly name a config would use (`pwsh`, `wsl`, `zsh`, ...).
     pub name: &'static str,
