@@ -1205,6 +1205,16 @@ impl WindowState<'_> {
             tab.focus = id; // click focuses the pane under the pointer
         }
         let cell = self.cell_in_focused(x, y);
+        // A click on a fold-summary line expands the folded command block
+        // (C17') instead of starting a selection.
+        if let Some(p) = self.pane()
+            && p.grid.lock().unfold_summary_at(cell.1)
+        {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
         // Click-to-move-cursor (G21): a plain first click at the shell
         // prompt sends the arrow presses that walk the readline cursor to
         // the clicked cell. Mouse-tracking apps own their clicks, so this
@@ -1492,6 +1502,16 @@ impl WindowState<'_> {
             // Window creation needs the event loop, which lives above this
             // per-window layer — flag it for the router to act on.
             Action::NewWindow => self.wants_new_window = true,
+            // Collapse/expand the last finished command's output (C17'):
+            // its rows fold to a one-line "N lines hidden" summary.
+            Action::FoldOutput => {
+                if let Some(p) = self.pane()
+                    && p.grid.lock().toggle_last_fold()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             Action::CloseTab => {
                 if let Some(id) = self.tabs.get(self.active).map(|t| t.focus) {
                     self.close_pane(id);

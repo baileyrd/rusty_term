@@ -5064,3 +5064,98 @@ fn webp_lossless_palette_roundtrips_exactly() {
         }
     }
 }
+
+/// Text of viewport row `r`, trailing blanks trimmed.
+#[cfg(test)]
+fn vrow_text(g: &Grid, r: usize) -> String {
+    (0..g.cols).map(|c| g.viewport_cell(c, r).ch).collect::<String>().trim_end().to_string()
+}
+
+#[test]
+fn folded_block_renders_one_summary_line_over_hidden_history() {
+    let mut g = Grid::new(40, 4);
+    let mut p = AnsiParser::new();
+    p.advance(
+        &mut g,
+        b"before\r\n\x1b]133;C\x07out1\r\nout2\r\nout3\r\nout4\r\n\x1b]133;D\x07after1\r\nafter2\r\nafter3\r\nafter4\r\n",
+    );
+    let dhl_before = g.display_history_len();
+    assert!(g.toggle_last_fold(), "a fully-scrolled block folds");
+    let hidden = {
+        let b = g.fold_blocks()[0];
+        b.end - b.start - 1
+    };
+    assert_eq!(g.display_history_len(), dhl_before - hidden);
+
+    // Scroll to the top of (display) history and find the summary row.
+    assert!(g.scroll_view_up(1000));
+    let rows: Vec<String> = (0..g.rows).map(|r| vrow_text(&g, r)).collect();
+    let summary = rows
+        .iter()
+        .position(|t| t.contains("lines hidden"))
+        .expect("a fold summary line is visible");
+    assert!(rows[summary].starts_with('\u{25B7}'), "summary marked with a triangle: {rows:?}");
+    assert!(rows[summary].contains("4 lines hidden"), "{rows:?}");
+    // The block's interior never paints; the line after the summary is the
+    // first line past the block.
+    assert!(rows.iter().all(|t| !t.contains("out2")), "hidden rows stay hidden: {rows:?}");
+    assert_eq!(rows[summary + 1], "after1", "{rows:?}");
+    // The summary cell is styled dim+italic on default colors.
+    let c = g.viewport_cell(0, summary);
+    assert!(c.flags & ATTR_DIM != 0 && c.flags & ATTR_ITALIC != 0);
+    // abs_of_view_row maps the summary to the block's first line and the next
+    // row past the whole block (the hidden interior is unreachable).
+    let b = g.fold_blocks()[0];
+    assert_eq!(g.abs_of_view_row(summary), b.start);
+    assert_eq!(g.abs_of_view_row(summary + 1), b.end);
+}
+
+#[test]
+fn clicking_the_summary_row_expands_the_block() {
+    let mut g = Grid::new(40, 4);
+    let mut p = AnsiParser::new();
+    p.advance(
+        &mut g,
+        b"\x1b]133;C\x07out1\r\nout2\r\nout3\r\n\x1b]133;D\x07a\r\nb\r\nc\r\nd\r\ne\r\n",
+    );
+    assert!(g.toggle_last_fold());
+    assert!(g.scroll_view_up(1000));
+    let summary = (0..g.rows)
+        .position(|r| vrow_text(&g, r).contains("lines hidden"))
+        .expect("summary visible");
+    // A click elsewhere does nothing; on the summary it expands.
+    assert!(!g.unfold_summary_at(summary + 1));
+    assert!(g.unfold_summary_at(summary));
+    assert!(!g.fold_blocks()[0].folded);
+    let rows: Vec<String> = (0..g.rows).map(|r| vrow_text(&g, r)).collect();
+    assert!(rows.iter().all(|t| !t.contains("lines hidden")), "{rows:?}");
+}
+
+#[test]
+fn search_unfolds_a_block_hiding_its_match() {
+    let mut g = Grid::new(40, 4);
+    let mut p = AnsiParser::new();
+    p.advance(
+        &mut g,
+        b"\x1b]133;C\x07alpha\r\nneedle\r\nomega\r\n\x1b]133;D\x07a\r\nb\r\nc\r\nd\r\ne\r\n",
+    );
+    assert!(g.toggle_last_fold());
+    assert!(g.fold_blocks()[0].folded);
+    assert_eq!(g.search_with("needle", false), 1);
+    assert!(!g.fold_blocks()[0].folded, "jumping to a hidden match unfolds its block");
+}
+
+#[test]
+fn folding_clamps_the_view_offset_to_the_shorter_history() {
+    let mut g = Grid::new(40, 4);
+    let mut p = AnsiParser::new();
+    p.advance(
+        &mut g,
+        b"\x1b]133;C\x07l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\n\x1b]133;D\x07a\r\nb\r\nc\r\nd\r\ne\r\n",
+    );
+    assert!(g.scroll_view_up(1000));
+    let deep = g.view_offset;
+    assert!(g.toggle_last_fold());
+    assert!(g.view_offset <= g.display_history_len());
+    assert!(g.view_offset < deep, "folding shrinks the scroll range");
+}
