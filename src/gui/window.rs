@@ -216,9 +216,9 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         });
     }
 
-    // Control socket (`single_instance` config / `--single-instance`): serve
-    // `rusty_term ctl` requests and let a second launch reuse this instance.
-    #[cfg(unix)]
+    // Control socket/pipe (`single_instance` config / `--single-instance`):
+    // serve `rusty_term ctl` requests and let a second launch reuse this
+    // instance.
     if config.single_instance.unwrap_or(false) || args.iter().any(|a| a == "--single-instance") {
         match super::control::serve(proxy.clone()) {
             Ok(path) => eprintln!("rusty_term: control socket at {}", path.display()),
