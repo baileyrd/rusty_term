@@ -548,7 +548,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C12′ | GIF / WebP / progressive JPEG decode | ✅ done 2026-07 (lossy VP8 excepted, see below) | L×3 |
 | C13 | Multiple top-level windows | ✅ done 2026-07 (see below) | L |
 | C14′ | CPU-renderer opacity + platform blur | partial (GPU-only opacity) | M |
-| C17′ | Command-output folding — render path | data model done, rendering open | M–L |
+| C17′ | Command-output folding — render path | ✅ done 2026-07 (see below) | M–L |
 | C18 | Unicode width mode 2027 | watch | M |
 | C19 | Text-sizing protocol (OSC 66) | watch | L |
 | C20 | Accessibility (accesskit) | open — still a field-wide gap, still a differentiator | L |
@@ -556,6 +556,24 @@ Carried forward unchanged (see that document for full write-ups):
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | open, needs own scoping pass | XL |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
+
+**C17′ status (2026-07):** the fold render path landed on top of the
+existing `CommandBlock` data model. Folding remaps only the *history*
+portion of the viewport: blocks fully inside scrollback collapse to one
+synthesized summary line ("▷ N lines hidden — click to expand", dim +
+italic on default colors) while the live screen mapping stays identity.
+The remap lives in a display-line layer inside the grid
+(`display_history_len` / `history_line` / `display_index_of_abs`), and
+every viewport↔absolute conversion — `viewport_cell`,
+`abs_of_view_row`, search highlights, URL detection, the links menu,
+scrollbar geometry, prompt-mark navigation, and the scroll clamps — goes
+through it, so selection/copy-mode/click hit-testing stay consistent by
+construction. Interaction: Ctrl+Shift+U (`fold_output` in `[keys]`)
+toggles the most recent command block that has scrolled into history;
+clicking a summary line expands it; a search jump whose match is hidden
+inside a folded block unfolds that block first. Known minor artifact:
+placed pixel images anchored below a folded block draw at their unfolded
+offset (rare combination; tracked, not fixed).
 
 **C12′ status (2026-07):** three new in-house decoders on the iTerm2
 OSC 1337 inline-image path, all fixture-tested against PIL/libwebp/libjpeg

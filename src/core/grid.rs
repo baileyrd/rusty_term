@@ -56,6 +56,14 @@ pub(crate) struct CommandBlock {
     pub(crate) folded: bool,
 }
 
+/// One line of the fold-aware history view: a real scrollback line, or the
+/// one-line summary standing in for a folded [`CommandBlock`] (by index).
+#[cfg(any(test, feature = "gui"))]
+enum HistLine {
+    Abs(usize),
+    Summary(usize),
+}
+
 /// Maximum depth of the XTPUSHTITLE stack. Further pushes are dropped rather
 /// than growing without bound — no real app nests this deep.
 const TITLE_STACK_MAX: usize = 64;
@@ -1727,7 +1735,7 @@ impl Grid {
             // If the user is browsing history, advance the offset in step with
             // the incoming line so the viewed region stays put under new output.
             if self.view_offset > 0 {
-                self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+                self.view_offset = (self.view_offset + 1).min(self.display_history_len());
                 self.dirty.iter_mut().for_each(|d| *d = true);
             }
         }
@@ -1915,10 +1923,181 @@ impl Grid {
     }
 
     /// The absolute row (scrollback + live) a viewport row currently shows.
+    /// A fold-summary row maps to its block's first (heading) line, so
+    /// selection/copy anchors land somewhere sensible.
     #[cfg(any(test, feature = "gui"))]
     pub fn abs_of_view_row(&self, vr: usize) -> usize {
-        let off = self.view_offset.min(self.scrollback.len());
-        self.scrollback.len() - off + vr
+        let dhl = self.display_history_len();
+        let off = self.view_offset.min(dhl);
+        if vr < off {
+            match self.history_line(dhl - off + vr) {
+                HistLine::Abs(l) => l,
+                HistLine::Summary(i) => self.fold_blocks[i].start,
+            }
+        } else {
+            self.scrollback.len() + vr - off
+        }
+    }
+
+    /// Folded command blocks that actually collapse in the view: fully
+    /// inside scrollback (the live screen never folds) and at least two
+    /// lines long. Yields `(fold_blocks index, block)` in start order —
+    /// blocks are recorded in stream order, so they're sorted and disjoint.
+    #[cfg(any(test, feature = "gui"))]
+    fn visible_folds(&self) -> impl Iterator<Item = (usize, &CommandBlock)> {
+        let h = self.scrollback.len();
+        self.fold_blocks
+            .iter()
+            .enumerate()
+            .filter(move |(_, b)| b.folded && b.end <= h && b.end > b.start + 1)
+    }
+
+    /// History length in *display* lines: each visibly-folded block's rows
+    /// collapse to one summary line. Equal to `scrollback.len()` when
+    /// nothing is folded (and always, in a TUI-only build).
+    pub(crate) fn display_history_len(&self) -> usize {
+        #[cfg(any(test, feature = "gui"))]
+        {
+            let hidden: usize = self.visible_folds().map(|(_, b)| b.end - b.start - 1).sum();
+            self.scrollback.len() - hidden
+        }
+        #[cfg(not(any(test, feature = "gui")))]
+        {
+            self.scrollback.len()
+        }
+    }
+
+    /// What history *display* index `d` (0 = oldest visible line) shows: an
+    /// absolute scrollback line, or a folded block's one-line summary.
+    #[cfg(any(test, feature = "gui"))]
+    fn history_line(&self, d: usize) -> HistLine {
+        let mut abs = 0usize; // absolute line the walk has reached
+        let mut rem = d; // display lines still to cover
+        for (i, b) in self.visible_folds() {
+            let plain = b.start - abs; // unfolded lines before this block
+            if rem < plain {
+                return HistLine::Abs(abs + rem);
+            }
+            rem -= plain;
+            if rem == 0 {
+                return HistLine::Summary(i);
+            }
+            rem -= 1; // past the summary line
+            abs = b.end;
+        }
+        HistLine::Abs(abs + rem)
+    }
+
+    /// The history display index that shows absolute line `abs` — the
+    /// summary line's index when `abs` is hidden inside a folded block.
+    /// Identity in a TUI-only build (nothing folds there).
+    fn display_index_of_abs(&self, abs: usize) -> usize {
+        #[cfg(any(test, feature = "gui"))]
+        {
+            let mut hidden = 0usize;
+            for (_, b) in self.visible_folds() {
+                if abs < b.start {
+                    break;
+                }
+                if abs < b.end {
+                    // Inside the block: everything past its first line is
+                    // hidden behind the summary at the block-start's display
+                    // position.
+                    hidden += abs - b.start;
+                    break;
+                }
+                hidden += b.end - b.start - 1;
+            }
+            abs - hidden
+        }
+        #[cfg(not(any(test, feature = "gui")))]
+        {
+            abs
+        }
+    }
+
+    /// The absolute line shown at the top of the viewport for a display
+    /// offset `off` (identity `history - off` when nothing is folded).
+    fn abs_top_for_offset(&self, off: usize) -> usize {
+        #[cfg(any(test, feature = "gui"))]
+        {
+            let dhl = self.display_history_len();
+            if off == 0 || off > dhl {
+                return self.scrollback.len();
+            }
+            match self.history_line(dhl - off) {
+                HistLine::Abs(l) => l,
+                HistLine::Summary(i) => self.fold_blocks[i].start,
+            }
+        }
+        #[cfg(not(any(test, feature = "gui")))]
+        {
+            self.scrollback.len() - off.min(self.scrollback.len())
+        }
+    }
+
+    /// The fold block whose one-line summary is shown at viewport row `vr`,
+    /// as an index into `fold_blocks`.
+    #[cfg(any(test, feature = "gui"))]
+    fn summary_block_at(&self, vr: usize) -> Option<usize> {
+        let dhl = self.display_history_len();
+        let off = self.view_offset.min(dhl);
+        if vr >= off {
+            return None;
+        }
+        match self.history_line(dhl - off + vr) {
+            HistLine::Summary(i) => Some(i),
+            HistLine::Abs(_) => None,
+        }
+    }
+
+    /// Expand the folded block whose summary line is at viewport row `vr`
+    /// (a click on the summary). Returns whether one was expanded.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn unfold_summary_at(&mut self, vr: usize) -> bool {
+        let Some(i) = self.summary_block_at(vr) else { return false };
+        self.fold_blocks[i].folded = false;
+        self.view_offset = self.view_offset.min(self.display_history_len());
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        true
+    }
+
+    /// Toggle the most recent command block that has fully scrolled into
+    /// history (the fold keybinding's target: "collapse that last wall of
+    /// output"). Returns whether a block was toggled.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn toggle_last_fold(&mut self) -> bool {
+        let h = self.scrollback.len();
+        let Some(b) = self
+            .fold_blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.end <= h && b.end > b.start + 1)
+        else {
+            return false;
+        };
+        b.folded = !b.folded;
+        self.view_offset = self.view_offset.min(self.display_history_len());
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        true
+    }
+
+    /// The synthesized cell at `(col)` of a fold block's summary line: a dim
+    /// italic "N lines hidden" notice on default colors.
+    #[cfg(any(test, feature = "gui"))]
+    fn summary_cell(&self, block: usize, col: usize) -> Cell {
+        let b = &self.fold_blocks[block];
+        let text = format!("\u{25B7} {} lines hidden \u{2014} click to expand", b.end - b.start);
+        let ch = text.chars().nth(col).unwrap_or(' ');
+        Cell {
+            ch,
+            cluster: 0,
+            fg: self.default_fg,
+            bg: self.default_bg,
+            flags: crate::core::cell::ATTR_DIM | crate::core::cell::ATTR_ITALIC,
+            link: 0,
+            underline_color: self.default_fg,
+        }
     }
 
     /// Select the "word" under `(col, row)` — the maximal run of word
@@ -2279,7 +2458,7 @@ impl Grid {
                 self.evict_fold_blocks();
             }
         }
-        self.view_offset = self.view_offset.min(self.scrollback.len());
+        self.view_offset = self.view_offset.min(self.display_history_len());
     }
 
     /// Seed the grid's default colors from the configured startup theme and
@@ -3088,14 +3267,15 @@ impl Grid {
     /// renderers can draw it without new plumbing.
     #[cfg(any(test, feature = "gui"))]
     pub fn scrollbar(&self) -> Option<(usize, usize, u32)> {
-        let off = self.view_offset.min(self.scrollback.len());
+        let dhl = self.display_history_len();
+        let off = self.view_offset.min(dhl);
         if off == 0 || self.rows == 0 {
             return None;
         }
-        let total = self.scrollback.len() + self.rows;
+        let total = dhl + self.rows;
         let len = ((self.rows * self.rows) / total).clamp(1, self.rows);
-        // Top of the viewport in absolute rows, over the scrollable range.
-        let top = self.scrollback.len() - off;
+        // Top of the viewport in display rows, over the scrollable range.
+        let top = dhl - off;
         let denom = (total - self.rows).max(1);
         let first = (top * (self.rows - len)) / denom;
         let mix = |a: u32, b: u32| {
@@ -3487,7 +3667,7 @@ impl Grid {
         if self.primary.is_some() {
             return false;
         }
-        let target = (self.view_offset + n).min(self.scrollback.len());
+        let target = (self.view_offset + n).min(self.display_history_len());
         self.set_view_offset(target)
     }
 
@@ -3515,12 +3695,22 @@ impl Grid {
         }
     }
 
-    /// Scroll the viewport so absolute row `abs` is visible, about a third down.
+    /// Scroll the viewport so absolute row `abs` is visible, about a third
+    /// down. A target hidden inside a folded command block unfolds it first
+    /// (a search hit must be visible, not buried behind a summary line).
     #[cfg(any(test, feature = "gui"))]
     fn scroll_to_abs(&mut self, abs: usize) {
-        let h = self.scrollback.len();
-        let want = h as isize + (self.rows / 3) as isize - abs as isize;
-        let off = want.clamp(0, h as isize) as usize;
+        let hit = self
+            .visible_folds()
+            .find(|(_, b)| abs > b.start && abs < b.end)
+            .map(|(i, _)| i);
+        if let Some(i) = hit {
+            self.fold_blocks[i].folded = false;
+        }
+        let dhl = self.display_history_len();
+        let d = self.display_index_of_abs(abs.min(self.scrollback.len()));
+        let want = dhl as isize + (self.rows / 3) as isize - d as isize;
+        let off = want.clamp(0, dhl as isize) as usize;
         self.set_view_offset(off);
     }
 
@@ -3620,8 +3810,7 @@ impl Grid {
     #[cfg(any(test, feature = "gui"))]
     pub fn search_highlight(&self, col: usize, vr: usize) -> Option<bool> {
         let s = self.search.as_ref()?;
-        let off = self.view_offset.min(self.scrollback.len());
-        let abs = self.scrollback.len() - off + vr;
+        let abs = self.abs_of_view_row(vr);
         for &(start, end, mi) in s.rows.get(&abs)? {
             if col >= start && col < end {
                 return Some(mi == s.current);
@@ -3700,8 +3889,7 @@ impl Grid {
         if self.primary.is_some() {
             return false;
         }
-        let h = self.scrollback.len();
-        let top_visible = h - self.view_offset.min(h);
+        let top_visible = self.abs_top_for_offset(self.view_offset.min(self.display_history_len()));
         match self
             .prompt_marks
             .iter()
@@ -3709,7 +3897,10 @@ impl Grid {
             .filter(|&l| l < top_visible)
             .max()
         {
-            Some(l) => self.set_view_offset(h - l),
+            Some(l) => {
+                let off = self.display_history_len() - self.display_index_of_abs(l);
+                self.set_view_offset(off)
+            }
             None => false,
         }
     }
@@ -3722,7 +3913,7 @@ impl Grid {
             return false;
         }
         let h = self.scrollback.len();
-        let top_visible = h - self.view_offset.min(h);
+        let top_visible = self.abs_top_for_offset(self.view_offset.min(self.display_history_len()));
         match self
             .prompt_marks
             .iter()
@@ -3730,7 +3921,10 @@ impl Grid {
             .filter(|&l| l > top_visible)
             .min()
         {
-            Some(l) if l < h => self.set_view_offset(h - l),
+            Some(l) if l < h => {
+                let off = self.display_history_len() - self.display_index_of_abs(l);
+                self.set_view_offset(off)
+            }
             _ => self.reset_view(),
         }
     }
@@ -3742,10 +3936,15 @@ impl Grid {
     /// Used by the windowed renderers so a scrolled-up view paints history.
     #[cfg(any(test, feature = "gui"))]
     pub fn viewport_cell(&self, col: usize, row: usize) -> Cell {
-        let off = self.view_offset.min(self.scrollback.len());
+        let dhl = self.display_history_len();
+        let off = self.view_offset.min(dhl);
         if row < off {
-            let line = &self.scrollback[self.scrollback.len() - off + row].cells;
-            line.get(col).copied().unwrap_or_else(Cell::blank)
+            match self.history_line(dhl - off + row) {
+                HistLine::Abs(l) => {
+                    self.scrollback[l].cells.get(col).copied().unwrap_or_else(Cell::blank)
+                }
+                HistLine::Summary(i) => self.summary_cell(i, col),
+            }
         } else {
             self.cells[(row - off) * self.cols + col]
         }
@@ -3761,8 +3960,7 @@ impl Grid {
         if col >= self.cols || row >= self.rows {
             return None;
         }
-        let off = self.view_offset.min(self.scrollback.len());
-        let abs = self.scrollback.len() - off + row;
+        let abs = self.abs_of_view_row(row);
         let (text, at) = self.logical_line_of(abs);
         let idx = at.iter().position(|&(a, c)| a == abs && c == col)?;
         detect_urls(&text)
@@ -3782,10 +3980,9 @@ impl Grid {
                 out.push(u);
             }
         };
-        let off = self.view_offset.min(self.scrollback.len());
-        let mut abs = self.scrollback.len() - off;
         let mut row = 0;
         while row < self.rows {
+            let abs = self.abs_of_view_row(row);
             // OSC 8 links on this visual row.
             for col in 0..self.cols {
                 if let Some(u) = self.link_at(col, row) {
@@ -3801,7 +3998,6 @@ impl Grid {
             let line_rows = at.last().map_or(1, |&(last_abs, _)| last_abs - at[0].0 + 1);
             let skip = line_rows - (abs - at[0].0);
             row += skip.max(1);
-            abs += skip.max(1);
         }
         out
     }

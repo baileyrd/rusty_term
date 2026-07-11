@@ -15,6 +15,7 @@ pub enum Action {
     Paste,
     NewTab,
     NewWindow,
+    FoldOutput,
     CloseTab,
     NextTab,
     PrevTab,
@@ -91,6 +92,7 @@ impl Default for Keymap {
                 (c(true, true, Char('v')), Paste),
                 (c(true, true, Char('t')), NewTab),
                 (c(true, true, Char('n')), NewWindow),
+                (c(true, true, Char('u')), FoldOutput),
                 (c(true, true, Char('w')), CloseTab),
                 (c(true, false, Tab), NextTab),
                 (c(true, true, Tab), PrevTab),
@@ -144,6 +146,7 @@ pub fn parse_action(name: &str) -> Option<Action> {
         "paste" => Action::Paste,
         "new_tab" => Action::NewTab,
         "new_window" => Action::NewWindow,
+        "fold_output" => Action::FoldOutput,
         "close_tab" => Action::CloseTab,
         "next_tab" => Action::NextTab,
         "prev_tab" => Action::PrevTab,
@@ -227,6 +230,7 @@ mod tests {
         assert_eq!(km.action(Chord::new(false, true, false, Key::PageUp)), Some(Action::ScrollPageUp));
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char(','))), Some(Action::OpenSettings));
         assert_eq!(km.action(Chord::new(true, true, false, Key::Char('n'))), Some(Action::NewWindow));
+        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('u'))), Some(Action::FoldOutput));
         // Unbound chords (plain typing, Ctrl+C) fall through to the child.
         assert_eq!(km.action(Chord::new(false, false, false, Key::Char('a'))), None);
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char('c'))), None);
@@ -268,6 +272,7 @@ mod tests {
     fn parse_action_maps_names() {
         assert_eq!(parse_action("new_tab"), Some(Action::NewTab));
         assert_eq!(parse_action("new_window"), Some(Action::NewWindow));
+        assert_eq!(parse_action("fold_output"), Some(Action::FoldOutput));
         assert_eq!(parse_action("scroll_prompt_down"), Some(Action::ScrollPromptDown));
         assert_eq!(parse_action("open_settings"), Some(Action::OpenSettings));
         assert_eq!(parse_action("nonsense"), None);
