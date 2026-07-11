@@ -48,14 +48,14 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
 | ✅ G19 | Scrollbar | P2 | Ghostty 1.3, kitty 0.43, Windows Terminal, Konsole | M |
 | ✅ G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
-| G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
+| ✅ G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
 | ✅ G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
 | ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
 | ✅ G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
 | ✅ G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
 | ✅ G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
 | ✅ G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
-| G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
+| ✅ G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
 | G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
 | ✅ G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
@@ -64,7 +64,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G34 | Profiles (shell+theme+font bundles) | P2 | Windows Terminal, iTerm2, Konsole, WezTerm | M |
 | G35 | Multiple-cursors protocol | W | kitty 0.43 (originated) | M |
 | G36 | Cursor trail / animated cursor | P3 | kitty 0.43, neovide-inspired | S–M |
-| G37 | Fuzzing harness for hand-rolled decoders | P1 (infra) | industry practice (Alacritty, VTE fuzz targets) | M |
+| ✅ G37 | Fuzzing harness for hand-rolled decoders | P1 (infra) | industry practice (Alacritty, VTE fuzz targets) | M |
 
 ---
 
@@ -323,6 +323,7 @@ rusty_term this is nearly pure glue — both halves already exist.
 state (G13).
 
 #### G21 — Click-to-move-cursor at the prompt
+**Status: done.** `Grid::prompt_cursor_moves` decides when a click may move the readline cursor — primary screen, live view, a current OSC 133 prompt mark, no open command capture, click at/below the prompt row — and yields the `(dx, dy)`; the window sends DECCKM-aware arrow presses (vertical then horizontal, capped at 400/axis) on a plain first click when mouse reporting is off. `click_to_move = false` disables. Works in any shell with 133 integration and multiline-aware line editors.
 **Current.** Clicks either select text or get reported to a mouse-tracking
 app; clicking elsewhere in the current prompt line does not move the shell
 cursor.
@@ -405,6 +406,7 @@ has all three; splits without resize are a demo, not a tool.
 **Size** M · **Deps** `gui`; layout tree already stores ratios.
 
 #### G28 — Broadcast input to multiple panes
+**Status: done.** `broadcast` action (Ctrl+Shift+B, rebindable) toggles mirroring: encoded keystrokes (incl. numpad) and pastes route through `App::write_child`, which fans out to every pane in the active tab while on; the active tab label shows a `⇉` marker. Per-window state, off by default.
 **Current.** Input goes to the focused pane only.
 **Target.** A toggle to mirror keystrokes to all panes in the current tab
 (with a visible indicator while active).
@@ -504,6 +506,7 @@ low priority, but cheap goodwill with zero protocol risk. **Size** S–M.
 ### A.5 Infrastructure
 
 #### G37 — Fuzzing harness for the hand-rolled decoders
+**Status: done.** The crate gained a library target (`src/lib.rs`; `main.rs` is now a thin CLI), enabling an out-of-tree `fuzz/` crate (workspace-excluded, cargo-fuzz/libFuzzer) with two coverage-guided targets driving the *public* parser surface: `parser` (arbitrary bytes through `AnsiParser::advance`, split across two chunks to exercise incremental state) and `graphics` (the same input framed as Sixel DCS / kitty APC / iTerm2 OSC so the base64→inflate→PNG/JPEG decoders see coherent framing immediately). Two deterministic xorshift-seeded stress tests (~256 KiB of escape-seasoned soup + hostile graphics payloads) run in the ordinary suite so every CI run gets a smoke-fuzz without nightly.
 **Current.** `docs/repo-analysis.md` follow-up #6 remains open: the
 from-scratch `inflate`/`png`/`jpeg`/`base64`/`sixel`/kitty-APC decoders were
 hand-traced for memory safety but have no coverage-guided fuzzing; the
@@ -552,7 +555,7 @@ Carried forward unchanged (see that document for full write-ups):
 | 6 | G25, G24 | Rendering: box-drawing synthesis first (helps everything), then color emoji. |
 | 7 | G34, G32, G31, G33 | App model: profiles → sessions → daemon → remote control (each builds on the last). |
 | 8 | G07, G10, G11, G05, G15, G21, G28, G29, G30, G36 | Long-tail protocol depth + platform features, pulled opportunistically. |
-| ∥ | G37 | Fuzzing is independent — start any time; ideally before wave 6's new decoders (CBDT/COLR). |
+| ∥ | ✅ G37 | Fuzzing is independent — start any time; ideally before wave 6's new decoders (CBDT/COLR). |
 
 Section B items keep their original sequencing advice; C13 (multi-window)
 gates G30/G31's full value and should precede wave 7 if the app-model work

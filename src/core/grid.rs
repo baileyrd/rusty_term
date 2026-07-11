@@ -2731,6 +2731,31 @@ impl Grid {
         }
     }
 
+    /// Click-to-move-cursor (G21): the arrow presses that would move the
+    /// shell's readline cursor from where it is to viewport cell
+    /// `(col, row)`, as `(dx, dy)` (positive = right/down), or `None` when
+    /// the click shouldn't move anything: alternate screen, scrolled view,
+    /// no shell-integration prompt mark, a command currently running (open
+    /// 133 `C`…`D` capture), a click above the prompt's first row, or a
+    /// click on the cursor cell itself.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn prompt_cursor_moves(&self, col: usize, row: usize) -> Option<(isize, isize)> {
+        if self.in_alt_screen() || self.view_offset != 0 || self.fold_pending_start.is_some() {
+            return None;
+        }
+        let prompt = *self.prompt_marks.last()?;
+        let abs = self.scrollback.len() + row.min(self.rows.saturating_sub(1));
+        let cursor_abs = self.scrollback.len() + self.cursor.1;
+        if prompt > cursor_abs || abs < prompt {
+            return None; // mark is stale, or the click is above the prompt
+        }
+        let (col, row) = (col.min(self.cols.saturating_sub(1)), row.min(self.rows - 1));
+        if (col, row) == self.cursor {
+            return None;
+        }
+        Some((col as isize - self.cursor.0 as isize, row as isize - self.cursor.1 as isize))
+    }
+
     /// The scrollbar overlay for the current view, or `None` at the live
     /// bottom (the bar auto-hides): `(first_row, rows, color)` — the thumb's
     /// viewport rows plus its color (a fg/bg mix). Cell-resolution, so both

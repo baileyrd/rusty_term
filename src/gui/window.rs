@@ -245,6 +245,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         selecting: false,
         focused: true,
         search_regex: false,
+        broadcast: false,
         copy_mode: None,
         last_grid_click: None,
         click_streak: 0,
@@ -377,6 +378,10 @@ struct App<'a> {
     /// instead of plain text. Toggled with Ctrl+R inside search mode;
     /// remembered across searches.
     search_regex: bool,
+    /// Broadcast input (G28): while set, keystrokes and pastes go to every
+    /// pane in the active tab (multi-host workflows), not just the focused
+    /// one. Toggled per-window; the active tab shows a `⇉` marker.
+    broadcast: bool,
     /// Keyboard copy mode (G18): a viewport-cell cursor plus an optional
     /// anchor (absolute coords). While `Some`, keys move the cursor /
     /// extend the selection instead of reaching the keymap or the child.
@@ -1105,8 +1110,11 @@ impl App<'_> {
                 let alert = self.theme.palette16[1]; // ANSI red
                 put_text(&mut row, &mut hits, &mut tcol, label_end, " •", alert, bg, Hit::Tab(i));
             }
-            let label: String =
-                format!(" {title}{suffix}").chars().take(label_end.saturating_sub(tcol)).collect();
+            let cast = if is_active && self.broadcast { "⇉ " } else { "" };
+            let label: String = format!(" {cast}{title}{suffix}")
+                .chars()
+                .take(label_end.saturating_sub(tcol))
+                .collect();
             put_text(&mut row, &mut hits, &mut tcol, label_end, &label, fg, bg, Hit::Tab(i));
             if has_close {
                 let mut ccol = tab_end - close_w;
@@ -1204,6 +1212,29 @@ impl App<'_> {
             tab.focus = id; // click focuses the pane under the pointer
         }
         let cell = self.cell_in_focused(x, y);
+        // Click-to-move-cursor (G21): a plain first click at the shell
+        // prompt sends the arrow presses that walk the readline cursor to
+        // the clicked cell. Mouse-tracking apps own their clicks, so this
+        // only fires when reporting is off; drag-selection still arms below
+        // (the arrows only ever move within the prompt's own line).
+        if self.config.click_to_move.unwrap_or(true)
+            && let Some(p) = self.pane()
+        {
+            let moves = {
+                let g = p.grid.lock();
+                if g.mouse_modes.active() {
+                    None
+                } else {
+                    g.prompt_cursor_moves(cell.0, cell.1).map(|m| (m, g.app_cursor_keys))
+                }
+            };
+            if let Some(((dx, dy), app_cursor)) = moves {
+                let bytes = arrow_presses(dx, dy, app_cursor);
+                if let Some(p) = self.pane_mut() {
+                    let _ = p.writer.write(&bytes);
+                }
+            }
+        }
         // Consecutive clicks on the same cell escalate the selection: one
         // arms a drag, two select the word under the pointer, three the
         // whole (soft-wrap-joined) line; a fourth starts over.
@@ -1489,6 +1520,12 @@ impl App<'_> {
             Action::ResizeDown => self.resize_pane(Dir::Horizontal, RESIZE_STEP),
             Action::ZoomPane => self.toggle_zoom(),
             Action::CopyMode => self.enter_copy_mode(),
+            Action::Broadcast => {
+                self.broadcast = !self.broadcast;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             Action::ScrollPageUp => self.scroll_key(false, true),
             Action::ScrollPageDown => self.scroll_key(false, false),
             Action::ScrollPromptUp => self.scroll_key(true, true),
@@ -1596,6 +1633,22 @@ impl App<'_> {
         );
     }
 
+    /// Write child input to the focused pane — or, while broadcast is on,
+    /// to every pane in the active tab.
+    fn write_child(&mut self, bytes: &[u8]) {
+        if !self.broadcast {
+            if let Some(p) = self.pane_mut() {
+                let _ = p.writer.write(bytes);
+            }
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            for p in &mut tab.panes {
+                let _ = p.writer.write(bytes);
+            }
+        }
+    }
+
     /// Copy the focused pane's selection to the PRIMARY selection
     /// (X11/Wayland copy-on-select; a no-op elsewhere — macOS/Windows have
     /// no primary selection concept).
@@ -1644,9 +1697,10 @@ impl App<'_> {
         if text.is_empty() {
             return;
         }
-        let Some(p) = self.pane_mut() else { return };
+        let Some(p) = self.pane() else { return };
         let bracketed = p.grid.lock().bracketed_paste;
-        let _ = p.writer.write(&encode_paste(&text, bracketed));
+        let bytes = encode_paste(&text, bracketed);
+        self.write_child(&bytes);
     }
 
     /// Encode a native mouse event as SGR/1006 and send it to the active tab's
@@ -2533,9 +2587,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if let Some(bytes) = numpad.or_else(|| {
                     super::input::encode(&event.logical_key, self.mods, app_cursor, kitty_flags)
                 }) {
-                    if let Some(p) = self.pane_mut() {
-                        let _ = p.writer.write(&bytes);
-                    }
+                    self.write_child(&bytes);
                     // Typing returns the view to the live bottom, as most
                     // terminals do, so the echoed input is visible.
                     self.snap_to_bottom();
@@ -2749,6 +2801,24 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         text.into_bytes()
     }
+}
+
+/// The DECCKM-aware arrow-key byte sequence that moves a readline cursor by
+/// `(dx, dy)` cells: vertical first (multiline editing), then horizontal,
+/// capped so a pathological distance can't flood the child.
+fn arrow_presses(dx: isize, dy: isize, app_cursor: bool) -> Vec<u8> {
+    let prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
+    let mut out = Vec::new();
+    let mut push = |n: isize, pos: u8, neg: u8| {
+        let final_byte = if n >= 0 { pos } else { neg };
+        for _ in 0..n.unsigned_abs().min(400) {
+            out.extend_from_slice(prefix);
+            out.push(final_byte);
+        }
+    };
+    push(dy, b'B', b'A'); // Down / Up
+    push(dx, b'C', b'D'); // Right / Left
+    out
 }
 
 /// The pointer's position in pixels relative to a pane's pixel origin,
@@ -2976,7 +3046,7 @@ fn osc52_reply(sel: char, text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, pane_pixel_point,
+        Hit, MenuKind, arrow_presses, encode_paste, is_openable_url, mix, osc52_reply, pane_pixel_point,
         path_from_file_uri, put_text, shell_menu_items,
     };
     #[cfg(not(windows))]
@@ -3117,6 +3187,15 @@ mod tests {
         assert!(matches!(items[1].kind, MenuKind::LaunchShell(1)));
         assert!(matches!(items[2].kind, MenuKind::Settings));
         assert!(matches!(items[3].kind, MenuKind::EditConfig));
+    }
+
+    #[test]
+    fn arrow_presses_encode_decckm_aware_sequences() {
+        assert_eq!(arrow_presses(2, 0, false), b"\x1b[C\x1b[C");
+        assert_eq!(arrow_presses(-1, 1, false), b"\x1b[B\x1b[D");
+        assert_eq!(arrow_presses(0, -2, true), b"\x1bOA\x1bOA");
+        // Capped so a pathological delta can't flood the child.
+        assert_eq!(arrow_presses(10_000, 0, false).len(), 400 * 3);
     }
 
     #[test]

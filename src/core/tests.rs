@@ -4542,3 +4542,125 @@ fn scrollbar_hides_at_bottom_and_tracks_position() {
     g.reset_view();
     assert_eq!(g.scrollbar(), None);
 }
+
+// ---- Wave-8: deterministic parser stress (the in-suite face of G37) ----
+
+/// A tiny deterministic xorshift so the stress input is reproducible; real
+/// coverage-guided fuzzing lives in `fuzz/` (cargo-fuzz, nightly).
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+#[test]
+fn parser_survives_deterministic_byte_soup() {
+    // Byte soup seasoned with escape introducers so the state machine
+    // actually leaves ground; split into chunks to exercise incremental
+    // state. Asserting "does not panic / hang" over ~256 KiB of input.
+    let mut rng = XorShift(0x5EED_1BAD_F00D_2026);
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    for _ in 0..64 {
+        let mut chunk = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            let r = rng.next();
+            let b = match r % 10 {
+                0 => 0x1b,
+                1 => *b"[]P_^X#()78cnqSHJKm~u".get((r >> 8) as usize % 21).unwrap(),
+                2 => b';',
+                3..=4 => (r >> 16) as u8 % 10 + b'0',
+                _ => (r >> 24) as u8,
+            };
+            chunk.push(b);
+        }
+        p.advance(&mut g, &chunk);
+        let _ = p.take_responses();
+        let _ = g.take_host_out();
+    }
+    // The grid must still be internally consistent enough to render.
+    assert_eq!(g.cells.len(), g.cols * g.rows);
+    let _ = g.snapshot_viewport();
+}
+
+#[test]
+fn graphics_payload_soup_never_panics() {
+    // The wrapped-payload shapes the `fuzz/graphics` target uses, driven
+    // deterministically: hostile Sixel / Kitty APC / iTerm2 bodies.
+    let mut rng = XorShift(0xC0FF_EE00_2026_0711);
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    for i in 0..48 {
+        let mut body = Vec::with_capacity(512);
+        for _ in 0..512 {
+            body.push((rng.next() >> 32) as u8);
+        }
+        let mut frame = match i % 3 {
+            0 => {
+                let mut f = b"\x1bPq".to_vec();
+                f.extend_from_slice(&body);
+                f
+            }
+            1 => {
+                let mut f = b"\x1b_G".to_vec();
+                f.extend_from_slice(&body);
+                f
+            }
+            _ => {
+                let mut f = b"\x1b]1337;File=inline=1:".to_vec();
+                f.extend_from_slice(&body);
+                f.push(0x07);
+                f
+            }
+        };
+        if i % 3 != 2 {
+            frame.extend_from_slice(b"\x1b\\");
+        }
+        p.advance(&mut g, &frame);
+        let _ = p.take_responses();
+        let _ = g.take_host_out();
+    }
+}
+
+#[test]
+fn prompt_cursor_moves_computes_arrow_deltas() {
+    let mut g = Grid::new(40, 10);
+    let mut p = AnsiParser::new();
+    // No prompt mark yet: never moves.
+    p.advance(&mut g, b"plain$ ");
+    assert_eq!(g.prompt_cursor_moves(0, 0), None);
+    // Prompt mark, cursor at col 7 row 0: click right on the same row.
+    p.advance(&mut g, b"\r\x1b]133;A\x07prompt$ ");
+    assert_eq!(g.prompt_cursor_moves(12, 0), Some((4, 0)));
+    assert_eq!(g.prompt_cursor_moves(2, 0), Some((-6, 0)));
+    // Click on the cursor cell itself: nothing to do.
+    assert_eq!(g.prompt_cursor_moves(8, 0), None);
+    // Click above the prompt row: outside the editable region.
+    p.advance(&mut g, b"\r\n\x1b]133;A\x07$ ");
+    assert_eq!(g.prompt_cursor_moves(0, 0), None);
+    // A running command (open 133;C capture) disables it...
+    p.advance(&mut g, b"\x1b]133;C\x07");
+    assert_eq!(g.prompt_cursor_moves(3, 1), None);
+    // ...and the next prompt re-enables.
+    p.advance(&mut g, b"\x1b]133;D;0\x07\r\n\x1b]133;A\x07$ ");
+    assert!(g.prompt_cursor_moves(5, 2).is_some());
+    // Scrolled views never move the cursor (needs real history to scroll
+    // into — an empty scrollback clamps the offset back to the live view).
+    for _ in 0..12 {
+        p.advance(&mut g, b"x\r\n");
+    }
+    p.advance(&mut g, b"\x1b]133;A\x07$ ");
+    g.scroll_view_up(1);
+    assert_eq!(g.prompt_cursor_moves(5, 2), None);
+    g.reset_view();
+    assert!(g.prompt_cursor_moves(5, g.cursor.1).is_some());
+    // Neither does the alternate screen.
+    p.advance(&mut g, b"\x1b[?1049h");
+    assert_eq!(g.prompt_cursor_moves(1, 1), None);
+}

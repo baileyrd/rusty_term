@@ -106,6 +106,11 @@ pub struct Config {
     /// Preset used when the OS appearance is light under `theme = "auto"`
     /// (`theme_light = "name"`; default `solarized-light`).
     pub theme_light: Option<Theme>,
+    /// Click-to-move-cursor: a plain click at the shell prompt sends the
+    /// arrow presses that move the readline cursor to the clicked cell
+    /// (needs OSC 133 shell integration; default on, `click_to_move =
+    /// false` disables).
+    pub click_to_move: Option<bool>,
     /// Whether BEL raises an alert (windowed front-end): a window-attention
     /// request when the window is unfocused, plus a badge on the ringing tab.
     /// Default on; `bell = false` silences both. (There is no audible bell —
@@ -293,6 +298,7 @@ pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
 /// A double-quoted TOML string literal for `s`, escaping the backslash, quote,
 /// tab, newline, and CR that [`parse_value`] understands — so a Windows path
 /// like `C:\Foo\bar.exe` round-trips through the config file unmangled.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn toml_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -317,6 +323,7 @@ pub(crate) fn toml_string(s: &str) -> String {
 /// controls a `Some` value when the key is absent: `true` adds it, `false`
 /// leaves it out — so a setting left at its built-in default updates an existing
 /// line but never adds noise to a file that never mentioned it.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) struct SettingEdit {
     pub section: &'static str,
     pub key: &'static str,
@@ -328,6 +335,7 @@ pub(crate) struct SettingEdit {
 /// formatting, and every key the settings page doesn't manage (fonts, custom
 /// colors, keybindings). Creates the file (and parent dirs) from the commented
 /// [`Config::template`] when absent. The live-reload watcher re-reads the save.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> std::io::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -347,6 +355,7 @@ pub(crate) fn save_settings(path: &std::path::Path, edits: &[SettingEdit]) -> st
 /// a value and `insert`, creating the section header if needed. Comments, blank
 /// lines, and unmanaged keys are preserved verbatim. Pure (no I/O) so it is
 /// unit-tested directly.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn upsert(text: &str, edits: &[SettingEdit]) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let mut done = vec![false; edits.len()];
@@ -436,6 +445,7 @@ fn upsert(text: &str, edits: &[SettingEdit]) -> String {
 
 /// The lowercased name inside a `[section]` header line, or `None` when `line`
 /// (already trimmed) isn't a well-formed header. Mirrors [`parse`]'s rule.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn header_name(line: &str) -> Option<String> {
     let rest = line.strip_prefix('[')?;
     let (name, tail) = rest.split_once(']')?;
@@ -580,6 +590,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("", "shell") => cfg.shell = Some(expect_str(key, value)?),
         ("", "session") => cfg.session = Some(PathBuf::from(expect_str(key, value)?)),
         ("", "single_instance") => cfg.single_instance = Some(expect_bool(key, value)?),
+        ("", "click_to_move") => cfg.click_to_move = Some(expect_bool(key, value)?),
         ("", "bell") => cfg.bell = Some(expect_bool(key, value)?),
         ("", "command_notify_secs") => {
             cfg.command_notify_secs = Some(expect_int(key, value)?.clamp(0, 86_400) as u64)

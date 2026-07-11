@@ -113,7 +113,7 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 /// Client side: connect to the running instance, send one request line, and
 /// return its full reply (data lines + the trailing `ok`/`err …`).
 #[cfg(unix)]
-pub(crate) fn request(line: &str) -> std::io::Result<String> {
+pub fn request(line: &str) -> std::io::Result<String> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket_path())?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;

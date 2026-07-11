@@ -1,5 +1,7 @@
 [workspace]
 members = ["l13"]
+# The fuzz crate needs nightly + cargo-fuzz; keep it out of ordinary builds.
+exclude = ["fuzz"]
 
 [package]
 name = "rusty_term"
