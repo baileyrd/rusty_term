@@ -1089,7 +1089,16 @@ impl AnsiParser {
                     out.push(4000 + style);
                 } else {
                     out.push(base);
-                    out.extend(sub);
+                    let rest: Vec<usize> = sub.collect();
+                    // T.416 direct color carries an optional colorspace id:
+                    // `38:2:<id>:r:g:b`. Drop the id so the flattened form
+                    // lines up with the semicolon layout `38;2;r;g;b`.
+                    if matches!(base, 38 | 48 | 58) && rest.first() == Some(&2) && rest.len() >= 5 {
+                        out.push(2);
+                        out.extend(&rest[2..]);
+                    } else {
+                        out.extend(rest);
+                    }
                 }
             } else {
                 out.push(field.parse().unwrap_or(0));
@@ -1470,80 +1479,6 @@ impl AnsiParser {
                 59 => self.pen.attrs &= !ATTR_UNDERLINE_COLOR,
                 90..=97 => self.pen.fg = self.palette.index(8 + (params[i] - 90)),
                 100..=107 => self.pen.bg = self.palette.index(8 + (params[i] - 100)),
-                _ => {}
-            }
-            i += 1;
-        }
-    }
-
-    /// SGR with colon sub-parameters present (ISO 8613-6, emitted by libvte
-    /// apps among others): each `;`-separated group is one parameter plus its
-    /// colon-joined sub-parameters. Colon groups are self-delimiting — an
-    /// unknown one (`58:…` underline color, say) is consumed whole instead of
-    /// bleeding into its neighbors — while plain parameters keep their ECMA-48
-    /// semantics, including the legacy `38;2;r;g;b` lookahead.
-    fn apply_sgr_groups(&mut self, groups: &[Vec<usize>]) {
-        let mut i = 0;
-        while i < groups.len() {
-            let group = &groups[i];
-            match (group[0], group.len()) {
-                // Colon extended color: `38:5:n`, `38:2:r:g:b`, or the ITU-T
-                // T.416 form `38:2:<colorspace>:r:g:b` (colorspace skipped).
-                (38 | 48, 2..) => {
-                    let sub = &group[1..];
-                    let color = match sub.first().copied() {
-                        Some(5) => sub.get(1).map(|&n| self.palette.index(n)),
-                        Some(2) => {
-                            let rgb =
-                                if sub.len() >= 5 { &sub[2..5] } else { sub.get(1..4).unwrap_or(&[]) };
-                            match *rgb {
-                                [r, g, b] => Some(
-                                    ((r as u32 & 0xff) << 16)
-                                        | ((g as u32 & 0xff) << 8)
-                                        | (b as u32 & 0xff),
-                                ),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(c) = color {
-                        if group[0] == 38 {
-                            self.pen.fg = c;
-                        } else {
-                            self.pen.bg = c;
-                        }
-                    }
-                }
-                // Legacy semicolon-form extended color mixed into a sequence
-                // that has colon groups elsewhere.
-                (38 | 48, 1) => {
-                    let rest: Vec<usize> = groups[i + 1..]
-                        .iter()
-                        .take_while(|q| q.len() == 1)
-                        .map(|q| q[0])
-                        .collect();
-                    if let Some((color, consumed)) = self.palette.extended(&rest) {
-                        if group[0] == 38 {
-                            self.pen.fg = color;
-                        } else {
-                            self.pen.bg = color;
-                        }
-                        i += consumed;
-                    }
-                }
-                // Underline styles: `4:0` removes underline, `4:1..=5` (single
-                // through dashed) all map to our single underline attribute.
-                (4, 2..) => {
-                    if group[1] == 0 {
-                        self.pen.attrs &= !ATTR_UNDERLINE;
-                    } else {
-                        self.pen.attrs |= ATTR_UNDERLINE;
-                    }
-                }
-                // A plain parameter: ordinary SGR semantics.
-                (n, 1) => self.apply_sgr(&[n]),
-                // Any other colon group is consumed without effect.
                 _ => {}
             }
             i += 1;

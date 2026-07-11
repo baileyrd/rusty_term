@@ -1587,6 +1587,17 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rusty_lsp"
 version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_lsp?tag=v0.1.0#3bdbdb44046cd7e58227543eca052cc2fe564977"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rusty_regx"
+version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_regx?rev=1249a62de68f68e821c13cecd3838d49e52e22b6#1249a62de68f68e821c13cecd3838d49e52e22b6"
 
 [[package]]
 name = "rusty_term"
@@ -1598,8 +1609,8 @@ dependencies = [
  "libc",
  "parking_lot",
  "pollster",
- "rusty_lsp",
- "serde_json",
+ "rusty_regx",
+ "rusty_term_l13",
  "softbuffer",
  "tokio",
  "ttf-parser",
@@ -1608,6 +1619,14 @@ dependencies = [
  "wgpu",
  "windows-sys 0.59.0",
  "winit",
+]
+
+[[package]]
+name = "rusty_term_l13"
+version = "0.1.0"
+dependencies = [
+ "rusty_lsp",
+ "serde_json",
 ]
 
 [[package]]
@@ -1657,6 +1676,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1957,6 +1977,7 @@ version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
