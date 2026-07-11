@@ -78,6 +78,7 @@ pub(crate) enum UserEvent {
     ConfigChanged,
     /// A control-socket request (`--single-instance` / `rusty_term ctl`),
     /// with the channel its connection thread waits on for the reply.
+    #[cfg_attr(windows, allow(dead_code))] // constructed once the Windows named-pipe transport lands (G31)
     Control(super::control::CtlCommand, std::sync::mpsc::Sender<String>),
 }
 
