@@ -2198,6 +2198,111 @@ impl Grid {
         Some(out)
     }
 
+    /// The current selection as styled HTML (a `<pre>` of per-run `<span>`s
+    /// carrying color/bold/italic/underline/strike/dim), for rich clipboard
+    /// copy (G29). `None` when nothing is selected. The alt/plain flavor is
+    /// [`Self::selected_text`]; both walk the same cells.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn selected_html(&self) -> Option<String> {
+        let (start, end) = self.selection_bounds()?;
+        let esc = |c: char, out: &mut String| match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        };
+        let hex = |c: u32| format!("#{:06x}", c & 0xFF_FF_FF);
+        let style_of = |cell: &Cell| -> (u32, u32, u16) {
+            // Reverse video swaps the resolved pair; the run key is what the
+            // reader sees, not the raw attribute.
+            let (fg, bg) = if cell.flags & super::cell::ATTR_REVERSE != 0 {
+                (cell.bg, cell.fg)
+            } else {
+                (cell.fg, cell.bg)
+            };
+            const STYLED: u16 =
+                super::cell::ATTR_BOLD | super::cell::ATTR_ITALIC | super::cell::ATTR_UNDERLINE | super::cell::ATTR_STRIKE | super::cell::ATTR_DIM;
+            (fg, bg, cell.flags & STYLED)
+        };
+        let mut out = format!(
+            "<pre style=\"font-family:monospace;background:{};color:{}\">",
+            hex(self.default_bg),
+            hex(self.default_fg)
+        );
+        for row in start.1..=end.1 {
+            let (cells, _) = self.phys_row(row);
+            let c0 = if row == start.1 { start.0 } else { 0 };
+            let c1 = if row == end.1 { end.0 } else { self.cols - 1 };
+            if row != start.1 {
+                out.push('\n');
+            }
+            // Collect the styled chars, then trim trailing blanks like the
+            // plain flavor does.
+            let hi = c1.min(cells.len().saturating_sub(1));
+            // One selected char: its cluster suffix and (fg, bg, flags) run key.
+            type StyledChar<'a> = (char, Option<&'a str>, (u32, u32, u16));
+            let mut line: Vec<StyledChar> = Vec::new();
+            for cell in cells.get(c0..=hi).unwrap_or(&[]) {
+                if cell.flags & WIDE_TRAILER != 0 {
+                    continue;
+                }
+                let suffix = (cell.cluster != 0)
+                    .then(|| self.clusters.get((cell.cluster - 1) as usize))
+                    .flatten()
+                    .map(String::as_str);
+                line.push((cell.ch, suffix, style_of(cell)));
+            }
+            while line.last().is_some_and(|(c, s, _)| *c == ' ' && s.is_none()) {
+                line.pop();
+            }
+            let mut open: Option<(u32, u32, u16)> = None;
+            for (ch, suffix, style) in line {
+                if open != Some(style) {
+                    if open.is_some() {
+                        out.push_str("</span>");
+                    }
+                    let (fg, bg, flags) = style;
+                    let mut css = format!("color:{}", hex(fg));
+                    if bg != self.default_bg {
+                        css.push_str(&format!(";background:{}", hex(bg)));
+                    }
+                    if flags & super::cell::ATTR_BOLD != 0 {
+                        css.push_str(";font-weight:bold");
+                    }
+                    if flags & super::cell::ATTR_ITALIC != 0 {
+                        css.push_str(";font-style:italic");
+                    }
+                    let deco: Vec<&str> = [
+                        (flags & super::cell::ATTR_UNDERLINE != 0, "underline"),
+                        (flags & super::cell::ATTR_STRIKE != 0, "line-through"),
+                    ]
+                    .iter()
+                    .filter_map(|&(on, name)| on.then_some(name))
+                    .collect();
+                    if !deco.is_empty() {
+                        css.push_str(&format!(";text-decoration:{}", deco.join(" ")));
+                    }
+                    if flags & super::cell::ATTR_DIM != 0 {
+                        css.push_str(";opacity:.6");
+                    }
+                    out.push_str(&format!("<span style=\"{css}\">"));
+                    open = Some(style);
+                }
+                esc(ch, &mut out);
+                if let Some(s) = suffix {
+                    for c in s.chars() {
+                        esc(c, &mut out);
+                    }
+                }
+            }
+            if open.is_some() {
+                out.push_str("</span>");
+            }
+        }
+        out.push_str("</pre>");
+        Some(out)
+    }
+
     /// Append `ch` to the grapheme continuation of the cell at `(x, y)`,
     /// re-interning the grown suffix and marking the row dirty.
     fn append_to_glyph(&mut self, x: usize, y: usize, ch: char) {

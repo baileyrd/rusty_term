@@ -1356,9 +1356,18 @@ impl WindowState<'_> {
     /// Copy the active tab's selection to the system clipboard (Ctrl+Shift+C).
     fn copy_selection(&mut self) {
         let Some(p) = self.pane() else { return };
-        let text = p.grid.lock().selected_text();
+        let (text, html) = {
+            let g = p.grid.lock();
+            let html = if self.config.copy_html.unwrap_or(true) { g.selected_html() } else { None };
+            (g.selected_text(), html)
+        };
         if let (Some(text), Some(cb)) = (text, self.clipboard.as_mut()) {
-            let _ = cb.set_text(text);
+            // The HTML flavor carries the selection's colors/attributes for
+            // rich-paste targets (G29); plain editors read the text flavor.
+            let _ = match html {
+                Some(html) => cb.set_html(html, Some(text)),
+                None => cb.set_text(text),
+            };
         }
     }
 

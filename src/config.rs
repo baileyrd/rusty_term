@@ -79,6 +79,10 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Whether Ctrl+Shift+C also puts styled HTML on the clipboard alongside
+    /// plain text (`copy_html`; default on). Rich-paste targets (docs, chat)
+    /// get colors; plain editors still read the text flavor.
+    pub copy_html: Option<bool>,
     /// Height of the quake (dropdown) window as a fraction of the monitor's
     /// height, `0.1..=1.0` (`[window] quake_height`; default 0.4). The window
     /// itself is created/toggled with `rusty_term ctl quake`.
@@ -216,6 +220,8 @@ impl Config {
 # launch_mode = "maximized" # or "fullscreen"
 # opacity = 0.9            # 0.0-1.0; GPU renderer (--features gui-gpu) only
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
+
+# copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -694,6 +700,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             };
             cfg.theme.palette16[n] = expect_color(k, value)?;
         }
+        ("", "copy_html") => cfg.copy_html = Some(expect_bool(key, value)?),
         ("", "cursor_style") => {
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
@@ -1209,6 +1216,15 @@ color15 = "ffffff"
         let (cfg4, warns4) = parse("[window]\nopacity = -0.1\n");
         assert_eq!(cfg4.opacity, None);
         assert_eq!(warns4.len(), 1);
+    }
+
+    #[test]
+    fn copy_html_key_parses() {
+        let (cfg, warns) = parse("copy_html = false\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.copy_html, Some(false));
+        let (cfg2, _) = parse("");
+        assert_eq!(cfg2.copy_html, None); // default-on at the copy site
     }
 
     #[test]
