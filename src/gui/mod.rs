@@ -14,6 +14,7 @@
 //! - [`input`] — native key encoding (winit key → terminal bytes).
 //! - [`window`] — the `winit` event loop + window tying it together.
 
+mod boxdraw;
 mod cpu;
 mod font;
 #[cfg(feature = "gui-gpu")]

@@ -23,12 +23,17 @@ pub(crate) struct Glyph {
     pub top: i32,
     /// Row-major coverage, `len() == width * height`.
     pub coverage: Vec<u8>,
+    /// Row-major straight-alpha color pixels (`0xAARRGGBB`), for color-emoji
+    /// bitmap strikes (CBDT/sbix). `None` for ordinary fg-tinted glyphs.
+    /// `coverage` still carries the alpha channel, so a renderer without a
+    /// color path (the GPU atlas) degrades to a monochrome silhouette.
+    pub color: Option<Vec<u32>>,
 }
 
 impl Glyph {
     /// An empty (whitespace / unoutlined) glyph.
     fn blank() -> Glyph {
-        Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new() }
+        Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new(), color: None }
     }
 }
 
@@ -63,6 +68,9 @@ pub(crate) struct FontSet {
     pub italic: Option<Vec<u8>>,
     pub bold_italic: Option<Vec<u8>>,
     pub fallback: Vec<Vec<u8>>,
+    /// A color-emoji font's raw bytes (CBDT or sbix bitmap strikes), for the
+    /// color-glyph path; `None` when no emoji font was found.
+    pub emoji: Option<Vec<u8>>,
 }
 
 /// Source of cell metrics and rasterized glyphs. [`FontCache`] is the real
@@ -93,6 +101,9 @@ pub(crate) struct FontCache {
     /// Per-face GSUB ligature shapers (same indexing as `faces`); `None` when the
     /// face has no `liga`/`calt` lookups or ligatures are disabled.
     shapers: [Option<Shaper>; 4],
+    /// A color-emoji font's raw bytes, parsed on demand for bitmap strikes
+    /// (`ttf-parser` borrows, so the bytes are kept, not a `Face`).
+    emoji: Option<Vec<u8>>,
     /// Fonts tried in order when the chosen face lacks a glyph (CJK, symbols, …).
     fallback: Vec<FontVec>,
     scale: PxScale,
@@ -138,6 +149,7 @@ impl FontCache {
             faces,
             shapers,
             fallback,
+            emoji: set.emoji,
             scale,
             cell_w,
             cell_h,
@@ -150,6 +162,55 @@ impl FontCache {
     /// The face that has a glyph for `ch` in `style`: the styled face (or regular
     /// if that variant is absent), else the first fallback font covering `ch`,
     /// else the styled face (renders notdef).
+    /// Rasterize `ch` from the color-emoji font's bitmap strikes (CBDT/sbix
+    /// PNG), scaled to the cell height, or `None` when no emoji font is
+    /// loaded / it lacks the char / the strike isn't PNG. Only consulted for
+    /// emoji-block scalars so ordinary text never pays the lookup (G24).
+    fn color_emoji(&self, ch: char) -> Option<Glyph> {
+        if !matches!(ch as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x2049 | 0x203C) {
+            return None;
+        }
+        let data = self.emoji.as_deref()?;
+        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let gid = face.glyph_index(ch)?;
+        let (cw, chh) = self.cell_size();
+        let img = face.glyph_raster_image(gid, chh as u16)?;
+        if img.format != ttf_parser::RasterImageFormat::PNG {
+            return None;
+        }
+        let decoded = crate::core::png_decode(img.data)?;
+        if decoded.width == 0 || decoded.height == 0 {
+            return None;
+        }
+        // "Contain"-fit into the emoji's two-cell footprint, preserving
+        // aspect (bitmap strikes are square in practice).
+        let max_w = (cw * 2).max(1);
+        let scale = (chh as f32 / decoded.height as f32).min(max_w as f32 / decoded.width as f32);
+        let w = ((decoded.width as f32 * scale).round() as usize).max(1);
+        let h = ((decoded.height as f32 * scale).round() as usize).max(1);
+        let mut color = Vec::with_capacity(w * h);
+        let mut coverage = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let sy = y * decoded.height / h;
+            for x in 0..w {
+                let sx = x * decoded.width / w;
+                let i = (sy * decoded.width + sx) * 4;
+                let (r, g, b, a) =
+                    (decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2], decoded.rgba[i + 3]);
+                color.push(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32);
+                coverage.push(a);
+            }
+        }
+        Some(Glyph {
+            width: w,
+            height: h,
+            left: 0,
+            top: -self.baseline() + (chh as i32 - h as i32), // bottom-align in the cell
+            coverage,
+            color: Some(color),
+        })
+    }
+
     fn face_for(&self, ch: char, style: Style) -> &FontVec {
         let styled =
             self.faces[style as usize].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
@@ -193,10 +254,19 @@ impl GlyphSource for FontCache {
         if let Some(g) = self.cache.get(&(ch, style)) {
             return Rc::clone(g);
         }
-        let g = Rc::new(rasterize(self.face_for(ch, style), self.scale, ch));
+        // Box-drawing / blocks / braille / Powerline are synthesized at exact
+        // cell geometry instead of asking the font — seamless joins beat any
+        // font's own metrics-mismatched glyphs (G25).
+        let (cw, chh) = self.cell_size();
+        let g = Rc::new(
+            super::boxdraw::synthesize(ch, cw, chh, self.baseline())
+                .or_else(|| self.color_emoji(ch))
+                .unwrap_or_else(|| rasterize(self.face_for(ch, style), self.scale, ch)),
+        );
         self.cache.insert((ch, style), Rc::clone(&g));
         g
     }
+
 
     fn shape(&mut self, text: &[char], style: Style) -> Vec<(Rc<Glyph>, usize)> {
         let eff = self.eff_face(style);
@@ -257,6 +327,7 @@ fn rasterize_id(font: &FontVec, scale: PxScale, id: GlyphId) -> Glyph {
         left: bounds.min.x.round() as i32,
         top: bounds.min.y.round() as i32,
         coverage,
+        color: None,
     }
 }
 
@@ -304,12 +375,14 @@ pub(crate) fn load_set(
         fb.push(b);
     }
     fb.extend(SYSTEM_FALLBACKS.iter().filter_map(|p| std::fs::read(p).ok()).take(2));
+    let emoji = EMOJI_FONTS.iter().find_map(|p| std::fs::read(p).ok());
     Some(FontSet {
         regular,
         bold: load_variant(bold, regular_path, &["Bold", "bold"]),
         italic: load_variant(italic, regular_path, &["Italic", "Oblique", "italic"]),
         bold_italic: load_variant(bold_italic, regular_path, &["BoldItalic", "BoldOblique"]),
         fallback: fb,
+        emoji,
     })
 }
 
@@ -340,6 +413,16 @@ fn load_variant(
 }
 
 /// System fonts with broad CJK/symbol coverage, used to seed the fallback chain.
+/// Well-known color-emoji font locations (CBDT on Linux/Windows, sbix on
+/// macOS), tried in order.
+const EMOJI_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+    "C:\\Windows\\Fonts\\seguiemj.ttf",
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+];
+
 const SYSTEM_FALLBACKS: &[&str] = &[
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -371,5 +454,25 @@ mod tests {
         assert!(Rc::ptr_eq(&fc.glyph('M', Style::Regular), &fc.glyph('M', Style::Regular)));
         // A missing variant face falls back to regular but caches per style.
         assert!(fc.glyph('M', Style::Bold).width > 0);
+    }
+
+    #[test]
+    fn box_drawing_is_synthesized_and_emoji_degrades_without_a_font() {
+        let Some(bytes) = load_default_font(None) else {
+            return; // no system font on this host; covered by boxdraw's own tests
+        };
+        let mut fc =
+            FontCache::new(FontSet { regular: bytes, ..Default::default() }, 18.0, false).expect("font parses");
+        let (w, h) = fc.cell_size();
+        // Box drawing comes from the synthesizer: exactly cell-sized, at the
+        // cell origin — regardless of what the font provides.
+        let g = fc.glyph('─', Style::Regular);
+        assert_eq!((g.width, g.height), (w, h));
+        assert_eq!((g.left, g.top), (0, -fc.baseline()));
+        assert!(g.color.is_none());
+        // With no emoji font loaded (FontSet::default has none), an emoji
+        // scalar takes the ordinary rasterize path without panicking.
+        let e = fc.glyph('\u{1F600}', Style::Regular);
+        assert!(e.color.is_none());
     }
 }

@@ -43,6 +43,8 @@ pub use cell::{Cell, char_width};
 pub use grid::{MouseModes, Selection};
 #[cfg(feature = "gui")]
 pub(crate) use base64::encode as base64_encode;
+#[cfg(feature = "gui")]
+pub(crate) use png::decode as png_decode;
 pub use parser::AnsiParser;
 
 #[cfg(test)]

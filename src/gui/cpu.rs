@@ -159,6 +159,10 @@ pub(crate) fn draw_grid(
                 && cell.cluster == 0
                 && cell.ch != ' '
                 && char_width(cell.ch) == 1
+                // Synthesized glyphs (box drawing etc.) bypass shaping so a
+                // font's GSUB can never substitute them away from the exact
+                // cell-geometry bitmaps.
+                && !crate::gui::boxdraw::is_synthesized(cell.ch)
         };
         let mut col = 0;
         while col < grid.cols {
@@ -478,11 +482,22 @@ fn blit(buf: &mut [u32], width: usize, height: usize, glyph: &Glyph, pen_x: i32,
             if px < 0 || px as usize >= width {
                 continue;
             }
-            let a = glyph.coverage[gy * glyph.width + gx];
+            let gi = gy * glyph.width + gx;
+            let idx = row + px as usize;
+            // Color glyphs (emoji bitmap strikes) carry their own pixels and
+            // ignore the pen color; ordinary glyphs tint coverage with `fg`.
+            if let Some(color) = &glyph.color {
+                let argb = color[gi];
+                let a = (argb >> 24) as u8;
+                if a != 0 {
+                    buf[idx] = blend(buf[idx], argb & 0x00FF_FFFF, a);
+                }
+                continue;
+            }
+            let a = glyph.coverage[gi];
             if a == 0 {
                 continue;
             }
-            let idx = row + px as usize;
             buf[idx] = blend(buf[idx], fg, a);
         }
     }
@@ -519,10 +534,10 @@ mod tests {
         }
         fn glyph(&mut self, ch: char, _style: Style) -> Rc<Glyph> {
             if ch == ' ' {
-                return Rc::new(Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new() });
+                return Rc::new(Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new(), color: None });
             }
             // top = -baseline places the bitmap's top row at the cell's top.
-            Rc::new(Glyph { width: 2, height: 2, left: 0, top: -6, coverage: vec![255; 4] })
+            Rc::new(Glyph { width: 2, height: 2, left: 0, top: -6, coverage: vec![255; 4], color: None })
         }
     }
 
@@ -891,5 +906,26 @@ mod tests {
         assert_eq!(nonbg(&on, cw, chh, 1), 0, "ligature consumes the second cell");
         // Without ligatures, the second cell renders its own glyph.
         assert!(nonbg(&off, cw, chh, 1) > 0, "no ligature: second cell renders");
+    }
+
+    #[test]
+    fn blit_color_glyph_uses_its_own_pixels_not_fg() {
+        let mut buf = vec![0u32; 4 * 4];
+        let glyph = Glyph {
+            width: 2,
+            height: 2,
+            left: 0,
+            top: 0,
+            coverage: vec![255, 0, 255, 128],
+            // Opaque red, transparent, opaque green, half-alpha blue.
+            color: Some(vec![0xFFFF0000, 0x00000000, 0xFF00FF00, 0x800000FF]),
+        };
+        blit(&mut buf, 4, 4, &glyph, 0, 0, 0x123456 /* fg must be ignored */);
+        assert_eq!(buf[0], 0xFF0000, "opaque red pixel");
+        assert_eq!(buf[1], 0x000000, "transparent pixel leaves bg");
+        assert_eq!(buf[4], 0x00FF00, "opaque green pixel");
+        // Half-alpha blue over black: roughly half-intensity blue.
+        let b = buf[5] & 0xFF;
+        assert!((100..=160).contains(&b), "{b}");
     }
 }
