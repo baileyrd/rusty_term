@@ -1595,6 +1595,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_regx"
+version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_regx?rev=1249a62de68f68e821c13cecd3838d49e52e22b6#1249a62de68f68e821c13cecd3838d49e52e22b6"
+
+[[package]]
 name = "rusty_term"
 version = "0.1.0"
 dependencies = [
@@ -1604,6 +1609,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "pollster",
+ "rusty_regx",
  "rusty_term_l13",
  "softbuffer",
  "tokio",

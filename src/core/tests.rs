@@ -1477,12 +1477,12 @@ fn search_finds_matches_across_scrollback_and_screen() {
     let mut p = AnsiParser::new();
     // 5 lines, 3 rows: "alpha"/"beta" scroll into history, screen keeps the rest.
     p.advance(&mut g, b"alpha\r\nbeta\r\ngamma\r\nalpha two\r\ndelta");
-    assert_eq!(g.search("alpha"), 2); // history "alpha" + screen "alpha two"
+    assert_eq!(g.search_with("alpha", false), 2); // history "alpha" + screen "alpha two"
     assert_eq!(g.search_status(), Some((1, 2)));
     // Case-insensitive.
-    assert_eq!(g.search("ALPHA"), 2);
+    assert_eq!(g.search_with("ALPHA", false), 2);
     // No match.
-    assert_eq!(g.search("zzz"), 0);
+    assert_eq!(g.search_with("zzz", false), 0);
     assert_eq!(g.search_status(), None);
 }
 
@@ -1491,7 +1491,7 @@ fn search_matches_across_a_soft_wrap() {
     let mut g = Grid::new(5, 3);
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"abcdefgh"); // wraps: "abcde" then "fgh" as one logical line
-    assert_eq!(g.search("ef"), 1); // 'e' ends row 0, 'f' starts row 1
+    assert_eq!(g.search_with("ef", false), 1); // 'e' ends row 0, 'f' starts row 1
     // Highlight spans both physical rows (view snapped to show the match).
     assert_eq!(g.search_highlight(4, 0), Some(true));
     assert_eq!(g.search_highlight(0, 1), Some(true));
@@ -1503,7 +1503,7 @@ fn search_jump_cycles_and_clear_resets() {
     let mut g = Grid::new(20, 3);
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"alpha\r\nbeta\r\ngamma\r\nalpha two\r\ndelta");
-    assert_eq!(g.search("alpha"), 2);
+    assert_eq!(g.search_with("alpha", false), 2);
     assert_eq!(g.search_status(), Some((1, 2)));
     g.search_jump(true);
     assert_eq!(g.search_status(), Some((2, 2)));
@@ -4300,4 +4300,112 @@ fn select_line_at_follows_soft_wraps() {
     assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno"));
     g.select_line_at(2);
     assert_eq!(g.selected_text().as_deref(), Some("second"));
+}
+
+// ---- Wave-3 additions: regex search (rusty_regx) ----
+
+#[test]
+fn regex_search_matches_and_folds_case() {
+    let mut g = Grid::new(40, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"Error: 404\r\nwarning: X\r\nERROR: 500");
+    assert_eq!(g.search_with("error: [0-9]+", true), 2);
+    // Plain mode still works through the same entry point.
+    assert_eq!(g.search_with("error", false), 2);
+}
+
+#[test]
+fn regex_search_spans_highlight_the_matched_cells() {
+    let mut g = Grid::new(40, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"pi=3.14 e=2.71");
+    assert_eq!(g.search_with("[0-9]+\\.[0-9]+", true), 2);
+    // First match "3.14" covers cols 3..7 of row 0.
+    assert_eq!(g.search_highlight(3, 0), Some(true));
+    assert_eq!(g.search_highlight(6, 0), Some(true));
+    assert_eq!(g.search_highlight(7, 0), None);
+    assert_eq!(g.search_highlight(10, 0), Some(false)); // "2.71", inactive
+}
+
+#[test]
+fn regex_search_anchors_match_once_per_logical_line() {
+    let mut g = Grid::new(10, 6);
+    let mut p = AnsiParser::new();
+    // "ababab..." soft-wraps; ^ab must match only at the true line start.
+    p.advance(&mut g, b"abababababab\r\nab");
+    assert_eq!(g.search_with("^ab", true), 2);
+    // `$` anchors to the logical line end, not each visual row.
+    assert_eq!(g.search_with("ab$", true), 2);
+}
+
+#[test]
+fn regex_search_rejects_malformed_and_skips_empty_matches() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"hello");
+    assert_eq!(g.search_with("(unclosed", true), 0); // malformed: no matches
+    assert_eq!(g.search_with("z*", true), 0); // only empty-width: nothing to show
+    assert_eq!(g.search_with("l+", true), 1); // and the engine still terminates
+}
+
+#[test]
+fn url_at_detects_plain_text_urls_across_wraps() {
+    let mut g = Grid::new(20, 5);
+    let mut p = AnsiParser::new();
+    // URL soft-wraps across two rows; detection joins the logical line.
+    p.advance(&mut g, b"see https://example.com/a/long/path now");
+    assert_eq!(g.url_at(6, 0).as_deref(), Some("https://example.com/a/long/path"));
+    assert_eq!(g.url_at(2, 1).as_deref(), Some("https://example.com/a/long/path"));
+    assert_eq!(g.url_at(0, 0), None); // "see" is not a URL
+}
+
+#[test]
+fn url_detection_trims_punctuation_and_handles_www() {
+    let mut g = Grid::new(60, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"(see https://ex.com/x). Or www.rust-lang.org, ok? mailto:a@b.c!");
+    assert_eq!(g.url_at(6, 0).as_deref(), Some("https://ex.com/x"));
+    assert_eq!(g.url_at(28, 0).as_deref(), Some("http://www.rust-lang.org"));
+    assert_eq!(g.url_at(51, 0).as_deref(), Some("mailto:a@b.c"));
+    // The trailing ")." and "," were trimmed; the "." between them is no URL.
+    assert_eq!(g.url_at(22, 0), None);
+}
+
+#[test]
+fn url_detection_keeps_balanced_parens() {
+    let mut g = Grid::new(60, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"https://en.wikipedia.org/wiki/Rust_(language)");
+    assert_eq!(
+        g.url_at(0, 0).as_deref(),
+        Some("https://en.wikipedia.org/wiki/Rust_(language)")
+    );
+}
+
+#[test]
+fn visible_links_collects_osc8_and_detected_urls() {
+    let mut g = Grid::new(40, 6);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]8;;https://osc8.example\x07link\x1b]8;;\x07 and http://plain.example\r\nhttp://plain.example again");
+    let links = g.visible_links();
+    assert!(links.contains(&"https://osc8.example".to_string()));
+    assert!(links.contains(&"http://plain.example".to_string()));
+    assert_eq!(links.len(), 2, "{links:?}"); // deduped
+}
+
+#[test]
+fn osc_52_primary_selection_routes_separately() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // `p` selection sets the primary side; `c` (and empty) the clipboard side.
+    p.advance(&mut g, b"\x1b]52;p;SGVsbG8=\x07");
+    assert_eq!(g.clipboard_set_primary.as_deref(), Some("Hello"));
+    assert_eq!(g.clipboard_set, None);
+    p.advance(&mut g, b"\x1b]52;c;V29ybGQ=\x07");
+    assert_eq!(g.clipboard_set.as_deref(), Some("World"));
+    // Queries route the same way.
+    p.advance(&mut g, b"\x1b]52;p;?\x07");
+    assert!(g.clipboard_query_primary);
+    assert!(!g.clipboard_query);
+    let _ = g.take_host_out();
 }
