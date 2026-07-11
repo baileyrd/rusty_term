@@ -660,6 +660,13 @@ impl AnsiParser {
     fn ground_byte(&mut self, b: u8, g: &mut Grid) {
         match b {
             0x1b => self.state = ParserState::Esc,
+            // BEL — flag the ring for the windowed front-end (attention
+            // request + tab badge) and relay the byte so a TUI-mode host
+            // terminal rings its own bell.
+            0x07 => {
+                g.bell = true;
+                g.host_out.push(0x07);
+            }
             0x08 => {
                 g.cursor.0 = g.cursor.0.saturating_sub(1); // backspace
                 self.last_char = None;

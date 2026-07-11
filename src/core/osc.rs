@@ -110,9 +110,18 @@ pub(crate) fn dispatch(
         // with a digit field and are not notifications, so they're left alone.
         "9" => {
             if let Some(body) = text {
-                let head = body.split(';').next().unwrap_or("");
+                let mut fields = body.split(';');
+                let head = fields.next().unwrap_or("");
                 let conemu = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
-                if !body.is_empty() && !conemu {
+                if head == "4" {
+                    // ConEmu progress: `9 ; 4 ; st ; pr`. Missing/garbled
+                    // fields read as 0, which clears — the safe direction.
+                    let mut num =
+                        || fields.next().and_then(|f| f.parse::<u8>().ok()).unwrap_or(0);
+                    let (state, percent) = (num(), num());
+                    g.set_progress(state, percent);
+                    forward_to_host(osc_buffer, g);
+                } else if !body.is_empty() && !conemu {
                     forward_to_host(osc_buffer, g);
                     g.push_notification(String::new(), body.to_string());
                 }
@@ -247,19 +256,26 @@ fn mark_command_lifecycle(
             #[cfg(feature = "l13")]
             g.command_output_begin();
             #[cfg(any(test, feature = "gui"))]
-            g.fold_output_begin();
+            {
+                g.fold_output_begin();
+                g.command_timer_begin();
+            }
             true
         }
         "D" => {
+            let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let _ = exit; // consumed only by the cfg-gated arms below
             #[cfg(feature = "l13")]
             {
-                let exit = parts.next().and_then(|s| s.parse::<i32>().ok());
                 g.command_finished(exit);
                 rusty_term_l13::notify_command_finished(g, exit, responses);
                 rusty_term_l13::notify_resource_changed(g, rusty_term_l13::RES_COMMAND, responses);
             }
             #[cfg(any(test, feature = "gui"))]
-            g.fold_output_end();
+            {
+                g.fold_output_end();
+                g.command_timer_end(exit);
+            }
             true
         }
         _ => false,

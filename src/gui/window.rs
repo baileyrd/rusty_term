@@ -28,7 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, KeyLocation, ModifiersState, PhysicalKey};
-use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
 use crate::config::{Config, LaunchMode};
@@ -129,6 +129,10 @@ struct Tab {
     layout: Layout,
     /// Id of the focused pane — it receives input and shows the cursor.
     focus: u64,
+    /// Unseen-alert badge (bell or finished command while the tab was in the
+    /// background / the window unfocused); cleared when the tab is active in
+    /// a focused window.
+    attention: bool,
 }
 
 impl Tab {
@@ -199,6 +203,9 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         clipboard: arboard::Clipboard::new().ok(),
         mouse_pos: (0.0, 0.0),
         selecting: false,
+        focused: true,
+        last_grid_click: None,
+        click_streak: 0,
         mouse_button_down: None,
         sel_anchor: None,
         hits: Vec::new(),
@@ -295,6 +302,15 @@ struct App<'a> {
     hits: Vec<Hit>,
     /// Time of the last single click on the drag strip (double-click detect).
     last_strip_click: Option<Instant>,
+    /// Whether the window currently has OS focus. Gates the `?1004` focus
+    /// reports (wave 1), bell attention requests, and command-finished
+    /// notifications.
+    focused: bool,
+    /// Last left-click on pane content `(when, cell)` plus the current
+    /// consecutive-click count — double-click selects a word, triple a
+    /// logical line (`click_streak` cycles 1 → 2 → 3 → 1).
+    last_grid_click: Option<(Instant, (usize, usize))>,
+    click_streak: u8,
     /// Whether the blinking cursor is in its visible phase this frame.
     cursor_blink_on: bool,
     /// When the blink phase last toggled, paced by the event loop.
@@ -395,7 +411,7 @@ impl App<'_> {
         let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
         let pane = self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref())?;
         let focus = pane.id;
-        self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus });
+        self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus, attention: false });
         self.active = self.tabs.len() - 1;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -627,6 +643,13 @@ impl App<'_> {
         let btn0 = cols.saturating_sub(12);
         let tab_limit = btn0.saturating_sub(8);
 
+        // The active tab of a focused window is being watched; its badge is
+        // stale by definition.
+        if self.focused
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.attention = false;
+        }
         let close_w = 3; // " × " on each tab
         let mut col = 0usize;
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -637,9 +660,22 @@ impl App<'_> {
             // The active tab adopts the terminal background, visually merging
             // with the grid below; inactive ones sit dimmed on the bar.
             let (fg, bg) = if is_active { (self.theme.fg, self.theme.bg) } else { (dim_fg, bar_bg) };
-            let title = {
-                let label = tab.focused().map(|p| p.grid.lock().title.clone()).unwrap_or_default();
-                if label.is_empty() { format!("shell {}", i + 1) } else { label }
+            let (title, progress) = {
+                let state = tab.focused().map(|p| {
+                    let g = p.grid.lock();
+                    (g.title.clone(), g.progress)
+                });
+                let (label, progress) = state.unwrap_or_default();
+                (if label.is_empty() { format!("shell {}", i + 1) } else { label }, progress)
+            };
+            // OSC 9;4 progress rides the label: ` 42%`, `!42%` on error/
+            // paused, `…` while indeterminate. An attention badge prepends
+            // `•` in the alert color.
+            let suffix = match progress {
+                Some((2 | 4, pct)) => format!(" !{pct}%"),
+                Some((3, _)) => " …".to_string(),
+                Some((_, pct)) => format!(" {pct}%"),
+                None => String::new(),
             };
             let tab_end = (col + TAB_CELLS).min(tab_limit);
             // Paint the whole tab span in its color and make it activate on click.
@@ -653,7 +689,12 @@ impl App<'_> {
             let has_close = tab_end - col > close_w + 1;
             let label_end = if has_close { tab_end - close_w } else { tab_end };
             let mut tcol = col;
-            let label: String = format!(" {title}").chars().take(label_end - col).collect();
+            if tab.attention {
+                let alert = self.theme.palette16[1]; // ANSI red
+                put_text(&mut row, &mut hits, &mut tcol, label_end, " •", alert, bg, Hit::Tab(i));
+            }
+            let label: String =
+                format!(" {title}{suffix}").chars().take(label_end.saturating_sub(tcol)).collect();
             put_text(&mut row, &mut hits, &mut tcol, label_end, &label, fg, bg, Hit::Tab(i));
             if has_close {
                 let mut ccol = tab_end - close_w;
@@ -750,10 +791,27 @@ impl App<'_> {
         {
             tab.focus = id; // click focuses the pane under the pointer
         }
-        self.sel_anchor = Some(self.cell_in_focused(x, y));
-        self.selecting = true;
+        let cell = self.cell_in_focused(x, y);
+        // Consecutive clicks on the same cell escalate the selection: one
+        // arms a drag, two select the word under the pointer, three the
+        // whole (soft-wrap-joined) line; a fourth starts over.
+        let now = Instant::now();
+        self.click_streak = match self.last_grid_click {
+            Some((t, c)) if c == cell && now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS => {
+                self.click_streak % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_grid_click = Some((now, cell));
+        self.sel_anchor = Some(cell);
+        self.selecting = self.click_streak == 1;
         if let Some(p) = self.pane() {
-            p.grid.lock().selection = None; // cleared until the drag moves
+            let mut g = p.grid.lock();
+            match self.click_streak {
+                2 => g.select_word_at(cell.0, cell.1),
+                3 => g.select_line_at(cell.1),
+                _ => g.selection = None, // cleared until the drag moves
+            }
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -894,6 +952,60 @@ impl App<'_> {
         for (title, body) in notes {
             let title = if title.is_empty() { "rusty_term" } else { title.as_str() };
             notify(title, &body);
+        }
+    }
+
+    /// Drain a pane's bell ring and finished-command records and raise the
+    /// configured alerts: a bell requests window attention when the window is
+    /// unfocused and badges a background tab; a command that ran at least
+    /// `command_notify_secs` and finished while the window was unfocused (or
+    /// its tab in the background) raises a desktop notification. Alerts for
+    /// the active tab of a focused window are dropped — the user watched it
+    /// happen.
+    fn service_alerts(&mut self, id: u64) {
+        let (bell, finished) = {
+            let Some(p) = self.pane_by_id(id) else { return };
+            let mut g = p.grid.lock();
+            (std::mem::take(&mut g.bell), std::mem::take(&mut g.finished_commands))
+        };
+        if !bell && finished.is_empty() {
+            return;
+        }
+        let tab_idx = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id));
+        let background = tab_idx != Some(self.active);
+        let unseen = background || !self.focused;
+        let mut badge = false;
+        if bell && self.config.bell.unwrap_or(true) && unseen {
+            if !self.focused
+                && let Some(window) = &self.window
+            {
+                window.request_user_attention(Some(UserAttentionType::Informational));
+            }
+            badge = true;
+        }
+        let threshold = self.config.command_notify_secs.unwrap_or(10);
+        for (exit, runtime) in finished {
+            if threshold != 0 && runtime.as_secs() >= threshold && unseen {
+                let status = match exit {
+                    Some(0) => "succeeded".to_string(),
+                    Some(code) => format!("failed (exit {code})"),
+                    None => "finished".to_string(),
+                };
+                notify(
+                    "Command finished",
+                    &format!("A command {status} after {}s", runtime.as_secs()),
+                );
+                badge = true;
+            }
+        }
+        if badge
+            && let Some(i) = tab_idx
+            && let Some(tab) = self.tabs.get_mut(i)
+        {
+            tab.attention = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -1733,7 +1845,9 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             WindowEvent::Focused(focused) => {
                 // Focus reporting (`?1004`): tell the focused pane's child it
                 // gained/lost focus, if it asked. Redraw either way — the
-                // cursor renders only while focused.
+                // cursor renders only while focused, and regaining focus
+                // clears the active tab's attention badge (in `chrome_row`).
+                self.focused = focused;
                 if let Some(p) = self.pane_mut()
                     && p.grid.lock().focus_reporting
                 {
@@ -1978,6 +2092,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             UserEvent::Redraw(id) => {
                 self.service_clipboard(id);
                 self.service_notifications(id);
+                self.service_alerts(id);
                 // A synchronized-output window on this pane suppresses the
                 // repaint until it closes (or times out), so a multi-write
                 // frame update never paints half-drawn.

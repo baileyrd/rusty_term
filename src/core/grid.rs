@@ -261,6 +261,27 @@ pub struct Grid {
     /// of browsing rusty_term's own scrollback — lets the wheel drive `less`/
     /// `man`/other pagers that never registered native mouse support.
     pub alt_scroll: bool,
+    /// Pending BEL (C0 `0x07`) ring, set by the parser and drained by the
+    /// windowed front-end (which raises a window-attention request and a tab
+    /// badge); the TUI relays the byte to the host instead. A boolean, so a
+    /// burst of bells coalesces into one alert.
+    pub bell: bool,
+    /// ConEmu OSC `9;4` progress state as `(state, percent)`: state `1`
+    /// normal, `2` error, `3` indeterminate, `4` warning/paused; `None` when
+    /// cleared (state `0` or unknown). The windowed front-end surfaces it in
+    /// the tab strip; the TUI relays the sequence to the host.
+    pub progress: Option<(u8, u8)>,
+    /// When the running command's output began (OSC 133/633 `C`), for
+    /// measuring how long a command ran (windowed front-end "command
+    /// finished" notifications).
+    #[cfg(any(test, feature = "gui"))]
+    command_began: Option<std::time::Instant>,
+    /// Commands that finished (OSC 133/633 `D`) since last drained:
+    /// `(exit code, runtime)`. The windowed front-end drains these to notify
+    /// about long commands finishing in an unfocused window; bounded so an
+    /// undrained grid (TUI mode) never grows it.
+    #[cfg(any(test, feature = "gui"))]
+    pub finished_commands: Vec<(Option<i32>, std::time::Duration)>,
     /// Whether focus reporting (DEC `?1004`) is enabled by the child. In TUI
     /// mode the mode is also relayed to the host, which generates the actual
     /// `CSI I`/`CSI O` reports; the windowed front-end has no host, so it
@@ -919,6 +940,12 @@ impl Grid {
             bracketed_paste: false,
             app_cursor_keys: false,
             alt_scroll: false,
+            bell: false,
+            progress: None,
+            #[cfg(any(test, feature = "gui"))]
+            command_began: None,
+            #[cfg(any(test, feature = "gui"))]
+            finished_commands: Vec::new(),
             focus_reporting: false,
             app_keypad: false,
             line_feed_new_line: false,
@@ -1517,6 +1544,69 @@ impl Grid {
         };
         let lin = |c: usize, r: usize| r * self.cols + c;
         (lin(start.0, start.1)..=lin(end.0, end.1)).contains(&lin(col, row))
+    }
+
+    /// Select the "word" under `(col, row)` — the maximal run of word
+    /// characters around it on that screen row (double-click). Word
+    /// characters are everything except blanks and common separators, kept
+    /// deliberately URL/path-friendly (`/`, `.`, `-`, `_`, `:`, `~`, … stay
+    /// part of a word) so a double-click grabs a whole path or URL, matching
+    /// kitty/foot defaults more than xterm's alnum-only class. Clicking a
+    /// separator or blank selects just that cell. Operates on the live
+    /// screen, like the rest of the selection model.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn select_word_at(&mut self, col: usize, row: usize) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let (col, row) = (col.min(self.cols - 1), row.min(self.rows - 1));
+        let is_word = |c: usize| {
+            let cell = self.cells[row * self.cols + c];
+            if cell.flags & WIDE_TRAILER != 0 {
+                return true; // ride with its wide lead cell
+            }
+            let ch = cell.ch;
+            !(ch == ' '
+                || ch == '\0'
+                || "\t\"'`()[]{}<>|;,".contains(ch))
+        };
+        if !is_word(col) {
+            self.selection = Some(Selection { anchor: (col, row), head: (col, row) });
+            return;
+        }
+        let mut start = col;
+        while start > 0 && is_word(start - 1) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < self.cols && is_word(end + 1) {
+            end += 1;
+        }
+        self.selection = Some(Selection { anchor: (start, row), head: (end, row) });
+    }
+
+    /// Select the whole logical line through screen `row` (triple-click):
+    /// the row plus any soft-wrapped continuation rows above/below it, per
+    /// the per-row wrap bits the resize reflow also uses. Only the live
+    /// screen's wrap bits are consulted, so while scrolled into history the
+    /// selection is the single visual row.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn select_line_at(&mut self, row: usize) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let row = row.min(self.rows - 1);
+        let (mut start, mut end) = (row, row);
+        if self.view_offset == 0 {
+            while start > 0 && self.wrapped[start - 1] {
+                start -= 1;
+            }
+            while end + 1 < self.rows && self.wrapped[end] {
+                end += 1;
+            }
+        }
+        self.selection =
+            Some(Selection { anchor: (0, start), head: (self.cols - 1, end) });
     }
 
     /// The selected text, or `None` when nothing is selected. Lines join with
@@ -2251,6 +2341,8 @@ impl Grid {
     /// (via [`Grid::set_default_colors`]) *before* calling this, so the blank
     /// fill below lands in the configured theme's colors.
     pub(crate) fn reset(&mut self) {
+        self.bell = false;
+        self.progress = None;
         self.primary = None; // leave the alternate screen if active
         self.cells = vec![self.erase_cell(); self.cols * self.rows];
         #[cfg(any(test, feature = "gui"))]
@@ -2402,6 +2494,35 @@ impl Grid {
     /// the output start at the current cursor line, closed into a
     /// [`CommandBlock`] at the matching `D`. Independent of the `l13`
     /// feature's own (separately anchored) output capture.
+    /// Apply a ConEmu OSC `9;4` progress report. State `0` (or anything
+    /// unrecognized) clears; percent clamps to 100. Indeterminate (`3`)
+    /// carries no meaningful percent and stores 0.
+    pub(crate) fn set_progress(&mut self, state: u8, percent: u8) {
+        self.progress = match state {
+            1 | 2 | 4 => Some((state, percent.min(100))),
+            3 => Some((3, 0)),
+            _ => None,
+        };
+    }
+
+    /// A command's output began (OSC 133/633 `C`): start the runtime clock
+    /// for the windowed front-end's "command finished" notification.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn command_timer_begin(&mut self) {
+        self.command_began = Some(std::time::Instant::now());
+    }
+
+    /// A command finished (OSC 133/633 `D`): record its exit code and
+    /// runtime for the windowed front-end to drain (no-op without a matching
+    /// `C`). Bounded so an undrained grid never grows it.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn command_timer_end(&mut self, exit: Option<i32>) {
+        let Some(began) = self.command_began.take() else { return };
+        if self.finished_commands.len() < 8 {
+            self.finished_commands.push((exit, began.elapsed()));
+        }
+    }
+
     #[cfg(any(test, feature = "gui"))]
     pub(crate) fn fold_output_begin(&mut self) {
         self.fold_pending_start = Some(self.scrollback.len() + self.cursor.1);

@@ -28,12 +28,12 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 
 | ID | Gap | Priority | Notable adopters | Size |
 |---|---|---|---|---|
-| G01 | OSC 9;4 progress reporting | P1 | Ghostty, Windows Terminal, kitty, Konsole, mintty | S–M |
+| ✅ G01 | OSC 9;4 progress reporting | P1 | Ghostty, Windows Terminal, kitty, Konsole, mintty | S–M |
 | G02 | Light/dark scheme detection + mode 2031 notify | P1 | kitty, Ghostty, Contour, foot, iTerm2 | S–M |
 | ✅ G03 | DECRQSS settings report (`DCS $ q`) | P1 | xterm, kitty, foot, WezTerm | S |
 | ✅ G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
 | G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
-| G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
+| ✅ G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
 | G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
 | G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
 | G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
@@ -44,10 +44,10 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G14 | SGR-pixel mouse (mode 1016) in GUI | P2 | xterm, kitty, foot, WezTerm | S |
 | G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
 | G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
-| G17 | Double/triple-click word/line selection | P1 | universal | S–M |
+| ✅ G17 | Double/triple-click word/line selection | P1 | universal | S–M |
 | G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
 | G19 | Scrollbar | P2 | Ghostty 1.3, kitty 0.43, Windows Terminal, Konsole | M |
-| G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
+| ✅ G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
 | G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
 | G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
 | ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
@@ -73,6 +73,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 ### A.1 Protocol & VT fidelity
 
 #### G01 — OSC 9;4 progress reporting (ConEmu extension)
+**Status: done.** `Grid::set_progress` (`src/core/grid.rs`), parsed from ConEmu `OSC 9;4;st;pr` (`src/core/osc.rs`) — states normal/error/indeterminate/warning, percent clamped, state 0/unknown clears, cleared on RIS — and relayed to the host for TUI mode. The window's tab strip renders it as a ` 42%` / ` !42%` (error/paused) / ` …` (indeterminate) suffix on the tab label (`chrome_row`).
 **Current.** Explicitly excluded: `src/core/osc.rs` treats OSC 9 as an iTerm2
 free-text notification and skips ConEmu's numeric `9;N;…` subcommands
 (documented in `docs/FEATURES.md` #9).
@@ -135,6 +136,7 @@ already-landed rectangular ops (C21).
 **Size** M · **Deps** none, but touches the scroll paths broadly.
 
 #### G06 — Bell: audible / visual bell, urgency, tab indicator
+**Status: done (visual/urgency/badge; no audio).** BEL sets `Grid::bell` and relays the byte to the host (TUI mode rings the host's bell with the host's own policy). The window drains it (`App::service_alerts`): when unfocused it requests OS window attention (`request_user_attention`), and a background/unfocused tab gets a red `•` badge in the tab strip, cleared once the tab is active in a focused window. `bell = false` disables.
 **Current.** BEL (0x07) is consumed as a C0 control with no observable
 effect anywhere; no `bell` config key exists.
 **Target.** Config-selectable: system beep, visual flash, window urgency
@@ -269,6 +271,7 @@ Windows Terminal, iTerm2, and Ghostty all auto-detect URLs.
 **Size** M · **Deps** `gui`; reuses the OSC 8 open path + scheme allowlist.
 
 #### G17 — Double-click word / triple-click line selection
+**Status: done.** Consecutive-click detection in `on_left_press` (`src/gui/window.rs`, `DOUBLE_CLICK_MS` window, same cell): two clicks call `Grid::select_word_at` — URL/path-friendly word characters (quotes/brackets/whitespace/`;`/`,`/`|` are the separators), a separator cell selects itself — and three call `Grid::select_line_at`, which follows the per-row soft-wrap bits to select the whole logical line; a fourth click cycles back to drag-selection.
 **Current.** Double-click is only implemented on the drag strip (toggle
 maximize); on the grid there is no multi-click selection — `src/gui/window.rs`
 has single-click-drag selection only.
@@ -300,6 +303,7 @@ Also the natural place to render search-match and prompt-mark positions.
 **Size** M · **Deps** `gui`.
 
 #### G20 — Command-completion notifications
+**Status: done.** OSC 133/633 `C`/`D` now drive `Grid::command_timer_begin/end` (runtime + exit code, bounded queue); `App::service_alerts` notifies via the existing OS-notification path when a command ran ≥ `command_notify_secs` (config, default 10, `0` disables) and finished while the window was unfocused or the tab in the background, and badges the tab. Alerts for the watched (active + focused) tab are dropped.
 **Current.** OSC 133 `D` (command end + exit code) is fully tracked
 (`Grid::last_exit`, fold blocks, L13 push), and OS notification delivery
 exists (#9) — but the two are not connected: a long build finishing in an

@@ -54,6 +54,15 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Whether BEL raises an alert (windowed front-end): a window-attention
+    /// request when the window is unfocused, plus a badge on the ringing tab.
+    /// Default on; `bell = false` silences both. (There is no audible bell —
+    /// the TUI relays BEL to the host, which applies its own policy.)
+    pub bell: Option<bool>,
+    /// Minimum runtime, in seconds, before a command finishing (OSC 133/633
+    /// `D`) in an unfocused window / background tab raises a desktop
+    /// notification. `0` disables the notification entirely. Default 10.
+    pub command_notify_secs: Option<u64>,
     /// Scrollback line cap (overrides [`crate::core::SCROLLBACK_MAX`]).
     pub scrollback: Option<usize>,
     /// Initial window size in cells (windowed front-end only; the TUI always
@@ -517,6 +526,10 @@ fn parse_value(s: &str) -> Result<Value, String> {
 fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(), String> {
     match (section, key) {
         ("", "shell") => cfg.shell = Some(expect_str(key, value)?),
+        ("", "bell") => cfg.bell = Some(expect_bool(key, value)?),
+        ("", "command_notify_secs") => {
+            cfg.command_notify_secs = Some(expect_int(key, value)?.clamp(0, 86_400) as u64)
+        }
         ("", "scrollback") => {
             cfg.scrollback = Some(expect_int(key, value)?.clamp(0, 10_000_000) as usize)
         }
@@ -856,6 +869,22 @@ color15 = "ffffff"
         let (cfg, warns) = parse("[window]\nfont_size = 14\n");
         assert!(warns.is_empty());
         assert_eq!(cfg.font_size, Some(14.0));
+    }
+
+    #[test]
+    fn bell_and_command_notify_keys_parse() {
+        let (cfg, warns) = parse("bell = false\ncommand_notify_secs = 30\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.bell, Some(false));
+        assert_eq!(cfg.command_notify_secs, Some(30));
+        // Unset by default (the front-end defaults: bell on, 10s threshold).
+        let (cfg2, _) = parse("");
+        assert_eq!(cfg2.bell, None);
+        assert_eq!(cfg2.command_notify_secs, None);
+        // A malformed value warns and is skipped, never fatal.
+        let (cfg3, warns3) = parse("command_notify_secs = \"soon\"\n");
+        assert_eq!(cfg3.command_notify_secs, None);
+        assert_eq!(warns3.len(), 1);
     }
 
     #[test]
