@@ -5159,3 +5159,41 @@ fn folding_clamps_the_view_offset_to_the_shorter_history() {
     assert!(g.view_offset <= g.display_history_len());
     assert!(g.view_offset < deep, "folding shrinks the scroll range");
 }
+
+#[test]
+fn selected_html_carries_colors_attrs_and_escapes() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    // red bold "hi", default " ", green "<&>"
+    p.advance(&mut g, b"\x1b[31;1mhi\x1b[0m \x1b[32m<&>\x1b[0m");
+    g.selection = Some(Selection { anchor: (0, 0), head: (5, 0) });
+    let html = g.selected_html().unwrap();
+    assert!(html.starts_with("<pre style=\""), "{html}");
+    assert!(html.ends_with("</pre>"), "{html}");
+    // Two styled runs plus the plain gap; entities escaped.
+    assert!(html.contains("font-weight:bold"), "{html}");
+    assert!(html.contains(">hi</span>"), "{html}");
+    assert!(html.contains("&lt;&amp;&gt;"), "{html}");
+    // The default-colored space between runs isn't styled as bold.
+    let bold_at = html.find("font-weight:bold").unwrap();
+    let lt_at = html.find("&lt;").unwrap();
+    assert!(bold_at < lt_at, "runs in order: {html}");
+    // Palette red/green resolve to distinct span colors.
+    let spans = html.matches("<span").count();
+    assert!(spans >= 3, "one span per style run: {html}");
+}
+
+#[test]
+fn selected_html_multiline_trims_and_none_without_selection() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"abc\r\ndef");
+    assert!(g.selected_html().is_none());
+    g.selection = Some(Selection { anchor: (0, 0), head: (9, 1) });
+    let html = g.selected_html().unwrap();
+    // Trailing blanks trimmed, newline between rows preserved (spans close
+    // at end of line, so the rows are separate runs).
+    assert!(html.contains(">abc</span>\n"), "{html}");
+    assert!(html.contains(">def</span>"), "{html}");
+    assert!(!html.contains("abc "), "trailing blanks trimmed: {html}");
+}

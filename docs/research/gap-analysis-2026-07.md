@@ -56,7 +56,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
 | ✅ G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
 | ✅ G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
-| G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
+| ✅ G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
 | ✅ G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
 | ✅ G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
 | ✅ G32 | Sessions / startup layouts / workspaces | P2 | kitty 0.43, WezTerm, Windows Terminal | M–L |
@@ -419,6 +419,15 @@ has all three; splits without resize are a demo, not a tool.
 **Size** S–M · **Deps** `gui`, panes (done).
 
 #### G29 — Rich-text (HTML/RTF) clipboard copy
+**Status: done (HTML; RTF not needed — macOS pasteboard converts HTML).**
+`Grid::selected_html()` serializes the selection to a `<pre>` of per-run
+`<span>`s carrying resolved colors (reverse video pre-swapped), bold,
+italic, underline/strike, and dim, with entities escaped and trailing
+blanks trimmed like the plain flavor. Ctrl+Shift+C now calls arboard's
+`set_html(html, Some(text))` so both flavors land on the clipboard —
+rich-paste targets get colors, plain editors read the text. `copy_html =
+false` turns it off; copy-on-select/primary stays plain text by
+convention.
 **Current.** Copy is plain text (`arboard` with image support explicitly
 compiled out).
 **Target.** Optional "copy with formatting": serialize the selection's
