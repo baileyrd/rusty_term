@@ -511,6 +511,14 @@ pub struct Grid {
     /// absolute cursor positioning (`CUP`/`HVP`/`VPA`) is relative to the scroll
     /// region top and the cursor is confined to the region.
     pub(crate) origin_mode: bool,
+    /// DECLRMM (DEC private mode 69): whether left/right margins are in
+    /// effect (and whether `CSI Pl;Pr s` means DECSLRM instead of SCP).
+    pub(crate) lr_margin_mode: bool,
+    /// DECSLRM left margin, 0-based inclusive. Only meaningful while
+    /// [`Grid::lr_margin_mode`] is set.
+    pub(crate) left_margin: usize,
+    /// DECSLRM right margin, 0-based inclusive.
+    pub(crate) right_margin: usize,
     /// Whether insert mode (IRM, ANSI mode `4`, default off) is enabled. When
     /// on, a printed glyph shifts the rest of the row right instead of
     /// overwriting.
@@ -1123,6 +1131,9 @@ impl Grid {
             cursor_icon: None,
             autowrap: true,
             origin_mode: false,
+            lr_margin_mode: false,
+            left_margin: 0,
+            right_margin: cols.saturating_sub(1),
             insert_mode: false,
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
@@ -1192,7 +1203,12 @@ impl Grid {
         } else {
             row.min(self.rows.saturating_sub(1))
         };
-        self.cursor = (col.min(self.cols.saturating_sub(1)), y);
+        let x = if self.origin_mode && self.side_margins_active() {
+            (self.left_margin + col).min(self.right_margin)
+        } else {
+            col.min(self.cols.saturating_sub(1))
+        };
+        self.cursor = (x, y);
     }
 
     /// Move the cursor up `n` rows (`CUU`). The scroll region's top margin is a
@@ -1222,7 +1238,8 @@ impl Grid {
     /// The cursor home position: the top-left of the screen, or of the scroll
     /// region when origin mode is on.
     fn home_position(&self) -> (usize, usize) {
-        (0, if self.origin_mode { self.scroll_top } else { 0 })
+        let x = if self.origin_mode && self.side_margins_active() { self.left_margin } else { 0 };
+        (x, if self.origin_mode { self.scroll_top } else { 0 })
     }
 
     /// Enable or disable origin mode (DECOM), moving the cursor to the (now
@@ -1317,7 +1334,73 @@ impl Grid {
     }
 
     /// Move the cursor to column 0 of the current row.
+    /// Whether DECSLRM margins narrower than the full width are in effect —
+    /// the guard on every margin-aware branch, so the common case pays one
+    /// boolean test.
+    pub(crate) fn side_margins_active(&self) -> bool {
+        self.lr_margin_mode && (self.left_margin > 0 || self.right_margin + 1 < self.cols)
+    }
+
+    /// Set the DECSLRM left/right margins (0-based, inclusive). An invalid
+    /// pair resets to the full width; the cursor homes, per VT420.
+    pub(crate) fn set_lr_margins(&mut self, left: usize, right: usize) {
+        let right = right.min(self.cols.saturating_sub(1));
+        if left < right {
+            self.left_margin = left;
+            self.right_margin = right;
+        } else {
+            self.left_margin = 0;
+            self.right_margin = self.cols.saturating_sub(1);
+        }
+        self.cursor = self.home_position();
+    }
+
+    /// Scroll the margin band (scroll region rows × left/right margin
+    /// columns) up one row. Partial-width scrolls never form scrollback.
+    fn scroll_band_up(&mut self) {
+        let (top, bottom) = (self.scroll_top, self.scroll_bottom.min(self.rows - 1));
+        let (l, r) = (self.left_margin, self.right_margin.min(self.cols - 1));
+        let blank = self.erase_cell();
+        for y in top..bottom {
+            for x in l..=r {
+                self.cells[y * self.cols + x] = self.cells[(y + 1) * self.cols + x];
+            }
+        }
+        for x in l..=r {
+            self.cells[bottom * self.cols + x] = blank;
+        }
+        for d in &mut self.dirty[top..=bottom] {
+            *d = true;
+        }
+    }
+
+    /// Scroll the margin band down one row (the [`Grid::scroll_band_up`]
+    /// mirror, for RI / SD).
+    fn scroll_band_down(&mut self) {
+        let (top, bottom) = (self.scroll_top, self.scroll_bottom.min(self.rows - 1));
+        let (l, r) = (self.left_margin, self.right_margin.min(self.cols - 1));
+        let blank = self.erase_cell();
+        for y in (top..bottom).rev() {
+            for x in l..=r {
+                self.cells[(y + 1) * self.cols + x] = self.cells[y * self.cols + x];
+            }
+        }
+        for x in l..=r {
+            self.cells[top * self.cols + x] = blank;
+        }
+        for d in &mut self.dirty[top..=bottom] {
+            *d = true;
+        }
+    }
+
     pub fn carriage_return(&mut self) {
+        // With DECSLRM margins, CR returns to the left margin when the
+        // cursor is at or right of it (a cursor left of the margin still
+        // goes to column 0, per VT420/xterm).
+        if self.side_margins_active() && self.cursor.0 >= self.left_margin {
+            self.cursor.0 = self.left_margin;
+            return;
+        }
         self.cursor.0 = 0;
     }
 
@@ -1325,7 +1408,11 @@ impl Grid {
     /// scrolls the region up instead of moving the cursor past it.
     pub fn newline(&mut self) {
         if self.cursor.1 == self.scroll_bottom {
-            self.scroll_up();
+            if self.side_margins_active() {
+                self.scroll_band_up();
+            } else {
+                self.scroll_up();
+            }
         } else if self.cursor.1 + 1 < self.rows {
             self.cursor.1 += 1;
         }
@@ -1593,7 +1680,14 @@ impl Grid {
             }
         }
         let w = char_width(ch); // >= 1 here (zero-width non-continuations dropped above)
-        if self.cursor.0 + w > self.cols {
+        // With DECSLRM margins, a cursor inside them wraps (or pins) at the
+        // right margin instead of the screen edge.
+        let limit = if self.side_margins_active() && self.cursor.0 >= self.left_margin {
+            (self.right_margin + 1).min(self.cols)
+        } else {
+            self.cols
+        };
+        if self.cursor.0 + w > limit {
             if self.autowrap {
                 // Mark this row as soft-wrapped before leaving it, so the reflow
                 // and scrollback know it and its successor are one logical line.
@@ -1603,8 +1697,9 @@ impl Grid {
                 self.carriage_return();
                 self.newline();
             } else {
-                // Autowrap off: keep the glyph in the last cell(s) of this row.
-                self.cursor.0 = self.cols.saturating_sub(w);
+                // Autowrap off: keep the glyph in the last cell(s) of the row
+                // (or of the margin band).
+                self.cursor.0 = limit.saturating_sub(w);
             }
         }
         // Insert mode (IRM): make room by shifting the rest of the row right.
@@ -1851,6 +1946,55 @@ impl Grid {
     }
 
     /// Blank columns `[from, to)` of row `y`, marking it dirty.
+    /// DECSEL: erase the line like EL `mode` (0 to end, 1 to start, 2 all),
+    /// skipping cells protected by DECSCA.
+    pub(crate) fn selective_erase_line(&mut self, mode: usize) {
+        let (from, to) = match mode {
+            1 => (0, self.cursor.0.min(self.cols.saturating_sub(1))),
+            2 => (0, self.cols.saturating_sub(1)),
+            _ => (self.cursor.0.min(self.cols.saturating_sub(1)), self.cols.saturating_sub(1)),
+        };
+        self.selective_clear(self.cursor.1, self.cursor.1, Some((from, to)));
+    }
+
+    /// DECSED: erase the display like ED `mode`, skipping DECSCA-protected
+    /// cells. Unlike ED 2, protected content survives, so this never takes
+    /// the clear-whole-rows fast path.
+    pub(crate) fn selective_erase_display(&mut self, mode: usize) {
+        let last = self.rows.saturating_sub(1);
+        match mode {
+            1 => {
+                if self.cursor.1 > 0 {
+                    self.selective_clear(0, self.cursor.1 - 1, None);
+                }
+                self.selective_erase_line(1);
+            }
+            2 => self.selective_clear(0, last, None),
+            _ => {
+                self.selective_erase_line(0);
+                if self.cursor.1 < last {
+                    self.selective_clear(self.cursor.1 + 1, last, None);
+                }
+            }
+        }
+    }
+
+    /// Erase every unprotected cell in rows `y0..=y1` (columns limited to
+    /// `cols` when given, inclusive).
+    fn selective_clear(&mut self, y0: usize, y1: usize, cols: Option<(usize, usize)>) {
+        let erase = self.erase_cell();
+        let (c0, c1) = cols.unwrap_or((0, self.cols.saturating_sub(1)));
+        for y in y0..=y1.min(self.rows.saturating_sub(1)) {
+            for x in c0..=c1.min(self.cols.saturating_sub(1)) {
+                let cell = &mut self.cells[y * self.cols + x];
+                if cell.flags & super::cell::ATTR_PROTECTED == 0 {
+                    *cell = erase;
+                }
+            }
+            self.dirty[y] = true;
+        }
+    }
+
     pub(crate) fn clear_row_range(&mut self, y: usize, from: usize, to: usize) {
         if y >= self.rows {
             return;
@@ -2089,6 +2233,10 @@ impl Grid {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
         }
+        // DECSLRM margins are width-relative; a real resize resets them (the
+        // simple, xterm-compatible choice — apps re-establish them).
+        self.left_margin = 0;
+        self.right_margin = cols.saturating_sub(1);
         #[cfg(any(test, feature = "gui"))]
         self.images.clear(); // serials/reflow change; drop placed images
         let (old_cols, old_rows) = (self.cols, self.rows);
@@ -2319,6 +2467,30 @@ impl Grid {
         if cy < self.scroll_top || cy > self.scroll_bottom {
             return;
         }
+        if self.side_margins_active() {
+            // VT420: IL requires the cursor within the side margins, and
+            // shifts only the margin band.
+            if self.cursor.0 < self.left_margin || self.cursor.0 > self.right_margin {
+                return;
+            }
+            let n = n.min(self.scroll_bottom + 1 - cy);
+            let (l, r) = (self.left_margin, self.right_margin.min(self.cols - 1));
+            let blank = self.erase_cell();
+            for y in ((cy + n)..=self.scroll_bottom).rev() {
+                for x in l..=r {
+                    self.cells[y * self.cols + x] = self.cells[(y - n) * self.cols + x];
+                }
+            }
+            for y in cy..(cy + n).min(self.scroll_bottom + 1) {
+                for x in l..=r {
+                    self.cells[y * self.cols + x] = blank;
+                }
+            }
+            for d in &mut self.dirty[cy..=self.scroll_bottom] {
+                *d = true;
+            }
+            return;
+        }
         let n = n.min(self.scroll_bottom + 1 - cy);
         let cols = self.cols;
         // Shift rows [cy, scroll_bottom - n] down by n. copy_within is a memmove,
@@ -2347,6 +2519,28 @@ impl Grid {
     pub(crate) fn delete_lines(&mut self, n: usize) {
         let cy = self.cursor.1;
         if cy < self.scroll_top || cy > self.scroll_bottom {
+            return;
+        }
+        if self.side_margins_active() {
+            if self.cursor.0 < self.left_margin || self.cursor.0 > self.right_margin {
+                return;
+            }
+            let n = n.min(self.scroll_bottom + 1 - cy);
+            let (l, r) = (self.left_margin, self.right_margin.min(self.cols - 1));
+            let blank = self.erase_cell();
+            for y in cy..=(self.scroll_bottom - n) {
+                for x in l..=r {
+                    self.cells[y * self.cols + x] = self.cells[(y + n) * self.cols + x];
+                }
+            }
+            for y in (self.scroll_bottom + 1 - n)..=self.scroll_bottom {
+                for x in l..=r {
+                    self.cells[y * self.cols + x] = blank;
+                }
+            }
+            for d in &mut self.dirty[cy..=self.scroll_bottom] {
+                *d = true;
+            }
             return;
         }
         let n = n.min(self.scroll_bottom + 1 - cy);
@@ -2381,6 +2575,13 @@ impl Grid {
     /// clears the region, and the cap bounds the per-row loop against a hostile
     /// count (e.g. `CSI 9999999999 S`) that would otherwise run for minutes.
     pub(crate) fn scroll_up_n(&mut self, n: usize) {
+        if self.side_margins_active() {
+            let h = self.scroll_bottom.saturating_sub(self.scroll_top) + 1;
+            for _ in 0..n.min(h) {
+                self.scroll_band_up();
+            }
+            return;
+        }
         let n = n.min(self.scroll_bottom + 1 - self.scroll_top);
         for _ in 0..n {
             self.scroll_up();
@@ -2391,6 +2592,13 @@ impl Grid {
     /// region's rows down and blank the `n` freed rows at the top. Displaced
     /// bottom rows are lost (scrollback is never un-scrolled).
     pub(crate) fn scroll_down_n(&mut self, n: usize) {
+        if self.side_margins_active() {
+            let h = self.scroll_bottom.saturating_sub(self.scroll_top) + 1;
+            for _ in 0..n.min(h) {
+                self.scroll_band_down();
+            }
+            return;
+        }
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         if bottom <= top || bottom >= self.rows {
             return;
@@ -2420,7 +2628,11 @@ impl Grid {
     /// top (`RI`, reverse index). The mirror of a line feed at the region bottom.
     pub(crate) fn reverse_index(&mut self) {
         if self.cursor.1 == self.scroll_top {
-            self.scroll_down_n(1);
+            if self.side_margins_active() {
+                self.scroll_band_down();
+            } else {
+                self.scroll_down_n(1);
+            }
         } else if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
         }
@@ -2563,6 +2775,9 @@ impl Grid {
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
+        self.lr_margin_mode = false;
+        self.left_margin = 0;
+        self.right_margin = self.cols.saturating_sub(1);
         self.insert_mode = false;
         self.cursor_shape = self.default_cursor_shape;
         self.cursor_blink = self.default_cursor_blink;
@@ -2593,6 +2808,9 @@ impl Grid {
         self.selection = None;
         self.autowrap = true;
         self.origin_mode = false;
+        self.lr_margin_mode = false;
+        self.left_margin = 0;
+        self.right_margin = self.cols.saturating_sub(1);
         self.insert_mode = false;
         self.cursor_shape = self.default_cursor_shape;
         self.cursor_blink = self.default_cursor_blink;

@@ -40,6 +40,11 @@ pub const ATTR_STRIKE: u16 = 1 << 8;
 /// SGR 58 — a custom underline color is set (in [`Cell::underline_color`] /
 /// [`Pen::underline_color`]) rather than following the foreground.
 pub const ATTR_UNDERLINE_COLOR: u16 = 1 << 12;
+/// DECSCA (`CSI 1 " q`) — the cell is protected from selective erase
+/// (DECSED/DECSEL). Deliberately *not* an SGR rendition: SGR 0 must not
+/// clear it, so the parser tracks it separately from the pen's SGR state
+/// and stamps it onto cells at write time.
+pub const ATTR_PROTECTED: u16 = 1 << 13;
 
 /// Bit offset of the 3-bit underline-style sub-field (SGR `4:0`-`4:5`) packed
 /// into the same `u16` as the `ATTR_*` bits. Only meaningful when

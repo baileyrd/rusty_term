@@ -9,7 +9,7 @@
 
 use super::cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
-    ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Pen, UnderlineStyle,
+    ATTR_PROTECTED, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Pen, UnderlineStyle,
 };
 use super::charset::Charset;
 use super::color::Palette;
@@ -89,6 +89,10 @@ pub struct AnsiParser {
     /// `advance` and writes them back to the PTY master, where the child reads
     /// them as terminal input.
     responses: Vec<u8>,
+    /// DECSCA (`CSI 1 " q`): newly written cells are protected from
+    /// selective erase. Separate from the pen's SGR state — SGR 0 must not
+    /// clear it. Reset by RIS/DECSTR.
+    protected: bool,
     /// Raw bytes of the OSC string currently being collected (between `ESC ]`
     /// and its `BEL`/`ST` terminator). Decoded as UTF-8 at dispatch. Capped at
     /// [`OSC_MAX`] so a pathological unterminated OSC can't grow without bound.
@@ -167,6 +171,7 @@ impl AnsiParser {
             utf8_acc: 0,
             utf8_remaining: 0,
             responses: Vec::new(),
+            protected: false,
             osc_buffer: Vec::new(),
             dcs_buffer: Vec::new(),
             apc_buffer: Vec::new(),
@@ -215,7 +220,7 @@ impl AnsiParser {
                         self.utf8_remaining -= 1;
                         if self.utf8_remaining == 0 {
                             let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
-                            g.put_char(ch, self.pen);
+                            g.put_char(ch, self.write_pen());
                             self.last_char = Some(ch);
                             self.state = ParserState::Ground;
                         }
@@ -273,6 +278,7 @@ impl AnsiParser {
                     b'c' => {
                         self.palette.reset();
                         self.reset_sgr();
+                        self.protected = false;
                         // Sync the themed defaults *before* the grid refills
                         // its cells, so the blank screen lands in theme colors.
                         g.set_default_colors(self.palette.fg, self.palette.bg, self.palette.cursor);
@@ -556,6 +562,7 @@ impl AnsiParser {
     fn answer_decrqss(&mut self, g: &Grid) {
         let payload = match &self.dcs_buffer[2..] {
             b"m" => Some(self.pen_sgr_params()),
+            b"\"q" => Some(format!("{}\"q", if self.protected { 1 } else { 0 })),
             b"r" => Some(format!("{};{}r", g.scroll_top + 1, g.scroll_bottom + 1)),
             b" q" => {
                 let ps = match (g.cursor_shape, g.cursor_blink) {
@@ -654,6 +661,16 @@ impl AnsiParser {
         );
     }
 
+    /// The pen cells are actually written with: the SGR pen plus the
+    /// DECSCA protection bit when set.
+    fn write_pen(&self) -> Pen {
+        let mut p = self.pen;
+        if self.protected {
+            p.attrs |= ATTR_PROTECTED;
+        }
+        p
+    }
+
     /// Handle a single byte while in the ground state: C0 controls, printable
     /// ASCII, and the lead byte of a UTF-8 code point (which transitions into
     /// [`ParserState::Utf8`]).
@@ -696,7 +713,7 @@ impl AnsiParser {
             0x0f => self.gl = 0,
             0x20..=0x7e => {
                 let ch = self.charsets[self.gl].map(b);
-                g.put_char(ch, self.pen);
+                g.put_char(ch, self.write_pen());
                 self.last_char = Some(ch);
             }
             // UTF-8 lead bytes: stash the payload bits and how many continuation
@@ -818,6 +835,17 @@ impl AnsiParser {
             self.answer_xtsmgraphics();
             return;
         }
+        // DECSED / DECSEL (`CSI ? Ps J` / `CSI ? Ps K`) — selective erase:
+        // like ED/EL, but cells written under DECSCA protection survive.
+        if self.csi_marker == b'?' && (cmd == b'J' || cmd == b'K') {
+            let mode = self.parse_params().first().copied().flatten().unwrap_or(0);
+            if cmd == b'J' {
+                g.selective_erase_display(mode);
+            } else {
+                g.selective_erase_line(mode);
+            }
+            return;
+        }
         // Only DEC-private (`?`) set/reset (`h`/`l`) sequences are actionable
         // here; other private forms are consumed without effect.
         if self.csi_marker != b'?' || (cmd != b'h' && cmd != b'l') {
@@ -887,6 +915,14 @@ impl AnsiParser {
             } else if param == 6 {
                 // DECOM — origin mode; toggling it homes the cursor.
                 g.set_origin_mode(set);
+            } else if param == 69 {
+                // DECLRMM — left/right margin mode. Disabling resets the
+                // margins to the full width (xterm behavior).
+                g.lr_margin_mode = set;
+                if !set {
+                    g.left_margin = 0;
+                    g.right_margin = g.cols.saturating_sub(1);
+                }
             } else if param == 2026 {
                 // Synchronized output: suppress render-loop wakeups until the
                 // matching reset (or a timeout) so a multi-write frame update
@@ -929,6 +965,7 @@ impl AnsiParser {
             1 => g.app_cursor_keys,
             6 => g.origin_mode,
             66 => g.app_keypad,
+            69 => g.lr_margin_mode,
             1004 => g.focus_reporting,
             2031 => g.report_color_scheme,
             7 => g.autowrap,
@@ -1055,7 +1092,7 @@ impl AnsiParser {
                 if let Some(ch) = self.last_char {
                     let cap = g.rows.saturating_add(g.scrollback_max).saturating_mul(g.cols);
                     for _ in 0..count.min(cap) {
-                        g.put_char(ch, self.pen);
+                        g.put_char(ch, self.write_pen());
                     }
                 }
             }
@@ -1080,7 +1117,17 @@ impl AnsiParser {
                     g.scroll_down_n(count);
                 }
             }
-            b's' => g.save_cursor(),    // SCP
+            b's' => {
+                // While DECLRMM (?69) is set, `CSI Pl;Pr s` is DECSLRM;
+                // otherwise the legacy SCP save-cursor.
+                if g.lr_margin_mode {
+                    let left = p(0, 1).saturating_sub(1);
+                    let right = p(1, g.cols).saturating_sub(1);
+                    g.set_lr_margins(left, right);
+                } else {
+                    g.save_cursor(); // SCP
+                }
+            }
             b'u' => g.restore_cursor(), // RCP
             b'r' => {
                 // DECSTBM — set top/bottom scrolling margins (1-based).
@@ -1177,11 +1224,18 @@ impl AnsiParser {
                 // DECSTR — soft terminal reset (`CSI ! p`).
                 self.palette.reset();
                 self.reset_sgr();
+                self.protected = false;
                 g.set_default_colors(self.palette.fg, self.palette.bg, self.palette.cursor);
                 g.soft_reset();
                 self.last_char = None;
                 self.charsets = [Charset::Ascii; 4];
                 self.gl = 0;
+            }
+            b'q' if self.csi_intermediate == b'"' => {
+                // DECSCA — select character protection attribute
+                // (`CSI Ps " q`): 1 protects newly written cells against
+                // selective erase; 0/2 (and default) unprotect.
+                self.protected = p(0, 0) == 1;
             }
             b'q' if self.csi_intermediate == b' ' => {
                 // DECSCUSR — set cursor style (`CSI Ps SP q`). Odd params blink,

@@ -32,17 +32,17 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G02 | Light/dark scheme detection + mode 2031 notify | P1 | kitty, Ghostty, Contour, foot, iTerm2 | S–M |
 | ✅ G03 | DECRQSS settings report (`DCS $ q`) | P1 | xterm, kitty, foot, WezTerm | S |
 | ✅ G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
-| G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
+| ✅ G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
 | ✅ G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
 | G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
 | ✅ G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
 | ✅ G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
 | G10 | win32-input-mode (ConPTY key fidelity) | P2 | Windows Terminal, WezTerm | M |
-| G11 | Kitty keyboard flags 2/4/16 in GUI | P2 | kitty, Ghostty, WezTerm, foot | M |
+| ✅ G11 | Kitty keyboard flags 2/4/16 in GUI | P2 | kitty, Ghostty, WezTerm, foot | M |
 | ✅ G12 | Keypad application mode (DECKPAM/DECKPNM) | P2 | universal (legacy but probed) | S |
 | ✅ G13 | Native focus reporting (mode 1004) in GUI | P1 | universal | S |
 | ✅ G14 | SGR-pixel mouse (mode 1016) in GUI | P2 | xterm, kitty, foot, WezTerm | S |
-| G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
+| ✅ G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
 | ✅ G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
 | ✅ G17 | Double/triple-click word/line selection | P1 | universal | S–M |
 | ✅ G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
@@ -126,6 +126,7 @@ defaults or skip Sixel. Complements the already-shipped XTWINOPS work (C07).
 **Size** S · **Deps** none.
 
 #### G05 — DECSLRM / DECLRMM — left/right margins (DEC mode 69)
+**Status: done.** `Grid::{lr_margin_mode, left_margin, right_margin}` with DECLRMM (`?69`, DECRQM-answerable; reset restores full width) gating `CSI Pl;Pr s` as DECSLRM vs legacy SCP. Margin-aware behaviors — all behind a single `side_margins_active()` guard so the common path pays one boolean: CR to the left margin, autowrap/pin at the right margin, LF/IND/RI and SU/SD scrolling only the margin band (never forming scrollback), IL/DL band-limited and requiring the cursor within the margins, DECOM addressing columns relative to the left margin, and margins reset on resize/RIS/DECSTR. Verified end-to-end on a real PTY (mode 69 DECRQM).
 **Current.** Only top/bottom margins (DECSTBM) exist; no vertical-split
 margin state in `Grid`.
 **Target.** Track mode 69 (DECLRMM), `CSI Pl;Pr s` (DECSLRM), and make
@@ -202,6 +203,7 @@ edge cases.
 **Size** M · **Deps** Windows + `gui`.
 
 #### G11 — Kitty keyboard protocol: flags 2/4/16 in the native GUI
+**Status: done (flags 2/4/16; flag 8 report-all intentionally out).** `encode_full` (`src/gui/input.rs`) threads a key's phase (press/repeat/release from winit's `state`+`repeat`), the flag-4 alternate (the shifted key while Shift is held), and flag-16 associated text (control chars filtered, never on release) through the `CSI u` and legacy-functional encodings — event types ride the mods sub-parameter (`CSI 1;mods:event A`), releases of plain text keys stay silent per the spec's no-flag-8 fallback, and the window now forwards key releases to a flag-2 subscriber (UI layers still only ever see presses).
 **Current.** C03 landed flag 1 (disambiguate) only; `src/gui/input.rs`
 doesn't encode event types (flag 2), alternate keys (4), or associated text
 (16) — documented as partial in the earlier assessment, promoted here to
@@ -249,6 +251,7 @@ kittens, notcurses demos) use it; trivial delta on the existing encoder.
 **Size** S · **Deps** `gui`.
 
 #### G15 — Protected areas (DECSCA / DECSED / DECSEL)
+**Status: done.** `ATTR_PROTECTED` (cell bit 13, deliberately not an SGR rendition — SGR 0 must not clear it, so the parser tracks DECSCA separately and stamps at write time); `CSI Ps " q` sets/clears it, `CSI ? Ps J`/`K` (DECSED/DECSEL) erase selectively around protected cells, DECRQSS answers `"q`, and RIS/DECSTR reset the protection state. Verified end-to-end on a real PTY (protected text survives `?2K` while unprotected text is erased).
 **Current.** Not implemented; ED/EL erase everything indiscriminately.
 **Target.** A per-cell protection bit set by `CSI Ps " q`, honored by the
 selective variants `CSI ? Ps J` / `CSI ? Ps K`.

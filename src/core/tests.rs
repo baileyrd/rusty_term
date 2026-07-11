@@ -4191,8 +4191,11 @@ fn decrqss_reports_sgr_scroll_region_and_cursor_style() {
 fn decrqss_unknown_request_reports_invalid() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
-    p.advance(&mut g, b"\x1bP$q\"q\x1b\\"); // DECSCA — not tracked
+    p.advance(&mut g, b"\x1bP$qt\x1b\\"); // DECSLPP — not tracked
     assert_eq!(p.take_responses(), b"\x1bP0$r\x1b\\");
+    // DECSCA *is* tracked now (G15): report the current protection state.
+    p.advance(&mut g, b"\x1bP$q\"q\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r0\"q\x1b\\".to_vec());
 }
 
 #[test]
@@ -4663,4 +4666,117 @@ fn prompt_cursor_moves_computes_arrow_deltas() {
     // Neither does the alternate screen.
     p.advance(&mut g, b"\x1b[?1049h");
     assert_eq!(g.prompt_cursor_moves(1, 1), None);
+}
+
+// ---- Wave-9 additions: protected areas, left/right margins ----
+
+#[test]
+fn decsca_protects_cells_from_selective_erase() {
+    let mut g = Grid::new(20, 4);
+    let mut p = AnsiParser::new();
+    // "keep" written protected, "drop" not.
+    p.advance(&mut g, b"\x1b[1\"qkeep\x1b[0\"qdrop");
+    // DECSEL 2 (whole line, selective): only "drop" goes.
+    p.advance(&mut g, b"\x1b[?2K");
+    let row: String = (0..8).map(|x| g.cells[x].ch).collect();
+    assert_eq!(row, "keep    ");
+    // SGR 0 must NOT clear protection (it's not a rendition attribute).
+    p.advance(&mut g, b"\x1b[H\x1b[1\"q\x1b[0mSAFE\x1b[?2K");
+    let row: String = (0..4).map(|x| g.cells[x].ch).collect();
+    assert_eq!(row, "SAFE");
+    // Plain EL still erases everything, protected or not.
+    p.advance(&mut g, b"\x1b[2K");
+    assert_eq!(g.cells[0].ch, ' ');
+}
+
+#[test]
+fn decsed_erases_display_selectively() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[1\"qAA\x1b[0\"qbb\r\ncc\r\ndd");
+    p.advance(&mut g, b"\x1b[H\x1b[?2J"); // selective erase all
+    assert_eq!(g.cells[0].ch, 'A');
+    assert_eq!(g.cells[1].ch, 'A');
+    assert_eq!(g.cells[2].ch, ' '); // "bb" gone
+    assert_eq!(g.cells[g.cols].ch, ' '); // "cc" gone
+    // DECSTR resets the protection state for subsequent writes.
+    p.advance(&mut g, b"\x1b[!p");
+    p.advance(&mut g, b"xx\x1b[?2K");
+    assert_eq!(g.cells[0].ch, ' ');
+}
+
+#[test]
+fn decslrm_sets_margins_only_under_declrmm() {
+    let mut g = Grid::new(20, 5);
+    let mut p = AnsiParser::new();
+    // Without ?69, `CSI s` is SCP (save cursor) — margins untouched.
+    p.advance(&mut g, b"\x1b[5;10s");
+    assert!(!g.side_margins_active());
+    // With ?69 set, the same sequence is DECSLRM (1-based, inclusive).
+    p.advance(&mut g, b"\x1b[?69h\x1b[5;10s");
+    assert!(g.side_margins_active());
+    assert_eq!((g.left_margin, g.right_margin), (4, 9));
+    assert_eq!(g.cursor, (0, 0), "DECSLRM homes the cursor");
+    // DECRQM reports the mode; resetting it restores the full width.
+    p.advance(&mut g, b"\x1b[?69$p");
+    assert_eq!(p.take_responses(), b"\x1b[?69;1$y");
+    p.advance(&mut g, b"\x1b[?69l");
+    assert!(!g.side_margins_active());
+    assert_eq!((g.left_margin, g.right_margin), (0, 19));
+}
+
+#[test]
+fn side_margins_confine_wrap_cr_and_scrolling() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    // Sentinels outside the margins must never move.
+    p.advance(&mut g, b"L        R");
+    p.advance(&mut g, b"\x1b[?69h\x1b[3;8s"); // margins cols 2..=7 (0-based)
+    // 19 chars from the left margin: the 6-wide band fills three rows
+    // (abcdef / ghijkl / mnopqr) and the 's' wraps at the band bottom,
+    // scrolling the band once — "abcdef" leaves, sentinels never move.
+    p.advance(&mut g, b"\x1b[1;3Habcdefghijklmnopqrs");
+    assert_eq!(g.cells[0].ch, 'L');
+    assert_eq!(g.cells[9].ch, 'R');
+    let band = |row: usize| -> String { (2..8).map(|x| g.cells[row * g.cols + x].ch).collect() };
+    assert_eq!(band(0), "ghijkl");
+    assert_eq!(band(1), "mnopqr");
+    assert_eq!(band(2), "s     ");
+    // CR returns to the left margin, not column 0.
+    p.advance(&mut g, b"\r");
+    assert_eq!(g.cursor.0, 2);
+    // Band scrolling never forms scrollback.
+    assert_eq!(g.scrollback.len(), 0);
+}
+
+#[test]
+fn side_margins_limit_il_dl_to_the_band() {
+    let mut g = Grid::new(10, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+    p.advance(&mut g, b"\x1b[?69h\x1b[3;8s\x1b[2;3H"); // margins 2..=7, cursor row 1 in band
+    p.advance(&mut g, b"\x1b[1L"); // IL: shift band rows 1.. down
+    // Outside the margins row 1 keeps its 'b's; inside it blanked.
+    assert_eq!(g.cells[g.cols].ch, 'b');
+    assert_eq!(g.cells[g.cols + 2].ch, ' ');
+    // The old band content of row 1 moved to row 2.
+    assert_eq!(g.cells[2 * g.cols + 2].ch, 'b');
+    // DL undoes it.
+    p.advance(&mut g, b"\x1b[1M");
+    assert_eq!(g.cells[g.cols + 2].ch, 'b');
+    // IL with the cursor outside the side margins is a no-op.
+    p.advance(&mut g, b"\x1b[2;1H\x1b[1L");
+    assert_eq!(g.cells[g.cols + 2].ch, 'b');
+}
+
+#[test]
+fn origin_mode_addresses_within_side_margins() {
+    let mut g = Grid::new(20, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?69h\x1b[5;10s\x1b[?6h"); // margins 4..=9, DECOM on
+    assert_eq!(g.cursor, (4, 0), "origin home is the margin corner");
+    p.advance(&mut g, b"\x1b[1;3H"); // col 3 relative -> absolute 6
+    assert_eq!(g.cursor, (6, 0));
+    p.advance(&mut g, b"\x1b[1;99H"); // clamps at the right margin
+    assert_eq!(g.cursor, (9, 0));
 }
