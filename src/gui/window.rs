@@ -53,6 +53,9 @@ const TAB_CELLS: usize = 26;
 const OVERLAY_ITEMS_TOP: usize = 2;
 /// Two clicks on the drag strip within this window toggle maximize.
 const DOUBLE_CLICK_MS: u128 = 400;
+
+/// One pane-resize keypress moves the split boundary by this ratio fraction.
+const RESIZE_STEP: f32 = 0.05;
 /// Scrollback lines moved per mouse-wheel notch.
 const WHEEL_LINES: isize = 3;
 
@@ -114,6 +117,13 @@ enum MenuKind {
     EditConfig,
 }
 
+/// Keyboard copy-mode state: the moving cursor in viewport cells, and the
+/// selection anchor (absolute coords) once `v`/Space pins one.
+struct CopyMode {
+    cur: (usize, usize),
+    anchor: Option<(usize, usize)>,
+}
+
 /// One terminal session inside a tab (a split pane): its screen state and PTY
 /// plumbing. The owning PTY handle lives here, so dropping a `Pane` tears the
 /// session down (its reader thread then EOFs and its exit event becomes a no-op).
@@ -135,12 +145,24 @@ struct Tab {
     /// background / the window unfocused); cleared when the tab is active in
     /// a focused window.
     attention: bool,
+    /// Pane zoom: the focused pane temporarily takes the whole tab area
+    /// (toggled by `zoom_pane`); cleared by any split/close/focus change.
+    zoomed: bool,
 }
 
 impl Tab {
     fn pane(&self, id: u64) -> Option<&Pane> {
         self.panes.iter().find(|p| p.id == id)
     }
+    /// The tab's pane rectangles within `area`, honoring pane zoom (a
+    /// zoomed tab shows only its focused pane, full-area).
+    fn rects(&self, area: Rect) -> Vec<(u64, Rect)> {
+        if self.zoomed {
+            return vec![(self.focus, area)];
+        }
+        self.layout.rects(area)
+    }
+
     fn focused(&self) -> Option<&Pane> {
         self.pane(self.focus)
     }
@@ -207,6 +229,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         selecting: false,
         focused: true,
         search_regex: false,
+        copy_mode: None,
         last_grid_click: None,
         click_streak: 0,
         mouse_button_down: None,
@@ -300,6 +323,9 @@ struct App<'a> {
     /// at all (only while a button is down; `?1003` reports regardless).
     mouse_button_down: Option<MouseButtonKind>,
     /// Cell where the current drag-selection began.
+    /// Cell where the current drag-selection began, in **absolute**
+    /// coordinates (`(col, abs_row)`) so the anchor survives scrolling
+    /// mid-drag.
     sel_anchor: Option<(usize, usize)>,
     /// Per-cell click actions for the chrome bar, rebuilt with each layout.
     hits: Vec<Hit>,
@@ -313,6 +339,10 @@ struct App<'a> {
     /// instead of plain text. Toggled with Ctrl+R inside search mode;
     /// remembered across searches.
     search_regex: bool,
+    /// Keyboard copy mode (G18): a viewport-cell cursor plus an optional
+    /// anchor (absolute coords). While `Some`, keys move the cursor /
+    /// extend the selection instead of reaching the keymap or the child.
+    copy_mode: Option<CopyMode>,
     /// Last left-click on pane content `(when, cell)` plus the current
     /// consecutive-click count — double-click selects a word, triple a
     /// logical line (`click_streak` cycles 1 → 2 → 3 → 1).
@@ -419,7 +449,13 @@ impl App<'_> {
         let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
         let pane = self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref())?;
         let focus = pane.id;
-        self.tabs.push(Tab { panes: vec![pane], layout: Layout::single(focus), focus, attention: false });
+        self.tabs.push(Tab {
+            panes: vec![pane],
+            layout: Layout::single(focus),
+            focus,
+            attention: false,
+            zoomed: false,
+        });
         self.active = self.tabs.len() - 1;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -441,6 +477,7 @@ impl App<'_> {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        tab.zoomed = false; // the pane set changed; zoom no longer meaningful
         let target = tab.focus;
         tab.panes.push(pane);
         tab.layout.split(target, new_id, dir);
@@ -461,6 +498,181 @@ impl App<'_> {
         }
     }
 
+    /// Enter keyboard copy mode: a movable cursor (hjkl/arrows) over the
+    /// viewport, `v`/Space to anchor a selection, `y`/Enter to copy and
+    /// exit, Esc/q to leave. The cursor renders through the ordinary
+    /// selection highlight (a one-cell selection until anchored).
+    fn enter_copy_mode(&mut self) {
+        let Some(p) = self.pane() else { return };
+        let cur = {
+            let mut g = p.grid.lock();
+            let cur = (g.cursor.0.min(g.cols.saturating_sub(1)), g.cursor.1);
+            let abs = g.abs_of_view_row(cur.1);
+            g.selection = Some(Selection { anchor: (cur.0, abs), head: (cur.0, abs) });
+            cur
+        };
+        self.copy_mode = Some(CopyMode { cur, anchor: None });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Handle a key press while copy mode is active. Returns whether the key
+    /// was consumed (always, while active — copy mode owns the keyboard).
+    fn copy_mode_key(&mut self, event: &KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(mut cm) = self.copy_mode.take() else { return false };
+        let Some(p) = self.pane() else { return false };
+        let mut exit = false;
+        let mut yank = false;
+        {
+            let mut g = p.grid.lock();
+            let (cols, rows) = (g.cols, g.rows);
+            let mv = |cm: &mut CopyMode, dc: isize, dr: isize, g: &mut Grid| {
+                cm.cur.0 = cm.cur.0.saturating_add_signed(dc).min(cols.saturating_sub(1));
+                if dr < 0 && cm.cur.1 == 0 {
+                    g.scroll_view_up(dr.unsigned_abs()); // keep moving into history
+                } else if dr > 0 && cm.cur.1 + 1 >= rows {
+                    g.scroll_view_down(dr as usize);
+                } else {
+                    cm.cur.1 = cm.cur.1.saturating_add_signed(dr).min(rows.saturating_sub(1));
+                }
+            };
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => exit = true,
+                Key::Named(NamedKey::Enter) => {
+                    yank = true;
+                    exit = true;
+                }
+                Key::Named(NamedKey::ArrowLeft) => mv(&mut cm, -1, 0, &mut g),
+                Key::Named(NamedKey::ArrowRight) => mv(&mut cm, 1, 0, &mut g),
+                Key::Named(NamedKey::ArrowUp) => mv(&mut cm, 0, -1, &mut g),
+                Key::Named(NamedKey::ArrowDown) => mv(&mut cm, 0, 1, &mut g),
+                Key::Named(NamedKey::PageUp) => mv(&mut cm, 0, -(rows as isize), &mut g),
+                Key::Named(NamedKey::PageDown) => mv(&mut cm, 0, rows as isize, &mut g),
+                Key::Named(NamedKey::Home) => cm.cur.0 = 0,
+                Key::Named(NamedKey::End) => cm.cur.0 = cols.saturating_sub(1),
+                Key::Named(NamedKey::Space) => {
+                    cm.anchor = Some((cm.cur.0, g.abs_of_view_row(cm.cur.1)));
+                }
+                Key::Character(s) => match s.as_str() {
+                    "q" => exit = true,
+                    "h" => mv(&mut cm, -1, 0, &mut g),
+                    "l" => mv(&mut cm, 1, 0, &mut g),
+                    "k" => mv(&mut cm, 0, -1, &mut g),
+                    "j" => mv(&mut cm, 0, 1, &mut g),
+                    "0" => cm.cur.0 = 0,
+                    "$" => cm.cur.0 = cols.saturating_sub(1),
+                    "g" => {
+                        // Top of scrollback.
+                        g.scroll_view_up(usize::MAX / 2);
+                        cm.cur = (0, 0);
+                    }
+                    "G" => {
+                        g.reset_view();
+                        cm.cur = (0, rows.saturating_sub(1));
+                    }
+                    "v" => {
+                        // Toggle the anchor (vi visual mode).
+                        cm.anchor = match cm.anchor {
+                            Some(_) => None,
+                            None => Some((cm.cur.0, g.abs_of_view_row(cm.cur.1))),
+                        };
+                    }
+                    "y" => {
+                        yank = true;
+                        exit = true;
+                    }
+                    _ => {}
+                },
+                _ => return true, // modifiers etc.: consumed, no effect
+            }
+            // Publish the selection: anchor..cursor, or the bare cursor cell.
+            let head = (cm.cur.0, g.abs_of_view_row(cm.cur.1));
+            let anchor = cm.anchor.unwrap_or(head);
+            g.selection = if exit && !yank { None } else { Some(Selection { anchor, head }) };
+        }
+        if yank {
+            self.copy_selection();
+            self.copy_selection_primary();
+        }
+        if exit {
+            if let Some(p) = self.pane()
+                && yank
+            {
+                p.grid.lock().selection = None;
+            }
+        } else {
+            self.copy_mode = Some(cm);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
+    /// Move focus to the nearest pane in direction `(dx, dy)` (one axis at a
+    /// time): the closest pane whose rect lies strictly beyond the focused
+    /// pane's edge, by center distance. No wrap.
+    fn focus_dir(&mut self, dx: isize, dy: isize) {
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let rects = tab.rects(area);
+        let Some(&(_, f)) = rects.iter().find(|(id, _)| *id == tab.focus) else { return };
+        let center = |r: &Rect| (r.col as isize * 2 + r.cols as isize, r.row as isize * 2 + r.rows as isize);
+        let (fcx, fcy) = center(&f);
+        let best = rects
+            .iter()
+            .filter(|(id, _)| *id != tab.focus)
+            .filter(|(_, r)| match (dx, dy) {
+                (1, _) => r.col >= f.col + f.cols,
+                (-1, _) => r.col + r.cols <= f.col,
+                (_, 1) => r.row >= f.row + f.rows,
+                _ => r.row + r.rows <= f.row,
+            })
+            .min_by_key(|(_, r)| {
+                let (cx, cy) = center(r);
+                (cx - fcx).abs() + (cy - fcy).abs()
+            })
+            .map(|(id, _)| *id);
+        if let Some(id) = best {
+            tab.focus = id;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Grow (`delta > 0`) or shrink the focused pane along `dir`, then
+    /// re-lay panes out to the moved boundary. Leaves a zoomed tab alone —
+    /// there is no visible boundary to move.
+    fn resize_pane(&mut self, dir: Dir, delta: f32) {
+        let ti = self.active;
+        let Some(tab) = self.tabs.get_mut(ti) else { return };
+        if tab.zoomed || !tab.layout.resize(tab.focus, dir, delta) {
+            return;
+        }
+        self.layout_panes(ti);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Toggle pane zoom: the focused pane takes the whole tab area until
+    /// toggled back (or the pane set changes).
+    fn toggle_zoom(&mut self) {
+        let ti = self.active;
+        let Some(tab) = self.tabs.get_mut(ti) else { return };
+        if tab.panes.len() < 2 {
+            return; // a single pane already has the whole area
+        }
+        tab.zoomed = !tab.zoomed;
+        self.layout_panes(ti);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Close pane `id`: collapse its split into the sibling, or close the whole
     /// tab when it was the last pane. Idempotent for stale exit events.
     fn close_pane(&mut self, id: u64, event_loop: &ActiveEventLoop) {
@@ -475,6 +687,7 @@ impl App<'_> {
             }
             Some(next) => {
                 tab.panes.retain(|p| p.id != id); // drops the PTY handle
+                tab.zoomed = false; // the pane set changed
                 if tab.focus == id {
                     tab.focus = next;
                 }
@@ -510,7 +723,7 @@ impl App<'_> {
         let Some(tab) = self.tabs.get_mut(ti) else {
             return;
         };
-        for (id, r) in tab.layout.rects(area) {
+        for (id, r) in tab.rects(area) {
             if let Some(p) = tab.panes.iter_mut().find(|p| p.id == id) {
                 let (c, rw) = (r.cols.max(1) as u16, r.rows.max(1) as u16);
                 {
@@ -577,7 +790,7 @@ impl App<'_> {
         let blink = self.cursor_blink_on;
         let focus = tab.focus;
         let mut held = Vec::new();
-        for (id, r) in tab.layout.rects(area) {
+        for (id, r) in tab.rects(area) {
             if let Some(p) = tab.pane(id) {
                 held.push((p.grid.lock(), r, id == focus));
             }
@@ -635,6 +848,28 @@ impl App<'_> {
             put_text(&mut row, &mut hits, &mut col, limit, &format!("{mode}{query}"), self.theme.fg, bar_bg, Hit::Drag);
             let mut ccol = limit;
             put_text(&mut row, &mut hits, &mut ccol, cols, &count, self.theme.fg, bar_bg, Hit::Drag);
+            self.hits = hits;
+            return row;
+        }
+        if self.copy_mode.is_some() {
+            let mut row = vec![Cell::blank(); cols];
+            let bar_bg = mix(self.theme.bg, self.theme.fg, 45);
+            for c in &mut row {
+                c.fg = self.theme.fg;
+                c.bg = bar_bg;
+            }
+            let mut hits = vec![Hit::Drag; cols];
+            let mut col = 0;
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut col,
+                cols,
+                " COPY   move: hjkl/arrows   v: select   y: copy   Esc: exit",
+                self.theme.fg,
+                bar_bg,
+                Hit::Drag,
+            );
             self.hits = hits;
             return row;
         }
@@ -812,7 +1047,8 @@ impl App<'_> {
             _ => 1,
         };
         self.last_grid_click = Some((now, cell));
-        self.sel_anchor = Some(cell);
+        self.sel_anchor =
+            self.pane().map(|p| (cell.0, p.grid.lock().abs_of_view_row(cell.1)));
         self.selecting = self.click_streak == 1;
         if let Some(p) = self.pane() {
             let mut g = p.grid.lock();
@@ -834,7 +1070,9 @@ impl App<'_> {
     fn pane_under(&self, px: f64, py: f64) -> Option<u64> {
         let (col, row) = self.cell_at(px, py);
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
-        self.tabs.get(self.active)?.layout.pane_at(area, col, row)
+        self.tabs.get(self.active).and_then(|t| {
+            t.rects(area).into_iter().find(|(_, r)| r.contains(col, row)).map(|(id, _)| id)
+        })
     }
 
     /// Map pixel `(px, py)` to a cell within the *focused* pane, clamped to it.
@@ -854,7 +1092,7 @@ impl App<'_> {
     fn focused_pane_rect(&self) -> Option<Rect> {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         let tab = self.tabs.get(self.active)?;
-        tab.layout.rects(area).into_iter().find(|(id, _)| *id == tab.focus).map(|(_, r)| r)
+        tab.rects(area).into_iter().find(|(id, _)| *id == tab.focus).map(|(_, r)| r)
     }
 
     /// Dispatch a click on the chrome bar through the hit map.
@@ -1073,6 +1311,16 @@ impl App<'_> {
             Action::SplitRight => self.split_pane(Dir::Vertical),
             Action::SplitDown => self.split_pane(Dir::Horizontal),
             Action::FocusNext => self.focus_pane(true),
+            Action::FocusLeft => self.focus_dir(-1, 0),
+            Action::FocusRight => self.focus_dir(1, 0),
+            Action::FocusUp => self.focus_dir(0, -1),
+            Action::FocusDown => self.focus_dir(0, 1),
+            Action::ResizeLeft => self.resize_pane(Dir::Vertical, -RESIZE_STEP),
+            Action::ResizeRight => self.resize_pane(Dir::Vertical, RESIZE_STEP),
+            Action::ResizeUp => self.resize_pane(Dir::Horizontal, -RESIZE_STEP),
+            Action::ResizeDown => self.resize_pane(Dir::Horizontal, RESIZE_STEP),
+            Action::ZoomPane => self.toggle_zoom(),
+            Action::CopyMode => self.enter_copy_mode(),
             Action::ScrollPageUp => self.scroll_key(false, true),
             Action::ScrollPageDown => self.scroll_key(false, false),
             Action::ScrollPromptUp => self.scroll_key(true, true),
@@ -2060,6 +2308,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if self.search_key(&event) {
                     return;
                 }
+                // Copy mode owns the keyboard while active.
+                if self.copy_mode_key(&event) {
+                    return;
+                }
                 // Terminal-owned shortcuts (configurable via the `[keys]` config
                 // section) are looked up before native encoding, so a bound chord
                 // never reaches the child.
@@ -2160,8 +2412,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     && let Some(anchor) = self.sel_anchor
                     && let Some(p) = self.pane()
                 {
-                    let head = self.cell_in_focused(position.x, position.y);
-                    p.grid.lock().selection = Some(Selection { anchor, head });
+                    let (hc, hr) = self.cell_in_focused(position.x, position.y);
+                    let mut g = p.grid.lock();
+                    let head = (hc, g.abs_of_view_row(hr));
+                    g.selection = Some(Selection { anchor, head });
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -2473,6 +2727,11 @@ fn chord_key(code: KeyCode) -> Option<crate::keymap::Key> {
         KeyCode::Tab => Key::Tab,
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
+        KeyCode::ArrowLeft => Key::Left,
+        KeyCode::ArrowRight => Key::Right,
+        KeyCode::ArrowUp => Key::Up,
+        KeyCode::ArrowDown => Key::Down,
+        KeyCode::Space => Key::Space,
         KeyCode::Comma => Key::Char(','),
         KeyCode::Period => Key::Char('.'),
         KeyCode::KeyA => Key::Char('a'),

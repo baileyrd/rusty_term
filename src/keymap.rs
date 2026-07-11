@@ -21,9 +21,19 @@ pub enum Action {
     OpenSettings,
     Search,
     OpenLinks,
+    CopyMode,
     SplitRight,
     SplitDown,
     FocusNext,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ZoomPane,
     ScrollPageUp,
     ScrollPageDown,
     ScrollPromptUp,
@@ -38,6 +48,11 @@ pub enum Key {
     Tab,
     PageUp,
     PageDown,
+    Left,
+    Right,
+    Up,
+    Down,
+    Space,
 }
 
 /// A key chord: modifier state plus one [`Key`].
@@ -83,6 +98,16 @@ impl Default for Keymap {
                 (c(true, true, Char('d')), SplitRight),
                 (c(true, true, Char('e')), SplitDown),
                 (c(true, true, Char('j')), FocusNext),
+                (Chord::new(true, false, true, Key::Left), FocusLeft),
+                (Chord::new(true, false, true, Key::Right), FocusRight),
+                (Chord::new(true, false, true, Key::Up), FocusUp),
+                (Chord::new(true, false, true, Key::Down), FocusDown),
+                (Chord::new(true, true, false, Key::Left), ResizeLeft),
+                (Chord::new(true, true, false, Key::Right), ResizeRight),
+                (Chord::new(true, true, false, Key::Up), ResizeUp),
+                (Chord::new(true, true, false, Key::Down), ResizeDown),
+                (c(true, true, Char('z')), ZoomPane),
+                (Chord::new(true, true, false, Key::Space), CopyMode),
                 (c(false, true, PageUp), ScrollPageUp),
                 (c(false, true, PageDown), ScrollPageDown),
                 (c(true, true, PageUp), ScrollPromptUp),
@@ -121,6 +146,16 @@ pub fn parse_action(name: &str) -> Option<Action> {
         "open_settings" => Action::OpenSettings,
         "search" => Action::Search,
         "open_links" => Action::OpenLinks,
+        "copy_mode" => Action::CopyMode,
+        "focus_left" => Action::FocusLeft,
+        "focus_right" => Action::FocusRight,
+        "focus_up" => Action::FocusUp,
+        "focus_down" => Action::FocusDown,
+        "resize_left" => Action::ResizeLeft,
+        "resize_right" => Action::ResizeRight,
+        "resize_up" => Action::ResizeUp,
+        "resize_down" => Action::ResizeDown,
+        "zoom_pane" => Action::ZoomPane,
         "split_right" => Action::SplitRight,
         "split_down" => Action::SplitDown,
         "focus_next" => Action::FocusNext,
@@ -152,6 +187,11 @@ pub fn parse_chord(s: &str) -> Result<Chord, String> {
             "tab" => key = Some(Key::Tab),
             "pageup" | "pgup" => key = Some(Key::PageUp),
             "pagedown" | "pgdn" => key = Some(Key::PageDown),
+            "left" => key = Some(Key::Left),
+            "right" => key = Some(Key::Right),
+            "up" => key = Some(Key::Up),
+            "down" => key = Some(Key::Down),
+            "space" => key = Some(Key::Space),
             other => {
                 let mut chars = other.chars();
                 let c = chars.next().unwrap(); // `t` is non-empty
@@ -223,5 +263,31 @@ mod tests {
         assert_eq!(parse_action("scroll_prompt_down"), Some(Action::ScrollPromptDown));
         assert_eq!(parse_action("open_settings"), Some(Action::OpenSettings));
         assert_eq!(parse_action("nonsense"), None);
+    }
+
+    #[test]
+    fn pane_and_copy_mode_bindings_parse_and_default() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.action(Chord::new(true, false, true, Key::Left)),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Right)),
+            Some(Action::ResizeRight)
+        );
+        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('z'))), Some(Action::ZoomPane));
+        assert_eq!(km.action(Chord::new(true, true, false, Key::Space)), Some(Action::CopyMode));
+        // Config strings for the new keys/actions round-trip.
+        assert_eq!(parse_action("zoom_pane"), Some(Action::ZoomPane));
+        assert_eq!(parse_action("copy_mode"), Some(Action::CopyMode));
+        assert_eq!(
+            parse_chord("Ctrl+Alt+Up"),
+            Ok(Chord::new(true, false, true, Key::Up))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Shift+Space"),
+            Ok(Chord::new(true, true, false, Key::Space))
+        );
     }
 }

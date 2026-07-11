@@ -45,8 +45,8 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
 | ✅ G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
 | ✅ G17 | Double/triple-click word/line selection | P1 | universal | S–M |
-| G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
-| G19 | Scrollbar | P2 | Ghostty 1.3, kitty 0.43, Windows Terminal, Konsole | M |
+| ✅ G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
+| ✅ G19 | Scrollbar | P2 | Ghostty 1.3, kitty 0.43, Windows Terminal, Konsole | M |
 | ✅ G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
 | G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
 | ✅ G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
@@ -54,7 +54,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
 | G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
 | ✅ G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
-| G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
+| ✅ G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
 | G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
 | G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
@@ -287,6 +287,7 @@ felt within minutes of real use.
 **Size** S–M · **Deps** `gui`.
 
 #### G18 — Keyboard copy mode (vi-style selection)
+**Status: done.** Ctrl+Shift+Space (rebindable `copy_mode`) enters a vi-style keyboard selection mode: hjkl/arrows move (scrolling into history at the edges), `0`/`$`/Home/End, PageUp/Down, `g`/`G` top/bottom of scrollback, `v`/Space anchors, `y`/Enter copies (clipboard + primary) and exits, Esc/`q` cancels — with a chrome hint bar while active. Enabled by refactoring `Selection` to **absolute** coordinates (`(col, abs_row)` over scrollback+screen), which also fixes the pre-existing limitation that drag selection broke while scrolled: selections now stay anchored to their text across scrolling, and word/line selection works in history.
 **Current.** Selection is mouse-only; no matches for a copy/mark mode.
 **Target.** A keybind enters a mode where the keyboard moves a selection
 cursor over scrollback (h/j/k/l + word/line motions, `v`/`V` to anchor,
@@ -297,6 +298,7 @@ all have it; keyboard-centric users treat it as a requirement.
 model.
 
 #### G19 — Scrollbar
+**Status: done.** `Grid::scrollbar()` computes an auto-hiding thumb (`(first_row, rows, color)`, hidden at the live bottom) from the scroll state; the CPU renderer draws a sub-cell pixel bar hugging the pane's right edge, the GPU renderer draws cell-resolution background quads in the rightmost column (an accepted parity note, like the half-block images). Drag-to-scroll on the bar is future work.
 **Current.** No scrollbar anywhere; scroll position is invisible except via
 the search counter.
 **Target.** A minimal overlay scrollbar (thumb = viewport/history ratio)
@@ -389,6 +391,7 @@ colors are resolved, and a real accessibility aid ahead of full C20.
 **Size** S · **Deps** `gui`.
 
 #### G27 — Pane management: resize, zoom, directional focus
+**Status: done (keyboard; divider dragging deferred).** `Layout::resize` adjusts the nearest matching-axis split ratio (deepest first, clamped 0.1–0.9) — bound to Ctrl+Shift+arrows; `zoom_pane` (Ctrl+Shift+Z) temporarily gives the focused pane the whole tab area via zoom-aware `Tab::rects` (cleared when the pane set changes); directional focus (Ctrl+Alt+arrows) picks the nearest pane beyond the focused edge by center distance. All rebindable; arrow/space keys added to the chord vocabulary.
 **Current.** `src/gui/layout.rs` splits are fixed at `ratio: 0.5` with no
 API to change a ratio after the split; focus cycles with `focus_next` only;
 no zoom/maximize-pane.
