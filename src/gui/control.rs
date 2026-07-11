@@ -16,11 +16,13 @@
 //! `/tmp/rusty_term-<uid>.sock` with `0600` permissions — same trust model
 //! as kitty's: anything running as the user may drive the terminal.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 /// One parsed control request.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(windows, allow(dead_code))] // used once the Windows named-pipe transport lands (G31)
 pub(crate) enum CtlCommand {
     NewTab { cwd: Option<PathBuf>, profile: Option<String>, shell: Option<String> },
     /// Open a new top-level window (same options as `new-tab` for its first tab).
@@ -35,6 +37,7 @@ pub(crate) enum CtlCommand {
 }
 
 /// Where the control socket lives for this user.
+#[cfg(unix)]
 pub(crate) fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
@@ -47,6 +50,7 @@ pub(crate) fn socket_path() -> PathBuf {
 
 /// Parse one request line. Tokens split on whitespace outside double quotes;
 /// `key=value` pairs may quote the value.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn parse_command(line: &str) -> Result<CtlCommand, String> {
     let tokens = tokenize(line)?;
     let cmd = tokens.first().ok_or("empty command")?;
@@ -83,6 +87,7 @@ pub(crate) fn parse_command(line: &str) -> Result<CtlCommand, String> {
 
 /// Split a request line into tokens, honoring double quotes and decoding
 /// `\n` `\t` `\\` `\"` escapes inside them.
+#[cfg_attr(windows, allow(dead_code))]
 fn tokenize(line: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -282,6 +287,7 @@ mod tests {
         let _ = std::fs::remove_file(socket_path());
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_is_user_scoped() {
         let p = socket_path();
