@@ -15,6 +15,7 @@
 //! - [`window`] — the `winit` event loop + window tying it together.
 
 mod boxdraw;
+pub(crate) mod control;
 mod cpu;
 mod font;
 #[cfg(feature = "gui-gpu")]
