@@ -58,9 +58,9 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
 | G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
-| G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
+| ✅ G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
 | ✅ G32 | Sessions / startup layouts / workspaces | P2 | kitty 0.43, WezTerm, Windows Terminal | M–L |
-| G33 | Remote control / scripting API | P2 | kitty `@`, WezTerm CLI, Ghostty AppleScript | M |
+| ✅ G33 | Remote control / scripting API | P2 | kitty `@`, WezTerm CLI, Ghostty AppleScript | M |
 | ✅ G34 | Profiles (shell+theme+font bundles) | P2 | Windows Terminal, iTerm2, Konsole, WezTerm | M |
 | G35 | Multiple-cursors protocol | W | kitty 0.43 (originated) | M |
 | G36 | Cursor trail / animated cursor | P3 | kitty 0.43, neovide-inspired | S–M |
@@ -436,6 +436,7 @@ feature with strong pull.
 winit; sequenced naturally after C13 (multi-window).
 
 #### G31 — Single-instance / daemon mode
+**Status: done (Unix; Windows named pipes deferred).** With `single_instance = true` (or `--single-instance`), the window serves a user-private control socket (`$XDG_RUNTIME_DIR/rusty_term.sock`, else `/tmp/rusty_term-<uid>.sock`, `0600`); a second `--gui --single-instance` launch pings it and, if an instance answers, forwards `new-tab` (carrying `--cwd`/`--profile`) and exits instead of opening a second window. Stale sockets from a dead instance are reclaimed after a failed ping; a live instance's socket is never stolen. Full startup-latency value arrives with multi-window (C13).
 **Current.** Every launch cold-starts the process, loads fonts, and (GPU)
 compiles pipelines.
 **Target.** A `--single-instance`/server mode where subsequent launches ask
@@ -460,6 +461,7 @@ spawn-orchestration feature.
 **Size** M–L · **Deps** `gui`, panes (done), OSC 7 cwd (done).
 
 #### G33 — Remote control / scripting API
+**Status: done (socket CLI; L13 mutating MCP tools deferred).** `src/gui/control.rs` implements a dependency-free line protocol (quoted values, `\n`/`\t` escapes, `ok`/`err` terminators) over the single-instance socket; requests are handed to the event loop as `UserEvent::Control` with a reply channel. `rusty_term ctl <cmd>` speaks it: `new-tab [cwd= profile= shell=]`, `send-text text=`, `list-tabs`, `focus-tab n=`, `ping`. Client framing verified over a real Unix socket in tests; a live end-to-end needs a display, so the in-window executor is exercised by unit tests only.
 **Current.** The L13 side-channel exposes *introspection* (MCP tools:
 get_screen, get_cwd, …) to the **child** over OSC — but nothing can
 *control* the terminal (open tab, split, set title, send text), and

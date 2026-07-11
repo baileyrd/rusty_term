@@ -62,13 +62,16 @@ const WHEEL_LINES: isize = 3;
 
 /// Wakeups sent from per-tab PTY reader threads into the winit loop, tagged
 /// with the tab id they concern.
-enum UserEvent {
+pub(crate) enum UserEvent {
     /// New output was parsed into the tab's grid; repaint if it's the active one.
     Redraw(u64),
     /// The tab's child exited; close that tab (the last one closes the window).
     Exit(u64),
     /// The config file changed on disk; reload and apply what can change live.
     ConfigChanged,
+    /// A control-socket request (`--single-instance` / `rusty_term ctl`),
+    /// with the channel its connection thread waits on for the reply.
+    Control(super::control::CtlCommand, std::sync::mpsc::Sender<String>),
 }
 
 /// What a click on a given chrome-bar cell does.
@@ -208,6 +211,16 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         crate::config::watch(path, move || {
             let _ = watch_proxy.send_event(UserEvent::ConfigChanged);
         });
+    }
+
+    // Control socket (`single_instance` config / `--single-instance`): serve
+    // `rusty_term ctl` requests and let a second launch reuse this instance.
+    #[cfg(unix)]
+    if config.single_instance.unwrap_or(false) || args.iter().any(|a| a == "--single-instance") {
+        match super::control::serve(proxy.clone()) {
+            Ok(path) => eprintln!("rusty_term: control socket at {}", path.display()),
+            Err(e) => eprintln!("rusty_term: control socket unavailable: {e}"),
+        }
     }
 
     let mut app = App {
@@ -472,6 +485,62 @@ impl App<'_> {
     fn spawn_tab_profile(&mut self, i: usize) -> Result<(), std::io::Error> {
         let Some(p) = self.config.profiles.get(i).cloned() else { return Ok(()) };
         self.spawn_tab_opts(p.shell, &[], p.cwd, p.theme)
+    }
+
+    /// Execute one control-socket command and produce its reply text
+    /// (data lines + a trailing `ok` / `err …` line).
+    fn handle_control(&mut self, cmd: super::control::CtlCommand) -> String {
+        use super::control::CtlCommand;
+        match cmd {
+            CtlCommand::Ping => "ok\n".to_string(),
+            CtlCommand::NewTab { cwd, profile, shell } => {
+                let p = profile.as_deref().and_then(|n| self.config.profile(n)).cloned();
+                if profile.is_some() && p.is_none() {
+                    return format!("err no profile named `{}`\n", profile.unwrap_or_default());
+                }
+                let p = p.unwrap_or_default();
+                let shell = shell.or(p.shell);
+                let cwd = cwd.or(p.cwd);
+                match self.spawn_tab_opts(shell, &[], cwd, p.theme) {
+                    Ok(()) => {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                            window.focus_window();
+                        }
+                        "ok\n".to_string()
+                    }
+                    Err(e) => format!("err {e}\n"),
+                }
+            }
+            CtlCommand::SendText(text) => match self.pane_mut() {
+                Some(p) => {
+                    let _ = p.writer.write(text.as_bytes());
+                    "ok\n".to_string()
+                }
+                None => "err no pane\n".to_string(),
+            },
+            CtlCommand::ListTabs => {
+                let mut out = String::new();
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    let title =
+                        tab.focused().map(|p| p.grid.lock().title.clone()).unwrap_or_default();
+                    let marker = if i == self.active { "*" } else { " " };
+                    out.push_str(&format!("{i}\t{marker}\t{title}\n"));
+                }
+                out.push_str("ok\n");
+                out
+            }
+            CtlCommand::FocusTab(n) => {
+                if n >= self.tabs.len() {
+                    return format!("err no tab {n}\n");
+                }
+                self.active = n;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                "ok\n".to_string()
+            }
+        }
     }
 
     /// Spawn one session-file tab: profile defaults, then the tab's own
@@ -2657,6 +2726,10 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
             UserEvent::Exit(id) => self.close_pane(id, event_loop),
             UserEvent::ConfigChanged => self.reload_config(),
+            UserEvent::Control(cmd, reply) => {
+                let text = self.handle_control(cmd);
+                let _ = reply.send(text);
+            }
         }
     }
 }

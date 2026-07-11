@@ -71,6 +71,12 @@ fn main() -> Result<(), std::io::Error> {
         return Ok(());
     }
 
+    // `rusty_term ctl <command…>`: talk to a running instance's control
+    // socket and print its reply — the whole scripting surface (G33).
+    if args.first().map(String::as_str) == Some("ctl") {
+        return run_ctl(&args[1..]);
+    }
+
     let (mut config, warnings) = Config::load(args);
     for w in &warnings {
         eprintln!("rusty_term: {w}");
@@ -149,6 +155,28 @@ fn main() -> Result<(), std::io::Error> {
     // rendering into the host terminal. Requires the `gui` feature.
     #[cfg(feature = "gui")]
     if args.iter().any(|a| a == "--gui") {
+        // Single-instance: if a control socket answers, hand this launch to
+        // the running instance as a new tab and exit instead of opening a
+        // second window.
+        #[cfg(unix)]
+        if config.single_instance.unwrap_or(false)
+            || args.iter().any(|a| a == "--single-instance")
+        {
+            let mut req = String::from("new-tab");
+            if let Some(cwd) = &config.cwd {
+                req.push_str(&format!(" cwd=\"{}\"", cwd.display()));
+            }
+            if let Some(name) = flag_value(args, "--profile") {
+                req.push_str(&format!(" profile=\"{name}\""));
+            }
+            if let Ok(reply) = gui::control::request(&req) {
+                if reply.trim_end().ends_with("ok") {
+                    return Ok(());
+                }
+                eprintln!("rusty_term: running instance refused: {}", reply.trim_end());
+            }
+            // No (or dead) instance: fall through and become it.
+        }
         return gui::run(backend.as_ref(), &config)
             .map_err(|e| std::io::Error::other(e.to_string()));
     }
@@ -188,4 +216,43 @@ fn main() -> Result<(), std::io::Error> {
     // Hand off to the tokio runtime — a single async reactor driving the grid
     // and backend (Unix via AsyncFd, Windows by bridging ConPTY's blocking pipes).
     runtime::run(backend, grid, init_cols, init_rows, config)
+}
+
+/// `rusty_term ctl <command> [key=value]…`: forward one control request to
+/// the running instance and print its reply. Exits nonzero on `err`.
+fn run_ctl(args: &[String]) -> std::io::Result<()> {
+    #[cfg(all(unix, feature = "gui"))]
+    {
+        if args.is_empty() {
+            eprintln!(
+                "usage: rusty_term ctl <new-tab|send-text|list-tabs|focus-tab|ping> [key=value]…"
+            );
+            return Err(std::io::Error::other("no control command"));
+        }
+        // Re-quote each token so values with spaces survive the round trip.
+        let line = args
+            .iter()
+            .map(|a| match a.split_once('=') {
+                Some((k, v)) if !v.starts_with('"') => {
+                    format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+                _ => a.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let reply = gui::control::request(&line).map_err(|e| {
+            std::io::Error::other(format!("no running rusty_term instance ({e})"))
+        })?;
+        print!("{reply}");
+        if reply.lines().last().is_some_and(|l| l.starts_with("err")) {
+            return Err(std::io::Error::other("control command failed"));
+        }
+        Ok(())
+    }
+    #[cfg(not(all(unix, feature = "gui")))]
+    {
+        let _ = args;
+        eprintln!("rusty_term: `ctl` needs a Unix build with the `gui` feature");
+        Err(std::io::Error::other("ctl unsupported on this build"))
+    }
 }

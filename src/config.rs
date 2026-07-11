@@ -83,6 +83,10 @@ pub struct Config {
     /// theme bundle, surfaced in the shell-launcher dropdown and selectable
     /// at startup with `--profile <name>`.
     pub profiles: Vec<Profile>,
+    /// Serve the control socket and let a second `--single-instance` launch
+    /// reuse this instance (windowed front-end, Unix). Also enabled by the
+    /// `--single-instance` flag.
+    pub single_instance: Option<bool>,
     /// Session file to open at startup (`session = "path"` or `--session`):
     /// a list of tabs (cwd/command/profile/splits) the window builds instead
     /// of the single default shell. Windowed front-end only.
@@ -575,6 +579,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
     match (section, key) {
         ("", "shell") => cfg.shell = Some(expect_str(key, value)?),
         ("", "session") => cfg.session = Some(PathBuf::from(expect_str(key, value)?)),
+        ("", "single_instance") => cfg.single_instance = Some(expect_bool(key, value)?),
         ("", "bell") => cfg.bell = Some(expect_bool(key, value)?),
         ("", "command_notify_secs") => {
             cfg.command_notify_secs = Some(expect_int(key, value)?.clamp(0, 86_400) as u64)
