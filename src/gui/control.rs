@@ -23,6 +23,11 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CtlCommand {
     NewTab { cwd: Option<PathBuf>, profile: Option<String>, shell: Option<String> },
+    /// Open a new top-level window (same options as `new-tab` for its first tab).
+    NewWindow { cwd: Option<PathBuf>, profile: Option<String>, shell: Option<String> },
+    /// Toggle the quake (dropdown) window: create it on first use, then
+    /// show/hide it. Bind a WM/desktop hotkey to `rusty_term ctl quake`.
+    Quake,
     SendText(String),
     ListTabs,
     FocusTab(usize),
@@ -56,6 +61,12 @@ pub(crate) fn parse_command(line: &str) -> Result<CtlCommand, String> {
             profile: kv("profile"),
             shell: kv("shell"),
         }),
+        "new-window" => Ok(CtlCommand::NewWindow {
+            cwd: kv("cwd").map(PathBuf::from),
+            profile: kv("profile"),
+            shell: kv("shell"),
+        }),
+        "quake" => Ok(CtlCommand::Quake),
         "send-text" => {
             let text = kv("text").ok_or("send-text needs text=…")?;
             Ok(CtlCommand::SendText(text))
@@ -219,6 +230,23 @@ mod tests {
             CtlCommand::SendText("ls -la\n".into())
         );
         assert_eq!(parse_command("focus-tab n=2").unwrap(), CtlCommand::FocusTab(2));
+    }
+
+    #[test]
+    fn window_commands_parse() {
+        assert_eq!(
+            parse_command("new-window shell=/bin/zsh cwd=/tmp").unwrap(),
+            CtlCommand::NewWindow {
+                cwd: Some(PathBuf::from("/tmp")),
+                profile: None,
+                shell: Some("/bin/zsh".into())
+            }
+        );
+        assert_eq!(
+            parse_command("new-window").unwrap(),
+            CtlCommand::NewWindow { cwd: None, profile: None, shell: None }
+        );
+        assert_eq!(parse_command("quake").unwrap(), CtlCommand::Quake);
     }
 
     #[test]

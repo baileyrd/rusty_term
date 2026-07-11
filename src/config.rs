@@ -79,6 +79,10 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Height of the quake (dropdown) window as a fraction of the monitor's
+    /// height, `0.1..=1.0` (`[window] quake_height`; default 0.4). The window
+    /// itself is created/toggled with `rusty_term ctl quake`.
+    pub quake_height: Option<f32>,
     /// Named launch profiles (`[profile.<name>]` sections): a shell + cwd +
     /// theme bundle, surfaced in the shell-launcher dropdown and selectable
     /// at startup with `--profile <name>`.
@@ -211,6 +215,7 @@ impl Config {
 # ligatures = false        # disable programming-font ligatures (default on)
 # launch_mode = "maximized" # or "fullscreen"
 # opacity = 0.9            # 0.0-1.0; GPU renderer (--features gui-gpu) only
+# quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -664,6 +669,17 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
                 return Err(format!("{key}: {v} out of range (0.0-1.0)"));
             }
             cfg.opacity = Some(v as f32);
+        }
+        ("window", "quake_height") => {
+            let v = match value {
+                Value::Float(f) => f,
+                Value::Int(i) => i as f64,
+                _ => return Err(format!("{key}: expected a number")),
+            };
+            if !(0.1..=1.0).contains(&v) {
+                return Err(format!("{key}: {v} out of range (0.1-1.0)"));
+            }
+            cfg.quake_height = Some(v as f32);
         }
         ("colors", "foreground") => cfg.theme.fg = expect_color(key, value)?,
         ("colors", "background") => cfg.theme.bg = expect_color(key, value)?,
@@ -1192,6 +1208,23 @@ color15 = "ffffff"
         assert_eq!(warns3.len(), 1);
         let (cfg4, warns4) = parse("[window]\nopacity = -0.1\n");
         assert_eq!(cfg4.opacity, None);
+        assert_eq!(warns4.len(), 1);
+    }
+
+    #[test]
+    fn quake_height_parses_and_rejects_out_of_range() {
+        let (cfg, warns) = parse("[window]\nquake_height = 0.3\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.quake_height, Some(0.3));
+        let (cfg2, warns2) = parse("[window]\nquake_height = 1\n");
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert_eq!(cfg2.quake_height, Some(1.0));
+        // Out of range (a sliver of a window, or taller than the monitor).
+        let (cfg3, warns3) = parse("[window]\nquake_height = 0.05\n");
+        assert_eq!(cfg3.quake_height, None);
+        assert_eq!(warns3.len(), 1);
+        let (cfg4, warns4) = parse("[window]\nquake_height = 2\n");
+        assert_eq!(cfg4.quake_height, None);
         assert_eq!(warns4.len(), 1);
     }
 

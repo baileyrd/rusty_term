@@ -57,7 +57,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
 | ✅ G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
-| G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
+| ✅ G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
 | ✅ G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
 | ✅ G32 | Sessions / startup layouts / workspaces | P2 | kitty 0.43, WezTerm, Windows Terminal | M–L |
 | ✅ G33 | Remote control / scripting API | P2 | kitty `@`, WezTerm CLI, Ghostty AppleScript | M |
@@ -431,6 +431,16 @@ docs and chat.
 ### A.3 Application model
 
 #### G30 — Quake-style quick terminal + global hotkey
+**Status: done (2026-07, hotkey via the WM).** Landed with C13
+(multi-window): `rusty_term ctl quake` toggles a dropdown window — borderless,
+docked to the top of the primary monitor, full monitor width, height a
+`[window] quake_height` fraction (0.1–1.0, default 0.4), kept above other
+windows (`WindowLevel::AlwaysOnTop`) — creating it on first use and
+show/hide+focusing it after. Global hotkeys stay out of process: OS-level
+hotkey registration is per-platform code beyond winit, and every desktop
+environment can already bind a key to a command — pointing one at
+`rusty_term ctl quake` gives the summon-from-anywhere behavior with a
+running `--single-instance` instance serving the socket.
 **Current.** One normal window per process; no global-hotkey or slide-down
 mode.
 **Target.** A summonable overlay window (top-of-screen slide-down) bound to
@@ -536,7 +546,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C08 | GPU renderer ligatures | ✅ done 2026-07 (see below) | L |
 | C09 | GPU renderer pixel images | ✅ done 2026-07 (see below) | L |
 | C12′ | GIF / WebP / progressive JPEG decode | deferred, each ~L | L×3 |
-| C13 | Multiple top-level windows | assessed, deferred (App rework) | L |
+| C13 | Multiple top-level windows | ✅ done 2026-07 (see below) | L |
 | C14′ | CPU-renderer opacity + platform blur | partial (GPU-only opacity) | M |
 | C17′ | Command-output folding — render path | data model done, rendering open | M–L |
 | C18 | Unicode width mode 2027 | watch | M |
@@ -546,6 +556,19 @@ Carried forward unchanged (see that document for full write-ups):
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | open, needs own scoping pass | XL |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
+
+**C13 status (2026-07):** the winit front-end was reworked from one
+implicit window into an `App` router owning a `WindowState` per top-level
+window. All per-window state (tabs/panes, renderer, font, chrome hit map,
+selection, overlays, search, copy mode, focus) lives in `WindowState`;
+window events route by `WindowId`, PTY reader-thread wakeups by pane id
+(pane ids now come from a counter shared across windows). New windows open
+with Ctrl+Shift+N (`new_window` in `[keys]`) or `rusty_term ctl
+new-window` (accepting the same `cwd=`/`profile=`/`shell=` options as
+`new-tab`); the loop exits when the last window closes. Window-less
+control commands act on the last-focused window. This also unblocked G30
+(quake window, see Section A) and gives G31's single instance its full
+startup-latency value.
 
 **C08 + C09 status (2026-07):** the GPU renderer (`src/gui/gpu.rs`) was
 rebuilt around a variable-width RGBA8 shelf-packed atlas (up to 2048²,
