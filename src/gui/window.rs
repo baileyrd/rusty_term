@@ -28,6 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, KeyLocation, ModifiersState, PhysicalKey};
+use std::path::PathBuf;
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
@@ -109,6 +110,8 @@ struct MenuItem {
 enum MenuKind {
     /// Launch a new tab running detected shell `[index]`.
     LaunchShell(usize),
+    /// Launch a new tab from configured profile `[index]`.
+    LaunchProfile(usize),
     /// Open this URL with the OS handler (the visible-links menu).
     OpenUrl(String),
     /// Open the in-app settings page.
@@ -243,7 +246,29 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         overlay: None,
         font_px,
     };
-    app.spawn_tab()?; // the first shell; more come from Ctrl+Shift+T / the + button
+    // A session file builds the initial tab set; otherwise one default shell
+    // (more come from Ctrl+Shift+T / the + button either way).
+    let session = app.config.session.clone();
+    let mut opened = 0usize;
+    if let Some(path) = &session {
+        let (tabs, warns) = crate::config::load_session(path);
+        for w in &warns {
+            eprintln!("rusty_term: session: {w}");
+        }
+        for t in tabs {
+            if let Err(e) = app.spawn_session_tab(&t) {
+                eprintln!("rusty_term: session tab: {e}");
+            } else {
+                opened += 1;
+            }
+        }
+        if opened > 0 {
+            app.active = 0; // land on the session's first tab
+        }
+    }
+    if opened == 0 {
+        app.spawn_tab()?;
+    }
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -373,24 +398,26 @@ impl App<'_> {
         shell: Option<&str>,
         args: &[String],
         cwd: Option<&std::path::Path>,
+        theme: Option<Theme>,
     ) -> Result<Pane, std::io::Error> {
         let handle = self.backend.spawn_shell(cols, rows, shell, args, cwd)?;
         let id = self.next_id;
         self.next_id += 1;
 
+        let theme = theme.unwrap_or(self.theme);
         let mut g = Grid::new(cols as usize, rows as usize);
         if let Some(max) = self.config.scrollback {
             g.set_scrollback_max(max);
         }
         g.cell_px = Some((self.cell_w as u16, self.cell_h as u16));
-        g.apply_theme(&self.theme);
+        g.apply_theme(&theme);
         g.set_default_cursor(
             self.config.cursor_style.unwrap_or_default(),
             self.config.cursor_blink.unwrap_or(false),
         );
         g.min_contrast = self.config.minimum_contrast.unwrap_or(1.0);
         let grid = Arc::new(Mutex::new(g));
-        let parser = Arc::new(Mutex::new(AnsiParser::with_theme(self.theme)));
+        let parser = Arc::new(Mutex::new(AnsiParser::with_theme(theme)));
 
         // Reader thread: PTY -> parser -> grid, writing replies back and waking
         // the loop. Independent handle clones so it shares no lock with us.
@@ -437,17 +464,76 @@ impl App<'_> {
     /// and make it active. Backs the `+` button, `Ctrl+Shift+T`, and the
     /// shell-launcher menu (which passes a detected shell's path).
     fn spawn_tab_with(&mut self, shell: Option<String>) -> Result<(), std::io::Error> {
+        self.spawn_tab_opts(shell, &[], None, None)
+    }
+
+    /// Spawn a tab from a profile: its shell/cwd/theme, top-level config for
+    /// anything the profile leaves unset.
+    fn spawn_tab_profile(&mut self, i: usize) -> Result<(), std::io::Error> {
+        let Some(p) = self.config.profiles.get(i).cloned() else { return Ok(()) };
+        self.spawn_tab_opts(p.shell, &[], p.cwd, p.theme)
+    }
+
+    /// Spawn one session-file tab: profile defaults, then the tab's own
+    /// cwd/command overrides, then its splits (each split pane runs the same
+    /// shell and inherits the tab's cwd).
+    fn spawn_session_tab(
+        &mut self,
+        t: &crate::config::SessionTab,
+    ) -> Result<(), std::io::Error> {
+        let profile = t.profile.as_deref().and_then(|n| self.config.profile(n)).cloned();
+        if t.profile.is_some() && profile.is_none() {
+            eprintln!(
+                "rusty_term: session: no profile named `{}`",
+                t.profile.as_deref().unwrap_or_default()
+            );
+        }
+        let profile = profile.unwrap_or_default();
+        // A `command` runs directly (whitespace-split argv); else the
+        // profile's shell; else the configured default.
+        let (shell, args): (Option<String>, Vec<String>) = match &t.command {
+            Some(cmd) => {
+                let mut it = cmd.split_whitespace().map(str::to_string);
+                (it.next(), it.collect())
+            }
+            None => (profile.shell.clone(), Vec::new()),
+        };
+        let cwd = t.cwd.clone().or_else(|| profile.cwd.clone());
+        self.spawn_tab_opts(shell, &args, cwd.clone(), profile.theme)?;
+        for split in &t.splits {
+            let dir = if split == "right" { Dir::Vertical } else { Dir::Horizontal };
+            self.split_pane_with(dir, profile.shell.clone(), cwd.clone(), profile.theme);
+        }
+        Ok(())
+    }
+
+    /// The general tab spawner: explicit shell/args/cwd/theme, each falling
+    /// back to the config (and, for cwd, the focused pane) when `None`.
+    fn spawn_tab_opts(
+        &mut self,
+        shell: Option<String>,
+        args: &[String],
+        cwd: Option<PathBuf>,
+        theme: Option<Theme>,
+    ) -> Result<(), std::io::Error> {
         let shell = shell.or_else(|| self.config.shell.clone());
         // The launch-time `-- prog arg...` argv only applies when spawning
         // that same configured shell; a shell picked fresh from the menu
         // starts bare rather than replaying args meant for a different program.
-        let args: Vec<String> =
-            if shell == self.config.shell { self.config.command_args.clone() } else { Vec::new() };
-        // The focused pane's cwd wins (so a new tab follows where the user
-        // navigated to); the launch `--cwd` is only a fallback for the very
-        // first tab, before any pane has reported a cwd.
-        let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
-        let pane = self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref())?;
+        let args: Vec<String> = if !args.is_empty() {
+            args.to_vec()
+        } else if shell == self.config.shell {
+            self.config.command_args.clone()
+        } else {
+            Vec::new()
+        };
+        // An explicit cwd (profile/session) wins; else the focused pane's
+        // cwd (so a new tab follows where the user navigated to); the launch
+        // `--cwd` is the final fallback.
+        let cwd =
+            cwd.or_else(|| self.focused_pane_cwd()).or_else(|| self.config.cwd.clone());
+        let pane =
+            self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref(), theme)?;
         let focus = pane.id;
         self.tabs.push(Tab {
             panes: vec![pane],
@@ -468,8 +554,21 @@ impl App<'_> {
     fn split_pane(&mut self, dir: Dir) {
         let shell = self.config.shell.clone();
         let cwd = self.focused_pane_cwd().or_else(|| self.config.cwd.clone());
+        self.split_pane_with(dir, shell, cwd, None);
+    }
+
+    /// [`Self::split_pane`] with explicit shell/cwd/theme (session tabs pass
+    /// their profile's, so a split doesn't fall back to the global config).
+    fn split_pane_with(
+        &mut self,
+        dir: Dir,
+        shell: Option<String>,
+        cwd: Option<PathBuf>,
+        theme: Option<Theme>,
+    ) {
+        let shell = shell.or_else(|| self.config.shell.clone());
         let Ok(pane) =
-            self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref(), &[], cwd.as_deref())
+            self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref(), &[], cwd.as_deref(), theme)
         else {
             return;
         };
@@ -1706,7 +1805,7 @@ impl App<'_> {
     /// Open the shell-launcher dropdown (the `▾` button): the detected shells
     /// plus *Settings* and *Open config file* entries.
     fn open_menu(&mut self) {
-        let items = shell_menu_items(&self.shells);
+        let items = shell_menu_items(&self.config.profiles, &self.shells);
         self.overlay = Some(Overlay::Menu { items, sel: 0 });
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -1813,6 +1912,11 @@ impl App<'_> {
                 self.overlay = None;
                 if let Err(e) = self.spawn_tab_with(shell) {
                     eprintln!("rusty_term: new tab: {e}");
+                }
+            }
+            MenuKind::LaunchProfile(i) => {
+                if let Err(e) = self.spawn_tab_profile(i) {
+                    eprintln!("rusty_term: profile tab: {e}");
                 }
             }
             MenuKind::OpenUrl(url) => {
@@ -2054,14 +2158,24 @@ impl App<'_> {
     }
 }
 
-/// Build the shell-launcher dropdown: each detected shell (launching a new tab)
-/// then the *Settings* and *Open config file* entries.
-fn shell_menu_items(shells: &[crate::shells::DetectedShell]) -> Vec<MenuItem> {
-    let mut items: Vec<MenuItem> = shells
+/// Build the shell-launcher dropdown: configured profiles first, then each
+/// detected shell (launching a new tab), then the *Settings* and *Open
+/// config file* entries.
+fn shell_menu_items(
+    profiles: &[crate::config::Profile],
+    shells: &[crate::shells::DetectedShell],
+) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = profiles
         .iter()
         .enumerate()
-        .map(|(i, s)| MenuItem { label: s.name.to_string(), kind: MenuKind::LaunchShell(i) })
+        .map(|(i, p)| MenuItem { label: format!("Profile: {}", p.name), kind: MenuKind::LaunchProfile(i) })
         .collect();
+    items.extend(
+        shells
+            .iter()
+            .enumerate()
+            .map(|(i, s)| MenuItem { label: s.name.to_string(), kind: MenuKind::LaunchShell(i) }),
+    );
     items.push(MenuItem { label: "Settings".to_string(), kind: MenuKind::Settings });
     items.push(MenuItem { label: "Open config file".to_string(), kind: MenuKind::EditConfig });
     items
@@ -2917,7 +3031,14 @@ mod tests {
             DetectedShell { name: "pwsh", path: PathBuf::from("/x/pwsh") },
             DetectedShell { name: "bash", path: PathBuf::from("/bin/bash") },
         ];
-        let items = shell_menu_items(&shells);
+        let profiles = vec![crate::config::Profile {
+            name: "dev".into(),
+            ..Default::default()
+        }];
+        let with_profiles = shell_menu_items(&profiles, &shells);
+        assert_eq!(with_profiles[0].label, "Profile: dev");
+        assert!(matches!(with_profiles[0].kind, MenuKind::LaunchProfile(0)));
+        let items = shell_menu_items(&[], &shells);
         assert_eq!(items.len(), 4, "2 shells + Settings + config file");
         assert!(matches!(items[0].kind, MenuKind::LaunchShell(0)));
         assert!(matches!(items[1].kind, MenuKind::LaunchShell(1)));
