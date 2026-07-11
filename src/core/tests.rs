@@ -1421,6 +1421,12 @@ fn osc_9_conemu_progress_is_not_a_notification() {
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"\x1b]9;4;1;50\x07"); // ConEmu progress, not iTerm2 notify
     assert!(g.notifications.is_empty());
+    // …but since G01 it *is* tracked as progress state and relayed to the host.
+    assert_eq!(g.progress, Some((1, 50)));
+    assert_eq!(g.take_host_out(), b"\x1b]9;4;1;50\x07");
+    // Other ConEmu numeric subcommands stay ignored entirely.
+    p.advance(&mut g, b"\x1b]9;2;text\x07");
+    assert!(g.notifications.is_empty());
     assert!(g.take_host_out().is_empty());
 }
 
@@ -4214,4 +4220,84 @@ fn xtsmgraphics_rejects_unknown_item_and_action() {
     assert_eq!(p.take_responses(), b"\x1b[?3;1S");
     p.advance(&mut g, b"\x1b[?1;9S"); // bad action on a known item
     assert_eq!(p.take_responses(), b"\x1b[?1;2S");
+}
+
+// ---- Wave-2 additions: bell, OSC 9;4 progress, command timing, selection ----
+
+#[test]
+fn bel_flags_bell_and_relays_to_host() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.bell);
+    p.advance(&mut g, b"before\x07after");
+    assert!(g.bell);
+    assert_eq!(g.take_host_out(), b"\x07");
+    // Text around the BEL still prints normally.
+    assert_eq!(g.cells[0].ch, 'b');
+    assert_eq!(g.cells[6].ch, 'a');
+    // RIS clears the pending ring.
+    p.advance(&mut g, b"\x1bc");
+    assert!(!g.bell);
+}
+
+#[test]
+fn osc_9_4_progress_states_track_and_clear() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]9;4;1;150\x07"); // percent clamps to 100
+    assert_eq!(g.progress, Some((1, 100)));
+    p.advance(&mut g, b"\x1b]9;4;2;30\x07"); // error state keeps its percent
+    assert_eq!(g.progress, Some((2, 30)));
+    p.advance(&mut g, b"\x1b]9;4;3\x07"); // indeterminate: no percent
+    assert_eq!(g.progress, Some((3, 0)));
+    p.advance(&mut g, b"\x1b]9;4;0\x07"); // clear
+    assert_eq!(g.progress, None);
+    p.advance(&mut g, b"\x1b]9;4;9;9\x07"); // unknown state clears too
+    assert_eq!(g.progress, None);
+    let _ = g.take_host_out();
+}
+
+#[test]
+fn command_timer_records_exit_and_runtime_on_133_d() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // D without C: no record (shell only emits D).
+    p.advance(&mut g, b"\x1b]133;D;0\x07");
+    assert!(g.finished_commands.is_empty());
+    // C … D with an exit code records one entry.
+    p.advance(&mut g, b"\x1b]133;C\x07output\x1b]133;D;3\x07");
+    assert_eq!(g.finished_commands.len(), 1);
+    assert_eq!(g.finished_commands[0].0, Some(3));
+    // And without one records None.
+    p.advance(&mut g, b"\x1b]133;C\x07\x1b]133;D\x07");
+    assert_eq!(g.finished_commands[1].0, None);
+}
+
+#[test]
+fn select_word_at_expands_over_path_like_runs() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"ls /tmp/dir-1/file.txt \"quoted\"");
+    g.select_word_at(8, 0); // inside the path
+    assert_eq!(g.selected_text().as_deref(), Some("/tmp/dir-1/file.txt"));
+    g.select_word_at(0, 0); // inside `ls`
+    assert_eq!(g.selected_text().as_deref(), Some("ls"));
+    g.select_word_at(2, 0); // the blank between: selects just that cell
+    assert_eq!(g.selected_text().as_deref(), Some(""));
+    g.select_word_at(24, 0); // inside `quoted` — quotes are separators
+    assert_eq!(g.selected_text().as_deref(), Some("quoted"));
+}
+
+#[test]
+fn select_line_at_follows_soft_wraps() {
+    let mut g = Grid::new(10, 5);
+    let mut p = AnsiParser::new();
+    // 15 chars soft-wrap onto row 1; then a hard-broken second line.
+    p.advance(&mut g, b"abcdefghijklmno\r\nsecond");
+    g.select_line_at(0);
+    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno"));
+    g.select_line_at(1); // clicking the continuation selects the same logical line
+    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno"));
+    g.select_line_at(2);
+    assert_eq!(g.selected_text().as_deref(), Some("second"));
 }
