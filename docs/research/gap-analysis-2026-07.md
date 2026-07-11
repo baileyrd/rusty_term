@@ -51,8 +51,8 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
 | ✅ G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
 | ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
-| G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
-| G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
+| ✅ G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
+| ✅ G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
 | ✅ G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
 | ✅ G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
 | G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
@@ -356,6 +356,7 @@ winit already delivers the event, so this is a small handler.
 **Size** S · **Deps** `gui`.
 
 #### G24 — Color emoji font rendering (COLR/CBDT/sbix)
+**Status: done (CBDT/sbix PNG bitmap strikes, CPU renderer; COLR vector emoji and a GPU RGBA atlas deferred).** `FontCache::color_emoji` (`src/gui/font.rs`) finds a system color-emoji font (Noto Color Emoji / Segoe UI Emoji / Apple Color Emoji paths), reads its PNG bitmap strike via `ttf-parser`'s `glyph_raster_image`, decodes with the in-house PNG decoder, and contain-fits it into the emoji's two-cell footprint. `Glyph` gained an optional straight-alpha color image; the CPU blit composites it per-pixel (ignoring the pen color) while `coverage` still carries the alpha so the GPU path degrades to a monochrome silhouette rather than a blank.
 **Current.** Glyphs render via `ab_glyph` outlines with a single fg color;
 color-emoji tables aren't read (no COLR/CBDT/sbix matches), so emoji render
 as monochrome silhouettes at best via fallback fonts.
@@ -369,6 +370,7 @@ monochrome boxes read as broken.
 the atlas question from C08/C09).
 
 #### G25 — Built-in box-drawing / block-element / Powerline glyph synthesis
+**Status: done.** New `src/gui/boxdraw.rs` synthesizes U+2500–257F box drawing (a 109-entry arm table generated from Unicode names — light/heavy/double, plus dashes, rounded arcs, diagonals, half-lines), U+2580–259F block elements (fractional blocks, 25/50/75% shades, quadrants), U+2800–28FF braille, and Powerline U+E0B0–E0B3, all at exact cell geometry. `FontCache::glyph` intercepts these before font lookup (both renderers inherit it through `GlyphSource`), and the CPU ligature-run builder excludes them so GSUB can never substitute them away. Always on, matching kitty/Ghostty.
 **Current.** Box-drawing chars (U+2500…), block elements, and Powerline
 triangles come from whatever font/fallback provides them — with visible
 seams and misalignment when metrics don't match the cell exactly.
