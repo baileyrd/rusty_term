@@ -2533,6 +2533,32 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    // Key releases are terminal input only under Kitty
+                    // keyboard flag 2 (report event types); the UI layers
+                    // (chords, search, copy mode) never see them.
+                    let (app_cursor, kitty_flags) = self
+                        .pane()
+                        .map(|p| {
+                            let g = p.grid.lock();
+                            (g.app_cursor_keys, g.kitty_keyboard_flags())
+                        })
+                        .unwrap_or_default();
+                    if kitty_flags & 2 != 0
+                        && self.overlay.is_none()
+                        && self.searching.is_none()
+                        && self.copy_mode.is_none()
+                        && let Some(bytes) = super::input::encode_full(
+                            &event.logical_key,
+                            self.mods,
+                            app_cursor,
+                            kitty_flags,
+                            super::input::KeyPhase::Release,
+                            kitty_alternate(&event.logical_key, self.mods),
+                            None,
+                        )
+                    {
+                        self.write_child(&bytes);
+                    }
                     return;
                 }
                 // A settings page / shell menu, if open, owns all key input.
@@ -2584,8 +2610,21 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 let numpad = (event.location == KeyLocation::Numpad)
                     .then(|| super::input::encode_numpad(&event.logical_key, self.mods, app_keypad))
                     .flatten();
+                let phase = if event.repeat {
+                    super::input::KeyPhase::Repeat
+                } else {
+                    super::input::KeyPhase::Press
+                };
                 if let Some(bytes) = numpad.or_else(|| {
-                    super::input::encode(&event.logical_key, self.mods, app_cursor, kitty_flags)
+                    super::input::encode_full(
+                        &event.logical_key,
+                        self.mods,
+                        app_cursor,
+                        kitty_flags,
+                        phase,
+                        kitty_alternate(&event.logical_key, self.mods),
+                        event.text.as_deref(),
+                    )
                 }) {
                     self.write_child(&bytes);
                     // Typing returns the view to the live bottom, as most
@@ -2800,6 +2839,20 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
         out
     } else {
         text.into_bytes()
+    }
+}
+
+/// The Kitty flag-4 "alternate key": the shifted form of a text key while
+/// Shift is held (winit's logical key already has Shift applied), used as
+/// the `code:shifted` sub-parameter. `None` for named keys or unshifted
+/// presses.
+fn kitty_alternate(key: &winit::keyboard::Key, mods: ModifiersState) -> Option<char> {
+    if !mods.shift_key() {
+        return None;
+    }
+    match key {
+        winit::keyboard::Key::Character(s) => s.chars().next(),
+        _ => None,
     }
 }
 
