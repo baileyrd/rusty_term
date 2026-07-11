@@ -749,6 +749,14 @@ impl GpuCore {
 
         for row in 0..grid.rows {
             let on_status = status.is_some() && row == last_row;
+            // Bidi (implicit mode): the row's visual/logical permutation, or
+            // `None` (identity) for pure-LTR/status rows — mirrors the CPU
+            // renderer. Cell state stays logical; only the emitted instance
+            // X position (and glyph mirroring) go through the map.
+            let bidi = if on_status { None } else { grid.bidi_row(row) };
+            let vis = |col: usize| -> usize {
+                bidi.as_ref().and_then(|b| b.log2vis.get(col)).map_or(col, |&v| v as usize)
+            };
             let mut cols: Vec<Resolved> = Vec::with_capacity(grid.cols);
             for col in 0..grid.cols {
                 let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
@@ -783,6 +791,9 @@ impl GpuCore {
                     && char_width(cell.ch) == 1
                     && !super::boxdraw::is_synthesized(cell.ch)
                     && cell.ch != '\u{10EEEE}'
+                    // A reordered (bidi) row draws cell-by-cell; a shaped run
+                    // across visually non-adjacent cells would garble it.
+                    && bidi.is_none()
                     && font.has_ligatures();
                 cols.push(Resolved { cell, fg, bg, curs, ccol, deco, dcol, run_ok, trailer: false });
             }
@@ -799,11 +810,16 @@ impl GpuCore {
                 if !r.run_ok {
                     let style = Style::new(r.cell.flags & ATTR_BOLD != 0, r.cell.flags & ATTR_ITALIC != 0);
                     let ch = if r.cell.ch == '\u{10EEEE}' { ' ' } else { r.cell.ch };
+                    // Rule L4: chars in an RTL run draw their mirrored form.
+                    let ch = match &bidi {
+                        Some(b) if b.rtl[col] => crate::core::bidi_mirrored(ch).unwrap_or(ch),
+                        _ => ch,
+                    };
                     let (rect, is_color) = self.tile_for_char(ch, style, font);
                     let span = char_width(r.cell.ch).max(1) as u32;
                     let fg = if is_color { 0xFFFFFF } else { r.fg };
                     frame.base.push(Self::base_inst(
-                        (col0 + col) as u32,
+                        (col0 + vis(col)) as u32,
                         (row0 + row) as u32,
                         span,
                         rect,

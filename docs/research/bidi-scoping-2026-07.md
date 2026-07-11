@@ -102,6 +102,13 @@ This scopes "normalization" down from XL-sounding to S–M with a clear test.
 
 ## Phases
 
+Status (2026-07): **phases 1–2 done** — `src/core/bidi.rs` (full UAX #9,
+2,479-case UCD conformance sample in the suite), frozen UCD 17.0.0 tables
+(`src/core/bidi_tables.rs`, generator in `tools/`), `Grid::bidi_row` /
+`logical_col`, both renderers, and the mouse paths. `bidi = "auto"` opts
+in. Wide glyphs reorder as lead+trailer units; shaped ligature runs are
+disabled on reordered rows; fold summaries compose (they're LTR).
+
 | Phase | Deliverable | Size | Verifiable headlessly? |
 |---|---|---|---|
 | 1 | Bidi_Class tables + UAX #9 levels + reorder map, pure function, `bidi = "auto"/"off"` config (default **off** until phase 2 lands) | L | Yes — UCD `BidiTest.txt`/`BidiCharacterTest.txt` subsets embedded as fixtures |

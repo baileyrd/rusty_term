@@ -5197,3 +5197,42 @@ fn selected_html_multiline_trims_and_none_without_selection() {
     assert!(html.contains(">def</span>"), "{html}");
     assert!(!html.contains("abc "), "trailing blanks trimmed: {html}");
 }
+
+#[test]
+fn bidi_row_reorders_hebrew_and_maps_clicks_back() {
+    let mut g = Grid::new(12, 2);
+    g.bidi = true;
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, "ab \u{5D0}\u{5D1}\u{5D2}".as_bytes());
+    let b = g.bidi_row(0).expect("mixed row reorders");
+    // Logical: a b SP alef bet gimel ...  Visual: a b SP gimel bet alef ...
+    assert_eq!(&b.vis2log[..6], &[0, 1, 2, 5, 4, 3]);
+    // Inversion round-trips: the user clicks visual col 3 (gimel) and the
+    // model cell is logical col 5.
+    assert_eq!(g.logical_col(3, 0), 5);
+    assert_eq!(g.logical_col(5, 0), 3);
+    assert_eq!(g.logical_col(0, 0), 0);
+    // RTL cells are flagged for glyph mirroring.
+    assert!(b.rtl[3] && b.rtl[4] && b.rtl[5]);
+    assert!(!b.rtl[0]);
+    // A pure-LTR row costs nothing.
+    assert!(g.bidi_row(1).is_none());
+    // Off switch: identity everywhere.
+    g.bidi = false;
+    assert!(g.bidi_row(0).is_none());
+    assert_eq!(g.logical_col(3, 0), 3);
+}
+
+#[test]
+fn bidi_row_keeps_wide_glyph_cells_adjacent() {
+    let mut g = Grid::new(10, 1);
+    g.bidi = true;
+    let mut p = AnsiParser::new();
+    // Hebrew + a wide CJK char: the lead/trailer pair must stay adjacent
+    // (lead left of trailer) wherever the unit lands.
+    p.advance(&mut g, "\u{5D0}\u{5D1} \u{4E2D}".as_bytes());
+    let b = g.bidi_row(0).expect("reorders");
+    let lead_v = b.log2vis[3] as usize;
+    let trail_v = b.log2vis[4] as usize;
+    assert_eq!(trail_v, lead_v + 1, "wide pair adjacent, lead first: {:?}", b.vis2log);
+}

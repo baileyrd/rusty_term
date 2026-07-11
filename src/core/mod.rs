@@ -16,6 +16,10 @@
 //! pragmatic subset of the VT100/ECMA-48 escape repertoire.
 
 mod base64;
+#[cfg(any(test, feature = "gui"))]
+mod bidi;
+#[cfg(any(test, feature = "gui"))]
+mod bidi_tables;
 mod cell;
 mod charset;
 mod color;
@@ -41,6 +45,10 @@ pub use color::Theme;
 #[cfg(feature = "gui")]
 pub(crate) use color::ensure_contrast;
 pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
+#[cfg(any(test, feature = "gui"))]
+pub use grid::BidiRow;
+#[cfg(any(test, feature = "gui"))]
+pub(crate) use bidi::mirrored as bidi_mirrored;
 #[cfg(feature = "gui")]
 pub use cell::{Cell, char_width};
 #[cfg(feature = "gui")]

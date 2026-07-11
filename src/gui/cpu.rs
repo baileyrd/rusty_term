@@ -112,6 +112,18 @@ pub(crate) fn draw_grid(
     let search_hl = |col: usize, row: usize| grid.search_highlight(col, row);
     let status = grid.status_row();
     let last_row = grid.rows.saturating_sub(1);
+    // Bidi (implicit mode): per-row visual/logical permutations. `None` for
+    // pure-LTR rows, status rows, and when `bidi` is off — the common case,
+    // costing one flag check. Cell *state* stays keyed by logical position;
+    // only the draw X position (and glyph mirroring) go through the map.
+    let bidi: Vec<Option<crate::core::BidiRow>> = (0..grid.rows)
+        .map(|r| {
+            if status.is_some() && r == last_row { None } else { grid.bidi_row(r) }
+        })
+        .collect();
+    let vis = |col: usize, row: usize| -> usize {
+        bidi[row].as_ref().and_then(|b| b.log2vis.get(col)).map_or(col, |&v| v as usize)
+    };
 
     // Pass 1: backgrounds (every cell, incl. wide trailers, before glyphs).
     for i in 0..grid.cols * grid.rows {
@@ -129,7 +141,7 @@ pub(crate) fn draw_grid(
         } else {
             cell.bg
         };
-        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+        let (x0, y0) = ((col0 + vis(col, row)) * cw, (row0 + row) * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
@@ -165,6 +177,9 @@ pub(crate) fn draw_grid(
                 // content, never a glyph.
                 && !crate::gui::boxdraw::is_synthesized(cell.ch)
                 && cell.ch != '\u{10EEEE}'
+                // A reordered (bidi) row draws cell-by-cell; shaping a run
+                // across visually non-adjacent cells would garble it.
+                && bidi[row].is_none()
         };
         let mut col = 0;
         while col < grid.cols {
@@ -177,7 +192,14 @@ pub(crate) fn draw_grid(
                     || cell.ch == '\u{10EEEE}';
                 plan[row * grid.cols + col] = (!blank).then(|| {
                     let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
-                    font.glyph(cell.ch, style)
+                    // Rule L4: chars in an RTL run draw their mirrored form.
+                    let ch = match &bidi[row] {
+                        Some(b) if b.rtl[col] => {
+                            crate::core::bidi_mirrored(cell.ch).unwrap_or(cell.ch)
+                        }
+                        _ => cell.ch,
+                    };
+                    font.glyph(ch, style)
                 });
                 col += 1;
                 continue;
@@ -227,7 +249,7 @@ pub(crate) fn draw_grid(
         // Minimum-contrast enforcement (`minimum_contrast` config): nudge the
         // glyph color against the background this cell actually painted.
         let fg = crate::core::ensure_contrast(fg, under_bg, grid.min_contrast);
-        let pen_x = ((col0 + col) * cw) as i32 + glyph.left;
+        let pen_x = ((col0 + vis(col, row)) * cw) as i32 + glyph.left;
         let pen_y = ((row0 + row) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, glyph, pen_x, pen_y, fg);
     }
@@ -258,7 +280,7 @@ pub(crate) fn draw_grid(
         } else {
             cell.fg
         };
-        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+        let (x0, y0) = ((col0 + vis(col, row)) * cw, (row0 + row) * ch);
         if underline {
             let color = if !swapped && cell.flags & ATTR_UNDERLINE_COLOR != 0 {
                 cell.underline_color
@@ -317,7 +339,7 @@ pub(crate) fn draw_grid(
         && shape != CursorShape::Block
         && !(status.is_some() && crow == last_row)
     {
-        let (x0, y0) = ((col0 + ccol) * cw, (row0 + crow) * ch);
+        let (x0, y0) = ((col0 + vis(ccol, crow)) * cw, (row0 + crow) * ch);
         let color = grid.cursor_color;
         match shape {
             CursorShape::Underline => {
