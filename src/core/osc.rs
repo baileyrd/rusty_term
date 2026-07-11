@@ -86,12 +86,22 @@ pub(crate) fn dispatch(
         // forms aren't forwarded — the reply path isn't wired.
         "52" => {
             if let Some(text) = text {
-                // `<selection> ; <data>`; `?` for the data is a query.
+                // `<selection> ; <data>`; `?` for the data is a query. The
+                // selection field is a string of targets (`c` clipboard, `p`
+                // primary, `s`/`q` cut buffers, empty = clipboard); a leading
+                // `p` routes to the PRIMARY selection, anything else to the
+                // clipboard — xterm applies each listed target, but one
+                // faithful target beats a half-modeled many.
                 let data = text.rsplit(';').next().unwrap_or("");
+                let primary = text.split(';').next().unwrap_or("").starts_with('p');
                 if data == "?" {
                     // The window backend answers from the system clipboard; the
                     // TUI relies on the host terminal for the reply.
-                    g.clipboard_query = true;
+                    if primary {
+                        g.clipboard_query_primary = true;
+                    } else {
+                        g.clipboard_query = true;
+                    }
                 } else {
                     // Set: relay to the host (TUI) and decode for the window
                     // backend, which owns the clipboard.
@@ -99,7 +109,11 @@ pub(crate) fn dispatch(
                     if let Some(bytes) = super::base64::decode(data.as_bytes())
                         && let Ok(s) = String::from_utf8(bytes)
                     {
-                        g.clipboard_set = Some(s);
+                        if primary {
+                            g.clipboard_set_primary = Some(s);
+                        } else {
+                            g.clipboard_set = Some(s);
+                        }
                     }
                 }
             }

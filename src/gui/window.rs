@@ -102,10 +102,12 @@ struct MenuItem {
     kind: MenuKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MenuKind {
     /// Launch a new tab running detected shell `[index]`.
     LaunchShell(usize),
+    /// Open this URL with the OS handler (the visible-links menu).
+    OpenUrl(String),
     /// Open the in-app settings page.
     Settings,
     /// Open the config file in the user's editor.
@@ -204,6 +206,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         mouse_pos: (0.0, 0.0),
         selecting: false,
         focused: true,
+        search_regex: false,
         last_grid_click: None,
         click_streak: 0,
         mouse_button_down: None,
@@ -306,6 +309,10 @@ struct App<'a> {
     /// reports (wave 1), bell attention requests, and command-finished
     /// notifications.
     focused: bool,
+    /// Whether the find bar matches as a regex (`rusty_regx`, POSIX ERE)
+    /// instead of plain text. Toggled with Ctrl+R inside search mode;
+    /// remembered across searches.
+    search_regex: bool,
     /// Last left-click on pane content `(when, cell)` plus the current
     /// consecutive-click count — double-click selects a word, triple a
     /// logical line (`click_streak` cycles 1 → 2 → 3 → 1).
@@ -623,7 +630,8 @@ impl App<'_> {
             let limit = cols.saturating_sub(count.chars().count());
             let mut hits = vec![Hit::Drag; cols];
             let mut col = 0;
-            put_text(&mut row, &mut hits, &mut col, limit, &format!(" Find: {query}"), self.theme.fg, bar_bg, Hit::Drag);
+            let mode = if self.search_regex { " Find(re): " } else { " Find: " };
+            put_text(&mut row, &mut hits, &mut col, limit, &format!("{mode}{query}"), self.theme.fg, bar_bg, Hit::Drag);
             let mut ccol = limit;
             put_text(&mut row, &mut hits, &mut ccol, cols, &count, self.theme.fg, bar_bg, Hit::Drag);
             self.hits = hits;
@@ -813,6 +821,9 @@ impl App<'_> {
                 _ => g.selection = None, // cleared until the drag moves
             }
         }
+        if self.click_streak > 1 {
+            self.copy_selection_primary(); // copy-on-select
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -915,23 +926,51 @@ impl App<'_> {
     /// the child from the system clipboard. Called on a tab's output, so
     /// background tabs are serviced too.
     fn service_clipboard(&mut self, id: u64) {
-        let (set, query) = {
+        let (set, set_primary, query, query_primary) = {
             let Some(p) = self.pane_by_id(id) else { return };
             let mut g = p.grid.lock();
-            if g.clipboard_set.is_none() && !g.clipboard_query {
+            if g.clipboard_set.is_none()
+                && g.clipboard_set_primary.is_none()
+                && !g.clipboard_query
+                && !g.clipboard_query_primary
+            {
                 return;
             }
-            (g.clipboard_set.take(), std::mem::take(&mut g.clipboard_query))
+            (
+                g.clipboard_set.take(),
+                g.clipboard_set_primary.take(),
+                std::mem::take(&mut g.clipboard_query),
+                std::mem::take(&mut g.clipboard_query_primary),
+            )
         };
         if let Some(text) = set
             && let Some(cb) = self.clipboard.as_mut()
         {
             let _ = cb.set_text(text);
         }
+        if let Some(text) = set_primary
+            && let Some(cb) = self.clipboard.as_mut()
+        {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                use arboard::SetExtLinux as _;
+                let _ = cb.set().clipboard(arboard::LinuxClipboardKind::Primary).text(text);
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let _ = cb.set_text(text); // no primary selection: best effort
+        }
         if query
             && let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
         {
-            let reply = osc52_reply(&text);
+            let reply = osc52_reply('c', &text);
+            if let Some(p) = self.pane_by_id_mut(id) {
+                let _ = p.writer.write(&reply);
+            }
+        }
+        if query_primary
+            && let Some(text) = self.primary_text()
+        {
+            let reply = osc52_reply('p', &text);
             if let Some(p) = self.pane_by_id_mut(id) {
                 let _ = p.writer.write(&reply);
             }
@@ -1029,6 +1068,7 @@ impl App<'_> {
             Action::OpenConfig => self.open_config(),
             Action::OpenSettings => self.open_settings(),
             Action::Search => self.start_search(),
+            Action::OpenLinks => self.open_links_menu(),
             Action::SplitRight => self.split_pane(Dir::Vertical),
             Action::SplitDown => self.split_pane(Dir::Horizontal),
             Action::FocusNext => self.focus_pane(true),
@@ -1073,6 +1113,10 @@ impl App<'_> {
                 }
                 self.run_search();
             }
+            Key::Character(s) if self.mods.control_key() && s.as_str() == "r" => {
+                self.search_regex = !self.search_regex;
+                self.run_search();
+            }
             Key::Character(s) if !self.mods.control_key() && !self.mods.alt_key() => {
                 if let Some(q) = self.searching.as_mut() {
                     q.push_str(s);
@@ -1090,8 +1134,9 @@ impl App<'_> {
     /// Re-run the active tab's search for the current query.
     fn run_search(&mut self) {
         let q = self.searching.clone().unwrap_or_default();
+        let regex = self.search_regex;
         if let Some(p) = self.pane() {
-            p.grid.lock().search(&q);
+            p.grid.lock().search_with(&q, regex);
         }
     }
 
@@ -1132,6 +1177,47 @@ impl App<'_> {
             winit::dpi::PhysicalPosition::new(x, y),
             winit::dpi::PhysicalSize::new(self.cell_w as u32, self.cell_h as u32),
         );
+    }
+
+    /// Copy the focused pane's selection to the PRIMARY selection
+    /// (X11/Wayland copy-on-select; a no-op elsewhere — macOS/Windows have
+    /// no primary selection concept).
+    fn copy_selection_primary(&mut self) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let Some(p) = self.pane() else { return };
+            let text = p.grid.lock().selected_text();
+            if let (Some(text), Some(cb)) = (text.filter(|t| !t.is_empty()), self.clipboard.as_mut()) {
+                use arboard::SetExtLinux as _;
+                let _ = cb.set().clipboard(arboard::LinuxClipboardKind::Primary).text(text);
+            }
+        }
+    }
+
+    /// The PRIMARY selection's text (X11/Wayland), or the regular clipboard
+    /// where no primary selection exists.
+    fn primary_text(&mut self) -> Option<String> {
+        let cb = self.clipboard.as_mut()?;
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use arboard::GetExtLinux as _;
+            cb.get().clipboard(arboard::LinuxClipboardKind::Primary).text().ok()
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            cb.get_text().ok()
+        }
+    }
+
+    /// Middle-click pastes the PRIMARY selection (X11 muscle memory), unless
+    /// the child is tracking the mouse — then the click is the child's.
+    fn paste_primary(&mut self) {
+        let Some(text) = self.primary_text().filter(|t| !t.is_empty()) else { return };
+        if let Some(p) = self.pane_mut() {
+            let bracketed = p.grid.lock().bracketed_paste;
+            let _ = p.writer.write(&encode_paste(&text, bracketed));
+        }
+        self.snap_to_bottom();
     }
 
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
@@ -1189,8 +1275,44 @@ impl App<'_> {
     fn open_link_under_pointer(&self) -> bool {
         let Some(p) = self.pane() else { return false };
         let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
-        let url = p.grid.lock().link_at(col, row).map(str::to_owned);
+        let url = {
+            let g = p.grid.lock();
+            // An explicit OSC 8 link wins; otherwise scan the cell's logical
+            // line for a plain-text URL (G16) — most programs never emit OSC 8.
+            g.link_at(col, row).map(str::to_owned).or_else(|| g.url_at(col, row))
+        };
         url.is_some_and(|u| open_url(&u))
+    }
+
+    /// Open a dropdown listing every link visible in the focused pane —
+    /// explicit OSC 8 hyperlinks and detected plain-text URLs — so links are
+    /// reachable without the mouse (Ctrl+Shift+O; the keyboard side of G16).
+    fn open_links_menu(&mut self) {
+        let links = match self.pane() {
+            Some(p) => p.grid.lock().visible_links(),
+            None => return,
+        };
+        if links.is_empty() {
+            return;
+        }
+        let items = links
+            .into_iter()
+            .map(|u| {
+                // Menu rows are narrow; elide the middle of long URLs.
+                let label = if u.chars().count() > 46 {
+                    let head: String = u.chars().take(30).collect();
+                    let tail: String = u.chars().rev().take(13).collect::<Vec<_>>().into_iter().rev().collect();
+                    format!("{head}…{tail}")
+                } else {
+                    u.clone()
+                };
+                MenuItem { label, kind: MenuKind::OpenUrl(u) }
+            })
+            .collect();
+        self.overlay = Some(Overlay::Menu { items, sel: 0 });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// Whether alternate scroll mode (`?1007`) should intercept wheel input
@@ -1414,7 +1536,7 @@ impl App<'_> {
     fn overlay_activate(&mut self) {
         match &self.overlay {
             Some(Overlay::Menu { items, sel }) => {
-                if let Some(kind) = items.get(*sel).map(|i| i.kind) {
+                if let Some(kind) = items.get(*sel).map(|i| i.kind.clone()) {
                     self.menu_pick(kind);
                 }
             }
@@ -1426,7 +1548,7 @@ impl App<'_> {
     /// Pick menu row `n` (1-based, from a digit key); ignored off the menu.
     fn menu_pick_index(&mut self, n: usize) {
         let kind = match &self.overlay {
-            Some(Overlay::Menu { items, .. }) if n >= 1 => items.get(n - 1).map(|i| i.kind),
+            Some(Overlay::Menu { items, .. }) if n >= 1 => items.get(n - 1).map(|i| i.kind.clone()),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -1443,6 +1565,9 @@ impl App<'_> {
                 if let Err(e) = self.spawn_tab_with(shell) {
                     eprintln!("rusty_term: new tab: {e}");
                 }
+            }
+            MenuKind::OpenUrl(url) => {
+                open_url(&url);
             }
             MenuKind::Settings => self.open_settings(),
             MenuKind::EditConfig => {
@@ -2032,6 +2157,12 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                             }
                             self.on_left_press(event_loop);
                         }
+                        if kind == MouseButtonKind::Middle
+                            && !self.pane().is_some_and(|p| p.grid.lock().mouse_modes.active())
+                        {
+                            self.paste_primary();
+                            return;
+                        }
                         self.mouse_button_down = Some(kind);
                         let (sh, al, ct) =
                             (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
@@ -2044,6 +2175,9 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     }
                     ElementState::Released => {
                         if kind == MouseButtonKind::Left {
+                            if self.selecting {
+                                self.copy_selection_primary(); // copy-on-select
+                            }
                             self.selecting = false;
                         }
                         if self.mouse_button_down == Some(kind) {
@@ -2339,8 +2473,10 @@ fn chord_key(code: KeyCode) -> Option<crate::keymap::Key> {
 /// Build the OSC 52 clipboard query reply for the child: `OSC 52 ; c ; <b64>`
 /// (BEL-terminated), answering a `OSC 52 ; … ; ?` query from the system
 /// clipboard.
-fn osc52_reply(text: &str) -> Vec<u8> {
-    let mut out = Vec::from(&b"\x1b]52;c;"[..]);
+fn osc52_reply(sel: char, text: &str) -> Vec<u8> {
+    let mut out = Vec::from(&b"\x1b]52;"[..]);
+    out.push(sel as u8);
+    out.push(b';');
     out.extend_from_slice(crate::core::base64_encode(text.as_bytes()).as_bytes());
     out.push(0x07);
     out
@@ -2419,7 +2555,8 @@ mod tests {
     #[test]
     fn osc52_reply_wraps_base64() {
         // "hi" -> base64 "aGk=", framed as an OSC 52 clipboard reply (BEL).
-        assert_eq!(osc52_reply("hi"), b"\x1b]52;c;aGk=\x07");
+        assert_eq!(osc52_reply('c', "hi"), b"\x1b]52;c;aGk=\x07");
+        assert_eq!(osc52_reply('p', "hi"), b"\x1b]52;p;aGk=\x07");
     }
 
     #[test]

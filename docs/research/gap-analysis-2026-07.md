@@ -36,20 +36,20 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
 | G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
 | G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
-| G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
+| ✅ G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
 | G10 | win32-input-mode (ConPTY key fidelity) | P2 | Windows Terminal, WezTerm | M |
 | G11 | Kitty keyboard flags 2/4/16 in GUI | P2 | kitty, Ghostty, WezTerm, foot | M |
 | ✅ G12 | Keypad application mode (DECKPAM/DECKPNM) | P2 | universal (legacy but probed) | S |
 | ✅ G13 | Native focus reporting (mode 1004) in GUI | P1 | universal | S |
 | ✅ G14 | SGR-pixel mouse (mode 1016) in GUI | P2 | xterm, kitty, foot, WezTerm | S |
 | G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
-| G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
+| ✅ G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
 | ✅ G17 | Double/triple-click word/line selection | P1 | universal | S–M |
 | G18 | Keyboard copy mode (vi-style selection) | P2 | kitty, WezTerm, Windows Terminal, tmux | M |
 | G19 | Scrollbar | P2 | Ghostty 1.3, kitty 0.43, Windows Terminal, Konsole | M |
 | ✅ G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
 | G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
-| G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
+| ✅ G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
 | ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
 | G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
 | G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
@@ -175,6 +175,7 @@ the delivery pipeline — this is a parser-front-end extension.
 **Size** S–M · **Deps** existing notification plumbing.
 
 #### G09 — Primary selection: copy-on-select, middle-click paste, OSC 52 `p`
+**Status: done.** Copy-on-select (drag release and word/line multi-click) and middle-click paste target the PRIMARY selection via `arboard`'s Linux extension (`src/gui/window.rs::{copy_selection_primary, paste_primary}`; middle-click defers to a mouse-tracking child). OSC 52's selection field now routes: a leading `p` targets PRIMARY for both set and query (`Grid::{clipboard_set_primary, clipboard_query_primary}`, `osc52_reply` carries the target), still relayed to the host in TUI mode — verified on the wire. Non-Linux platforms fall back to the regular clipboard.
 **Current.** Selection copies only via explicit Ctrl+Shift+C to the CLIPBOARD
 target (`arboard` default); no matches for primary selection; middle-click
 is only a mouse-report button; OSC 52 handles the `c` clipboard only.
@@ -257,6 +258,7 @@ the landed LNM/rect-ops work.
 ### A.2 Interaction & UX
 
 #### G16 — Implicit URL/path detection + keyboard hints mode
+**Status: done (detection + Ctrl+click + link menu; label-overlay hints deferred).** `detect_urls`/`Grid::url_at`/`Grid::visible_links` (`src/core/grid.rs`) scan logical lines (following soft wraps) for `http(s)/ftp/file/mailto/www.` URLs over RFC 3986 characters, trimming trailing sentence punctuation and unbalanced closers. Ctrl+click falls back to detected URLs when no OSC 8 link covers the cell; Ctrl+Shift+O (`open_links` action) lists every visible link — explicit and detected — in the dropdown menu for keyboard-driven opening. kitty-style on-screen label overlays remain future renderer work.
 **Current.** Only explicit OSC 8 hyperlinks are clickable
 (`Grid::link_at`); plain `https://…` text printed by any ordinary program is
 inert. No regex machinery exists in the tree.
@@ -329,6 +331,7 @@ is an input-synthesis feature over existing state.
 **Size** M · **Deps** OSC 133 (done), `gui`.
 
 #### G22 — Regex + Unicode case-folded search
+**Status: done.** `Grid::search_with(query, regex)` — both modes fold case with simple Unicode folding (not just ASCII). Regex mode compiles with **`rusty_regx`** (in-house zero-dep, linear-time POSIX ERE on a Pike VM — a user-supplied pattern can't hang the search), matching per logical line with `^`/`$` anchoring to the line; malformed patterns find nothing. Ctrl+R toggles the mode inside the find bar (`Find:` ↔ `Find(re):`).
 **Current.** `Grid::search` is a plain-substring, ASCII-case-insensitive
 scan (`src/core/grid.rs`).
 **Target.** Unicode case folding for the existing search, plus a regex mode

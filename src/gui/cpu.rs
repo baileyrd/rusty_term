@@ -735,7 +735,7 @@ mod tests {
         let mut g = Grid::new(5, 1);
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"xyz");
-        assert_eq!(g.search("y"), 1); // 'y' at col 1, the active (current) match
+        assert_eq!(g.search_with("y", false), 1); // 'y' at col 1, the active (current) match
         let (w, h) = (5 * 4, 8); // 5 cols * 4px cell width
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);

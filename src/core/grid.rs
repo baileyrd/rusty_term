@@ -107,15 +107,106 @@ pub(crate) struct Search {
 #[cfg(any(test, feature = "gui"))]
 const SEARCH_MAX: usize = 2000;
 
+/// Detect plain-text URLs in one logical line, as `(start, end_exclusive,
+/// url)` char spans. Recognized: `http(s)://`, `ftp://`, `file://`,
+/// `mailto:`, and bare `www.` (returned with `http://` prepended). A URL
+/// runs over RFC 3986 characters and is trimmed of trailing punctuation
+/// that's overwhelmingly sentence context (`.` `,` `;` `:` `!` `?` and any
+/// closer without its matching opener in the URL), matching what kitty and
+/// WezTerm do.
+#[cfg(any(test, feature = "gui"))]
+fn detect_urls(text: &[char]) -> Vec<(usize, usize, String)> {
+    const SCHEMES: [&str; 6] = ["https://", "http://", "ftp://", "file://", "mailto:", "www."];
+    let is_url_char = |c: char| {
+        c.is_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+    };
+    let lower: Vec<char> = text.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let Some(scheme) = SCHEMES.iter().find(|s| {
+            lower[i..].starts_with(&s.chars().collect::<Vec<_>>()[..])
+        }) else {
+            i += 1;
+            continue;
+        };
+        // A scheme mid-word (e.g. "xhttp://") isn't a URL start.
+        if i > 0 && (text[i - 1].is_alphanumeric() || text[i - 1] == '.') {
+            i += 1;
+            continue;
+        }
+        let mut end = i + scheme.chars().count();
+        while end < text.len() && is_url_char(text[end]) {
+            end += 1;
+        }
+        // Trim trailing sentence punctuation and unbalanced closers.
+        while end > i {
+            let c = text[end - 1];
+            let trim = match c {
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+                ')' => text[i..end].iter().filter(|&&x| x == '(').count()
+                    < text[i..end].iter().filter(|&&x| x == ')').count(),
+                ']' => text[i..end].iter().filter(|&&x| x == '[').count()
+                    < text[i..end].iter().filter(|&&x| x == ']').count(),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            end -= 1;
+        }
+        // Require something after the scheme, and skip bare "www." itself.
+        if end > i + scheme.chars().count() {
+            let mut url: String = text[i..end].iter().collect();
+            if *scheme == "www." {
+                url.insert_str(0, "http://");
+            }
+            out.push((i, end, url));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Record the match `text[i..i + mlen]` into `st` as an anchor plus per-row
+/// highlight spans (a match can cross a soft wrap, hence per-row).
+#[cfg(any(test, feature = "gui"))]
+fn record_match(text: &[char], at: &[(usize, usize)], i: usize, mlen: usize, st: &mut Search) {
+    let mi = st.anchors.len();
+    st.anchors.push(at[i]);
+    let mut j = i;
+    while j < i + mlen {
+        let row = at[j].0;
+        let start = at[j].1;
+        let mut end = at[j].1 + char_width(text[j]).max(1);
+        let mut k = j + 1;
+        while k < i + mlen && at[k].0 == row {
+            end = at[k].1 + char_width(text[k]).max(1);
+            k += 1;
+        }
+        st.rows.entry(row).or_default().push((start, end, mi));
+        j = k;
+    }
+}
+
+/// The searchable length of one logical line: its `text` minus trailing spaces.
+#[cfg(any(test, feature = "gui"))]
+fn line_len(text: &[char]) -> usize {
+    let mut len = text.len();
+    while len > 0 && text[len - 1] == ' ' {
+        len -= 1;
+    }
+    len
+}
+
 /// Find every (non-overlapping) occurrence of `q` in one logical line's `text`
 /// (with parallel per-char `at` cell positions), recording each as an anchor
 /// plus per-row highlight spans in `st`. Trailing spaces are ignored.
 #[cfg(any(test, feature = "gui"))]
 fn find_matches(text: &[char], at: &[(usize, usize)], q: &[char], st: &mut Search) {
-    let mut len = text.len();
-    while len > 0 && text[len - 1] == ' ' {
-        len -= 1;
-    }
+    let len = line_len(text);
     if q.is_empty() || q.len() > len {
         return;
     }
@@ -125,24 +216,69 @@ fn find_matches(text: &[char], at: &[(usize, usize)], q: &[char], st: &mut Searc
             i += 1;
             continue;
         }
-        let mi = st.anchors.len();
-        st.anchors.push(at[i]);
-        let mut j = i;
-        while j < i + q.len() {
-            let row = at[j].0;
-            let start = at[j].1;
-            let mut end = at[j].1 + char_width(text[j]).max(1);
-            let mut k = j + 1;
-            while k < i + q.len() && at[k].0 == row {
-                end = at[k].1 + char_width(text[k]).max(1);
-                k += 1;
-            }
-            st.rows.entry(row).or_default().push((start, end, mi));
-            j = k;
-        }
+        record_match(text, at, i, q.len(), st);
         i += q.len();
         if st.anchors.len() >= SEARCH_MAX {
             return;
+        }
+    }
+}
+
+/// Simple one-char Unicode case fold (the first char of `to_lowercase()`).
+/// Full folding (ß → ss) changes lengths and would break the char↔column
+/// mapping, so it's deliberately out. Both the search haystack and the query
+/// (or regex pattern) fold through this, making every search mode
+/// case-insensitive beyond plain ASCII.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// The regex flavor of [`find_matches`]: every non-overlapping match of the
+/// compiled pattern (`rusty_regx`, POSIX-longest semantics) in one logical
+/// line. The engine matches `&str` with byte offsets, so the folded char
+/// line is materialized once with a byte→char index table. Empty-width
+/// matches (e.g. `x*` where there is no `x`) are skipped — there is nothing
+/// to highlight — advancing one char so the scan always terminates. A
+/// `^`-anchored pattern matches at most once per line: find-all scans
+/// successive suffixes, where `^` would falsely re-anchor.
+#[cfg(any(test, feature = "gui"))]
+fn find_matches_rx(text: &[char], at: &[(usize, usize)], re: &rusty_regx::Regex, anchored: bool, st: &mut Search) {
+    let len = line_len(text);
+    let line: String = text[..len].iter().collect();
+    // Byte offset of each char (plus the end sentinel), for offset mapping.
+    let mut byte_of = Vec::with_capacity(len + 1);
+    let mut b = 0;
+    for &c in &text[..len] {
+        byte_of.push(b);
+        b += c.len_utf8();
+    }
+    byte_of.push(b);
+    let mut from = 0usize; // byte offset the next scan starts at
+    while from <= line.len() {
+        let suffix = &line[from..];
+        let Some(caps) = re.captures(suffix) else { return };
+        let Some(m) = caps.get(0) else { return };
+        // The engine has no positional API, but `m` borrows from `suffix`,
+        // so its byte offset is plain (safe) pointer arithmetic on the same
+        // allocation. (A textual `find(&m)` would be wrong for `$`-anchored
+        // patterns, whose matched text can also occur earlier in the line.)
+        let rel = m.as_ptr() as usize - suffix.as_ptr() as usize;
+        let (sb, eb) = (from + rel, from + rel + m.len());
+        let s_idx = byte_of.partition_point(|&x| x < sb);
+        let e_idx = byte_of.partition_point(|&x| x < eb);
+        if e_idx > s_idx {
+            record_match(text, at, s_idx, e_idx - s_idx, st);
+            if st.anchors.len() >= SEARCH_MAX {
+                return;
+            }
+            from = eb;
+        } else {
+            // Empty-width match: nothing to highlight; step one char.
+            from = *byte_of.get(s_idx + 1).unwrap_or(&(line.len() + 1));
+        }
+        if anchored {
+            return; // `^…` can only ever match at the true line start
         }
     }
 }
@@ -322,9 +458,15 @@ pub struct Grid {
     /// pending pickup by the window backend (which owns the clipboard); `None`
     /// when nothing is pending. The TUI relays OSC 52 to the host and ignores it.
     pub clipboard_set: Option<String>,
+    /// Like [`Grid::clipboard_set`] but targeting the PRIMARY selection
+    /// (OSC 52 with a `p` selection argument). Serviced on X11/Wayland;
+    /// elsewhere it falls back to the regular clipboard.
+    pub clipboard_set_primary: Option<String>,
     /// Set when the child queried the clipboard (`OSC 52 ; … ; ?`); the window
     /// backend answers from the system clipboard and clears it.
     pub clipboard_query: bool,
+    /// Like [`Grid::clipboard_query`] but for the PRIMARY selection.
+    pub clipboard_query_primary: bool,
     /// Desktop notifications (OSC 9 / OSC 777) the child requested, drained by
     /// the windowed front-end which raises them via the OS; the TUI relays the
     /// OSC to the host. Each entry is `(title, body)`; an empty title means the
@@ -950,7 +1092,9 @@ impl Grid {
             app_keypad: false,
             line_feed_new_line: false,
             clipboard_set: None,
+            clipboard_set_primary: None,
             clipboard_query: false,
+            clipboard_query_primary: false,
             notifications: Vec::new(),
             ime_preedit: String::new(),
             mouse_modes: MouseModes::default(),
@@ -2691,10 +2835,32 @@ impl Grid {
     /// (ASCII), joining soft-wrapped rows into logical lines so a match can cross
     /// a wrap. Stores matches for highlighting and next/prev, scrolls the first
     /// into view, and returns the count. An empty query clears the search.
+    /// Search the scrollback + live screen for `query`. `regex = true` compiles the
+    /// query with the from-scratch engine (`core::rx`) and matches per
+    /// logical line (`^`/`$` anchor to the line); a malformed pattern finds
+    /// nothing, which the find bar shows as "no matches". Both modes fold
+    /// case (simple Unicode folding, not just ASCII).
     #[cfg(any(test, feature = "gui"))]
-    pub fn search(&mut self, query: &str) -> usize {
+    pub fn search_with(&mut self, query: &str, regex: bool) -> usize {
         self.search = None;
-        let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let re = if regex {
+            // Fold the pattern like the haystack, so literals match
+            // case-insensitively. Safe for POSIX ERE: folding never touches
+            // metacharacters, and the engine has no `\D`-style classes whose
+            // meaning a case change could invert.
+            let folded: String = query.chars().map(fold_char).collect();
+            match rusty_regx::Regex::new_posix(&folded) {
+                Ok(re) => Some((re, folded.starts_with('^'))),
+                Err(_) => {
+                    // Malformed pattern: finds nothing ("no matches" in the bar).
+                    self.dirty.iter_mut().for_each(|d| *d = true);
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
+        let q: Vec<char> = query.chars().map(fold_char).collect();
         if q.is_empty() {
             self.dirty.iter_mut().for_each(|d| *d = true);
             return 0;
@@ -2709,20 +2875,26 @@ impl Grid {
                 if cell.flags & WIDE_TRAILER != 0 {
                     continue;
                 }
-                text.push(cell.ch.to_ascii_lowercase());
+                text.push(fold_char(cell.ch));
                 at.push((abs, col));
             }
             if wrapped {
                 continue;
             }
-            find_matches(&text, &at, &q, &mut st);
+            match &re {
+                Some((re, anchored)) => find_matches_rx(&text, &at, re, *anchored, &mut st),
+                None => find_matches(&text, &at, &q, &mut st),
+            }
             text.clear();
             at.clear();
             if st.anchors.len() >= SEARCH_MAX {
                 break;
             }
         }
-        find_matches(&text, &at, &q, &mut st);
+        match &re {
+            Some((re, anchored)) => find_matches_rx(&text, &at, re, *anchored, &mut st),
+            None => find_matches(&text, &at, &q, &mut st),
+        }
         let n = st.anchors.len();
         if n > 0 {
             let anchor = st.anchors[0].0;
@@ -2884,6 +3056,94 @@ impl Grid {
         } else {
             self.cells[(row - off) * self.cols + col]
         }
+    }
+
+    /// The plain-text URL under viewport `(col, row)`, detected by scanning
+    /// the cell's whole logical line (following soft wraps) — the implicit
+    /// counterpart of [`Grid::link_at`] for the overwhelming majority of
+    /// programs that print URLs without OSC 8. A `www.`-prefixed match gets
+    /// `http://` prepended so the result is directly openable.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn url_at(&self, col: usize, row: usize) -> Option<String> {
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        let off = self.view_offset.min(self.scrollback.len());
+        let abs = self.scrollback.len() - off + row;
+        let (text, at) = self.logical_line_of(abs);
+        let idx = at.iter().position(|&(a, c)| a == abs && c == col)?;
+        detect_urls(&text)
+            .into_iter()
+            .find(|&(s, e, _)| idx >= s && idx < e)
+            .map(|(_, _, url)| url)
+    }
+
+    /// Every distinct link visible in the viewport, explicit (OSC 8) and
+    /// detected (plain text), top-to-bottom, capped at 16 — feeds the
+    /// window's "open a link" menu.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn visible_links(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |u: String| {
+            if !out.contains(&u) && out.len() < 16 {
+                out.push(u);
+            }
+        };
+        let off = self.view_offset.min(self.scrollback.len());
+        let mut abs = self.scrollback.len() - off;
+        let mut row = 0;
+        while row < self.rows {
+            // OSC 8 links on this visual row.
+            for col in 0..self.cols {
+                if let Some(u) = self.link_at(col, row) {
+                    push(u.to_string());
+                }
+            }
+            // Detected URLs on the logical line through this row; skip the
+            // line's remaining visual rows so it isn't scanned once per row.
+            let (text, at) = self.logical_line_of(abs);
+            for (_, _, url) in detect_urls(&text) {
+                push(url);
+            }
+            let line_rows = at.last().map_or(1, |&(last_abs, _)| last_abs - at[0].0 + 1);
+            let skip = line_rows - (abs - at[0].0);
+            row += skip.max(1);
+            abs += skip.max(1);
+        }
+        out
+    }
+
+    /// The logical line containing absolute row `abs`: its chars (wide-glyph
+    /// trailers skipped, like search) and per-char `(abs_row, col)` positions.
+    /// Bounded to 64 physical rows each way so a degenerate fully-wrapped
+    /// scrollback can't make one lookup scan everything.
+    #[cfg(any(test, feature = "gui"))]
+    fn logical_line_of(&self, abs: usize) -> (Vec<char>, Vec<(usize, usize)>) {
+        let total = self.scrollback.len() + self.rows;
+        let mut start = abs.min(total.saturating_sub(1));
+        let mut back = 0;
+        while start > 0 && back < 64 && self.phys_row(start - 1).1 {
+            start -= 1;
+            back += 1;
+        }
+        let mut text = Vec::new();
+        let mut at = Vec::new();
+        let mut r = start;
+        loop {
+            let (cells, wrapped) = self.phys_row(r);
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.flags & WIDE_TRAILER != 0 {
+                    continue;
+                }
+                text.push(cell.ch);
+                at.push((r, col));
+            }
+            r += 1;
+            if !wrapped || r >= total || r - start > 128 {
+                break;
+            }
+        }
+        (text, at)
     }
 
     /// The OSC 8 hyperlink URI covering viewport `(col, row)`, if any. Mirrors
