@@ -53,7 +53,7 @@ pub(crate) use color::ensure_contrast;
 pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 #[cfg(any(test, feature = "gui"))]
 pub use grid::BidiRow;
-#[cfg(any(test, feature = "gui"))]
+#[cfg(feature = "gui")]
 pub(crate) use bidi::mirrored as bidi_mirrored;
 #[cfg(feature = "gui")]
 pub use cell::{Cell, char_width};
