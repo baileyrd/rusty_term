@@ -374,6 +374,19 @@ monochrome boxes read as broken.
 **Size** L · **Deps** `gui`; extends `font.rs`/`cpu.rs` (GPU path inherits
 the atlas question from C08/C09).
 
+**Nerd Fonts addendum (2026-07):** three follow-ups landed on top of G25.
+(1) *Extended Powerline synthesis*: U+E0B4–U+E0BF (semicircle caps, slant
+triangles, diagonal lines) join the built-in set, so extended
+Powerline/starship prompts render with no Nerd Font installed at all.
+(2) *PUA glyph constraining*: Private Use Area glyphs (Nerd Font icons,
+BMP PUA + planes 15–16) that rasterize larger than their width-1 cell are
+contain-fit and centered (Ghostty-style), so icons neither clip nor bleed
+into the neighbor cell. (3) *Symbols auto-discovery*: `load_set` finds an
+installed "Symbols Nerd Font" companion (well-known paths plus a
+one-level scan of the user/system font dirs) and appends it to the
+fallback chain automatically — any base font gets working icons with zero
+config; an explicit `font_fallback` still takes precedence.
+
 #### G25 — Built-in box-drawing / block-element / Powerline glyph synthesis
 **Status: done.** New `src/gui/boxdraw.rs` synthesizes U+2500–257F box drawing (a 109-entry arm table generated from Unicode names — light/heavy/double, plus dashes, rounded arcs, diagonals, half-lines), U+2580–259F block elements (fractional blocks, 25/50/75% shades, quadrants), U+2800–28FF braille, and Powerline U+E0B0–E0B3, all at exact cell geometry. `FontCache::glyph` intercepts these before font lookup (both renderers inherit it through `GlyphSource`), and the CPU ligature-run builder excludes them so GSUB can never substitute them away. Always on, matching kitty/Ghostty.
 **Current.** Box-drawing chars (U+2500…), block elements, and Powerline

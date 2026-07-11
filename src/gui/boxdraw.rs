@@ -8,14 +8,16 @@
 //! Covered: U+2500–257F box drawing (arms via a table generated from the
 //! Unicode names, plus dashes, rounded arcs, and diagonals), U+2580–259F
 //! block elements (fractional blocks, shades, quadrants), U+2800–28FF
-//! braille, and the Powerline separators U+E0B0–U+E0B3.
+//! braille, and the Powerline separators U+E0B0–U+E0BF (the core triangles
+//! plus the extended semicircles and slants), so Powerline/starship prompts
+//! render seamlessly with no Nerd Font installed.
 
 use super::font::Glyph;
 
 /// Whether `ch` is synthesized here (and must therefore bypass font lookup
 /// and GSUB shaping runs).
 pub(crate) fn is_synthesized(ch: char) -> bool {
-    matches!(ch as u32, 0x2500..=0x259F | 0x2800..=0x28FF | 0xE0B0..=0xE0B3)
+    matches!(ch as u32, 0x2500..=0x259F | 0x2800..=0x28FF | 0xE0B0..=0xE0BF)
 }
 
 /// Synthesize `ch` at a `cw x ch_px` cell with the given `baseline`
@@ -32,6 +34,7 @@ pub(crate) fn synthesize(ch: char, cw: usize, ch_px: usize, baseline: i32) -> Op
         0x2580..=0x259F => draw_block(&mut c, cp),
         0x2800..=0x28FF => draw_braille(&mut c, cp - 0x2800),
         0xE0B0..=0xE0B3 => draw_powerline(&mut c, cp),
+        0xE0B4..=0xE0BF => draw_powerline_ext(&mut c, cp),
         _ => return None,
     }
     Some(c.into_glyph(baseline))
@@ -471,6 +474,48 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
     }
 }
 
+/// Extended Powerline separators U+E0B4–U+E0BF: semicircle caps (filled and
+/// outline, both directions) and the slant triangles / diagonal lines.
+fn draw_powerline_ext(c: &mut Canvas, cp: u32) {
+    let (w, h) = (c.w, c.h);
+    let t = c.light() as f32;
+    // Semicircle geometry: a half-ellipse anchored to the cell's left (for
+    // right-pointing) or right (for left-pointing) edge, full cell height.
+    let (rw, rh) = (w as f32, h as f32 / 2.0);
+    let diag = ((w * w + h * h) as f32).sqrt();
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cy = fy - h as f32 / 2.0;
+            // Normalized ellipse distance from each anchoring edge (1.0 = on
+            // the arc), and pixel distance from each diagonal.
+            let right = ((fx / rw).powi(2) + (cy / rh).powi(2)).sqrt();
+            let left = (((w as f32 - fx) / rw).powi(2) + (cy / rh).powi(2)).sqrt();
+            let ring = t / (2.0 * rw.min(rh));
+            let d_back = (fx * h as f32 - fy * w as f32).abs() / diag; // `\`
+            let d_fwd = ((w as f32 - fx) * h as f32 - fy * w as f32).abs() / diag; // `/`
+            let (dx, dy) = (fx / w as f32, fy / h as f32);
+            let hit = match cp {
+                0xE0B4 => right <= 1.0,                    // solid right semicircle
+                0xE0B5 => (right - 1.0).abs() <= ring,     // right semicircle line
+                0xE0B6 => left <= 1.0,                     // solid left semicircle
+                0xE0B7 => (left - 1.0).abs() <= ring,      // left semicircle line
+                0xE0B8 => dx <= dy,                        // solid lower-left slant
+                0xE0B9 => d_back <= t / 2.0 + 0.5,         // backslash line
+                0xE0BA => dx + dy >= 1.0,                  // solid lower-right slant
+                0xE0BB => d_fwd <= t / 2.0 + 0.5,          // forward-slash line
+                0xE0BC => dx + dy <= 1.0,                  // solid upper-left slant
+                0xE0BD => d_fwd <= t / 2.0 + 0.5,          // forward-slash line
+                0xE0BE => dx >= dy,                        // solid upper-right slant
+                _ => d_back <= t / 2.0 + 0.5,              // 0xE0BF backslash line
+            };
+            if hit {
+                c.set(x, y);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +526,42 @@ mod tests {
 
     fn at(px: &[u8], w: usize, x: usize, y: usize) -> bool {
         px[y * w + x] != 0
+    }
+
+    #[test]
+    fn extended_powerline_semicircles_and_slants_synthesize() {
+        let (w, h) = (10, 20);
+        // Solid right semicircle: hugs the left edge, empty at the right edge.
+        let b4 = cov('\u{E0B4}', w, h);
+        assert!(at(&b4, w, 0, h / 2), "solid at the anchoring edge");
+        assert!(!at(&b4, w, w - 1, 0), "top-right corner outside the arc");
+        // Outline covers strictly less than the fill.
+        let b5 = cov('\u{E0B5}', w, h);
+        let (fill, line) = (
+            b4.iter().filter(|&&p| p != 0).count(),
+            b5.iter().filter(|&&p| p != 0).count(),
+        );
+        assert!(line > 0 && line < fill, "arc outline thinner than fill: {line} vs {fill}");
+        // Mirror: solid left semicircle anchors right.
+        let b6 = cov('\u{E0B6}', w, h);
+        assert!(at(&b6, w, w - 1, h / 2));
+        assert!(!at(&b6, w, 0, 0));
+        // Lower-left slant: bottom-left solid, top-right empty (and vice
+        // versa for the upper-right slant).
+        let b8 = cov('\u{E0B8}', w, h);
+        assert!(at(&b8, w, 0, h - 1) && !at(&b8, w, w - 1, 0));
+        let be = cov('\u{E0BE}', w, h);
+        assert!(at(&be, w, w - 1, 0) && !at(&be, w, 0, h - 1));
+        // The diagonal lines are thin but present.
+        for ch in ['\u{E0B9}', '\u{E0BB}', '\u{E0BD}', '\u{E0BF}'] {
+            let c = cov(ch, w, h);
+            let n = c.iter().filter(|&&p| p != 0).count();
+            assert!(n > 0 && n < w * h / 3, "{ch:?}: thin diagonal, got {n}");
+        }
+        // The whole extended range is claimed by the synthesizer.
+        for cp in 0xE0B4..=0xE0BF {
+            assert!(is_synthesized(char::from_u32(cp).unwrap()));
+        }
     }
 
     #[test]
