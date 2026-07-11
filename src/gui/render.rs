@@ -23,6 +23,10 @@ pub(crate) struct PaneFrame<'a> {
     pub row0: usize,
     pub focused: bool,
     pub cursor_on: bool,
+    /// Cursor-trail ghosts (G36): faded cursor blocks at these cells, alpha
+    /// `0.0..=1.0`, blended in the cursor color. Empty when the trail is off
+    /// or expired.
+    pub trail: Vec<(usize, usize, f32)>,
 }
 
 /// A present target: paint one frame of the tab's `panes` at the given pixel
@@ -88,6 +92,7 @@ impl Renderer for CpuRenderer {
         }
         for p in panes {
             cpu::draw_grid(&mut buffer, w, h, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
+            cpu::draw_trail(&mut buffer, w, h, p.grid, p.col0, p.row0, &p.trail, font);
         }
         let _ = buffer.present();
     }
