@@ -27,14 +27,14 @@ use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{KeyCode, KeyLocation, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
 use crate::config::{Config, LaunchMode};
 use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
 use crate::keymap::{Action, Chord};
-use crate::gui::mouse::{MouseButtonKind, MouseEvent, SgrEncoder};
+use crate::gui::mouse::{MouseButtonKind, MouseEvent, MousePoint, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
 use super::layout::{Dir, Layout, Rect};
 use super::render::{CpuRenderer, PaneFrame, Renderer};
@@ -770,17 +770,21 @@ impl App<'_> {
     /// Map pixel `(px, py)` to a cell within the *focused* pane, clamped to it.
     fn cell_in_focused(&self, px: f64, py: f64) -> (usize, usize) {
         let (col, row) = self.cell_at(px, py);
-        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
-        if let Some(tab) = self.tabs.get(self.active)
-            && let Some((_, r)) =
-                tab.layout.rects(area).into_iter().find(|(id, _)| *id == tab.focus)
-        {
+        if let Some(r) = self.focused_pane_rect() {
             return (
                 col.saturating_sub(r.col).min(r.cols.saturating_sub(1)),
                 row.saturating_sub(r.row).min(r.rows.saturating_sub(1)),
             );
         }
         (col, row)
+    }
+
+    /// The focused pane's cell rect within the window's grid area, `None`
+    /// before any tab exists.
+    fn focused_pane_rect(&self) -> Option<Rect> {
+        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        let tab = self.tabs.get(self.active)?;
+        tab.layout.rects(area).into_iter().find(|(id, _)| *id == tab.focus).map(|(_, r)| r)
     }
 
     /// Dispatch a click on the chrome bar through the hit map.
@@ -1042,8 +1046,23 @@ impl App<'_> {
             return false;
         }
         let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
+        let mut e = build(col, row);
+        // SGR-pixel mode (`?1016`): the same SGR encoding, but the position
+        // is the pointer's pixel offset within the focused pane's text area
+        // (this pane is its own terminal, so pane-relative is the analogue of
+        // xterm's text-area-relative pixels). The chrome bar above the grid
+        // is one cell row tall, hence the +1 on the pane's row origin.
+        if modes.extended & 8 != 0
+            && let Some(r) = self.focused_pane_rect()
+        {
+            e.point = pane_pixel_point(
+                self.mouse_pos,
+                (r.col * self.cell_w, (r.row + 1) * self.cell_h),
+                (r.cols * self.cell_w, r.rows * self.cell_h),
+            );
+        }
         let mut out = Vec::new();
-        SgrEncoder::new(modes).write(build(col, row), &mut out);
+        SgrEncoder::new(modes).write(e, &mut out);
         if out.is_empty() {
             return false;
         }
@@ -1711,6 +1730,30 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                // Focus reporting (`?1004`): tell the focused pane's child it
+                // gained/lost focus, if it asked. Redraw either way — the
+                // cursor renders only while focused.
+                if let Some(p) = self.pane_mut()
+                    && p.grid.lock().focus_reporting
+                {
+                    let _ = p.writer.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                // Paste the dropped file's shell-quoted path (plus a trailing
+                // space, so several drops land as separate arguments), same
+                // bracketed-paste handling as a clipboard paste.
+                let quoted = format!("{} ", shell_quote(&path.to_string_lossy()));
+                if let Some(p) = self.pane_mut() {
+                    let bracketed = p.grid.lock().bracketed_paste;
+                    let _ = p.writer.write(&encode_paste(&quoted, bracketed));
+                }
+                self.snap_to_bottom();
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
                 self.apply_size(size.width, size.height);
@@ -1755,16 +1798,22 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
                     return;
                 }
-                let (app_cursor, kitty_flags) = self
+                let (app_cursor, app_keypad, kitty_flags) = self
                     .pane()
                     .map(|p| {
                         let g = p.grid.lock();
-                        (g.app_cursor_keys, g.kitty_keyboard_flags())
+                        (g.app_cursor_keys, g.app_keypad, g.kitty_keyboard_flags())
                     })
                     .unwrap_or_default();
-                if let Some(bytes) =
+                // Application keypad mode (DECKPAM/DECNKM): a key physically
+                // on the numpad encodes as its SS3 sequence; everything else
+                // (mode off, modifiers held) falls through to normal encoding.
+                let numpad = (event.location == KeyLocation::Numpad)
+                    .then(|| super::input::encode_numpad(&event.logical_key, self.mods, app_keypad))
+                    .flatten();
+                if let Some(bytes) = numpad.or_else(|| {
                     super::input::encode(&event.logical_key, self.mods, app_cursor, kitty_flags)
-                {
+                }) {
                     if let Some(p) = self.pane_mut() {
                         let _ = p.writer.write(&bytes);
                     }
@@ -1967,6 +2016,35 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// The pointer's position in pixels relative to a pane's pixel origin,
+/// clamped into the pane (`0..size-1` per axis) so a pointer over the chrome
+/// or a divider never reports an out-of-pane position. 0-based; the SGR
+/// encoder adds the protocol's 1-basing.
+fn pane_pixel_point(pos: (f64, f64), origin: (usize, usize), size: (usize, usize)) -> MousePoint {
+    let clamp = |v: f64, o: usize, s: usize| {
+        ((v.max(0.0) as usize).saturating_sub(o)).min(s.saturating_sub(1))
+    };
+    MousePoint { col: clamp(pos.0, origin.0, size.0), row: clamp(pos.1, origin.1, size.1) }
+}
+
+/// Quote `path` for pasting into a shell command line (a drag-and-dropped
+/// file). Unix: single quotes, with embedded `'` rewritten to `'\''` — safe
+/// for every byte a path can contain. Windows: double quotes when the path
+/// needs them (paths can't contain `"` there, so no escaping is required).
+fn shell_quote(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        if path.is_empty() || path.contains(' ') {
+            return format!("\"{path}\"");
+        }
+        path.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
 /// Open `url` with the OS default handler when its scheme is one we allow
 /// (see [`is_openable_url`]). Ctrl+click on an OSC 8 hyperlink routes here.
 /// Returns whether a handler was launched.
@@ -2156,9 +2234,11 @@ fn osc52_reply(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, path_from_file_uri,
-        put_text, shell_menu_items,
+        Hit, MenuKind, encode_paste, is_openable_url, mix, osc52_reply, pane_pixel_point,
+        path_from_file_uri, put_text, shell_menu_items,
     };
+    #[cfg(not(windows))]
+    use super::shell_quote;
     use crate::core::Cell;
 
     #[test]
@@ -2287,5 +2367,25 @@ mod tests {
         assert!(matches!(items[1].kind, MenuKind::LaunchShell(1)));
         assert!(matches!(items[2].kind, MenuKind::Settings));
         assert!(matches!(items[3].kind, MenuKind::EditConfig));
+    }
+
+    #[test]
+    fn pane_pixel_point_offsets_and_clamps() {
+        // Pointer at window (25, 40), pane origin (10, 16), pane 100x80 px.
+        let p = pane_pixel_point((25.0, 40.0), (10, 16), (100, 80));
+        assert_eq!((p.col, p.row), (15, 24));
+        // Above/left of the pane clamps to 0; beyond it clamps to size-1.
+        let p = pane_pixel_point((3.0, 3.0), (10, 16), (100, 80));
+        assert_eq!((p.col, p.row), (0, 0));
+        let p = pane_pixel_point((500.0, 500.0), (10, 16), (100, 80));
+        assert_eq!((p.col, p.row), (99, 79));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_quote_wraps_and_escapes_single_quotes() {
+        assert_eq!(shell_quote("/tmp/plain"), "'/tmp/plain'");
+        assert_eq!(shell_quote("/tmp/with space"), "'/tmp/with space'");
+        assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
     }
 }

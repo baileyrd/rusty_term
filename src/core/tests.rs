@@ -1196,10 +1196,16 @@ fn decrqm_reports_known_dec_private_modes_and_unknown_as_not_recognized() {
     assert_eq!(p.take_responses(), b"\x1b[?1;2$y");
     p.advance(&mut g, b"\x1b[?1h\x1b[?1$p");
     assert_eq!(p.take_responses(), b"\x1b[?1;1$y");
-    // A mode we genuinely don't track state for (e.g. focus reporting,
-    // relayed to the host only) is answered honestly rather than guessed.
+    // Focus reporting is tracked (the window backend reports its own focus
+    // transitions), so it answers real state now, not "0" (not recognized).
     p.advance(&mut g, b"\x1b[?1004$p");
-    assert_eq!(p.take_responses(), b"\x1b[?1004;0$y");
+    assert_eq!(p.take_responses(), b"\x1b[?1004;2$y");
+    p.advance(&mut g, b"\x1b[?1004h\x1b[?1004$p");
+    assert_eq!(p.take_responses(), b"\x1b[?1004;1$y");
+    // A mode we genuinely don't track state for is answered honestly ("0",
+    // not recognized) rather than guessed.
+    p.advance(&mut g, b"\x1b[?1010$p");
+    assert_eq!(p.take_responses(), b"\x1b[?1010;0$y");
 }
 
 #[test]
@@ -4114,4 +4120,98 @@ fn retheme_recolors_scrollback() {
             assert_ne!(cell.fg, 0xd8d8d8, "old themed fg gone from history");
         }
     }
+}
+
+// ---- Wave-1 additions: keypad mode, focus reporting, DECRQSS, XTSMGRAPHICS ----
+
+#[test]
+fn keypad_application_mode_tracked_and_relayed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.app_keypad);
+    // DECKPAM (`ESC =`) sets application keypad and relays to the host.
+    p.advance(&mut g, b"\x1b=");
+    assert!(g.app_keypad);
+    assert_eq!(g.take_host_out(), b"\x1b=");
+    // DECKPNM (`ESC >`) resets it.
+    p.advance(&mut g, b"\x1b>");
+    assert!(!g.app_keypad);
+    assert_eq!(g.take_host_out(), b"\x1b>");
+    // DECNKM (`?66`) toggles the same state and answers DECRQM.
+    p.advance(&mut g, b"\x1b[?66h");
+    assert!(g.app_keypad);
+    p.advance(&mut g, b"\x1b[?66$p");
+    assert_eq!(p.take_responses(), b"\x1b[?66;1$y");
+    // RIS restores the numeric default.
+    p.advance(&mut g, b"\x1bc");
+    assert!(!g.app_keypad);
+}
+
+#[test]
+fn focus_reporting_mode_tracked_and_relayed() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.focus_reporting);
+    p.advance(&mut g, b"\x1b[?1004h");
+    assert!(g.focus_reporting);
+    assert_eq!(g.take_host_out(), b"\x1b[?1004h"); // still relayed for TUI mode
+    p.advance(&mut g, b"\x1b[?1004l");
+    assert!(!g.focus_reporting);
+}
+
+#[test]
+fn decrqss_reports_sgr_scroll_region_and_cursor_style() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Default pen: just the reset.
+    p.advance(&mut g, b"\x1bP$qm\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r0m\x1b\\");
+    // Bold + curly underline + truecolor fg.
+    p.advance(&mut g, b"\x1b[1;4:3m\x1b[38;2;1;2;3m\x1bP$qm\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r0;1;4:3;38;2;1;2;3m\x1b\\");
+    p.advance(&mut g, b"\x1b[0m");
+    // DECSTBM: default region, then an explicit one.
+    p.advance(&mut g, b"\x1bP$qr\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r1;24r\x1b\\");
+    p.advance(&mut g, b"\x1b[5;10r\x1bP$qr\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r5;10r\x1b\\");
+    // DECSCUSR: steady bar (6), set then queried.
+    p.advance(&mut g, b"\x1b[6 q\x1bP$q q\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1bP1$r6 q\x1b\\");
+    let _ = g.take_host_out(); // drop the relayed DECSCUSR/DECSTBM bytes
+}
+
+#[test]
+fn decrqss_unknown_request_reports_invalid() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1bP$q\"q\x1b\\"); // DECSCA — not tracked
+    assert_eq!(p.take_responses(), b"\x1bP0$r\x1b\\");
+}
+
+#[test]
+fn xtsmgraphics_reports_color_registers_and_sixel_geometry() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Item 1: color registers — read and read-max report the fixed table size.
+    p.advance(&mut g, b"\x1b[?1;1S");
+    assert_eq!(p.take_responses(), b"\x1b[?1;0;256S");
+    p.advance(&mut g, b"\x1b[?1;4S");
+    assert_eq!(p.take_responses(), b"\x1b[?1;0;256S");
+    // Item 2: Sixel geometry — the decoder's per-axis cap.
+    p.advance(&mut g, b"\x1b[?2;1S");
+    assert_eq!(p.take_responses(), b"\x1b[?2;0;2000;2000S");
+    // A "set" succeeds by reporting the actual (unchanged) limits.
+    p.advance(&mut g, b"\x1b[?2;3;900;900S");
+    assert_eq!(p.take_responses(), b"\x1b[?2;0;2000;2000S");
+}
+
+#[test]
+fn xtsmgraphics_rejects_unknown_item_and_action() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?3;1S"); // ReGIS: unsupported item
+    assert_eq!(p.take_responses(), b"\x1b[?3;1S");
+    p.advance(&mut g, b"\x1b[?1;9S"); // bad action on a known item
+    assert_eq!(p.take_responses(), b"\x1b[?1;2S");
 }

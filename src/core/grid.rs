@@ -261,6 +261,18 @@ pub struct Grid {
     /// of browsing rusty_term's own scrollback — lets the wheel drive `less`/
     /// `man`/other pagers that never registered native mouse support.
     pub alt_scroll: bool,
+    /// Whether focus reporting (DEC `?1004`) is enabled by the child. In TUI
+    /// mode the mode is also relayed to the host, which generates the actual
+    /// `CSI I`/`CSI O` reports; the windowed front-end has no host, so it
+    /// reads this directly and reports its own `WindowEvent::Focused`
+    /// transitions to the child.
+    pub focus_reporting: bool,
+    /// Whether application keypad mode (DECKPAM `ESC =` / DECNKM DEC `?66`)
+    /// is enabled. The windowed front-end's key encoder reads this to encode
+    /// numpad keys as `SS3 p`–`SS3 y` (and friends) instead of their plain
+    /// characters; TUI mode relays the sequence to the host, which does its
+    /// own keypad encoding.
+    pub app_keypad: bool,
     /// Whether ECMA-48 Line/New Line mode (LNM, ANSI mode `20`) is enabled.
     /// Reset (the default, matching xterm) means a bare LF only moves the
     /// cursor down a line; set means it also returns to column 0, as if it
@@ -907,6 +919,8 @@ impl Grid {
             bracketed_paste: false,
             app_cursor_keys: false,
             alt_scroll: false,
+            focus_reporting: false,
+            app_keypad: false,
             line_feed_new_line: false,
             clipboard_set: None,
             clipboard_query: false,
@@ -2261,6 +2275,8 @@ impl Grid {
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
         self.alt_scroll = false;
+        self.focus_reporting = false;
+        self.app_keypad = false;
         self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
@@ -2289,6 +2305,8 @@ impl Grid {
         self.bracketed_paste = false;
         self.app_cursor_keys = false;
         self.alt_scroll = false;
+        self.focus_reporting = false;
+        self.app_keypad = false;
         self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();
         self.mouse_modes = MouseModes::default();
