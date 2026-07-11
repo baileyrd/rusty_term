@@ -34,12 +34,7 @@ use crate::core::{
 };
 
 use super::font::{FontCache, Glyph, GlyphSource, Style};
-use super::render::Renderer;
-
-/// Search-match highlight (matches [`super::cpu`]): amber match, orange active.
-const SEARCH_BG: u32 = 0xFFD24A;
-const SEARCH_CUR_BG: u32 = 0xFF7A1A;
-const SEARCH_FG: u32 = 0x101010;
+use super::render::{Renderer, SEARCH_BG, SEARCH_CUR_BG, SEARCH_FG};
 
 /// Atlas texture edge (clamped to the device limit at creation).
 const ATLAS_MAX: u32 = 2048;
@@ -553,7 +548,7 @@ impl GpuCore {
     }
 
     /// Shelf-allocate a `w × cell_h` texel rect, or `None` when the atlas is
-    /// full (the caller falls back to the blank tile).
+    /// full (the caller recycles the atlas and retries).
     fn alloc_shelf(&mut self, w: u32) -> Option<(u32, u32)> {
         let w = w.min(self.atlas_w);
         if self.shelf_x + w > self.atlas_w {
@@ -577,9 +572,22 @@ impl GpuCore {
         }
         let w = (span.max(1) as u32) * self.cell_w;
         let h = self.cell_h;
-        let Some((x, y)) = self.alloc_shelf(w) else {
-            // Atlas full: fall back to blank (drawn as pure background).
-            return *self.tiles.get(&TileKey::Char(' ', Style::Regular)).unwrap_or(&(0, 0, 0, 0));
+        let (x, y) = match self.alloc_shelf(w) {
+            Some(at) => at,
+            None => {
+                // Atlas full: recycle it (drop every cached tile and restart the
+                // shelf cursor) rather than rendering blanks forever. In-flight
+                // frames still sample the old texels; the visual glitch lasts one
+                // frame, versus permanently blank glyphs.
+                self.tiles.clear();
+                self.shelf_x = 0;
+                self.shelf_y = 0;
+                match self.alloc_shelf(w) {
+                    Some(at) => at,
+                    // Wider than the atlas itself: draw as background.
+                    None => return (0, 0, 0, 0),
+                }
+            }
         };
         let mut tile = vec![0u8; (w * h) as usize * 4];
         for gy in 0..glyph.height {

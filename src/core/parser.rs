@@ -84,6 +84,10 @@ pub struct AnsiParser {
     utf8_acc: u32,
     /// Number of UTF-8 continuation bytes still expected.
     utf8_remaining: usize,
+    /// Smallest scalar the in-flight sequence's length may legally encode.
+    /// Anything below it is an overlong form — rejected, or a sequence like
+    /// `E0 80 9B` would smuggle a raw ESC past the parser into a cell.
+    utf8_min: u32,
     /// Bytes the parser owes the host in reply to a query (DA1/DA2/DSR). The
     /// driver drains these via [`AnsiParser::take_responses`] after each
     /// `advance` and writes them back to the PTY master, where the child reads
@@ -138,6 +142,12 @@ const OSC_IMAGE_MAX: usize = 8 * 1024 * 1024;
 /// be large but are bounded here; past this we keep consuming but stop storing.
 const DCS_MAX: usize = 4 * 1024 * 1024;
 
+/// Upper bound on the bytes buffered for one CSI's parameters. ECMA-48 params
+/// are short (the longest realistic SGR runs well under 100 bytes); past this
+/// we keep consuming the sequence but stop storing, matching the OSC/DCS caps —
+/// without it, `ESC [` followed by an endless digit stream grows unboundedly.
+const CSI_PARAM_MAX: usize = 256;
+
 impl Default for AnsiParser {
     fn default() -> Self {
         Self::new()
@@ -170,6 +180,7 @@ impl AnsiParser {
             csi_intermediate: 0,
             utf8_acc: 0,
             utf8_remaining: 0,
+            utf8_min: 0,
             responses: Vec::new(),
             protected: false,
             osc_buffer: Vec::new(),
@@ -219,7 +230,11 @@ impl AnsiParser {
                         self.utf8_acc = (self.utf8_acc << 6) | (b as u32 & 0x3f);
                         self.utf8_remaining -= 1;
                         if self.utf8_remaining == 0 {
-                            let ch = char::from_u32(self.utf8_acc).unwrap_or('\u{FFFD}');
+                            // `from_u32` rejects surrogates and > U+10FFFF; the
+                            // minimum check rejects overlong encodings.
+                            let ch = char::from_u32(self.utf8_acc)
+                                .filter(|_| self.utf8_acc >= self.utf8_min)
+                                .unwrap_or('\u{FFFD}');
                             g.put_char(ch, self.write_pen());
                             self.last_char = Some(ch);
                             self.state = ParserState::Ground;
@@ -336,12 +351,17 @@ impl AnsiParser {
                     _ => self.state = ParserState::Ground,
                 },
                 ParserState::Csi => match b {
-                    // Parameter bytes. `:` (ECMA-48 sub-parameter separator) is
-                    // only meaningful to SGR (see `parse_sgr_params`); every
-                    // other command's `parse_params` never sees a field
-                    // containing one in practice, so collecting it here
-                    // unconditionally is harmless.
-                    b'0'..=b'9' | b';' | b':' => self.param_buffer.push(b as char),
+                    // Parameter bytes, bounded (a hostile unterminated CSI must
+                    // not grow the buffer without limit). `:` (ECMA-48
+                    // sub-parameter separator) is only meaningful to SGR (see
+                    // `parse_sgr_params`); every other command's `parse_params`
+                    // never sees a field containing one in practice, so
+                    // collecting it here unconditionally is harmless.
+                    b'0'..=b'9' | b';' | b':' => {
+                        if self.param_buffer.len() < CSI_PARAM_MAX {
+                            self.param_buffer.push(b as char);
+                        }
+                    }
                     // Private markers (`<`, `=`, `>`, `?`): flag, remember which,
                     // and keep collecting.
                     0x3c..=0x3f => {
@@ -721,16 +741,19 @@ impl AnsiParser {
             0xc2..=0xdf => {
                 self.utf8_acc = (b as u32) & 0x1f;
                 self.utf8_remaining = 1;
+                self.utf8_min = 0x80;
                 self.state = ParserState::Utf8;
             }
             0xe0..=0xef => {
                 self.utf8_acc = (b as u32) & 0x0f;
                 self.utf8_remaining = 2;
+                self.utf8_min = 0x800;
                 self.state = ParserState::Utf8;
             }
             0xf0..=0xf4 => {
                 self.utf8_acc = (b as u32) & 0x07;
                 self.utf8_remaining = 3;
+                self.utf8_min = 0x10000;
                 self.state = ParserState::Utf8;
             }
             // Stray continuation or otherwise invalid lead byte.
@@ -1066,7 +1089,16 @@ impl AnsiParser {
                     out.push(4000 + style);
                 } else {
                     out.push(base);
-                    out.extend(sub);
+                    let rest: Vec<usize> = sub.collect();
+                    // T.416 direct color carries an optional colorspace id:
+                    // `38:2:<id>:r:g:b`. Drop the id so the flattened form
+                    // lines up with the semicolon layout `38;2;r;g;b`.
+                    if matches!(base, 38 | 48 | 58) && rest.first() == Some(&2) && rest.len() >= 5 {
+                        out.push(2);
+                        out.extend(&rest[2..]);
+                    } else {
+                        out.extend(rest);
+                    }
                 }
             } else {
                 out.push(field.parse().unwrap_or(0));
@@ -1171,7 +1203,13 @@ impl AnsiParser {
                         }
                         g.clear_row_range(cy, 0, cx + 1);
                     }
-                    2 | 3 => g.clear_all(),
+                    2 => g.clear_all(),
+                    3 => {
+                        // xterm `ED 3`: erase saved lines too. `clear(1)` sends
+                        // `2J` then `3J` expecting the latter to wipe history.
+                        g.clear_all();
+                        g.clear_scrollback();
+                    }
                     _ => {}
                 }
             }
