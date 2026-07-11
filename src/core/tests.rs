@@ -4780,3 +4780,73 @@ fn origin_mode_addresses_within_side_margins() {
     p.advance(&mut g, b"\x1b[1;99H"); // clamps at the right margin
     assert_eq!(g.cursor, (9, 0));
 }
+
+// ---- Wave-10 additions: kitty image store, placeholders, animation ----
+
+#[test]
+fn kitty_store_and_put_render_by_id() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // a=t stores without rendering; a=p places by id.
+    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=t,i=7;/wAA/w==\x1b\\");
+    assert_eq!(p.take_responses(), b"\x1b_Gi=7;OK\x1b\\");
+    assert_eq!(g.cells[0].ch, ' ', "transmit-only draws nothing");
+    p.advance(&mut g, b"\x1b_Ga=p,i=7;\x1b\\");
+    assert_eq!(g.cells[0].ch, '\u{2580}');
+    assert_eq!(g.cells[0].fg, 0xFF0000);
+    // Placing an unknown id is an error.
+    p.advance(&mut g, b"\x1b_Ga=p,i=8;\x1b\\");
+    let _ = p.take_responses();
+    // a=d,d=i deletes by id; the next put fails.
+    p.advance(&mut g, b"\x1b_Ga=d,d=i,i=7;\x1b\\");
+    p.advance(&mut g, b"\x1b_Ga=p,i=7;\x1b\\");
+    assert!(p.take_responses().windows(5).any(|w| w == b"EBADF"));
+}
+
+#[test]
+fn kitty_virtual_placement_and_placeholder_decode() {
+    let mut g = Grid::new(20, 6);
+    let mut p = AnsiParser::new();
+    // 1×1 red stored + virtually placed on a 2×2 cell grid.
+    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=T,U=1,i=42,c=2,r=2;/wAA/w==\x1b\\");
+    assert_eq!(g.cells[0].ch, ' ', "a virtual placement draws no cells");
+    assert_eq!(g.kitty_virtual_geometry(42), Some((2, 2)));
+    // The app prints placeholders: fg encodes the id, diacritics row/col.
+    // DIACRITICS[0]=U+0305 (0), DIACRITICS[1]=U+030D (1).
+    p.advance(&mut g, b"\x1b[38;2;0;0;42m");
+    p.advance(&mut g, "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes());
+    assert_eq!(g.placeholder_at(0, 0), Some((42, Some(0), Some(0))));
+    assert_eq!(g.placeholder_at(1, 0), Some((42, Some(0), Some(1))));
+    // A plain cell is not a placeholder.
+    assert_eq!(g.placeholder_at(5, 5), None);
+    // Placeholders without diacritics report None indices (inference is the
+    // renderer's job).
+    p.advance(&mut g, "\u{10EEEE}".as_bytes());
+    assert_eq!(g.placeholder_at(2, 0), Some((42, None, None)));
+}
+
+#[test]
+fn kitty_frames_composite_and_advance() {
+    let mut g = Grid::new(20, 6);
+    let mut p = AnsiParser::new();
+    // Root: 2x1 red|red (raw RGBA: ff0000ff ff0000ff).
+    p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=t,i=9;/wAA//8AAP8=\x1b\\");
+    // Frame 2: 1x1 green composited at x=1 -> red|green. `AP8A/w==`.
+    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=f,i=9,x=1,z=100;AP8A/w==\x1b\\");
+    let (w, _, px) = g.kitty_frame(9).unwrap();
+    assert_eq!(w, 2);
+    assert_eq!(px[0], Some(0xFF0000), "frame 0 shown before playback");
+    // Start playback; the frame advances only after its gap elapses.
+    p.advance(&mut g, b"\x1b_Ga=a,i=9,s=3;\x1b\\");
+    let t0 = std::time::Instant::now();
+    assert!(!g.advance_animations(t0), "no time elapsed: no change");
+    let later = t0 + std::time::Duration::from_millis(150);
+    assert!(g.advance_animations(later));
+    let (_, _, px) = g.kitty_frame(9).unwrap();
+    assert_eq!(px[1], Some(0x00FF00), "frame 1 composited green at x=1");
+    assert_eq!(px[0], Some(0xFF0000), "untouched pixel carried from root");
+    // Stop freezes it.
+    p.advance(&mut g, b"\x1b_Ga=a,i=9,s=1;\x1b\\");
+    let much_later = later + std::time::Duration::from_secs(1);
+    assert!(!g.advance_animations(much_later));
+}

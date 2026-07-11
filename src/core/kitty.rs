@@ -1,13 +1,19 @@
-//! Minimal Kitty graphics protocol decoder (library-free).
+//! Kitty graphics protocol decoder (library-free).
 //!
 //! Handles `ESC _ G <control> ; <base64-payload> ESC \` commands. Supported
 //! transmission formats (`f`): 24 (raw RGB), 32 (raw RGBA, the default), and 100
 //! (PNG, decoded by [`super::png`]). Optional `o=z` zlib compression and chunked
-//! transmission (`m=1`) are handled. A decoded image is rendered as half-block
-//! cells via [`Grid::render_image`] (cell resolution; rusty_term has no
-//! framebuffer). Query (`a=q`) is answered `OK` so clients select Kitty mode;
-//! transmit-and-display (`a=T`) renders. Store/put/delete actions aren't backed
-//! by an image store yet, so they're acknowledged as unsupported.
+//! transmission (`m=1`) are handled.
+//!
+//! Actions: query (`a=q`), transmit (`a=t`, into the grid's bounded image
+//! store), transmit-and-display (`a=T`), put (`a=p`, placing a stored image —
+//! honoring `c`/`r` cell geometry, and `U=1` creating a *virtual* placement
+//! for Unicode placeholders, the mechanism that survives tmux), delete
+//! (`a=d`, whole-store or by id), animation frames (`a=f`, composited onto
+//! the previous frame at `x`/`y` with a `z` ms gap), and animation control
+//! (`a=a`, run/stop). Non-virtual placements render as half-block cells via
+//! [`Grid::render_image`] (plus the CPU renderer's pixel overlay); virtual
+//! placements render wherever `U+10EEEE` placeholder cells appear.
 
 use super::grid::Grid;
 use super::{base64, inflate, png};
@@ -29,6 +35,20 @@ pub(crate) struct Transmission {
     compressed: bool,
     id: u32,
     quiet: u32,
+    /// `c`/`r`: placement size in cells (0 = derive from the pixel size).
+    cols: usize,
+    rows: usize,
+    /// `U=1`: a virtual placement (rendered via Unicode placeholders).
+    virt: bool,
+    /// `x`/`y`: an animation frame's offset within the root frame.
+    frame_x: usize,
+    frame_y: usize,
+    /// `z`: an animation frame's display gap in milliseconds.
+    gap_ms: u32,
+    /// `s` for `a=a`: 1 stops, 2/3 run the animation.
+    anim_state: u32,
+    /// `d` for `a=d`: the delete scope letter.
+    delete: u8,
     payload: Vec<u8>,
 }
 
@@ -59,15 +79,30 @@ pub(crate) fn feed(t: &mut Transmission, apc: &[u8], g: &mut Grid, responses: &m
             format: 32,
             ..Transmission::default()
         };
+        // `s` means width on a transmission but run-state on `a=a`, so the
+        // action must be known before the other keys are interpreted.
+        for (k, v) in kv_pairs(control) {
+            if k == b"a" {
+                t.action = v.first().copied().unwrap_or(b't');
+            }
+        }
         for (k, v) in kv_pairs(control) {
             match k {
-                b"a" => t.action = v.first().copied().unwrap_or(b't'),
+                b"a" => {}
+                b"s" if t.action == b'a' => t.anim_state = parse_u32(v),
                 b"f" => t.format = parse_u32(v),
                 b"s" => t.width = parse_u32(v) as usize,
                 b"v" => t.height = parse_u32(v) as usize,
                 b"o" => t.compressed = v == b"z",
                 b"i" => t.id = parse_u32(v),
                 b"q" => t.quiet = parse_u32(v),
+                b"c" => t.cols = parse_u32(v) as usize,
+                b"r" => t.rows = parse_u32(v) as usize,
+                b"U" => t.virt = parse_u32(v) == 1,
+                b"x" => t.frame_x = parse_u32(v) as usize,
+                b"y" => t.frame_y = parse_u32(v) as usize,
+                b"z" => t.gap_ms = parse_u32(v),
+                b"d" => t.delete = v.first().copied().unwrap_or(b'a'),
                 b"m" => more = parse_u32(v) == 1,
                 _ => {}
             }
@@ -84,8 +119,51 @@ pub(crate) fn feed(t: &mut Transmission, apc: &[u8], g: &mut Grid, responses: &m
     // Final chunk: act on the completed command.
     let ok = match t.action {
         b'q' => true, // query: we speak the protocol
-        b'T' => render(t, g),
-        _ => false, // transmit-only / put / delete: no image store yet
+        b'T' => {
+            // Transmit-and-display: store (so later `a=p`/frames can refer
+            // to it) and place at the cursor — or virtually with `U=1`.
+            match decode(t) {
+                Some((w, h, px)) => {
+                    if t.id != 0 {
+                        g.kitty_store(t.id, w, h, px.clone());
+                    }
+                    place(t, g, w, h, &px);
+                    true
+                }
+                None => false,
+            }
+        }
+        b't' => match decode(t) {
+            Some((w, h, px)) => {
+                g.kitty_store(t.id, w, h, px);
+                true
+            }
+            None => false,
+        },
+        b'p' => match g.kitty_get(t.id) {
+            Some((w, h, px)) => {
+                place(t, g, w, h, &px);
+                true
+            }
+            None => false,
+        },
+        b'f' => match decode(t) {
+            Some((w, h, px)) => g.kitty_add_frame(t.id, w, h, px, t.frame_x, t.frame_y, t.gap_ms),
+            None => false,
+        },
+        b'a' => g.kitty_animate(t.id, t.anim_state != 1),
+        b'd' => {
+            // `i`/`I` delete by id; every other scope clears the store (a
+            // superset of the requested visible-placement scopes — honest
+            // over-deletion beats silently keeping "deleted" images).
+            if matches!(t.delete, b'i' | b'I') {
+                g.kitty_delete(Some(t.id));
+            } else {
+                g.kitty_delete(None);
+            }
+            true
+        }
+        _ => false,
     };
     // Acknowledge unless suppressed: q=0 → OK + errors, q=1 → errors only,
     // q=2 → silent. Queries are always answered (that's their purpose).
@@ -99,41 +177,34 @@ pub(crate) fn feed(t: &mut Transmission, apc: &[u8], g: &mut Grid, responses: &m
     *t = Transmission::default();
 }
 
-/// Decode the accumulated payload per its format and render it. Returns whether
-/// an image was produced.
-fn render(t: &Transmission, g: &mut Grid) -> bool {
-    let Some(raw) = base64::decode(&t.payload) else {
-        return false;
-    };
-    let raw = if t.compressed {
-        match inflate::zlib_decompress(&raw, MAX_DECODED) {
-            Some(d) => d,
-            None => return false,
+/// Decode the accumulated payload per its format into `(w, h, pixels)`.
+fn decode(t: &Transmission) -> Option<(usize, usize, Vec<Option<u32>>)> {
+    let raw = base64::decode(&t.payload)?;
+    let raw = if t.compressed { inflate::zlib_decompress(&raw, MAX_DECODED)? } else { raw };
+    match t.format {
+        24 => raw_pixels(&raw, t.width, t.height, 3),
+        32 => raw_pixels(&raw, t.width, t.height, 4),
+        100 => {
+            let img = png::decode(&raw)?;
+            let px = rgba_pixels(&img.rgba);
+            Some((img.width, img.height, px))
         }
-    } else {
-        raw
-    };
+        _ => None,
+    }
+}
 
-    let (w, h, pixels) = match t.format {
-        24 => match raw_pixels(&raw, t.width, t.height, 3) {
-            Some(x) => x,
-            None => return false,
-        },
-        32 => match raw_pixels(&raw, t.width, t.height, 4) {
-            Some(x) => x,
-            None => return false,
-        },
-        100 => match png::decode(&raw) {
-            Some(img) => {
-                let px = rgba_pixels(&img.rgba);
-                (img.width, img.height, px)
-            }
-            None => return false,
-        },
-        _ => return false,
-    };
-    g.render_image(w, h, &pixels);
-    true
+/// Apply a placement: virtual (`U=1`) records the placeholder geometry;
+/// otherwise the image renders at the cursor, honoring `c`/`r`.
+fn place(t: &Transmission, g: &mut Grid, w: usize, h: usize, px: &[Option<u32>]) {
+    if t.virt {
+        g.kitty_virtual_place(t.id, t.cols, t.rows);
+    } else if t.cols != 0 || t.rows != 0 {
+        let c = (t.cols != 0).then_some(t.cols);
+        let r = (t.rows != 0).then_some(t.rows);
+        g.render_image_sized(w, h, px, c, r, true);
+    } else {
+        g.render_image(w, h, px);
+    }
 }
 
 /// Pack raw interleaved RGB (`ch == 3`) or RGBA (`ch == 4`) bytes into pixels,

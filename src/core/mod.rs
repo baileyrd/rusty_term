@@ -24,6 +24,7 @@ mod inflate;
 mod iterm;
 mod jpeg;
 mod kitty;
+mod kitty_diacritics;
 mod osc;
 mod parser;
 mod png;
