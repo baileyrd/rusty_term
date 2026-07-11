@@ -5236,3 +5236,81 @@ fn bidi_row_keeps_wide_glyph_cells_adjacent() {
     let trail_v = b.log2vis[4] as usize;
     assert_eq!(trail_v, lead_v + 1, "wide pair adjacent, lead first: {:?}", b.vis2log);
 }
+
+#[test]
+fn bdsm_mode_8_gates_bidi_and_alt_screen_defaults_explicit() {
+    let mut g = Grid::new(10, 2);
+    g.bidi = true;
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, "ab \u{5D0}\u{5D1}".as_bytes());
+    assert!(g.bidi_row(0).is_some(), "implicit is the main-screen default");
+    // The app opts out (explicit mode): no reordering.
+    p.advance(&mut g, b"\x1b[8l");
+    assert!(g.bidi_row(0).is_none());
+    p.advance(&mut g, b"\x1b[8h");
+    assert!(g.bidi_row(0).is_some());
+    // DECRQM (ANSI form) reports the state.
+    p.advance(&mut g, b"\x1b[8$p");
+    assert_eq!(p.take_responses(), b"\x1b[8;1$y");
+    // Alt screen defaults to explicit unless the app asks for implicit.
+    let mut g2 = Grid::new(10, 2);
+    g2.bidi = true;
+    let mut p2 = AnsiParser::new();
+    p2.advance(&mut g2, b"\x1b[?1049h");
+    p2.advance(&mut g2, "ab \u{5D0}\u{5D1}".as_bytes());
+    assert!(g2.bidi_row(0).is_none(), "alt screen: explicit by default");
+    p2.advance(&mut g2, b"\x1b[8$p");
+    assert_eq!(p2.take_responses(), b"\x1b[8;2$y");
+    p2.advance(&mut g2, b"\x1b[8h");
+    assert!(g2.bidi_row(0).is_some(), "app-requested implicit wins on alt");
+}
+
+#[test]
+fn scp_fixed_direction_applies_when_autodetect_is_off() {
+    let mut g = Grid::new(6, 1);
+    g.bidi = true;
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, "a \u{5D0}".as_bytes());
+    // Autodetected LTR paragraph: the single RTL char doesn't move.
+    assert!(g.bidi_row(0).is_none(), "identity under LTR autodetect");
+    // Turn autodetection off (2501) and fix the path RTL (SCP Ps1=2).
+    p.advance(&mut g, b"\x1b[?2501l\x1b[2;1 k");
+    let b = g.bidi_row(0).expect("RTL base reorders the line");
+    // An RTL paragraph right-aligns: trailing blanks reset to the paragraph
+    // level (rule L1) and fill the left; the text sits at the right edge.
+    assert_eq!(&b.vis2log[3..6], &[2, 1, 0], "line laid out right-to-left: {:?}", b.vis2log);
+    // DECRQM reports 2501 reset.
+    p.advance(&mut g, b"\x1b[?2501$p");
+    assert_eq!(p.take_responses(), b"\x1b[?2501;2$y");
+    // Back to LTR path: identity again.
+    p.advance(&mut g, b"\x1b[1;1 k");
+    assert!(g.bidi_row(0).is_none());
+}
+
+#[test]
+fn search_folds_canonical_accents_together() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    // Precomposed e-acute; the search query is a bare (even uppercase) E.
+    p.advance(&mut g, "caf\u{E9} time".as_bytes());
+    assert_eq!(g.search_with("cafE", false), 1, "E matches precomposed \u{E9}");
+    // And the reverse: an accented query finds plain text.
+    assert_eq!(g.search_with("t\u{EC}me", false), 1, "accented query folds too");
+    assert_eq!(g.search_with("xyz", false), 0);
+}
+
+#[test]
+fn arabic_row_shapes_joined_forms_through_bidi_row() {
+    let mut g = Grid::new(10, 1);
+    g.bidi = true;
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, "\u{645}\u{62D}\u{645}\u{62F}".as_bytes());
+    let b = g.bidi_row(0).expect("Arabic row reorders");
+    let s = b.shaped.as_ref().expect("and shapes");
+    assert_eq!(s[0], Some('\u{FEE3}'), "initial meem");
+    assert_eq!(s[1], Some('\u{FEA4}'), "medial hah");
+    assert_eq!(s[3], Some('\u{FEAA}'), "final dal");
+    // The visual map reverses the word, at the right edge of the RTL
+    // paragraph (rule L1 sends the trailing blanks to the paragraph level).
+    assert_eq!(&b.vis2log[6..10], &[3, 2, 1, 0], "{:?}", b.vis2log);
+}

@@ -192,12 +192,23 @@ pub(crate) fn draw_grid(
                     || cell.ch == '\u{10EEEE}';
                 plan[row * grid.cols + col] = (!blank).then(|| {
                     let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
-                    // Rule L4: chars in an RTL run draw their mirrored form.
+                    // Arabic contextual form first (phase 3), then rule L4
+                    // mirroring for RTL-run chars (Arabic never mirrors, so
+                    // the order can't double-substitute).
                     let ch = match &bidi[row] {
-                        Some(b) if b.rtl[col] => {
-                            crate::core::bidi_mirrored(cell.ch).unwrap_or(cell.ch)
+                        Some(b) => {
+                            let ch = b
+                                .shaped
+                                .as_ref()
+                                .and_then(|s| s[col])
+                                .unwrap_or(cell.ch);
+                            if b.rtl[col] {
+                                crate::core::bidi_mirrored(ch).unwrap_or(ch)
+                            } else {
+                                ch
+                            }
                         }
-                        _ => cell.ch,
+                        None => cell.ch,
                     };
                     font.glyph(ch, style)
                 });
