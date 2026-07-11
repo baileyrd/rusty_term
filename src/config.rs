@@ -79,6 +79,10 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Implicit bidi (`bidi = "auto"`): UAX #9 reordering of RTL-containing
+    /// rows at render time (`"off"`/unset disables; storage stays logical
+    /// order either way — see docs/research/bidi-scoping-2026-07.md).
+    pub bidi: Option<bool>,
     /// Whether the cursor leaves a brief fading trail when it jumps
     /// (`cursor_trail`; default off) — pure renderer eye candy (G36).
     pub cursor_trail: Option<bool>,
@@ -226,6 +230,7 @@ impl Config {
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
 # cursor_trail = true       # fading trail when the cursor jumps
+# bidi = "auto"             # reorder RTL text at render time (UAX #9)
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -706,6 +711,13 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         }
         ("", "copy_html") => cfg.copy_html = Some(expect_bool(key, value)?),
         ("", "cursor_trail") => cfg.cursor_trail = Some(expect_bool(key, value)?),
+        ("", "bidi") => {
+            cfg.bidi = Some(match expect_str(key, value)?.as_str() {
+                "auto" => true,
+                "off" => false,
+                other => return Err(format!("bidi: `{other}` (expected \"auto\" or \"off\")")),
+            });
+        }
         ("", "cursor_style") => {
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
@@ -1221,6 +1233,15 @@ color15 = "ffffff"
         let (cfg4, warns4) = parse("[window]\nopacity = -0.1\n");
         assert_eq!(cfg4.opacity, None);
         assert_eq!(warns4.len(), 1);
+    }
+
+    #[test]
+    fn bidi_key_parses_auto_off_and_rejects_junk() {
+        assert_eq!(parse("bidi = \"auto\"\n").0.bidi, Some(true));
+        assert_eq!(parse("bidi = \"off\"\n").0.bidi, Some(false));
+        let (cfg, warns) = parse("bidi = \"sideways\"\n");
+        assert_eq!(cfg.bidi, None);
+        assert_eq!(warns.len(), 1);
     }
 
     #[test]

@@ -434,6 +434,7 @@ impl WindowState<'_> {
             self.config.cursor_blink.unwrap_or(false),
         );
         g.min_contrast = self.config.minimum_contrast.unwrap_or(1.0);
+        g.bidi = self.config.bidi.unwrap_or(false);
         let grid = Arc::new(Mutex::new(g));
         let parser = Arc::new(Mutex::new(AnsiParser::with_theme(theme)));
 
@@ -1252,6 +1253,12 @@ impl WindowState<'_> {
             tab.focus = id; // click focuses the pane under the pointer
         }
         let cell = self.cell_in_focused(x, y);
+        // Bidi: selection anchors, word/line select, click-to-move, and the
+        // summary check below are all logical-cell consumers.
+        let cell = match self.pane() {
+            Some(p) => (p.grid.lock().logical_col(cell.0, cell.1), cell.1),
+            None => cell,
+        };
         // A click on a fold-summary line expands the folded command block
         // (C17') instead of starting a selection.
         if let Some(p) = self.pane()
@@ -1787,6 +1794,9 @@ impl WindowState<'_> {
             return false;
         }
         let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
+        // Bidi: apps address cells in logical order; a click on a reordered
+        // row reports the logical cell shown at the pointer's visual slot.
+        let col = p.grid.lock().logical_col(col, row);
         let mut e = build(col, row);
         // SGR-pixel mode (`?1016`): the same SGR encoding, but the position
         // is the pointer's pixel offset within the focused pane's text area
@@ -1820,6 +1830,7 @@ impl WindowState<'_> {
         let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
         let url = {
             let g = p.grid.lock();
+            let col = g.logical_col(col, row);
             // An explicit OSC 8 link wins; otherwise scan the cell's logical
             // line for a plain-text URL (G16) — most programs never emit OSC 8.
             g.link_at(col, row).map(str::to_owned).or_else(|| g.url_at(col, row))
@@ -2820,6 +2831,7 @@ impl WindowState<'_> {
                 {
                     let (hc, hr) = self.cell_in_focused(position.x, position.y);
                     let mut g = p.grid.lock();
+                    let hc = g.logical_col(hc, hr);
                     let head = (hc, g.abs_of_view_row(hr));
                     g.selection = Some(Selection { anchor, head });
                     if let Some(window) = &self.window {

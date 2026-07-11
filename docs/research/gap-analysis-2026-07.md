@@ -572,7 +572,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C20 | Accessibility (accesskit) | open — still a field-wide gap, still a differentiator | L |
 | C23 | io_uring backend (Linux) | open, perf-only | L |
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
-| C25 | Bidi + normalization | scoped 2026-07 → [bidi-scoping-2026-07.md](bidi-scoping-2026-07.md) (5 phases, grid model unchanged) | XL→L×2+M×3 |
+| C25 | Bidi + normalization | phases 1–2 ✅ done 2026-07 (UAX #9 engine + render/mouse integration, `bidi = "auto"`); 3–5 planned → [bidi-scoping-2026-07.md](bidi-scoping-2026-07.md) | XL→phased |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
 
 **C14′ resolution (2026-07):** closed as **GPU-only by design** rather

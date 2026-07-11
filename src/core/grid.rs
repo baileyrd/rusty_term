@@ -467,6 +467,11 @@ pub struct Grid {
     /// Lives on the grid so both renderers read one knob without new
     /// plumbing, like the cursor-style defaults.
     pub min_contrast: f32,
+    /// Implicit bidi (`bidi = "auto"`): render-time UAX #9 reordering of
+    /// RTL-containing rows. Off by default; the storage model stays logical
+    /// order regardless (see `src/core/bidi.rs`).
+    #[cfg(any(test, feature = "gui"))]
+    pub bidi: bool,
     /// In-flight multi-part OSC 99 notifications, keyed by the client's `i=`
     /// identifier: `(id, title, body)` accumulating until a `d=1` (done)
     /// part finalizes into [`Grid::notifications`]. Bounded.
@@ -783,6 +788,16 @@ pub(crate) struct GridImage {
     /// *current frame* renderers draw instead of `pixels` (same `pw × ph`).
     /// `pixels` stays as the first frame, the fallback if the store evicts it.
     pub(crate) anim: Option<u32>,
+}
+
+/// One viewport row's bidi view (see [`Grid::bidi_row`]): the visual→logical
+/// and logical→visual cell permutations plus which logical cells sit in an
+/// RTL (odd-level) run — those draw their glyph's mirrored form (rule L4).
+#[cfg(any(test, feature = "gui"))]
+pub struct BidiRow {
+    pub vis2log: Vec<u16>,
+    pub log2vis: Vec<u16>,
+    pub rtl: Vec<bool>,
 }
 
 /// The product of a wrap-aware reflow: the rebuilt history, the new on-screen
@@ -1165,6 +1180,8 @@ impl Grid {
             progress: None,
             report_color_scheme: false,
             min_contrast: 1.0,
+            #[cfg(any(test, feature = "gui"))]
+            bidi: false,
             notif99_pending: Vec::new(),
             #[cfg(any(test, feature = "gui"))]
             command_began: None,
@@ -4052,6 +4069,75 @@ impl Grid {
             }
         } else {
             self.cells[(row - off) * self.cols + col]
+        }
+    }
+
+    /// The bidi view of viewport row `row` (rule L2 applied to the row's
+    /// cells): `None` for pure-LTR rows or when `bidi` is off. Wide glyphs
+    /// (lead + trailer) reorder as one unit so the pair stays adjacent and
+    /// in lead-trailer order. Fold summaries and every other synthesized row
+    /// come out LTR and short-circuit to `None`, so the layers compose.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn bidi_row(&self, row: usize) -> Option<BidiRow> {
+        if !self.bidi || row >= self.rows {
+            return None;
+        }
+        // Unit per cell run: a wide lead absorbs its trailer.
+        let mut unit_chars: Vec<char> = Vec::with_capacity(self.cols);
+        let mut unit_cells: Vec<(u16, u16)> = Vec::new(); // (first col, ncells)
+        let mut col = 0usize;
+        while col < self.cols {
+            let cell = self.viewport_cell(col, row);
+            let w = if cell.flags & WIDE_TRAILER != 0 {
+                // Orphan trailer (shouldn't happen mid-row): own unit.
+                1
+            } else {
+                let mut n = 1;
+                while col + n < self.cols
+                    && self.viewport_cell(col + n, row).flags & WIDE_TRAILER != 0
+                {
+                    n += 1;
+                }
+                n
+            };
+            unit_chars.push(cell.ch);
+            unit_cells.push((col as u16, w as u16));
+            col += w;
+        }
+        let unit_map = super::bidi::visual_map(&unit_chars, None)?;
+        let levels_para = super::bidi::paragraph_level(&unit_chars);
+        let (levels, _) = super::bidi::reorder(&unit_chars, levels_para);
+        // Expand units back to cells, visual order.
+        let mut vis2log = Vec::with_capacity(self.cols);
+        for &u in &unit_map {
+            let (first, n) = unit_cells[u as usize];
+            for k in 0..n {
+                vis2log.push(first + k);
+            }
+        }
+        let mut log2vis = vec![0u16; self.cols];
+        for (v, &l) in vis2log.iter().enumerate() {
+            log2vis[l as usize] = v as u16;
+        }
+        let mut rtl = vec![false; self.cols];
+        for (ui, &(first, n)) in unit_cells.iter().enumerate() {
+            if !levels[ui].is_multiple_of(2) {
+                for k in 0..n {
+                    rtl[(first + k) as usize] = true;
+                }
+            }
+        }
+        Some(BidiRow { vis2log, log2vis, rtl })
+    }
+
+    /// Map a viewport cell the *user pointed at* (visual coordinates) to the
+    /// logical cell the model stores there — identity without bidi. Every
+    /// mouse path (selection, clicks, hyperlinks) converts through this.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn logical_col(&self, col: usize, row: usize) -> usize {
+        match self.bidi_row(row) {
+            Some(b) => b.vis2log.get(col).map_or(col, |&l| l as usize),
+            None => col,
         }
     }
 
