@@ -288,6 +288,34 @@ fn find_matches_rx(text: &[char], at: &[(usize, usize)], re: &rusty_regx::Regex,
     }
 }
 
+/// One stored Kitty image: its root pixels plus any animation frames.
+pub(crate) struct KittyImage {
+    pub id: u32,
+    pub w: usize,
+    pub h: usize,
+    /// Full-size frames (frame 0 is the root; `a=f` composites partial
+    /// payloads onto the previous frame, so every entry is directly drawable).
+    pub frames: Vec<KittyFrame>,
+    pub current: usize,
+    pub playing: bool,
+    /// When the current frame was shown, for gap pacing.
+    pub last_advance: Option<std::time::Instant>,
+}
+
+impl KittyImage {
+    /// The store-budget cost: every frame is full-size.
+    fn pixel_budget(&self) -> usize {
+        self.w * self.h * self.frames.len()
+    }
+}
+
+pub(crate) struct KittyFrame {
+    pub pixels: Vec<Option<u32>>,
+    /// Display time in milliseconds (floored to 40 — the protocol allows 0,
+    /// but a zero-gap loop would spin the repaint timer).
+    pub gap_ms: u32,
+}
+
 /// The authoritative screen buffer: a row-major grid of [`Cell`]s plus a
 /// per-row damage (`dirty`) tracker and a cursor position.
 pub struct Grid {
@@ -407,6 +435,12 @@ pub struct Grid {
     /// badge); the TUI relays the byte to the host instead. A boolean, so a
     /// burst of bells coalesces into one alert.
     pub bell: bool,
+    /// Stored Kitty images (`a=t`/`a=T` with an id), bounded; each carries
+    /// its animation frames and playback state.
+    pub(crate) kitty_images: Vec<KittyImage>,
+    /// Virtual Kitty placements (`U=1`): `(image id, cols, rows)` — the
+    /// geometry `U+10EEEE` placeholder cells render against.
+    pub(crate) kitty_virtual: Vec<(u32, usize, usize)>,
     /// ConEmu OSC `9;4` progress state as `(state, percent)`: state `1`
     /// normal, `2` error, `3` indeterminate, `4` warning/paused; `None` when
     /// cleared (state `0` or unknown). The windowed front-end surfaces it in
@@ -1109,6 +1143,8 @@ impl Grid {
             app_cursor_keys: false,
             alt_scroll: false,
             bell: false,
+            kitty_images: Vec::new(),
+            kitty_virtual: Vec::new(),
             progress: None,
             report_color_scheme: false,
             min_contrast: 1.0,
@@ -2738,6 +2774,8 @@ impl Grid {
     pub(crate) fn reset(&mut self) {
         self.bell = false;
         self.progress = None;
+        self.kitty_images.clear();
+        self.kitty_virtual.clear();
         self.report_color_scheme = false;
         self.notif99_pending.clear();
         self.primary = None; // leave the alternate screen if active
@@ -2995,6 +3033,179 @@ impl Grid {
             (ch(16) << 16) | (ch(8) << 8) | ch(0)
         };
         Some((first, len, mix(self.default_fg, self.default_bg)))
+    }
+
+    /// Store a Kitty image by id (`a=t`/`a=T`), bounded: a 17th image (or
+    /// one that would push the store past the pixel budget) evicts the
+    /// oldest. Restoring an existing id replaces it (frames reset).
+    pub(crate) fn kitty_store(&mut self, id: u32, w: usize, h: usize, pixels: Vec<Option<u32>>) {
+        const MAX_IMAGES: usize = 16;
+        const MAX_STORE_PIXELS: usize = 16 * 1024 * 1024;
+        if id == 0 || w == 0 || h == 0 {
+            return;
+        }
+        self.kitty_images.retain(|img| img.id != id);
+        let mut total: usize = self.kitty_images.iter().map(|i| i.pixel_budget()).sum();
+        while (self.kitty_images.len() >= MAX_IMAGES || total + w * h > MAX_STORE_PIXELS)
+            && !self.kitty_images.is_empty()
+        {
+            let dropped = self.kitty_images.remove(0);
+            total -= dropped.pixel_budget();
+        }
+        if w * h > MAX_STORE_PIXELS {
+            return;
+        }
+        self.kitty_images.push(KittyImage {
+            id,
+            w,
+            h,
+            frames: vec![KittyFrame { pixels, gap_ms: 0 }],
+            current: 0,
+            playing: false,
+            last_advance: None,
+        });
+    }
+
+    /// A stored image's current frame, cloned for placement.
+    pub(crate) fn kitty_get(&self, id: u32) -> Option<(usize, usize, Vec<Option<u32>>)> {
+        let img = self.kitty_images.iter().find(|i| i.id == id)?;
+        Some((img.w, img.h, img.frames[img.current].pixels.clone()))
+    }
+
+    /// Record a virtual placement (`U=1`): the image renders wherever
+    /// `U+10EEEE` placeholder cells with this id appear, on a `cols × rows`
+    /// grid (0 = derive from the pixel and cell sizes at draw time).
+    pub(crate) fn kitty_virtual_place(&mut self, id: u32, cols: usize, rows: usize) {
+        self.kitty_virtual.retain(|(i, _, _)| *i != id);
+        if self.kitty_virtual.len() < 16 {
+            self.kitty_virtual.push((id, cols, rows));
+        }
+    }
+
+    /// The virtual placement for image `id`, as `(cols, rows)`.
+    pub(crate) fn kitty_virtual_geometry(&self, id: u32) -> Option<(usize, usize)> {
+        self.kitty_virtual.iter().find(|(i, _, _)| *i == id).map(|&(_, c, r)| (c, r))
+    }
+
+    /// Append an animation frame (`a=f`) to image `id`: the payload is
+    /// composited onto a copy of the previous frame at `(x, y)`, so partial
+    /// frames accumulate the way the protocol specifies. `gap_ms` is how
+    /// long the *new* frame displays. Returns whether the image exists.
+    #[allow(clippy::too_many_arguments)] // mirrors the protocol's key set
+    pub(crate) fn kitty_add_frame(
+        &mut self,
+        id: u32,
+        w: usize,
+        h: usize,
+        pixels: Vec<Option<u32>>,
+        x: usize,
+        y: usize,
+        gap_ms: u32,
+    ) -> bool {
+        const MAX_FRAMES: usize = 64;
+        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else { return false };
+        if img.frames.len() >= MAX_FRAMES {
+            return false;
+        }
+        let mut base = img.frames.last().expect("images always have a root frame").pixels.clone();
+        for row in 0..h {
+            let dy = y + row;
+            if dy >= img.h {
+                break;
+            }
+            for col in 0..w {
+                let dx = x + col;
+                if dx >= img.w {
+                    break;
+                }
+                base[dy * img.w + dx] = pixels[row * w + col];
+            }
+        }
+        img.frames.push(KittyFrame { pixels: base, gap_ms: gap_ms.max(40) });
+        true
+    }
+
+    /// Start or stop an image's animation (`a=a`). Returns whether the image
+    /// exists and has more than one frame.
+    pub(crate) fn kitty_animate(&mut self, id: u32, run: bool) -> bool {
+        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else { return false };
+        img.playing = run && img.frames.len() > 1;
+        img.last_advance = None;
+        img.frames.len() > 1
+    }
+
+    /// Advance every playing animation to `now`, returning whether any frame
+    /// changed (the caller repaints). Cheap when nothing animates.
+    pub fn advance_animations(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
+        for img in &mut self.kitty_images {
+            if !img.playing || img.frames.len() < 2 {
+                continue;
+            }
+            let last = *img.last_advance.get_or_insert(now);
+            let gap = img.frames[(img.current + 1) % img.frames.len()].gap_ms.max(40) as u128;
+            if now.duration_since(last).as_millis() >= gap {
+                img.current = (img.current + 1) % img.frames.len();
+                img.last_advance = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.dirty.iter_mut().for_each(|d| *d = true);
+        }
+        changed
+    }
+
+    /// The current frame of stored image `id`, borrowed for drawing.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn kitty_frame(&self, id: u32) -> Option<(usize, usize, &[Option<u32>])> {
+        let img = self.kitty_images.iter().find(|i| i.id == id)?;
+        Some((img.w, img.h, &img.frames[img.current].pixels))
+    }
+
+    /// Delete stored Kitty images: by id, or everything (`None`). Virtual
+    /// placements of deleted images go with them.
+    pub(crate) fn kitty_delete(&mut self, id: Option<u32>) {
+        match id {
+            Some(id) => {
+                self.kitty_images.retain(|i| i.id != id);
+                self.kitty_virtual.retain(|(i, _, _)| *i != id);
+            }
+            None => {
+                self.kitty_images.clear();
+                self.kitty_virtual.clear();
+            }
+        }
+    }
+
+    /// Decode a Unicode placeholder cell (`U+10EEEE`) at viewport
+    /// `(col, row)`: the image id (24 bits from the foreground color, plus
+    /// the third diacritic's high byte) and the encoded `(row, col)` indices
+    /// from the first two diacritics (`None` = omitted, to be inferred from
+    /// neighbors). `None` when the cell isn't a placeholder.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn placeholder_at(&self, col: usize, row: usize) -> Option<(u32, Option<u32>, Option<u32>)> {
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        let cell = self.viewport_cell(col, row);
+        if cell.ch != '\u{10EEEE}' {
+            return None;
+        }
+        let mut r_idx = None;
+        let mut c_idx = None;
+        let mut id = cell.fg & 0x00FF_FFFF;
+        if cell.cluster != 0
+            && let Some(suffix) = self.clusters.get((cell.cluster - 1) as usize)
+        {
+            let mut vals = suffix.chars().filter_map(super::kitty_diacritics::diacritic_value);
+            r_idx = vals.next();
+            c_idx = vals.next();
+            if let Some(hi) = vals.next() {
+                id |= hi << 24;
+            }
+        }
+        Some((id, r_idx, c_idx))
     }
 
     /// Apply a ConEmu OSC `9;4` progress report. State `0` (or anything

@@ -2406,24 +2406,42 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     /// for the next real event (no idle wakeups).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         const BLINK: Duration = Duration::from_millis(530);
+        /// Kitty animation tick — the floor gap is 40ms, so ticking at it
+        /// hits every frame boundary within a frame's tolerance.
+        const ANIM: Duration = Duration::from_millis(40);
+        let now = Instant::now();
+        // Kitty graphics animations: advance every visible pane's playing
+        // images; a frame change repaints.
+        let mut animating = false;
+        if let Some(tab) = self.tabs.get(self.active) {
+            for p in &tab.panes {
+                let mut g = p.grid.lock();
+                if g.advance_animations(now)
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+                animating |= g.kitty_images.iter().any(|i| i.playing);
+            }
+        }
         let blinking = self.pane().is_some_and(|p| {
             let g = p.grid.lock();
             g.cursor_blink && g.cursor_visible && g.view_offset == 0
         });
-        if !blinking {
+        if !blinking && !animating {
             self.cursor_blink_on = true;
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        let now = Instant::now();
-        if now.duration_since(self.last_blink) >= BLINK {
+        if blinking && now.duration_since(self.last_blink) >= BLINK {
             self.cursor_blink_on = !self.cursor_blink_on;
             self.last_blink = now;
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_blink + BLINK));
+        let next = if animating { now + ANIM } else { self.last_blink + BLINK };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {

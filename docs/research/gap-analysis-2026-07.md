@@ -34,7 +34,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
 | ✅ G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
 | ✅ G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
-| G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
+| ✅ G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
 | ✅ G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
 | ✅ G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
 | G10 | win32-input-mode (ConPTY key fidelity) | P2 | Windows Terminal, WezTerm | M |
@@ -151,6 +151,7 @@ terminals (Windows Terminal, Konsole, iTerm2).
 **Size** S–M · **Deps** `gui` for visual/urgency variants.
 
 #### G07 — Kitty graphics protocol: animation + Unicode placeholders
+**Status: done (store/put/delete + Unicode placeholders + animation; z-index/quadrant composition out of scope).** The decoder (`src/core/kitty.rs`) now backs `a=t` with a bounded image store on the grid, `a=p` places by id (honoring `c`/`r` via `render_image_sized`), and `a=d` deletes (by id, or whole-store for the other scopes — honest over-deletion). **Placeholders:** `U=1` records a virtual placement; `U+10EEEE` cells decode the image id from the truecolor foreground (+ high byte from the third diacritic) and row/column from the first two diacritics — the 297-entry table lives in `src/core/kitty_diacritics.rs`, extracted verbatim from a published implementation of kitty's frozen `rowcolumn-diacritics.txt` (the docs host is blocked from this sandbox; the table is the wire format and must never be regenerated from newer Unicode data). Cells omitting diacritics infer from left/top neighbors per the spec. The CPU renderer paints each placeholder cell's slice of the placement grid (nearest-neighbor). **Animation:** `a=f` composites partial frames onto the previous frame at `x`/`y` with a `z` ms gap (floored to 40); `a=a` runs/stops; the window's frame timer advances playing images and repaints. TUI/GPU paths keep static first-frame half-blocks (existing parity note). Store+put verified end-to-end on a real PTY.
 **Current.** `src/core/kitty.rs` implements transmit/display/query and
 chunking, but not the animation subcommands (`a=a`, frame composition) nor
 Unicode placeholders (`U+10EEEE` + diacritics, `p=`/virtual placements) —

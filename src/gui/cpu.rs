@@ -161,14 +161,20 @@ pub(crate) fn draw_grid(
                 && char_width(cell.ch) == 1
                 // Synthesized glyphs (box drawing etc.) bypass shaping so a
                 // font's GSUB can never substitute them away from the exact
-                // cell-geometry bitmaps.
+                // cell-geometry bitmaps; Kitty placeholders draw image
+                // content, never a glyph.
                 && !crate::gui::boxdraw::is_synthesized(cell.ch)
+                && cell.ch != '\u{10EEEE}'
         };
         let mut col = 0;
         while col < grid.cols {
             let cell = cell_at(col);
             if !eligible(col, &cell) {
-                let blank = cell.flags & WIDE_TRAILER != 0 || (cell.ch == ' ' && cell.cluster == 0);
+                // Kitty Unicode placeholders draw image content (the pass
+                // below), never a font glyph.
+                let blank = cell.flags & WIDE_TRAILER != 0
+                    || (cell.ch == ' ' && cell.cluster == 0)
+                    || cell.ch == '\u{10EEEE}';
                 plan[row * grid.cols + col] = (!blank).then(|| {
                     let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
                     font.glyph(cell.ch, style)
@@ -325,6 +331,75 @@ pub(crate) fn draw_grid(
                 }
             }
             CursorShape::Block => {}
+        }
+    }
+
+    // Kitty Unicode placeholders (`U+10EEEE`): each cell paints its slice
+    // of a virtually placed image — the placement mechanism that survives
+    // multiplexers. Row/column come from the cell's diacritics; cells that
+    // omit them inherit from the left/top neighbor (spec inference).
+    let mut ph: Vec<Option<(u32, u32, u32)>> = Vec::new();
+    let mut any_ph = false;
+    for row in 0..grid.rows {
+        for col in 0..grid.cols {
+            let entry = grid.placeholder_at(col, row).map(|(id, r, c)| {
+                let left = (col > 0)
+                    .then(|| ph.get(row * grid.cols + col - 1).copied().flatten())
+                    .flatten()
+                    .filter(|&(lid, _, _)| lid == id);
+                let above = (row > 0)
+                    .then(|| ph.get((row - 1) * grid.cols + col).copied().flatten())
+                    .flatten()
+                    .filter(|&(aid, _, _)| aid == id);
+                let cc = c.or_else(|| left.map(|(_, _, lc)| lc + 1)).unwrap_or(0);
+                let rr = r
+                    .or_else(|| left.map(|(_, lr, _)| lr))
+                    .or_else(|| above.map(|(_, ar, _)| ar + 1))
+                    .unwrap_or(0);
+                (id, rr, cc)
+            });
+            any_ph |= entry.is_some();
+            ph.push(entry);
+        }
+    }
+    if any_ph {
+        for (i, entry) in ph.iter().enumerate() {
+            let Some((id, prow, pcol)) = *entry else { continue };
+            let Some((iw, ihh, pixels)) = grid.kitty_frame(id) else { continue };
+            // Placement grid: explicit `c`/`r` from the virtual placement,
+            // else derived from the image and cell pixel sizes.
+            let (mut pcols, mut prows) = grid.kitty_virtual_geometry(id).unwrap_or((0, 0));
+            if pcols == 0 {
+                pcols = iw.div_ceil(cw).max(1);
+            }
+            if prows == 0 {
+                prows = ihh.div_ceil(ch).max(1);
+            }
+            let (prow, pcol) = (prow as usize, pcol as usize);
+            if prow >= prows || pcol >= pcols {
+                continue; // an index past the placement grid shows nothing
+            }
+            let (col, row) = (i % grid.cols, i / grid.cols);
+            let (sx0, sx1) = (pcol * iw / pcols, ((pcol + 1) * iw / pcols).max(pcol * iw / pcols + 1));
+            let (sy0, sy1) = (prow * ihh / prows, ((prow + 1) * ihh / prows).max(prow * ihh / prows + 1));
+            let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+            for dy in 0..ch {
+                let py = y0 + dy;
+                if py >= height {
+                    break;
+                }
+                let sy = (sy0 + dy * (sy1 - sy0) / ch).min(ihh - 1);
+                for dx in 0..cw {
+                    let px = x0 + dx;
+                    if px >= width {
+                        break;
+                    }
+                    let sx = (sx0 + dx * (sx1 - sx0) / cw).min(iw - 1);
+                    if let Some(rgb) = pixels[sy * iw + sx] {
+                        buf[py * width + px] = rgb;
+                    }
+                }
+            }
         }
     }
 
@@ -806,6 +881,31 @@ mod tests {
         draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut MockFont);
         // The image composites as real pixels over its reserved half-block cell.
         assert_eq!(buf[0], 0xFF0000, "image pixel composited at the origin");
+    }
+
+    #[test]
+    fn kitty_placeholders_paint_the_image_slice() {
+        let mut g = Grid::new(4, 2);
+        let mut p = crate::core::AnsiParser::new();
+        // A 2x1 image (red|green) stored + virtually placed on a 2x1 grid.
+        p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA//8AAP8=\x1b\\");
+        // Wait — payload is red|red; use two colors: ff0000ff 00ff00ff.
+        p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA/wD/AP8=\x1b\\");
+        // Two placeholder cells, row 0 cols 0/1 (diacritics 0 and 1), id in fg.
+        p.advance(&mut g, b"\x1b[38;2;0;0;5m");
+        p.advance(&mut g, "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes());
+        let (cw, ch) = (4usize, 8usize);
+        let (w, h) = (4 * cw, 2 * ch);
+        let mut buf = vec![0u32; w * h];
+        draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut MockFont);
+        assert_eq!(buf[0], 0xFF0000, "cell (0,0) shows the red half");
+        assert_eq!(buf[cw], 0x00FF00, "cell (1,0) shows the green half");
+        // Inference: a third placeholder with no diacritics continues the
+        // row; column 2 is past the 2-wide placement, so it paints nothing.
+        p.advance(&mut g, "\u{10EEEE}".as_bytes());
+        let mut buf2 = vec![0u32; w * h];
+        draw_grid(&mut buf2, w, h, &g, 0, 0, false, false, &mut MockFont);
+        assert_eq!(buf2[2 * cw], 0, "index past the placement grid stays empty");
     }
 
     #[test]
