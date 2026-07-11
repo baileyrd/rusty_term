@@ -514,6 +514,11 @@ pub struct Grid {
     /// reads this directly and reports its own `WindowEvent::Focused`
     /// transitions to the child.
     pub focus_reporting: bool,
+    /// Whether win32-input-mode (DEC `?9001`, microsoft/terminal) is enabled
+    /// by the child. The windowed front-end's key encoder reads this to send
+    /// full key records (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`, press and release)
+    /// instead of VT sequences; TUI mode relays the mode to the host.
+    pub win32_input: bool,
     /// Whether application keypad mode (DECKPAM `ESC =` / DECNKM DEC `?66`)
     /// is enabled. The windowed front-end's key encoder reads this to encode
     /// numpad keys as `SS3 p`–`SS3 y` (and friends) instead of their plain
@@ -1219,6 +1224,7 @@ impl Grid {
             #[cfg(any(test, feature = "gui"))]
             finished_commands: Vec::new(),
             focus_reporting: false,
+            win32_input: false,
             app_keypad: false,
             line_feed_new_line: false,
             clipboard_set: None,
@@ -3224,6 +3230,7 @@ impl Grid {
         self.app_cursor_keys = false;
         self.alt_scroll = false;
         self.focus_reporting = false;
+        self.win32_input = false;
         self.app_keypad = false;
         self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();
@@ -3257,6 +3264,7 @@ impl Grid {
         self.app_cursor_keys = false;
         self.alt_scroll = false;
         self.focus_reporting = false;
+        self.win32_input = false;
         self.app_keypad = false;
         self.line_feed_new_line = false;
         self.kitty_flags_stack.clear();

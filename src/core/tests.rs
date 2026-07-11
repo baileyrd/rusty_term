@@ -4567,6 +4567,26 @@ fn mode_2031_is_tracked_relayed_and_reported() {
 }
 
 #[test]
+fn mode_9001_win32_input_is_tracked_relayed_and_reported() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.win32_input);
+    p.advance(&mut g, b"\x1b[?9001h");
+    assert!(g.win32_input);
+    assert_eq!(g.take_host_out(), b"\x1b[?9001h"); // relayed for TUI mode
+    p.advance(&mut g, b"\x1b[?9001$p");
+    assert_eq!(p.take_responses(), b"\x1b[?9001;1$y");
+    p.advance(&mut g, b"\x1b[?9001l");
+    assert!(!g.win32_input);
+    p.advance(&mut g, b"\x1b[?9001$p");
+    assert_eq!(p.take_responses(), b"\x1b[?9001;2$y");
+    // RIS clears it like the other input modes.
+    p.advance(&mut g, b"\x1b[?9001h");
+    p.advance(&mut g, b"\x1bc");
+    assert!(!g.win32_input);
+}
+
+#[test]
 fn osc_99_single_part_notification() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();

@@ -902,6 +902,7 @@ impl AnsiParser {
                     66 => g.app_keypad = set, // DECNKM — same state as ESC = / ESC >
                     1004 => g.focus_reporting = set,
                     2031 => g.report_color_scheme = set,
+                    9001 => g.win32_input = set,
                     1007 => g.alt_scroll = set,
                     2004 => g.bracketed_paste = set,
                     1000 | 1002 | 1003 => {
@@ -995,6 +996,7 @@ impl AnsiParser {
             69 => g.lr_margin_mode,
             1004 => g.focus_reporting,
             2031 => g.report_color_scheme,
+            9001 => g.win32_input,
             2501 => g.bidi_autodetect,
             7 => g.autowrap,
             25 => g.cursor_visible,
@@ -1497,10 +1499,11 @@ impl AnsiParser {
 /// - `1005`/`1006`/`1015`/`1016` — extended mouse coordinate encodings
 /// - `1007` — alternate scroll mode (wheel → arrow keys in the alt screen)
 /// - `2004` — bracketed paste
+/// - `9001` — win32-input-mode (full key records, press and release)
 fn is_host_input_mode(param: usize) -> bool {
     matches!(
         param,
-        1 | 66 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004 | 2031
+        1 | 66 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004 | 2031 | 9001
     )
 }
 

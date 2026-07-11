@@ -2677,20 +2677,33 @@ impl WindowState<'_> {
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
-                    // Key releases are terminal input only under Kitty
-                    // keyboard flag 2 (report event types); the UI layers
-                    // (chords, search, copy mode) never see them.
-                    let (app_cursor, kitty_flags) = self
+                    // Key releases are terminal input only under win32-input-
+                    // mode (?9001) or Kitty keyboard flag 2 (report event
+                    // types); the UI layers (chords, search, copy mode) never
+                    // see them.
+                    let (app_cursor, kitty_flags, win32_input) = self
                         .pane()
                         .map(|p| {
                             let g = p.grid.lock();
-                            (g.app_cursor_keys, g.kitty_keyboard_flags())
+                            (g.app_cursor_keys, g.kitty_keyboard_flags(), g.win32_input)
                         })
                         .unwrap_or_default();
+                    if self.overlay.is_some() || self.searching.is_some() || self.copy_mode.is_some()
+                    {
+                        return;
+                    }
+                    if win32_input {
+                        if let Some(bytes) = super::input::encode_win32(
+                            event.physical_key,
+                            &event.logical_key,
+                            self.mods,
+                            false,
+                        ) {
+                            self.write_child(&bytes);
+                        }
+                        return;
+                    }
                     if kitty_flags & 2 != 0
-                        && self.overlay.is_none()
-                        && self.searching.is_none()
-                        && self.copy_mode.is_none()
                         && let Some(bytes) = super::input::encode_full(
                             &event.logical_key,
                             self.mods,
@@ -2741,13 +2754,27 @@ impl WindowState<'_> {
                 if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
                     return;
                 }
-                let (app_cursor, app_keypad, kitty_flags) = self
+                let (app_cursor, app_keypad, kitty_flags, win32_input) = self
                     .pane()
                     .map(|p| {
                         let g = p.grid.lock();
-                        (g.app_cursor_keys, g.app_keypad, g.kitty_keyboard_flags())
+                        (g.app_cursor_keys, g.app_keypad, g.kitty_keyboard_flags(), g.win32_input)
                     })
                     .unwrap_or_default();
+                // win32-input-mode (?9001) supersedes every VT encoding: the
+                // child asked for raw key records, presses and releases alike.
+                if win32_input {
+                    if let Some(bytes) = super::input::encode_win32(
+                        event.physical_key,
+                        &event.logical_key,
+                        self.mods,
+                        true,
+                    ) {
+                        self.write_child(&bytes);
+                        self.snap_to_bottom();
+                    }
+                    return;
+                }
                 // Application keypad mode (DECKPAM/DECNKM): a key physically
                 // on the numpad encodes as its SS3 sequence; everything else
                 // (mode off, modifiers held) falls through to normal encoding.
