@@ -122,6 +122,47 @@ fn encode_named(named: NamedKey, mods: ModifiersState, app_cursor: bool, kitty_f
     Some(seq)
 }
 
+/// Encode a numpad key under application keypad mode (DECKPAM `ESC =` /
+/// DECNKM `?66`) as its `SS3` sequence, per xterm's PC-keyboard extension of
+/// the VT220 table (`SS3 j`–`o` for the operators, `p`–`y` for the digits,
+/// `X` for `=`, `M` for Enter). Returns `None` — falling back to the normal
+/// text/named encoding — when the mode is off, the key isn't a keypad
+/// character, or modifiers are held (a modified keypad key keeps its legacy
+/// encoding, which carries the xterm modifier parameter).
+///
+/// The caller is responsible for only routing keys whose winit `KeyLocation`
+/// is `Numpad` here; this function can't tell a top-row `5` from KP-5.
+pub(crate) fn encode_numpad(key: &Key, mods: ModifiersState, app_keypad: bool) -> Option<Vec<u8>> {
+    if !app_keypad || mods.control_key() || mods.alt_key() || mods.shift_key() {
+        return None;
+    }
+    let f = match key {
+        Key::Named(NamedKey::Enter) => b'M',
+        Key::Character(s) => match s.as_str() {
+            "0" => b'p',
+            "1" => b'q',
+            "2" => b'r',
+            "3" => b's',
+            "4" => b't',
+            "5" => b'u',
+            "6" => b'v',
+            "7" => b'w',
+            "8" => b'x',
+            "9" => b'y',
+            "*" => b'j',
+            "+" => b'k',
+            "," => b'l',
+            "-" => b'm',
+            "." => b'n',
+            "/" => b'o',
+            "=" => b'X',
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(vec![0x1b, b'O', f])
+}
+
 /// xterm modifier parameter: `1 + Shift + 2·Alt + 4·Ctrl + 8·Super`. `None` when
 /// no modifiers are held (so the base sequence is emitted without it).
 fn modifier_param(mods: ModifiersState) -> Option<u8> {
@@ -277,5 +318,26 @@ mod tests {
         // only the specifically ambiguous keys route through CSI u.
         assert_eq!(encode(&k_named(NamedKey::ArrowUp), NONE, false, 1).unwrap(), b"\x1b[A");
         assert_eq!(encode(&k_char("a"), NONE, false, 1).unwrap(), b"a");
+    }
+
+    #[test]
+    fn numpad_application_mode_encodes_ss3() {
+        // Digits map to SS3 p..y, operators to their xterm PC-keyboard slots.
+        assert_eq!(encode_numpad(&k_char("0"), NONE, true).unwrap(), b"\x1bOp");
+        assert_eq!(encode_numpad(&k_char("9"), NONE, true).unwrap(), b"\x1bOy");
+        assert_eq!(encode_numpad(&k_char("+"), NONE, true).unwrap(), b"\x1bOk");
+        assert_eq!(encode_numpad(&k_char("."), NONE, true).unwrap(), b"\x1bOn");
+        assert_eq!(encode_numpad(&k_named(NamedKey::Enter), NONE, true).unwrap(), b"\x1bOM");
+    }
+
+    #[test]
+    fn numpad_falls_back_when_mode_off_or_modified() {
+        // Mode off: no SS3 — the caller falls through to normal text encoding.
+        assert_eq!(encode_numpad(&k_char("5"), NONE, false), None);
+        // Modifiers keep the legacy encoding (which carries the mod param).
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(encode_numpad(&k_char("5"), ctrl, true), None);
+        // A non-keypad key at the numpad location (NumLock etc.) encodes normally.
+        assert_eq!(encode_numpad(&k_named(NamedKey::Home), NONE, true), None);
     }
 }

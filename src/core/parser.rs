@@ -302,6 +302,16 @@ impl AnsiParser {
                         self.charset_slot = 3;
                         self.state = ParserState::EscCharset;
                     }
+                    // DECKPAM / DECKPNM — application / numeric keypad mode.
+                    // Tracked for the windowed front-end's key encoder and
+                    // relayed to the host, which does the real keypad encoding
+                    // in TUI mode (same split as DECCKM).
+                    b'=' | b'>' => {
+                        g.app_keypad = b == b'=';
+                        g.host_out.push(0x1b);
+                        g.host_out.push(b);
+                        self.state = ParserState::Ground;
+                    }
                     // DCS (`ESC P`) is buffered so a Sixel image can be decoded
                     // at ST (see `finish_dcs`); other DCS types are discarded.
                     // SOS (`X`), PM (`^`), and APC (`_`, e.g. Kitty graphics) are
@@ -480,6 +490,13 @@ impl AnsiParser {
             self.dcs_buffer.clear();
             return;
         }
+        // DECRQSS (`DCS $ q <request> ST`): report a control function's
+        // current setting. The `$` intermediate distinguishes it from Sixel.
+        if self.dcs_buffer.starts_with(b"$q") {
+            self.answer_decrqss(g);
+            self.dcs_buffer.clear();
+            return;
+        }
         let mut i = 0;
         // Skip the Sixel parameter bytes (digits and `;`) to the final byte,
         // which for Sixel is `q`.
@@ -527,6 +544,87 @@ impl AnsiParser {
                 }
             }
         }
+    }
+
+    /// Answer a DECRQSS request (`DCS $ q <request> ST`) with a DECRPSS report:
+    /// `DCS 1 $ r <setting><request> ST` for a control function whose setting
+    /// this terminal tracks, `DCS 0 $ r ST` for anything else (`1` = valid is
+    /// xterm's convention, inverting the original — historically backwards —
+    /// DEC documentation; every modern client follows xterm). Supported
+    /// requests: `m` (SGR — the current pen), `r` (DECSTBM scrolling region),
+    /// and `SP q` (DECSCUSR cursor style).
+    fn answer_decrqss(&mut self, g: &Grid) {
+        let payload = match &self.dcs_buffer[2..] {
+            b"m" => Some(self.pen_sgr_params()),
+            b"r" => Some(format!("{};{}r", g.scroll_top + 1, g.scroll_bottom + 1)),
+            b" q" => {
+                let ps = match (g.cursor_shape, g.cursor_blink) {
+                    (CursorShape::Block, true) => 1,
+                    (CursorShape::Block, false) => 2,
+                    (CursorShape::Underline, true) => 3,
+                    (CursorShape::Underline, false) => 4,
+                    (CursorShape::Bar, true) => 5,
+                    (CursorShape::Bar, false) => 6,
+                };
+                Some(format!("{ps} q"))
+            }
+            _ => None,
+        };
+        match payload {
+            Some(p) => {
+                self.responses.extend_from_slice(b"\x1bP1$r");
+                self.responses.extend_from_slice(p.as_bytes());
+                self.responses.extend_from_slice(b"\x1b\\");
+            }
+            None => self.responses.extend_from_slice(b"\x1bP0$r\x1b\\"),
+        }
+    }
+
+    /// Serialize the parser's current pen as SGR parameters for DECRQSS `m`
+    /// (leading `0` reset, then each set attribute, then explicit truecolor
+    /// fg/bg/underline parameters when they differ from the palette defaults),
+    /// ending with the `m` final byte.
+    fn pen_sgr_params(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::from("0");
+        for (bit, code) in [
+            (ATTR_BOLD, 1),
+            (ATTR_DIM, 2),
+            (ATTR_ITALIC, 3),
+            (ATTR_BLINK, 5),
+            (ATTR_REVERSE, 7),
+            (ATTR_HIDDEN, 8),
+            (ATTR_STRIKE, 9),
+        ] {
+            if self.pen.attrs & bit != 0 {
+                let _ = write!(s, ";{code}");
+            }
+        }
+        if self.pen.attrs & ATTR_UNDERLINE != 0 {
+            let style = match UnderlineStyle::from_attrs(self.pen.attrs) {
+                UnderlineStyle::Straight => 1,
+                UnderlineStyle::Double => 2,
+                UnderlineStyle::Curly => 3,
+                UnderlineStyle::Dotted => 4,
+                UnderlineStyle::Dashed => 5,
+            };
+            let _ = write!(s, ";4:{style}");
+        }
+        let rgb = |c: u32| ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+        if self.pen.fg != self.palette.fg {
+            let (r, g, b) = rgb(self.pen.fg);
+            let _ = write!(s, ";38;2;{r};{g};{b}");
+        }
+        if self.pen.bg != self.palette.bg {
+            let (r, g, b) = rgb(self.pen.bg);
+            let _ = write!(s, ";48;2;{r};{g};{b}");
+        }
+        if self.pen.attrs & ATTR_UNDERLINE_COLOR != 0 {
+            let (r, g, b) = rgb(self.pen.underline_color);
+            let _ = write!(s, ";58;2;{r};{g};{b}");
+        }
+        s.push('m');
+        s
     }
 
     /// Finalize a collected APC string. Kitty graphics commands begin with `G`;
@@ -694,6 +792,14 @@ impl AnsiParser {
             self.report_dec_mode(g, mode);
             return;
         }
+        // XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) — query/set graphics
+        // attributes. Sixel-emitting apps (notcurses, chafa, img2sixel) probe
+        // this before choosing an output strategy; silence makes them fall
+        // back to conservative defaults.
+        if self.csi_marker == b'?' && cmd == b'S' {
+            self.answer_xtsmgraphics();
+            return;
+        }
         // Only DEC-private (`?`) set/reset (`h`/`l`) sequences are actionable
         // here; other private forms are consumed without effect.
         if self.csi_marker != b'?' || (cmd != b'h' && cmd != b'l') {
@@ -724,6 +830,8 @@ impl AnsiParser {
                 // itself. (TUI mode relays above and never reads these.)
                 match param {
                     1 => g.app_cursor_keys = set,
+                    66 => g.app_keypad = set, // DECNKM — same state as ESC = / ESC >
+                    1004 => g.focus_reporting = set,
                     1007 => g.alt_scroll = set,
                     2004 => g.bracketed_paste = set,
                     1000 | 1002 | 1003 => {
@@ -769,16 +877,40 @@ impl AnsiParser {
         }
     }
 
+    /// Answer an XTSMGRAPHICS query (`CSI ? Pi ; Pa ; Pv S`) with
+    /// `CSI ? Pi ; Ps ; Pv S`: `Ps` is `0` success, `1` error in `Pi`, `2`
+    /// error in `Pa`, `3` failure. Item 1 (color registers) and item 2
+    /// (Sixel geometry) answer with this terminal's fixed limits — the Sixel
+    /// decoder's register table and per-axis dimension cap aren't
+    /// runtime-adjustable, so a "set"/"reset" action succeeds by reporting
+    /// the actual (unchanged) values, same as a read. Item 3 (ReGIS) is not
+    /// implemented and reports an item error.
+    fn answer_xtsmgraphics(&mut self) {
+        let params = self.parse_params();
+        let p = |i: usize| params.get(i).copied().flatten().unwrap_or(0);
+        let (item, action) = (p(0), p(1));
+        let reply = match (item, action) {
+            (1, 1..=4) => "\x1b[?1;0;256S".to_string(),
+            (2, 1..=4) => {
+                format!("\x1b[?2;0;{0};{0}S", sixel::MAX_DIM)
+            }
+            (1 | 2, _) => format!("\x1b[?{item};2S"),
+            _ => format!("\x1b[?{item};1S"),
+        };
+        self.responses.extend_from_slice(reply.as_bytes());
+    }
+
     /// Answer a DEC private DECRQM query (`CSI ? Ps $ p`) with a DECRPM report
     /// (`CSI ? Ps ; Pv $ y`). `Pv` is `1` set, `2` reset, or `0` "not
-    /// recognized" — used honestly for modes this terminal only relays to the
-    /// host and doesn't track state for itself (focus reporting), rather than
-    /// guessing. Never reports the "permanently set/reset" `3`/`4` forms —
-    /// nothing here is locked.
+    /// recognized" — used honestly for modes this terminal doesn't track
+    /// state for itself, rather than guessing. Never reports the "permanently
+    /// set/reset" `3`/`4` forms — nothing here is locked.
     fn report_dec_mode(&mut self, g: &mut Grid, mode: usize) {
         let set = match mode {
             1 => g.app_cursor_keys,
             6 => g.origin_mode,
+            66 => g.app_keypad,
+            1004 => g.focus_reporting,
             7 => g.autowrap,
             25 => g.cursor_visible,
             47 | 1047 | 1049 => g.in_alt_screen(),
@@ -1220,7 +1352,7 @@ impl AnsiParser {
 fn is_host_input_mode(param: usize) -> bool {
     matches!(
         param,
-        1 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004
+        1 | 66 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004
     )
 }
 

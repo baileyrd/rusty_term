@@ -35,7 +35,7 @@ impl SixelImage {
 
 /// Per-axis dimension cap and total-pixel cap, bounding memory against an
 /// oversized or hostile image (the buffer is one-shot and downsampled away).
-const MAX_DIM: usize = 2000;
+pub(crate) const MAX_DIM: usize = 2000;
 const MAX_PIXELS: usize = 4 * 1024 * 1024;
 
 /// Decode a Sixel data payload (the bytes after the `q`) into an image.

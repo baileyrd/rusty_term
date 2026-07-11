@@ -30,8 +30,8 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 |---|---|---|---|---|
 | G01 | OSC 9;4 progress reporting | P1 | Ghostty, Windows Terminal, kitty, Konsole, mintty | S–M |
 | G02 | Light/dark scheme detection + mode 2031 notify | P1 | kitty, Ghostty, Contour, foot, iTerm2 | S–M |
-| G03 | DECRQSS settings report (`DCS $ q`) | P1 | xterm, kitty, foot, WezTerm | S |
-| G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
+| ✅ G03 | DECRQSS settings report (`DCS $ q`) | P1 | xterm, kitty, foot, WezTerm | S |
+| ✅ G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
 | G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
 | G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
 | G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
@@ -39,9 +39,9 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
 | G10 | win32-input-mode (ConPTY key fidelity) | P2 | Windows Terminal, WezTerm | M |
 | G11 | Kitty keyboard flags 2/4/16 in GUI | P2 | kitty, Ghostty, WezTerm, foot | M |
-| G12 | Keypad application mode (DECKPAM/DECKPNM) | P2 | universal (legacy but probed) | S |
-| G13 | Native focus reporting (mode 1004) in GUI | P1 | universal | S |
-| G14 | SGR-pixel mouse (mode 1016) in GUI | P2 | xterm, kitty, foot, WezTerm | S |
+| ✅ G12 | Keypad application mode (DECKPAM/DECKPNM) | P2 | universal (legacy but probed) | S |
+| ✅ G13 | Native focus reporting (mode 1004) in GUI | P1 | universal | S |
+| ✅ G14 | SGR-pixel mouse (mode 1016) in GUI | P2 | xterm, kitty, foot, WezTerm | S |
 | G15 | DECSCA/DECSED/DECSEL protected areas | P3 | xterm, VTE, Contour | S–M |
 | G16 | Implicit URL/path detection + hints mode | P1 | kitty, WezTerm, Alacritty, Windows Terminal | M |
 | G17 | Double/triple-click word/line selection | P1 | universal | S–M |
@@ -50,7 +50,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G20 | Command-completion notifications | P1 | Ghostty 1.3, iTerm2 | S–M |
 | G21 | Click-to-move-cursor at prompt | P2 | Ghostty 1.3, kitty | M |
 | G22 | Regex + Unicode case-folded search | P2 | kitty, WezTerm, Ghostty, iTerm2 | M |
-| G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
+| ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
 | G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
 | G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
 | G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
@@ -102,6 +102,7 @@ hang this off.
 **Size** S–M · **Deps** none for the VT side; `gui` for OS detection.
 
 #### G03 — DECRQSS (`DCS $ q … ST`) — request selection or setting
+**Status: done.** `AnsiParser::answer_decrqss`/`pen_sgr_params` (`src/core/parser.rs`), dispatched from `finish_dcs` on the `$q` prefix; answers `m` (current pen SGR, colon-form underline style, truecolor only when non-default), `r` (DECSTBM), and `SP q` (DECSCUSR), `DCS 0$r` otherwise. Verified end-to-end through the TUI binary on a real PTY.
 **Current.** No handler; `grep '\$q' src/` is empty. Probes get silence.
 **Target.** Answer at least the settings rusty_term tracks: SGR (`m`),
 DECSTBM (`r`), DECSCUSR (` q`), and report "invalid" (`DCS 0$r`) otherwise.
@@ -112,6 +113,7 @@ next to the existing XTGETTCAP responder.
 **Size** S · **Deps** none.
 
 #### G04 — XTSMGRAPHICS (`CSI ? Pi;Pa;Pv S`) — graphics attribute query/set
+**Status: done.** `AnsiParser::answer_xtsmgraphics` (`src/core/parser.rs`) answers item 1 (color registers, 256) and item 2 (Sixel geometry, `sixel::MAX_DIM` = 2000²) for all four actions — the limits are fixed, so set/reset succeed by reporting actual values; item 3 (ReGIS) reports an item error. Verified end-to-end on a real PTY.
 **Current.** No handler. Apps can't ask "how many Sixel color registers /
 what max geometry?"
 **Target.** Answer item 1 (color registers) and item 2 (Sixel geometry, from
@@ -207,6 +209,7 @@ offered; flag 2 (release events) is what enables hold-style keybindings.
 **Size** M · **Deps** `gui`.
 
 #### G12 — Keypad application mode (DECKPAM / DECKPNM, `ESC =` / `ESC >`)
+**Status: done.** `Grid::app_keypad`, set by `ESC =`/`ESC >` (relayed to the host for TUI mode) and DEC mode 66 (DECNKM, DECRQM-answerable), reset by RIS/DECSTR; `gui/input.rs::encode_numpad` encodes numpad-located keys as `SS3 j`–`y`/`X`/`M` when the mode is on and no modifiers are held (modified keys keep the legacy encoding that carries the xterm modifier parameter).
 **Current.** No matches for keypad-mode tracking; the GUI encoder has no
 numpad application encoding.
 **Target.** Track the mode in `Grid`; encode numpad keys as `SS3 p`–`SS3 y`
@@ -217,6 +220,7 @@ full-screen apps still set it; cheap next to the existing DECCKM tracking.
 **Size** S · **Deps** `gui` for the encoder side.
 
 #### G13 — Native focus reporting (mode 1004) in the GUI window
+**Status: done.** `Grid::focus_reporting`, tracked from DEC mode 1004 alongside the existing host relay and answerable via DECRQM; the window backend handles `WindowEvent::Focused` and writes `CSI I`/`CSI O` to the focused pane when the mode is set (plus a redraw either way — the cursor renders only while focused).
 **Current.** Mode 1004 is relayed in TUI mode (`is_host_input_mode`), but
 the GUI window never sends `CSI I`/`CSI O` — there is no
 `WindowEvent::Focused` handler that reports to the child (checked
@@ -230,6 +234,7 @@ document.
 **Size** S · **Deps** `gui`.
 
 #### G14 — SGR-pixel mouse reporting (mode 1016) in the GUI
+**Status: done.** `App::report_mouse` (`src/gui/window.rs`) overrides the report position with `pane_pixel_point` — the pointer's pixel offset within the focused pane's text area, clamped into the pane — whenever `?1016` is set (`mouse_modes.extended` bit 8, already tracked); the SGR encoder itself is unchanged, as 1016 shares the SGR format.
 **Current.** `src/gui/mouse.rs` encodes SGR (1006) cell coordinates only;
 1016 is relayed in TUI but not encoded natively.
 **Target.** When the child sets 1016, report pixel coordinates in the SGR
@@ -331,6 +336,7 @@ terminal search.
 **Size** M · **Deps** none (core).
 
 #### G23 — Drag-and-drop files → quoted path paste
+**Status: done.** `WindowEvent::DroppedFile` handler (`src/gui/window.rs`) pastes the shell-quoted path (`shell_quote`: single quotes with `'\''` escaping on Unix, double quotes on Windows when needed) plus a trailing space, through the same bracketed-paste-aware `encode_paste` path as a clipboard paste.
 **Current.** `WindowEvent::DroppedFile` is not handled.
 **Target.** On file drop, write the shell-quoted path(s) to the child
 (bracketed-paste aware, space-separated for multiple files).
