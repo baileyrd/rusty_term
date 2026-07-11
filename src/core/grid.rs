@@ -3163,6 +3163,55 @@ impl Grid {
         Some((img.w, img.h, &img.frames[img.current].pixels))
     }
 
+    /// Every placeholder cell in the viewport, resolved: `(id, row, col)`
+    /// per cell (`None` for ordinary cells), with omitted diacritics
+    /// inferred from the left/top neighbor per the spec. Shared by both
+    /// renderers so inference can't drift between them.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn placeholder_map(&self) -> Option<Vec<Option<(u32, u32, u32)>>> {
+        let mut ph: Vec<Option<(u32, u32, u32)>> = Vec::new();
+        let mut any = false;
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let entry = self.placeholder_at(col, row).map(|(id, r, c)| {
+                    let left = (col > 0)
+                        .then(|| ph.get(row * self.cols + col - 1).copied().flatten())
+                        .flatten()
+                        .filter(|&(lid, _, _)| lid == id);
+                    let above = (row > 0)
+                        .then(|| ph.get((row - 1) * self.cols + col).copied().flatten())
+                        .flatten()
+                        .filter(|&(aid, _, _)| aid == id);
+                    let cc = c.or_else(|| left.map(|(_, _, lc)| lc + 1)).unwrap_or(0);
+                    let rr = r
+                        .or_else(|| left.map(|(_, lr, _)| lr))
+                        .or_else(|| above.map(|(_, ar, _)| ar + 1))
+                        .unwrap_or(0);
+                    (id, rr, cc)
+                });
+                any |= entry.is_some();
+                ph.push(entry);
+            }
+        }
+        any.then_some(ph)
+    }
+
+    /// The placement grid (cols, rows) a placeholder image renders on:
+    /// explicit `c`/`r` from its virtual placement, else derived from the
+    /// image and cell pixel sizes.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn placeholder_grid(&self, id: u32, cw: usize, ch: usize) -> Option<(usize, usize)> {
+        let (iw, ih, _) = self.kitty_frame(id)?;
+        let (mut pcols, mut prows) = self.kitty_virtual_geometry(id).unwrap_or((0, 0));
+        if pcols == 0 {
+            pcols = iw.div_ceil(cw.max(1)).max(1);
+        }
+        if prows == 0 {
+            prows = ih.div_ceil(ch.max(1)).max(1);
+        }
+        Some((pcols, prows))
+    }
+
     /// Delete stored Kitty images: by id, or everything (`None`). Virtual
     /// placements of deleted images go with them.
     pub(crate) fn kitty_delete(&mut self, id: Option<u32>) {

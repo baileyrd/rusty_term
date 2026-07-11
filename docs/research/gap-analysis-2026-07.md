@@ -533,8 +533,8 @@ Carried forward unchanged (see that document for full write-ups):
 | ID | Item | Status there | Size |
 |---|---|---|---|
 | C03′ | Kitty keyboard flags 2/4/16 | partial — now promoted to **G11** | M |
-| C08 | GPU renderer ligatures | open (blocked on multi-cell-quad pipeline) | L |
-| C09 | GPU renderer pixel images | open (same pipeline) | L |
+| C08 | GPU renderer ligatures | ✅ done 2026-07 (see below) | L |
+| C09 | GPU renderer pixel images | ✅ done 2026-07 (see below) | L |
 | C12′ | GIF / WebP / progressive JPEG decode | deferred, each ~L | L×3 |
 | C13 | Multiple top-level windows | assessed, deferred (App rework) | L |
 | C14′ | CPU-renderer opacity + platform blur | partial (GPU-only opacity) | M |
@@ -546,6 +546,26 @@ Carried forward unchanged (see that document for full write-ups):
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | open, needs own scoping pass | XL |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
+
+**C08 + C09 status (2026-07):** the GPU renderer (`src/gui/gpu.rs`) was
+rebuilt around a variable-width RGBA8 shelf-packed atlas (up to 2048²,
+clamped to the device limit) with three draw layers per frame: opaque base
+cells (`REPLACE` blend, alpha = window opacity), an overlay layer for
+GSUB-shaped ligature-run glyphs and color emoji (straight-alpha over,
+alpha channel preserved for compositor transparency), and an image layer
+drawing per-image textures as cell-aligned quads. This closes the GPU/CPU
+parity list in one pass: ligatures (C08), placed Kitty images, Unicode
+placeholders, and animation frames (C09 — sharing `Grid::placeholder_map`
+/ `placeholder_grid` with the CPU path), color-emoji bitmap strikes (G24
+parity), and wide-glyph clipping (CJK/emoji now get two-cell tiles).
+Image textures are cached keyed by (kind, id, frame/revision) with a
+32-entry cap. Verified headless up to pipeline/shader/atlas creation plus
+allocator and tile-cache unit tests (`gpu_core_builds`,
+`shelf_allocator_packs_wraps_and_exhausts`,
+`wide_chars_get_two_cell_tiles_and_cache_hits`); the full
+render-to-texture readback (`gpu_renders_to_texture`) remains `#[ignore]`
+because headless software drivers (lavapipe/dzn) crash on submit — run it
+with `--ignored` on real GPU hardware.
 
 ## Suggested sequencing (Section A items)
 
