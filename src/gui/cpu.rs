@@ -566,12 +566,121 @@ fn blend(bg: u32, fg: u32, a: u8) -> u32 {
     (chan(16) << 16) | (chan(8) << 8) | chan(0)
 }
 
+
+/// Blend the cursor-trail ghosts (G36) over the finished pane: each entry is
+/// a cell position plus an alpha, drawn as a cursor-colored block mixed into
+/// what's already there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_trail(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    grid: &crate::core::Grid,
+    col0: usize,
+    row0: usize,
+    trail: &[(usize, usize, f32)],
+    font: &mut dyn GlyphSource,
+) {
+    if trail.is_empty() {
+        return;
+    }
+    let (cw, ch) = font.cell_size();
+    let color = grid.cursor_color;
+    for &(col, row, alpha) in trail {
+        if col >= grid.cols || row >= grid.rows {
+            continue;
+        }
+        let a = alpha.clamp(0.0, 1.0);
+        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+        for y in y0..(y0 + ch).min(height) {
+            for x in x0..(x0 + cw).min(width) {
+                let px = &mut buf[y * width + x];
+                *px = blend(*px, color, (a * 255.0) as u8);
+            }
+        }
+    }
+}
+
+
+/// The ghost cells of a cursor trail `from -> to` at animation progress `t`
+/// (`0.0` = just moved, `1.0` = done): up to eight cells sampled along the
+/// straight line between the two positions, alpha graded toward the head and
+/// fading with `t`. Shared by both renderers so the effect can't drift.
+pub(crate) fn trail_ghosts(
+    from: (usize, usize),
+    to: (usize, usize),
+    t: f32,
+) -> Vec<(usize, usize, f32)> {
+    if t >= 1.0 || from == to {
+        return Vec::new();
+    }
+    let (fx, fy) = (from.0 as f32, from.1 as f32);
+    let (tx, ty) = (to.0 as f32, to.1 as f32);
+    let dist = ((tx - fx).powi(2) + (ty - fy).powi(2)).sqrt();
+    let n = (dist.ceil() as usize).clamp(1, 8);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // Sample from the old position toward (but excluding) the live cursor.
+        let s = i as f32 / n as f32;
+        let (x, y) = (fx + (tx - fx) * s, fy + (ty - fy) * s);
+        let cell = (x.round() as usize, y.round() as usize);
+        if cell == to {
+            continue;
+        }
+        // Brighter near the head, all of it fading out over the animation.
+        let alpha = (0.15 + 0.45 * s) * (1.0 - t);
+        match out.last_mut() {
+            Some((lx, ly, la)) if (*lx, *ly) == cell => *la = alpha.max(*la),
+            _ => out.push((cell.0, cell.1, alpha)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::font::Glyph;
     use super::*;
     use crate::core::AnsiParser;
     use std::rc::Rc;
+
+    /// Ghost math: samples run old->new, brighten toward the head, fade with
+    /// time, never include the live cursor cell, and expire at t >= 1.
+    #[test]
+    fn trail_ghosts_sample_fade_and_expire() {
+        let g = trail_ghosts((0, 0), (6, 0), 0.0);
+        assert!(!g.is_empty() && g.len() <= 8);
+        assert!(g.iter().all(|&(c, r, _)| r == 0 && c < 6), "between, excluding the head: {g:?}");
+        assert_eq!(g[0].0, 0, "starts at the old position");
+        assert!(g.last().unwrap().2 > g[0].2, "alpha grades toward the head");
+        // Fading: same hop later in the animation is uniformly dimmer.
+        let later = trail_ghosts((0, 0), (6, 0), 0.5);
+        assert!(later[0].2 < g[0].2);
+        assert!(trail_ghosts((0, 0), (6, 0), 1.0).is_empty(), "expired");
+        assert!(trail_ghosts((3, 3), (3, 3), 0.0).is_empty(), "no hop, no trail");
+        // Adjacent-cell hop still leaves one ghost at the old position.
+        let one = trail_ghosts((4, 2), (5, 2), 0.0);
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].0, one[0].1), (4, 2));
+    }
+
+    /// draw_trail blends the cursor color into the buffer at ghost cells and
+    /// leaves everything else untouched.
+    #[test]
+    fn draw_trail_blends_cursor_color() {
+        let mut grid = Grid::new(4, 2);
+        grid.cursor_color = 0xFF0000;
+        let mut font = MockFont;
+        let (cw, ch) = font.cell_size();
+        let (w, h) = (4 * cw, 2 * ch);
+        let mut buf = vec![0u32; w * h];
+        draw_trail(&mut buf, w, h, &grid, 0, 0, &[(1, 0, 0.5)], &mut font);
+        let inside = buf[(ch / 2) * w + cw + cw / 2];
+        assert!((inside >> 16) & 0xFF > 0x40, "red blended in: {inside:06x}");
+        assert_eq!(buf[0], 0, "cells outside the ghost untouched");
+        // Out-of-range ghosts are ignored, not panicking.
+        draw_trail(&mut buf, w, h, &grid, 0, 0, &[(99, 99, 1.0)], &mut font);
+    }
 
     /// A deterministic 4×8 cell whose every non-space glyph is a solid 2×2 block
     /// at the cell's top-left — no font file needed.

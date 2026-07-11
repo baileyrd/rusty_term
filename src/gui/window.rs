@@ -81,6 +81,14 @@ pub(crate) enum UserEvent {
     Control(super::control::CtlCommand, std::sync::mpsc::Sender<String>),
 }
 
+/// An in-flight cursor-trail hop (G36): from where, to where, started when.
+#[derive(Clone, Copy)]
+struct Trail {
+    from: (usize, usize),
+    to: (usize, usize),
+    since: Instant,
+}
+
 /// What a click on a given chrome-bar cell does.
 #[derive(Clone, Copy, PartialEq)]
 enum Hit {
@@ -387,6 +395,11 @@ struct WindowState<'a> {
     /// Set by `Action::NewWindow` (Ctrl+Shift+N); the router picks it up after
     /// the event dispatch and opens a sibling window.
     wants_new_window: bool,
+    /// Cursor-trail state (G36): where the focused pane's cursor was last
+    /// frame, and the in-flight trail if it just jumped. Tracked per window
+    /// for its focused pane only.
+    cursor_prev: Option<(u64, (usize, usize))>,
+    trail: Option<Trail>,
     /// Whether this is the quake (dropdown) window: borderless strip docked to
     /// the top of the monitor, kept above other windows, toggled with
     /// `rusty_term ctl quake`.
@@ -926,8 +939,14 @@ impl WindowState<'_> {
                 return;
             };
             let size = window.inner_size();
-            let frame =
-                PaneFrame { grid: &page, col0: 0, row0: 1, focused: false, cursor_on: false };
+            let frame = PaneFrame {
+                grid: &page,
+                col0: 0,
+                row0: 1,
+                focused: false,
+                cursor_on: false,
+                trail: Vec::new(),
+            };
             renderer.render(
                 std::slice::from_ref(&frame),
                 &chrome,
@@ -961,6 +980,33 @@ impl WindowState<'_> {
                 held.push((p.grid.lock(), r, id == focus));
             }
         }
+        // Cursor trail (G36): when the focused pane's cursor jumped since the
+        // last frame, remember the hop and paint fading ghosts along it for
+        // TRAIL_MS (the tick loop keeps frames coming while one is live).
+        const TRAIL_MS: u64 = 150;
+        let mut ghosts: Vec<(usize, usize, f32)> = Vec::new();
+        if self.config.cursor_trail.unwrap_or(false) {
+            let now = Instant::now();
+            if let Some((g, _, _)) = held.iter().find(|(_, _, foc)| *foc) {
+                let cur = (g.cursor_visible && g.view_offset == 0).then_some(g.cursor);
+                match (self.cursor_prev, cur) {
+                    (Some((pid, prev)), Some(cur)) if pid == focus && prev != cur => {
+                        self.trail = Some(Trail { from: prev, to: cur, since: now });
+                    }
+                    _ => {}
+                }
+                self.cursor_prev = cur.map(|c| (focus, c));
+            }
+            if let Some(tr) = self.trail {
+                let t = tr.since.elapsed().as_millis() as f32 / TRAIL_MS as f32;
+                ghosts = super::cpu::trail_ghosts(tr.from, tr.to, t);
+                if ghosts.is_empty() {
+                    self.trail = None;
+                }
+            }
+        } else {
+            self.trail = None;
+        }
         let frames: Vec<PaneFrame> = held
             .iter()
             .map(|(g, r, foc)| PaneFrame {
@@ -969,6 +1015,7 @@ impl WindowState<'_> {
                 row0: r.row + 1,
                 focused: *foc,
                 cursor_on: blink,
+                trail: if *foc { std::mem::take(&mut ghosts) } else { Vec::new() },
             })
             .collect();
         renderer.render(&frames, &chrome, &mut self.font, size.width, size.height, divider);
@@ -2454,6 +2501,13 @@ impl WindowState<'_> {
             let g = p.grid.lock();
             g.cursor_blink && g.cursor_visible && g.view_offset == 0
         });
+        // A live cursor trail needs frames until it fades (~150ms).
+        if self.trail.is_some() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return Some(now + ANIM);
+        }
         if !blinking && !animating {
             self.cursor_blink_on = true;
             return None;
@@ -2969,6 +3023,8 @@ impl<'a> App<'a> {
             font_px,
             closed: false,
             wants_new_window: false,
+            cursor_prev: None,
+            trail: None,
             quake,
         })
     }

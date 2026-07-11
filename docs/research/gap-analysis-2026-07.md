@@ -63,7 +63,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G33 | Remote control / scripting API | P2 | kitty `@`, WezTerm CLI, Ghostty AppleScript | M |
 | ✅ G34 | Profiles (shell+theme+font bundles) | P2 | Windows Terminal, iTerm2, Konsole, WezTerm | M |
 | G35 | Multiple-cursors protocol | W | kitty 0.43 (originated) | M |
-| G36 | Cursor trail / animated cursor | P3 | kitty 0.43, neovide-inspired | S–M |
+| ✅ G36 | Cursor trail / animated cursor | P3 | kitty 0.43, neovide-inspired | S–M |
 | ✅ G37 | Fuzzing harness for hand-rolled decoders | P1 (infra) | industry practice (Alacritty, VTE fuzz targets) | M |
 
 ---
@@ -522,6 +522,15 @@ field to converge" posture as mode 2027/OSC 66 (C18/C19). Track; don't
 build.
 
 #### G36 — Cursor trail / animated cursor
+**Status: done (2026-07).** `cursor_trail = true` paints fading
+cursor-colored ghost blocks along the straight line between the cursor's
+previous and new positions for ~150 ms after a jump (up to 8 samples,
+alpha graded toward the head). The ghost math is one shared pure function
+(`cpu::trail_ghosts`, unit-tested), consumed by both renderers: the CPU
+path alpha-blends rects into the buffer, the GPU path draws solid fills
+on the blended overlay layer (a new instance `kind`), so the effect can't
+drift between them. Frames are driven by the existing animation tick
+while a trail is live; zero protocol surface, off by default.
 kitty 0.43 added configurable cursor trails; smooth cursor motion
 (neovide-style) is a recurring "delight" feature. Pure renderer work,
 low priority, but cheap goodwill with zero protocol risk. **Size** S–M.
@@ -556,7 +565,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C09 | GPU renderer pixel images | ✅ done 2026-07 (see below) | L |
 | C12′ | GIF / WebP / progressive JPEG decode | ✅ done 2026-07 (lossy VP8 excepted, see below) | L×3 |
 | C13 | Multiple top-level windows | ✅ done 2026-07 (see below) | L |
-| C14′ | CPU-renderer opacity + platform blur | partial (GPU-only opacity) | M |
+| C14′ | CPU-renderer opacity + platform blur | closed as GPU-only by design (see below) | M |
 | C17′ | Command-output folding — render path | ✅ done 2026-07 (see below) | M–L |
 | C18 | Unicode width mode 2027 | watch | M |
 | C19 | Text-sizing protocol (OSC 66) | watch | L |
@@ -565,6 +574,16 @@ Carried forward unchanged (see that document for full write-ups):
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | open, needs own scoping pass | XL |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
+
+**C14′ resolution (2026-07):** closed as **GPU-only by design** rather
+than implemented. The CPU path presents through `softbuffer`, whose
+buffers are `0RGB` with no alpha channel — there is nothing to composite
+window transparency through, and faking it (grabbing the wallpaper,
+pre-multiplying into opaque pixels) breaks the moment anything moves
+behind the window. Opacity therefore remains a `--features gui-gpu`
+feature (documented at the config key), and platform blur
+(KDE/Windows acrylic) would sit on the same compositor path if ever
+added. Revisit only if softbuffer grows alpha support.
 
 **C17′ status (2026-07):** the fold render path landed on top of the
 existing `CommandBlock` data model. Folding remaps only the *history*

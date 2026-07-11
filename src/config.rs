@@ -79,6 +79,9 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Whether the cursor leaves a brief fading trail when it jumps
+    /// (`cursor_trail`; default off) — pure renderer eye candy (G36).
+    pub cursor_trail: Option<bool>,
     /// Whether Ctrl+Shift+C also puts styled HTML on the clipboard alongside
     /// plain text (`copy_html`; default on). Rich-paste targets (docs, chat)
     /// get colors; plain editors still read the text flavor.
@@ -222,6 +225,7 @@ impl Config {
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
+# cursor_trail = true       # fading trail when the cursor jumps
 
 # [colors]                 # override individual colors (after any preset)
 # foreground = "#d8d8d8"
@@ -701,6 +705,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.theme.palette16[n] = expect_color(k, value)?;
         }
         ("", "copy_html") => cfg.copy_html = Some(expect_bool(key, value)?),
+        ("", "cursor_trail") => cfg.cursor_trail = Some(expect_bool(key, value)?),
         ("", "cursor_style") => {
             cfg.cursor_style = Some(parse_cursor_shape(&expect_str(key, value)?)?)
         }
@@ -1216,6 +1221,14 @@ color15 = "ffffff"
         let (cfg4, warns4) = parse("[window]\nopacity = -0.1\n");
         assert_eq!(cfg4.opacity, None);
         assert_eq!(warns4.len(), 1);
+    }
+
+    #[test]
+    fn cursor_trail_key_parses() {
+        let (cfg, warns) = parse("cursor_trail = true\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.cursor_trail, Some(true));
+        assert_eq!(parse("").0.cursor_trail, None); // default-off at the window
     }
 
     #[test]

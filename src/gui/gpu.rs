@@ -119,6 +119,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == 1u) {
         return vec4(in.fg.rgb * t.rgb, t.a);
     }
+    // Solid overlay fill (cursor-trail ghosts): fg at curs/255 alpha.
+    if (in.kind == 2u) {
+        return vec4(in.fg.rgb, f32(in.curs) / 255.0);
+    }
     let glyph = vec4(in.fg.rgb * t.rgb, 1.0);
     let base = mix(in.bg, glyph, t.a);
     // curs: 0 none/block (block uses the fg/bg swap); 2 underline, 3 bar.
@@ -1077,6 +1081,27 @@ impl GpuCore {
         self.append_chrome(&mut frame, chrome, font);
         for p in panes {
             self.append_grid(&mut frame, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
+            // Cursor-trail ghosts (G36): solid cursor-colored fills on the
+            // blended overlay layer, mirroring the CPU renderer's draw_trail.
+            for &(col, row, alpha) in &p.trail {
+                if col >= p.grid.cols || row >= p.grid.rows {
+                    continue;
+                }
+                frame.overlay.push(Instance {
+                    col: (p.col0 + col) as u32,
+                    row: (p.row0 + row) as u32,
+                    span: 1,
+                    uv_xy: 0,
+                    uv_wh: 0,
+                    fg: p.grid.cursor_color,
+                    bg: 0,
+                    curs: (alpha.clamp(0.0, 1.0) * 255.0) as u32,
+                    ccol: 0,
+                    deco: 0,
+                    dcol: 0,
+                    kind: 2,
+                });
+            }
         }
         self.draw_frame(view, &frame, divider);
     }
