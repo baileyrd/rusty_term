@@ -8,7 +8,7 @@
 //! u`, tracked in `Grid::kitty_flags_stack`), the disambiguating `CSI u`
 //! encoding instead for the keys that are otherwise ambiguous.
 
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 /// Kitty keyboard protocol flag bits this encoder implements: disambiguate
 /// escape codes (1), report event types (2, press/repeat/release), report
@@ -342,6 +342,181 @@ fn fn_seq(final_byte: u8, field: Option<&str>) -> Vec<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// win32-input-mode (DEC `?9001`, microsoft/terminal `win32-input-mode.md`):
+// every key event — press *and* release, modifiers included — is sent as a
+// serialized Win32 `KEY_EVENT_RECORD`, `CSI Vk;Sc;Uc;Kd;Cs;Rc _`, and conhost
+// on the far side reconstitutes real console input records from it.
+
+/// Win32 `ControlKeyState` bits carried in the `Cs` field. winit's
+/// `ModifiersState` doesn't distinguish left/right, so the left-hand bits
+/// stand in for both; lock-key states aren't observable through winit and are
+/// reported unset.
+const CS_LEFT_ALT: u16 = 0x0002;
+const CS_LEFT_CTRL: u16 = 0x0008;
+const CS_SHIFT: u16 = 0x0010;
+const CS_ENHANCED: u16 = 0x0100;
+
+/// Encode one key event as a win32-input-mode record. `None` only for keys
+/// that have neither a known virtual-key code nor a character — per the spec
+/// a record with `Vk`/`Sc` 0 but a real `Uc` is still meaningful, so unknown
+/// physical keys that produce text fall back to that.
+pub(crate) fn encode_win32(
+    physical: PhysicalKey,
+    logical: &Key,
+    mods: ModifiersState,
+    down: bool,
+) -> Option<Vec<u8>> {
+    let mapped = match physical {
+        PhysicalKey::Code(code) => vk_sc(code),
+        PhysicalKey::Unidentified(_) => None,
+    };
+    let uc = win32_uc(logical, mods);
+    let (vk, sc, enhanced) = match mapped {
+        Some(m) => m,
+        None if uc != 0 => (0, 0, false),
+        None => return None,
+    };
+    let mut cs = 0u16;
+    if mods.shift_key() {
+        cs |= CS_SHIFT;
+    }
+    if mods.control_key() {
+        cs |= CS_LEFT_CTRL;
+    }
+    if mods.alt_key() {
+        cs |= CS_LEFT_ALT;
+    }
+    if enhanced {
+        cs |= CS_ENHANCED;
+    }
+    // A modifier key's own state is part of its own record (winit's
+    // `ModifiersChanged` may not have fired yet when the key itself arrives).
+    match vk {
+        0x10 => cs = if down { cs | CS_SHIFT } else { cs & !CS_SHIFT },
+        0x11 => cs = if down { cs | CS_LEFT_CTRL } else { cs & !CS_LEFT_CTRL },
+        0x12 => cs = if down { cs | CS_LEFT_ALT } else { cs & !CS_LEFT_ALT },
+        _ => {}
+    }
+    let kd = u8::from(down);
+    Some(format!("\x1b[{vk};{sc};{uc};{kd};{cs};1_").into_bytes())
+}
+
+/// The `Uc` field: the UTF-16 code unit this key contributes, cooked the way
+/// a Win32 console would see it (Ctrl+letter is the C0 byte, Enter is CR).
+fn win32_uc(logical: &Key, mods: ModifiersState) -> u16 {
+    match logical {
+        Key::Named(named) => match named {
+            NamedKey::Enter => 13,
+            NamedKey::Tab => 9,
+            NamedKey::Backspace => 8,
+            NamedKey::Escape => 27,
+            NamedKey::Space => 32,
+            _ => 0,
+        },
+        Key::Character(s) => {
+            let c = s.encode_utf16().next().unwrap_or(0);
+            if mods.control_key() && !mods.alt_key() {
+                match c {
+                    // @ A–Z [ \ ] ^ _ and a–z fold to their C0 byte.
+                    0x40..=0x5f | 0x61..=0x7a => c & 0x1f,
+                    _ => 0,
+                }
+            } else {
+                c
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Physical key → (virtual-key code, PC/AT set-1 scan code, enhanced-key
+/// flag). The scan codes are the fixed per-key values Windows reports for a
+/// standard layout — the same table winit uses in the other direction.
+#[rustfmt::skip]
+fn vk_sc(code: KeyCode) -> Option<(u16, u16, bool)> {
+    use KeyCode as K;
+    Some(match code {
+        K::KeyA => (0x41, 0x1e, false), K::KeyB => (0x42, 0x30, false),
+        K::KeyC => (0x43, 0x2e, false), K::KeyD => (0x44, 0x20, false),
+        K::KeyE => (0x45, 0x12, false), K::KeyF => (0x46, 0x21, false),
+        K::KeyG => (0x47, 0x22, false), K::KeyH => (0x48, 0x23, false),
+        K::KeyI => (0x49, 0x17, false), K::KeyJ => (0x4a, 0x24, false),
+        K::KeyK => (0x4b, 0x25, false), K::KeyL => (0x4c, 0x26, false),
+        K::KeyM => (0x4d, 0x32, false), K::KeyN => (0x4e, 0x31, false),
+        K::KeyO => (0x4f, 0x18, false), K::KeyP => (0x50, 0x19, false),
+        K::KeyQ => (0x51, 0x10, false), K::KeyR => (0x52, 0x13, false),
+        K::KeyS => (0x53, 0x1f, false), K::KeyT => (0x54, 0x14, false),
+        K::KeyU => (0x55, 0x16, false), K::KeyV => (0x56, 0x2f, false),
+        K::KeyW => (0x57, 0x11, false), K::KeyX => (0x58, 0x2d, false),
+        K::KeyY => (0x59, 0x15, false), K::KeyZ => (0x5a, 0x2c, false),
+        K::Digit1 => (0x31, 0x02, false), K::Digit2 => (0x32, 0x03, false),
+        K::Digit3 => (0x33, 0x04, false), K::Digit4 => (0x34, 0x05, false),
+        K::Digit5 => (0x35, 0x06, false), K::Digit6 => (0x36, 0x07, false),
+        K::Digit7 => (0x37, 0x08, false), K::Digit8 => (0x38, 0x09, false),
+        K::Digit9 => (0x39, 0x0a, false), K::Digit0 => (0x30, 0x0b, false),
+        K::F1 => (0x70, 0x3b, false), K::F2 => (0x71, 0x3c, false),
+        K::F3 => (0x72, 0x3d, false), K::F4 => (0x73, 0x3e, false),
+        K::F5 => (0x74, 0x3f, false), K::F6 => (0x75, 0x40, false),
+        K::F7 => (0x76, 0x41, false), K::F8 => (0x77, 0x42, false),
+        K::F9 => (0x78, 0x43, false), K::F10 => (0x79, 0x44, false),
+        K::F11 => (0x7a, 0x57, false), K::F12 => (0x7b, 0x58, false),
+        K::Escape => (0x1b, 0x01, false),
+        K::Backquote => (0xc0, 0x29, false),
+        K::Minus => (0xbd, 0x0c, false),
+        K::Equal => (0xbb, 0x0d, false),
+        K::Backspace => (0x08, 0x0e, false),
+        K::Tab => (0x09, 0x0f, false),
+        K::BracketLeft => (0xdb, 0x1a, false),
+        K::BracketRight => (0xdd, 0x1b, false),
+        K::Enter => (0x0d, 0x1c, false),
+        K::ControlLeft => (0x11, 0x1d, false),
+        K::ControlRight => (0x11, 0x1d, true),
+        K::Semicolon => (0xba, 0x27, false),
+        K::Quote => (0xde, 0x28, false),
+        K::ShiftLeft => (0x10, 0x2a, false),
+        K::ShiftRight => (0x10, 0x36, false),
+        K::Backslash => (0xdc, 0x2b, false),
+        K::Comma => (0xbc, 0x33, false),
+        K::Period => (0xbe, 0x34, false),
+        K::Slash => (0xbf, 0x35, false),
+        K::AltLeft => (0x12, 0x38, false),
+        K::AltRight => (0x12, 0x38, true),
+        K::Space => (0x20, 0x39, false),
+        K::CapsLock => (0x14, 0x3a, false),
+        K::NumLock => (0x90, 0x45, false),
+        K::ScrollLock => (0x91, 0x46, false),
+        K::PrintScreen => (0x2c, 0x37, true),
+        K::Pause => (0x13, 0x45, false),
+        K::Insert => (0x2d, 0x52, true),
+        K::Delete => (0x2e, 0x53, true),
+        K::Home => (0x24, 0x47, true),
+        K::End => (0x23, 0x4f, true),
+        K::PageUp => (0x21, 0x49, true),
+        K::PageDown => (0x22, 0x51, true),
+        K::ArrowUp => (0x26, 0x48, true),
+        K::ArrowDown => (0x28, 0x50, true),
+        K::ArrowLeft => (0x25, 0x4b, true),
+        K::ArrowRight => (0x27, 0x4d, true),
+        K::Numpad0 => (0x60, 0x52, false), K::Numpad1 => (0x61, 0x4f, false),
+        K::Numpad2 => (0x62, 0x50, false), K::Numpad3 => (0x63, 0x51, false),
+        K::Numpad4 => (0x64, 0x4b, false), K::Numpad5 => (0x65, 0x4c, false),
+        K::Numpad6 => (0x66, 0x4d, false), K::Numpad7 => (0x67, 0x47, false),
+        K::Numpad8 => (0x68, 0x48, false), K::Numpad9 => (0x69, 0x49, false),
+        K::NumpadMultiply => (0x6a, 0x37, false),
+        K::NumpadAdd => (0x6b, 0x4e, false),
+        K::NumpadSubtract => (0x6d, 0x4a, false),
+        K::NumpadDecimal => (0x6e, 0x53, false),
+        K::NumpadDivide => (0x6f, 0x35, true),
+        K::NumpadEnter => (0x0d, 0x1c, true),
+        K::SuperLeft => (0x5b, 0x5b, true),
+        K::SuperRight => (0x5c, 0x5c, true),
+        K::ContextMenu => (0x5d, 0x5d, true),
+        K::IntlBackslash => (0xe2, 0x56, false),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +528,99 @@ mod tests {
         Key::Character(s.into())
     }
     const NONE: ModifiersState = ModifiersState::empty();
+
+    fn pk(code: KeyCode) -> PhysicalKey {
+        PhysicalKey::Code(code)
+    }
+
+    #[test]
+    fn win32_plain_and_shifted_letters() {
+        // a: Vk=65 ('A'), Sc=0x1e, Uc='a', down, no mods.
+        let b = encode_win32(pk(KeyCode::KeyA), &k_char("a"), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[65;30;97;1;0;1_");
+        // Shift+A: Uc='A', SHIFT_PRESSED (0x10).
+        let b = encode_win32(pk(KeyCode::KeyA), &k_char("A"), ModifiersState::SHIFT, true);
+        assert_eq!(b.unwrap(), b"\x1b[65;30;65;1;16;1_");
+        // Release is the same record with Kd=0.
+        let b = encode_win32(pk(KeyCode::KeyA), &k_char("a"), NONE, false);
+        assert_eq!(b.unwrap(), b"\x1b[65;30;97;0;0;1_");
+    }
+
+    #[test]
+    fn win32_ctrl_combinations_cook_the_c0_byte() {
+        // Ctrl+C: Uc=0x03, LEFT_CTRL_PRESSED (0x08).
+        let ctrl = ModifiersState::CONTROL;
+        let b = encode_win32(pk(KeyCode::KeyC), &k_char("c"), ctrl, true);
+        assert_eq!(b.unwrap(), b"\x1b[67;46;3;1;8;1_");
+        // Ctrl+Shift+A: Uc=0x01, ctrl|shift (0x18).
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let b = encode_win32(pk(KeyCode::KeyA), &k_char("A"), cs, true);
+        assert_eq!(b.unwrap(), b"\x1b[65;30;1;1;24;1_");
+        // Ctrl+[ folds to ESC; Ctrl+1 has no C0 mapping, Uc=0.
+        let b = encode_win32(pk(KeyCode::BracketLeft), &k_char("["), ctrl, true);
+        assert_eq!(b.unwrap(), b"\x1b[219;26;27;1;8;1_");
+        let b = encode_win32(pk(KeyCode::Digit1), &k_char("1"), ctrl, true);
+        assert_eq!(b.unwrap(), b"\x1b[49;2;0;1;8;1_");
+        // Ctrl+Alt (AltGr-ish) does not cook: the char passes through.
+        let ca = ModifiersState::CONTROL | ModifiersState::ALT;
+        let b = encode_win32(pk(KeyCode::KeyC), &k_char("c"), ca, true);
+        assert_eq!(b.unwrap(), b"\x1b[67;46;99;1;10;1_");
+    }
+
+    #[test]
+    fn win32_named_and_enhanced_keys() {
+        // Enter carries CR in Uc.
+        let b = encode_win32(pk(KeyCode::Enter), &k_named(NamedKey::Enter), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[13;28;13;1;0;1_");
+        // Arrows are enhanced keys: ENHANCED_KEY (0x100), Uc=0.
+        let b = encode_win32(pk(KeyCode::ArrowLeft), &k_named(NamedKey::ArrowLeft), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[37;75;0;1;256;1_");
+        let b = encode_win32(pk(KeyCode::ArrowUp), &k_named(NamedKey::ArrowUp), NONE, false);
+        assert_eq!(b.unwrap(), b"\x1b[38;72;0;0;256;1_");
+        // Numpad Enter is VK_RETURN with the enhanced flag.
+        let b = encode_win32(pk(KeyCode::NumpadEnter), &k_named(NamedKey::Enter), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[13;28;13;1;256;1_");
+        // F5, Tab, Escape, Backspace, Delete.
+        let b = encode_win32(pk(KeyCode::F5), &k_named(NamedKey::F5), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[116;63;0;1;0;1_");
+        let b = encode_win32(pk(KeyCode::Tab), &k_named(NamedKey::Tab), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[9;15;9;1;0;1_");
+        let b = encode_win32(pk(KeyCode::Escape), &k_named(NamedKey::Escape), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[27;1;27;1;0;1_");
+        let b = encode_win32(pk(KeyCode::Backspace), &k_named(NamedKey::Backspace), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[8;14;8;1;0;1_");
+        let b = encode_win32(pk(KeyCode::Delete), &k_named(NamedKey::Delete), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[46;83;0;1;256;1_");
+    }
+
+    #[test]
+    fn win32_modifier_keys_report_their_own_state() {
+        // A lone Shift press includes SHIFT_PRESSED even if ModifiersChanged
+        // hasn't fired yet; the release clears it.
+        let b = encode_win32(pk(KeyCode::ShiftLeft), &k_named(NamedKey::Shift), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[16;42;0;1;16;1_");
+        let b = encode_win32(pk(KeyCode::ShiftLeft), &k_named(NamedKey::Shift), ModifiersState::SHIFT, false);
+        assert_eq!(b.unwrap(), b"\x1b[16;42;0;0;0;1_");
+        // Right Ctrl is an enhanced key.
+        let b = encode_win32(pk(KeyCode::ControlRight), &k_named(NamedKey::Control), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[17;29;0;1;264;1_");
+        let b = encode_win32(pk(KeyCode::AltLeft), &k_named(NamedKey::Alt), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[18;56;0;1;2;1_");
+    }
+
+    #[test]
+    fn win32_unknown_keys_fall_back_to_uc_or_nothing() {
+        use winit::keyboard::NativeKeyCode;
+        let unident = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+        // No VK but real text: Vk/Sc 0, Uc carries the char.
+        let b = encode_win32(unident, &k_char("é"), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[0;0;233;1;0;1_");
+        // No VK and no text: nothing to send.
+        assert_eq!(encode_win32(unident, &k_named(NamedKey::F35), NONE, true), None);
+        // Unmapped KeyCode with text still falls back.
+        let b = encode_win32(pk(KeyCode::LaunchMail), &k_char("m"), NONE, true);
+        assert_eq!(b.unwrap(), b"\x1b[0;0;109;1;0;1_");
+    }
 
     #[test]
     fn plain_text_and_named_basics() {

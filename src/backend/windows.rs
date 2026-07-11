@@ -506,4 +506,149 @@ mod tests {
     fn backslashes_not_before_a_quote_pass_through() {
         assert_eq!(quote(r"C:\some\path"), r"C:\some\path");
     }
+
+    /// Smoke test: a ConPTY child spawns and its output reaches our reader.
+    ///
+    /// The pipe read is a blocking `ReadFile`, so the reads happen on a
+    /// detached thread and the deadline is enforced by polling the shared
+    /// buffer; a hung read can never wedge the test harness.
+    #[test]
+    fn conpty_child_output_reaches_the_reader() {
+        use crate::backend::{Backend as _, BackendHandle};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let h = super::WindowsBackend
+            .spawn_shell(80, 24, Some("cmd.exe /c echo boot_ok"), &[], None)
+            .expect("spawn");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut rh = h.try_clone().expect("clone read handle");
+        let out2 = Arc::clone(&out);
+        std::thread::spawn(move || {
+            loop {
+                match rh.read() {
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => out2.lock().unwrap().extend_from_slice(&b),
+                    Err(_) => break,
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if out.lock().unwrap().windows(7).any(|w| w == b"boot_ok") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let buf = out.lock().unwrap().clone();
+        panic!("no child output: {:?}", String::from_utf8_lossy(&buf));
+    }
+
+    /// End-to-end win32-input-mode (G10) against a real ConPTY child: conhost
+    /// requests `?9001` at startup, and a command typed purely as win32 key
+    /// records — presses *and* releases, plus an arrow-key history recall —
+    /// round-trips through cmd.exe.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn win32_input_records_round_trip_through_a_real_conpty_child() {
+        use crate::backend::{Backend as _, BackendHandle};
+        use crate::gui::input::encode_win32;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+
+        let mut h = super::WindowsBackend
+            .spawn_shell(120, 30, Some("cmd.exe"), &[], None)
+            .expect("spawn cmd.exe under ConPTY");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut rh = h.try_clone().expect("clone read handle");
+        let out2 = Arc::clone(&out);
+        let reader = std::thread::spawn(move || {
+            loop {
+                match rh.read() {
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => out2.lock().unwrap().extend_from_slice(&b),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let wait_for = |needle: &[u8], count: usize, why: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let n = {
+                    let buf = out.lock().unwrap();
+                    buf.windows(needle.len()).filter(|w| *w == needle).count()
+                };
+                if n >= count {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {why}; child output so far: {:?}",
+                    String::from_utf8_lossy(&out.lock().unwrap())
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // conhost announces win32-input-mode support by requesting the mode
+        // from the hosting terminal as soon as the pseudoconsole starts.
+        wait_for(b"\x1b[?9001h", 1, "conhost's ?9001h request");
+
+        fn keycode(c: char) -> KeyCode {
+            match c {
+                'c' => KeyCode::KeyC,
+                'e' => KeyCode::KeyE,
+                'h' => KeyCode::KeyH,
+                'i' => KeyCode::KeyI,
+                'k' => KeyCode::KeyK,
+                'o' => KeyCode::KeyO,
+                'r' => KeyCode::KeyR,
+                't' => KeyCode::KeyT,
+                'x' => KeyCode::KeyX,
+                '0' => KeyCode::Digit0,
+                '1' => KeyCode::Digit1,
+                '9' => KeyCode::Digit9,
+                ' ' => KeyCode::Space,
+                _ => unreachable!("test only types [cehikortx09 1]"),
+            }
+        }
+        let mods = ModifiersState::empty();
+        let mut press_release = |h: &mut Box<dyn BackendHandle>, code: KeyCode, key: &Key| {
+            for down in [true, false] {
+                let bytes =
+                    encode_win32(PhysicalKey::Code(code), key, mods, down).expect("encodable key");
+                h.write(&bytes).expect("write to child");
+            }
+        };
+        let mut type_line = |h: &mut Box<dyn BackendHandle>, line: &str| {
+            for c in line.chars() {
+                press_release(h, keycode(c), &Key::Character(c.to_string().into()));
+            }
+            press_release(h, KeyCode::Enter, &Key::Named(NamedKey::Enter));
+        };
+
+        // Every keystroke below reaches cmd.exe only as CSI ..._ records.
+        type_line(&mut h, "echo rtok9001");
+        // Once as the echoed input line, once as the command's output.
+        wait_for(b"rtok9001", 2, "echo output typed via win32 records");
+
+        // ArrowUp (an enhanced key) recalls the command from history.
+        press_release(&mut h, KeyCode::ArrowUp, &Key::Named(NamedKey::ArrowUp));
+        press_release(&mut h, KeyCode::Enter, &Key::Named(NamedKey::Enter));
+        wait_for(b"rtok9001", 4, "arrow-up history recall");
+
+        // `exit` typed as records must terminate the child for real.
+        let exited = h.exit_token().expect("owning handle has an exit token");
+        type_line(&mut h, "exit");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            exited();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("child exited after `exit` typed via win32 records");
+        drop(h); // tears down the pseudoconsole, EOFs the reader
+        reader.join().unwrap();
+    }
 }

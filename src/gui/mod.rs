@@ -20,7 +20,7 @@ mod cpu;
 mod font;
 #[cfg(feature = "gui-gpu")]
 mod gpu;
-mod input;
+pub(crate) mod input;
 mod layout;
 mod mouse;
 mod render;
