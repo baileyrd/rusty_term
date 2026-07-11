@@ -268,7 +268,19 @@ impl GlyphSource for FontCache {
         let g = Rc::new(
             super::boxdraw::synthesize(ch, cw, chh, self.baseline())
                 .or_else(|| self.color_emoji(ch))
-                .unwrap_or_else(|| rasterize(self.face_for(ch, style), self.scale, ch)),
+                .unwrap_or_else(|| {
+                    let g = rasterize(self.face_for(ch, style), self.scale, ch);
+                    // Nerd Font icons and other Private Use Area glyphs are
+                    // frequently drawn larger than the cell their width-1
+                    // classification allots; contain-fit them so icons never
+                    // clip or bleed into the neighbor cell (Ghostty-style
+                    // glyph constraining).
+                    if is_private_use(ch) {
+                        constrain_to_cell(g, crate::core::char_width(ch).max(1) * cw, chh, self.baseline())
+                    } else {
+                        g
+                    }
+                }),
         );
         self.cache.insert((ch, style), Rc::clone(&g));
         g
@@ -300,6 +312,53 @@ impl GlyphSource for FontCache {
             src += span;
         }
         out
+    }
+}
+
+/// Whether `ch` is a Private Use Area scalar (BMP PUA or planes 15–16) —
+/// where Nerd Fonts and friends park their icons.
+fn is_private_use(ch: char) -> bool {
+    matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x10_0000..=0x10_FFFD)
+}
+
+/// Contain-fit `g` into a `box_w × box_h` cell box anchored at the text
+/// baseline: a glyph that already fits comes back untouched; an oversized
+/// one is scaled down (nearest-neighbor, aspect preserved) and centered.
+fn constrain_to_cell(g: Glyph, box_w: usize, box_h: usize, baseline: i32) -> Glyph {
+    if g.width == 0 || g.height == 0 || box_w == 0 || box_h == 0 {
+        return g;
+    }
+    // The cell box in glyph coordinates: x in [0, box_w), y (relative to the
+    // baseline) in [-baseline, box_h - baseline).
+    let fits = g.left >= 0
+        && g.left as i64 + g.width as i64 <= box_w as i64
+        && g.top >= -baseline
+        && g.top as i64 + g.height as i64 <= (box_h as i64 - baseline as i64);
+    if fits {
+        return g;
+    }
+    let scale = (box_w as f32 / g.width as f32)
+        .min(box_h as f32 / g.height as f32)
+        .min(1.0);
+    let (nw, nh) = (
+        ((g.width as f32 * scale) as usize).clamp(1, box_w),
+        ((g.height as f32 * scale) as usize).clamp(1, box_h),
+    );
+    let mut coverage = vec![0u8; nw * nh];
+    for y in 0..nh {
+        let sy = y * g.height / nh;
+        for x in 0..nw {
+            let sx = x * g.width / nw;
+            coverage[y * nw + x] = g.coverage[sy * g.width + sx];
+        }
+    }
+    Glyph {
+        width: nw,
+        height: nh,
+        left: ((box_w - nw) / 2) as i32,
+        top: -baseline + ((box_h - nh) / 2) as i32,
+        coverage,
+        color: None,
     }
 }
 
@@ -381,6 +440,13 @@ pub(crate) fn load_set(
     if let Some(b) = fallback.and_then(|p| std::fs::read(p).ok()) {
         fb.push(b);
     }
+    // Auto-discover an installed Nerd Fonts symbols companion (the unpatched
+    // icons-only face): with it in the chain, any base font gets working
+    // Powerline/devicon/codicon glyphs without a patched font or any config.
+    // An explicit `font_fallback` still wins (it's first in the chain).
+    if let Some(b) = find_nerd_symbols() {
+        fb.push(b);
+    }
     fb.extend(SYSTEM_FALLBACKS.iter().filter_map(|p| std::fs::read(p).ok()).take(2));
     let emoji = EMOJI_FONTS.iter().find_map(|p| std::fs::read(p).ok());
     Some(FontSet {
@@ -419,6 +485,50 @@ fn load_variant(
     None
 }
 
+/// Locate the Nerd Fonts "Symbols Nerd Font" companion, if installed: fixed
+/// well-known paths first, then a shallow scan of the user/system font dirs
+/// for its canonical file names (the `getnf`/package-manager installs land
+/// under assorted subdirectory names, so the scan is one level deep).
+fn find_nerd_symbols() -> Option<Vec<u8>> {
+    const NAMES: [&str; 4] = [
+        "SymbolsNerdFont-Regular.ttf",
+        "SymbolsNerdFontMono-Regular.ttf",
+        "Symbols Nerd Font.ttf",
+        "Symbols Nerd Font Mono.ttf",
+    ];
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        dirs.push(h.join(".local/share/fonts"));
+        dirs.push(h.join("Library/Fonts")); // macOS user fonts
+    }
+    dirs.push("/usr/share/fonts/nerd-fonts".into());
+    dirs.push("/usr/share/fonts/TTF".into());
+    dirs.push("/usr/share/fonts/truetype".into());
+    dirs.push("/usr/local/share/fonts".into());
+    for dir in &dirs {
+        for name in NAMES {
+            if let Ok(b) = std::fs::read(dir.join(name)) {
+                return Some(b);
+            }
+        }
+        // One level of subdirectories (e.g. ~/.local/share/fonts/NerdFonts/).
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for name in NAMES {
+                if let Ok(b) = std::fs::read(path.join(name)) {
+                    return Some(b);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// System fonts with broad CJK/symbol coverage, used to seed the fallback chain.
 /// Well-known color-emoji font locations (CBDT on Linux/Windows, sbix on
 /// macOS), tried in order.
@@ -442,6 +552,46 @@ const SYSTEM_FALLBACKS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constrain_scales_oversized_pua_glyphs_and_leaves_fitting_ones() {
+        // A glyph 3x the cell box shrinks to fit, centered, aspect kept.
+        let big = Glyph {
+            width: 30,
+            height: 60,
+            left: -4,
+            top: -50,
+            coverage: vec![255; 30 * 60],
+            color: None,
+        };
+        let g = constrain_to_cell(big, 10, 20, 16);
+        assert!(g.width <= 10 && g.height <= 20, "{}x{}", g.width, g.height);
+        assert_eq!(g.height, 20, "limited by height (aspect 1:2 in a 1:2 box)");
+        assert!(g.left >= 0 && g.left as usize + g.width <= 10, "centered inside");
+        assert!(g.top >= -16 && g.top + g.height as i32 <= 4, "inside the cell vertically");
+        assert!(g.coverage.iter().any(|&c| c != 0));
+        // A fitting glyph passes through untouched.
+        let ok = Glyph {
+            width: 6,
+            height: 10,
+            left: 2,
+            top: -12,
+            coverage: vec![128; 60],
+            color: None,
+        };
+        let g2 = constrain_to_cell(ok, 10, 20, 16);
+        assert_eq!((g2.width, g2.height, g2.left, g2.top), (6, 10, 2, -12));
+        // Degenerates don't panic.
+        let _ = constrain_to_cell(Glyph::blank(), 10, 20, 16);
+    }
+
+    #[test]
+    fn private_use_detection_covers_nerd_font_planes() {
+        assert!(is_private_use('\u{E0A0}')); // Powerline branch symbol
+        assert!(is_private_use('\u{F0001}')); // Material (NF v3, plane 15)
+        assert!(!is_private_use('A'));
+        assert!(!is_private_use('\u{2500}'));
+    }
 
     #[test]
     fn real_font_metrics_and_glyphs() {
