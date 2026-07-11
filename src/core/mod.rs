@@ -19,16 +19,19 @@ mod base64;
 mod cell;
 mod charset;
 mod color;
+mod gif;
 mod grid;
 mod inflate;
 mod iterm;
 mod jpeg;
 mod kitty;
+#[cfg(any(test, feature = "gui"))]
 mod kitty_diacritics;
 mod osc;
 mod parser;
 mod png;
 mod sixel;
+mod webp;
 
 pub use cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,

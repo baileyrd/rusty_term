@@ -545,7 +545,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C03′ | Kitty keyboard flags 2/4/16 | partial — now promoted to **G11** | M |
 | C08 | GPU renderer ligatures | ✅ done 2026-07 (see below) | L |
 | C09 | GPU renderer pixel images | ✅ done 2026-07 (see below) | L |
-| C12′ | GIF / WebP / progressive JPEG decode | deferred, each ~L | L×3 |
+| C12′ | GIF / WebP / progressive JPEG decode | ✅ done 2026-07 (lossy VP8 excepted, see below) | L×3 |
 | C13 | Multiple top-level windows | ✅ done 2026-07 (see below) | L |
 | C14′ | CPU-renderer opacity + platform blur | partial (GPU-only opacity) | M |
 | C17′ | Command-output folding — render path | data model done, rendering open | M–L |
@@ -556,6 +556,29 @@ Carried forward unchanged (see that document for full write-ups):
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | open, needs own scoping pass | XL |
 | C26/C27 | DAP/Jupyter bridges; full LSP/ACP backends | open, speculative | L |
+
+**C12′ status (2026-07):** three new in-house decoders on the iTerm2
+OSC 1337 inline-image path, all fixture-tested against PIL/libwebp/libjpeg
+output. **GIF** (`src/core/gif.rs`): LZW with variable code widths,
+interlacing, local/global palettes, per-frame transparency, and the full
+disposal-method compositing model; multi-frame GIFs render their first
+frame as usual and store the composited frame set as a playing synthesized
+Kitty animation that both renderers substitute into the placed overlay
+(`GridImage.anim`), driven by the existing 40ms animation timer — TUI
+passthrough shows the first frame. **Progressive JPEG** (`src/core/jpeg.rs`
+reworked): baseline and progressive scans now share a raw-coefficient
+store; progressive spectral selection, successive approximation (DC and
+the tricky AC refinement pass), and EOB runs are implemented, with
+dequantize+IDCT once at the end. **WebP** (`src/core/webp.rs`): RIFF
+container + full VP8L lossless bitstream — canonical prefix codes, LZ77
+with the 120 2-D distance codes (table verified against libwebp's
+`kCodeToPlane`), color cache, meta prefix codes, and all four transforms
+(predictor with exact edge semantics, color, subtract-green,
+color-indexing with sub-byte packing); verified bit-exact on
+transform-heavy encodings. **Lossy (VP8) WebP intentionally returns
+`None`**: it's a boolean-arithmetic DCT video-intra codec — more code than
+all other decoders combined — and PNG/VP8L covers the inline-image use in
+practice. Animated WebP (ANMF) likewise.
 
 **C13 status (2026-07):** the winit front-end was reworked from one
 implicit window into an `App` router owning a `WindowState` per top-level

@@ -438,6 +438,10 @@ pub struct Grid {
     /// Stored Kitty images (`a=t`/`a=T` with an id), bounded; each carries
     /// its animation frames and playback state.
     pub(crate) kitty_images: Vec<KittyImage>,
+    /// Counter behind the synthesized `0xFFFF_xxxx` ids that inline animated
+    /// GIFs store their frames under (see `render_animated_image`).
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    next_anim_id: u32,
     /// Virtual Kitty placements (`U=1`): `(image id, cols, rows)` — the
     /// geometry `U+10EEEE` placeholder cells render against.
     pub(crate) kitty_virtual: Vec<(u32, usize, usize)>,
@@ -767,6 +771,10 @@ pub(crate) struct GridImage {
     pub(crate) ph: usize,
     /// Source pixels, row-major `pw × ph`; `None` = transparent (skipped).
     pub(crate) pixels: Vec<Option<u32>>,
+    /// For animated images (inline GIF): the backing [`KittyImage`] id whose
+    /// *current frame* renderers draw instead of `pixels` (same `pw × ph`).
+    /// `pixels` stays as the first frame, the fallback if the store evicts it.
+    pub(crate) anim: Option<u32>,
 }
 
 /// The product of a wrap-aware reflow: the rebuilt history, the new on-screen
@@ -1144,6 +1152,7 @@ impl Grid {
             alt_scroll: false,
             bell: false,
             kitty_images: Vec::new(),
+            next_anim_id: 0,
             kitty_virtual: Vec::new(),
             progress: None,
             report_color_scheme: false,
@@ -1592,10 +1601,71 @@ impl Grid {
     fn store_image(&mut self, pw: usize, ph: usize, pixels: &[Option<u32>], col: usize, cols: usize, rows: usize) {
         const MAX_IMAGES: usize = 8;
         let serial = self.total_scrolled + self.cursor.1;
-        self.images.push(GridImage { serial, col, cols, rows, pw, ph, pixels: pixels[..pw * ph].to_vec() });
+        self.images.push(GridImage {
+            serial,
+            col,
+            cols,
+            rows,
+            pw,
+            ph,
+            pixels: pixels[..pw * ph].to_vec(),
+            anim: None,
+        });
         if self.images.len() > MAX_IMAGES {
             self.images.remove(0);
         }
+    }
+
+    /// Render a decoded multi-frame image (an inline animated GIF): the first
+    /// frame draws exactly like [`Self::render_image_sized`] (half-block
+    /// cells plus the placed overlay), and the full frame set is stored as a
+    /// playing [`KittyImage`] under a synthesized id that the overlay
+    /// substitutes its current frame from, driven by the ordinary animation
+    /// timer. TUI passthrough (no `gui` overlay) shows the first frame.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn render_animated_image(
+        &mut self,
+        width: usize,
+        height: usize,
+        frames: Vec<(Vec<Option<u32>>, u32)>,
+        target_cols: Option<usize>,
+        target_rows: Option<usize>,
+        preserve_aspect: bool,
+    ) {
+        /// Same total-pixel budget the Kitty store enforces.
+        const MAX_STORE_PIXELS: usize = 16 * 1024 * 1024;
+        let Some((first, _)) = frames.first() else { return };
+        let over_budget =
+            width.saturating_mul(height).saturating_mul(frames.len()) > MAX_STORE_PIXELS;
+        if frames.len() == 1 || over_budget || width == 0 || height == 0 || first.len() < width * height {
+            if let Some((px, _)) = frames.into_iter().next() {
+                self.render_image_sized(width, height, &px, target_cols, target_rows, preserve_aspect);
+            }
+            return;
+        }
+        let first = first.clone();
+        self.render_image_sized(width, height, &first, target_cols, target_rows, preserve_aspect);
+        // `render_image_sized` bails (no image stored) on degenerate input;
+        // only animate an overlay that actually exists.
+        let Some(im) = self.images.last_mut() else { return };
+        // Synthesized ids live at the top of the id space so a Kitty client's
+        // own ids (typically small integers) don't collide with them.
+        let id = 0xFFFF_0000u32 | (self.next_anim_id & 0xFFFF);
+        self.next_anim_id = self.next_anim_id.wrapping_add(1);
+        im.anim = Some(id);
+        self.kitty_images.retain(|img| img.id != id);
+        self.kitty_images.push(KittyImage {
+            id,
+            w: width,
+            h: height,
+            frames: frames
+                .into_iter()
+                .map(|(pixels, gap_ms)| KittyFrame { pixels, gap_ms: gap_ms.max(40) })
+                .collect(),
+            current: 0,
+            playing: true,
+            last_advance: None,
+        });
     }
 
     /// Drop images that have scrolled out of the retained scrollback.
@@ -3082,7 +3152,9 @@ impl Grid {
         }
     }
 
-    /// The virtual placement for image `id`, as `(cols, rows)`.
+    /// The virtual placement for image `id`, as `(cols, rows)`. Only the
+    /// renderers' placeholder path (gui/test builds) consults it.
+    #[cfg(any(test, feature = "gui"))]
     pub(crate) fn kitty_virtual_geometry(&self, id: u32) -> Option<(usize, usize)> {
         self.kitty_virtual.iter().find(|(i, _, _)| *i == id).map(|&(_, c, r)| (c, r))
     }
@@ -3143,7 +3215,9 @@ impl Grid {
                 continue;
             }
             let last = *img.last_advance.get_or_insert(now);
-            let gap = img.frames[(img.current + 1) % img.frames.len()].gap_ms.max(40) as u128;
+            // A frame's gap is its own display time (kitty `z=`): show the
+            // current frame for its gap, then step to the next.
+            let gap = img.frames[img.current].gap_ms.max(40) as u128;
             if now.duration_since(last).as_millis() >= gap {
                 img.current = (img.current + 1) % img.frames.len();
                 img.last_advance = Some(now);

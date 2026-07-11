@@ -3,7 +3,7 @@ use super::color::*;
 use super::grid::*;
 use super::parser::*;
 use super::sixel::{SixelImage, decode};
-use super::{base64, inflate, iterm, jpeg, png};
+use super::{base64, gif, inflate, iterm, jpeg, png, webp};
 
 fn parse(input: &[u8], cols: usize, rows: usize) -> Grid {
     let mut g = Grid::new(cols, rows);
@@ -4849,4 +4849,218 @@ fn kitty_frames_composite_and_advance() {
     p.advance(&mut g, b"\x1b_Ga=a,i=9,s=1;\x1b\\");
     let much_later = later + std::time::Duration::from_secs(1);
     assert!(!g.advance_animations(much_later));
+}
+
+// ---- GIF / WebP / progressive JPEG fixtures (generated with PIL, embedded
+// as base64). See src/core/gif.rs, src/core/webp.rs, src/core/jpeg.rs.
+
+/// 4x4, three solid frames (red, green, blue) at 100/200/300 ms.
+const ANIM_GIF_B64: &str = "R0lGODlhBAAEAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAABAAEAAAICQABCBxIsCCAgAAh+QQBFAABACwAAAAABAAEAIEA/wAAAAAAAAAAAAAICQABCBxIsCCAgAAh+QQBHgABACwAAAAABAAEAIEAAP8AAAAAAAAAAAAICQABCBxIsCCAgAA7";
+/// 16x16 interlaced static GIF, rows cycling red/green/blue/white.
+const INTERLACE_GIF_B64: &str = "R0lGODdhEAAQAIEAAP///wD/AP8AAAAA/ywAAAAAEAAQAEAIOQAFCBxIsKDBgwgTKkw4oKHDhxAjSpxIsSLFABgzatwYAIDHjyBDAuBIMqPIkx9LlkSJUiVJlicDAgA7";
+/// Two frames with disposal=2 and palette index 0 transparent: frame 0 is
+/// fully transparent (its color *is* index 0), frame 1 restores-to-background
+/// then paints one green pixel at (0,0).
+const DISPOSAL_GIF_B64: &str = "R0lGODlhBAAEAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQJBQAAACwAAAAABAAEAAAICQABCBxIsCCAgAAh+QQJBgAAACwAAAAABAAEAIEAAAAA/wAAAAAAAAAICQADABhIsKDBgAA7";
+/// 32x24 progressive (SOF2) color JPEG, 4:2:0, two-axis gradient.
+const PROG_JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCAAYACADASIAAhEBAxEB/8QAGAABAQEBAQAAAAAAAAAAAAAABQAGBAf/xAAXAQEBAQEAAAAAAAAAAAAAAAAFBwYI/9oADAMBAAIQAxAAAAHw5rSs6Y/NNaVkOq8LVAcvMtUFVv/EABYQAAMAAAAAAAAAAAAAAAAAAAADBP/aAAgBAQABBQJUQqIVEKiFRCohUQqIVEKiFRCoj//EABkRAAIDAQAAAAAAAAAAAAAAAAAFAwQhMf/aAAgBAwEBPwFaz5otZ80W2JMFtiTD/8QAFxEBAQEBAAAAAAAAAAAAAAAAAwACBP/aAAgBAgEBPwFu+bvmbczbv//EABUQAQEAAAAAAAAAAAAAAAAAAAAx/9oACAEBAAY/AoiIiIiIiP/EABYQAQEBAAAAAAAAAAAAAAAAAAAxIP/aAAgBAQABPyFpkyWW0kyZIkf/2gAMAwEAAgADAAAAEJpYYv/EABYRAQEBAAAAAAAAAAAAAAAAAABBEP/aAAgBAwEBPxDACgoP/8QAFhEBAQEAAAAAAAAAAAAAAAAAIQAx/9oACAECAQE/ENG0ZDIb/8QAFxABAQEBAAAAAAAAAAAAAAAAAPExwf/aAAgBAQABPxDDhAQERhww4Y8MeEBARER//9k=";
+/// 16x16 progressive grayscale JPEG, horizontal gradient.
+const PROG_GRAY_JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/wgALCAAQABABAREA/8QAFQABAQAAAAAAAAAAAAAAAAAACAf/2gAIAQEAAAABj6qKqq//xAAVEAEBAAAAAAAAAAAAAAAAAAAABv/aAAgBAQABBQKbTabTb//EABUQAQEAAAAAAAAAAAAAAAAAAAAC/9oACAEBAAY/ApSlL//EABUQAQEAAAAAAAAAAAAAAAAAAADB/9oACAEBAAE/IZpppv/aAAgBAQAAABBf/8QAFBABAAAAAAAAAAAAAAAAAAAAIP/aAAgBAQABPxAAAf/Z";
+/// 16x16 lossless (VP8L) WebP with a patterned RGBA payload.
+const WEBP_LOSSLESS_B64: &str = "UklGRkQAAABXRUJQVlA4TDgAAAAvD8ADELkyRPQ/dhHR/wCZMMQq6N+Xzz0RE0AwSdPnw8eHwqQNmO6+ApqS/sIY8f2FllmwTPcPAQ==";
+/// 8x8 lossy (VP8) WebP — must be rejected, not misdecoded.
+const WEBP_LOSSY_B64: &str = "UklGRjoAAABXRUJQVlA4IC4AAADwAQCdASoIAAgAAUAmJaACdLoB+AAEyAAA/hMf+Uq8FjdHn/3nz9z5+58/5xgA";
+
+#[test]
+fn gif_decodes_animation_frames_and_delays() {
+    let data = base64::decode(ANIM_GIF_B64.as_bytes()).unwrap();
+    let g = gif::decode(&data).unwrap();
+    assert_eq!((g.width, g.height), (4, 4));
+    assert_eq!(g.frames.len(), 3);
+    let solid = |f: &gif::Frame, c: u32| f.pixels.iter().all(|p| *p == Some(c));
+    assert!(solid(&g.frames[0], 0xFF0000), "frame 0 red");
+    assert!(solid(&g.frames[1], 0x00FF00), "frame 1 green");
+    assert!(solid(&g.frames[2], 0x0000FF), "frame 2 blue");
+    assert_eq!(
+        g.frames.iter().map(|f| f.delay_ms).collect::<Vec<_>>(),
+        vec![100, 200, 300]
+    );
+}
+
+#[test]
+fn gif_deinterlaces_rows() {
+    let data = base64::decode(INTERLACE_GIF_B64.as_bytes()).unwrap();
+    let g = gif::decode(&data).unwrap();
+    assert_eq!((g.width, g.height), (16, 16));
+    assert_eq!(g.frames.len(), 1);
+    let colors = [0xFF0000u32, 0x00FF00, 0x0000FF, 0xFFFFFF];
+    for y in 0..16 {
+        for x in 0..16 {
+            assert_eq!(
+                g.frames[0].pixels[y * 16 + x],
+                Some(colors[y % 4]),
+                "row-cycled color at ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn gif_transparency_and_disposal_restore_background() {
+    let data = base64::decode(DISPOSAL_GIF_B64.as_bytes()).unwrap();
+    let g = gif::decode(&data).unwrap();
+    assert_eq!(g.frames.len(), 2);
+    // Frame 0's only color is the transparent index: everything unset.
+    assert!(g.frames[0].pixels.iter().all(|p| p.is_none()));
+    // Disposal 2 cleared the canvas; frame 1 paints one green pixel.
+    assert_eq!(g.frames[1].pixels[0], Some(0x00FF00));
+    assert!(g.frames[1].pixels[1..].iter().all(|p| p.is_none()));
+    assert_eq!((g.frames[0].delay_ms, g.frames[1].delay_ms), (50, 60));
+}
+
+#[test]
+fn gif_rejects_garbage() {
+    assert!(gif::decode(b"GIF89a").is_none());
+    assert!(gif::decode(b"not a gif").is_none());
+}
+
+#[test]
+fn jpeg_decodes_progressive_color() {
+    let data = base64::decode(PROG_JPEG_B64.as_bytes()).unwrap();
+    assert!(data.windows(2).any(|w| w == [0xFF, 0xC2]), "fixture is SOF2");
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (32, 24));
+    // Reference values from libjpeg's decode of the same file (tolerance
+    // covers IDCT rounding differences).
+    for (x, y, er, eg, eb) in [
+        (0usize, 0usize, 0i32, 2i32, 123i32),
+        (16, 12, 128, 121, 128),
+        (31, 23, 249, 229, 134),
+        (8, 20, 64, 200, 128),
+        (28, 4, 223, 40, 130),
+    ] {
+        let (r, g, b) = jpx(&img, x, y);
+        assert!(
+            (r - er).abs() <= 8 && (g - eg).abs() <= 8 && (b - eb).abs() <= 8,
+            "({x},{y}): want ~({er},{eg},{eb}), got {:?}",
+            (r, g, b)
+        );
+    }
+}
+
+#[test]
+fn jpeg_decodes_progressive_grayscale() {
+    let data = base64::decode(PROG_GRAY_JPEG_B64.as_bytes()).unwrap();
+    assert!(data.windows(2).any(|w| w == [0xFF, 0xC2]), "fixture is SOF2");
+    let img = jpeg::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (16, 16));
+    for (x, want) in [(0usize, 0i32), (5, 80), (10, 160), (15, 240)] {
+        let (r, g, b) = jpx(&img, x, 8);
+        assert_eq!((r, g), (b, b), "grayscale replicates luma");
+        assert!((r - want).abs() <= 8, "x={x}: want ~{want}, got {r}");
+    }
+}
+
+#[test]
+fn webp_lossless_roundtrips_exactly() {
+    let data = base64::decode(WEBP_LOSSLESS_B64.as_bytes()).unwrap();
+    let img = webp::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (16, 16));
+    // VP8L is lossless: reproduce the generator's exact pattern.
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let o = (y * 16 + x) * 4;
+            let want = [
+                ((x * 17) % 256) as u8,
+                ((y * 17) % 256) as u8,
+                ((x * y) % 256) as u8,
+                if (x + y) % 3 != 0 { 255 } else { 128 },
+            ];
+            assert_eq!(&img.rgba[o..o + 4], &want, "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn webp_rejects_lossy_and_garbage() {
+    let data = base64::decode(WEBP_LOSSY_B64.as_bytes()).unwrap();
+    assert!(webp::decode(&data).is_none(), "lossy VP8 is out of scope");
+    assert!(webp::decode(b"RIFFxxxxWEBP").is_none());
+    assert!(webp::decode(b"nope").is_none());
+}
+
+#[test]
+fn iterm2_inline_animated_gif_plays_in_overlay() {
+    let mut g = Grid::new(20, 8);
+    let mut p = AnsiParser::new();
+    let mut input = b"\x1b]1337;File=inline=1:".to_vec();
+    input.extend_from_slice(ANIM_GIF_B64.as_bytes());
+    input.push(0x07);
+    p.advance(&mut g, &input);
+    // The first frame reserved half-block cells and placed an overlay image
+    // wired to a synthesized animation.
+    let im = g.images().last().expect("overlay image stored");
+    let id = im.anim.expect("animated: backing kitty image id set");
+    let (w, h, px) = g.kitty_frame(id).expect("animation stored");
+    assert_eq!((w, h), (4, 4));
+    assert_eq!(px[0], Some(0xFF0000), "first frame red");
+    // The animation timer steps frames: 100ms shows frame 0, then green.
+    let t0 = std::time::Instant::now();
+    assert!(!g.advance_animations(t0));
+    assert!(g.advance_animations(t0 + std::time::Duration::from_millis(120)));
+    let (_, _, px) = g.kitty_frame(id).unwrap();
+    assert_eq!(px[0], Some(0x00FF00), "second frame green");
+}
+
+#[test]
+fn iterm2_inline_webp_renders_cells() {
+    let mut g = Grid::new(20, 10);
+    let mut p = AnsiParser::new();
+    let mut input = b"\x1b]1337;File=inline=1:".to_vec();
+    input.extend_from_slice(WEBP_LOSSLESS_B64.as_bytes());
+    input.push(0x07);
+    p.advance(&mut g, &input);
+    // 16x16 -> 16 cols x 8 half-block rows of image cells from the origin.
+    assert_eq!(g.cells[0].ch, '\u{2580}', "half-block cell painted");
+}
+
+/// 64x48 photo-like lossless WebP (sine/cosine gradients + quadratic blue):
+/// dense enough that the encoder uses predictor transforms, LZ77, and the
+/// color cache.
+const WEBP_PHOTO_B64: &str = "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";
+/// 33x5 three-color lossless WebP: the color-indexing transform with 2-bit
+/// packed pixels and an odd width (packing edge case).
+const WEBP_PAL_B64: &str = "UklGRi4AAABXRUJQVlA4TCEAAAAvIAABAFDTtgET/qRzdwCY//nvv5AgScoVEkwVH0leegAA";
+
+#[test]
+fn webp_lossless_photo_roundtrips_exactly() {
+    let data = base64::decode(WEBP_PHOTO_B64.as_bytes()).unwrap();
+    let img = webp::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (64, 48));
+    for y in 0..48usize {
+        for x in 0..64usize {
+            let o = (y * 64 + x) * 4;
+            let want = [
+                (127.0 + 120.0 * (x as f64 / 6.0).sin()) as u8,
+                (127.0 + 120.0 * (y as f64 / 5.0).cos()) as u8,
+                ((x * x + y * y) % 256) as u8,
+                255u8,
+            ];
+            assert_eq!(&img.rgba[o..o + 4], &want, "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn webp_lossless_palette_roundtrips_exactly() {
+    let data = base64::decode(WEBP_PAL_B64.as_bytes()).unwrap();
+    let img = webp::decode(&data).unwrap();
+    assert_eq!((img.width, img.height), (33, 5));
+    let cols: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    for y in 0..5usize {
+        for x in 0..33usize {
+            let o = (y * 33 + x) * 4;
+            assert_eq!(&img.rgba[o..o + 4], &cols[(x + 2 * y) % 3], "pixel ({x},{y})");
+        }
+    }
 }

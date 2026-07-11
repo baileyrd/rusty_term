@@ -894,8 +894,22 @@ impl GpuCore {
             if im.pw == 0 || im.ph == 0 || im.cols == 0 || im.rows == 0 {
                 continue;
             }
-            let key = (1u8, im.serial as u64, ((im.pw as u64) << 32) | im.ph as u64);
-            if let Some(bind) = self.image_texture(key, im.pw, im.ph, &im.pixels) {
+            // An animated image (inline GIF) uploads its backing animation's
+            // current frame, keyed by frame index so each frame gets its own
+            // cached texture; the stored snapshot is the eviction fallback.
+            let anim = im.anim.and_then(|id| {
+                let (w, h, px) = grid.kitty_frame(id)?;
+                (w == im.pw && h == im.ph).then_some(())?;
+                let cur = grid.kitty_images.iter().find(|i| i.id == id)?.current;
+                Some((id, cur, px))
+            });
+            let (key, pixels): (_, &[Option<u32>]) = match anim {
+                Some((id, cur, px)) => ((3u8, id as u64, cur as u64), px),
+                None => {
+                    ((1u8, im.serial as u64, ((im.pw as u64) << 32) | im.ph as u64), &im.pixels)
+                }
+            };
+            if let Some(bind) = self.image_texture(key, im.pw, im.ph, pixels) {
                 frame.images.push((
                     bind,
                     ImgInstance {
