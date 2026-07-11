@@ -506,6 +506,9 @@ impl GpuCore {
             } else {
                 (cell.fg, cell.bg, 0, 0, true)
             };
+            // Minimum-contrast enforcement (`minimum_contrast` config),
+            // mirroring the CPU renderer's glyph pass.
+            let fg = crate::core::ensure_contrast(fg, bg, grid.min_contrast);
             let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
             let slot = self.ensure_slot(cell.ch, style, font);
             let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, plain);

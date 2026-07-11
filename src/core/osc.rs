@@ -141,6 +141,46 @@ pub(crate) fn dispatch(
                 }
             }
         }
+        // 99 (kitty desktop notifications): `99 ; <metadata> ; <payload>`,
+        // metadata as `:`-separated `k=v` pairs. Supported: `i` (identifier,
+        // for multi-part), `d` (done, default 1), `p` (payload type: title /
+        // body; anything else — actions, icons, queries — is ignored), `e`
+        // (payload is base64). Relayed to the host so a capable TUI-mode
+        // host can render richer semantics than we track.
+        "99" => {
+            if let Some(text) = text {
+                let (meta, payload) = match text.split_once(';') {
+                    Some((m, p)) => (m, p),
+                    None => (text, ""),
+                };
+                let mut id = "";
+                let mut done = true;
+                let mut ptype = "title";
+                let mut b64 = false;
+                for kv in meta.split(':') {
+                    match kv.split_once('=') {
+                        Some(("i", v)) => id = v,
+                        Some(("d", v)) => done = v != "0",
+                        Some(("p", v)) => ptype = v,
+                        Some(("e", v)) => b64 = v == "1",
+                        _ => {}
+                    }
+                }
+                if ptype == "title" || ptype == "body" {
+                    forward_to_host(osc_buffer, g);
+                    let decoded;
+                    let part = if b64 {
+                        decoded = super::base64::decode(payload.as_bytes())
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_default();
+                        decoded.as_str()
+                    } else {
+                        payload
+                    };
+                    g.notif99_part(id, ptype == "title", part, done);
+                }
+            }
+        }
         // 777 (rxvt) posts a notification: `777 ; notify ; <title> ; <body>`.
         "777" => {
             if let Some(text) = text {

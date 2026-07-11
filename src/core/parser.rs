@@ -799,6 +799,17 @@ impl AnsiParser {
             self.report_dec_mode(g, mode);
             return;
         }
+        // DSR ?996n (Contour dark/light extension): report the current
+        // color-scheme preference as `CSI ? 997 ; 1|2 n` (1 dark, 2 light),
+        // derived from the live default background's luminance.
+        if self.csi_marker == b'?' && cmd == b'n' {
+            let param = self.parse_params().first().copied().flatten().unwrap_or(0);
+            if param == 996 {
+                let report = g.color_scheme_report();
+                self.responses.extend_from_slice(&report);
+            }
+            return;
+        }
         // XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) — query/set graphics
         // attributes. Sixel-emitting apps (notcurses, chafa, img2sixel) probe
         // this before choosing an output strategy; silence makes them fall
@@ -839,6 +850,7 @@ impl AnsiParser {
                     1 => g.app_cursor_keys = set,
                     66 => g.app_keypad = set, // DECNKM — same state as ESC = / ESC >
                     1004 => g.focus_reporting = set,
+                    2031 => g.report_color_scheme = set,
                     1007 => g.alt_scroll = set,
                     2004 => g.bracketed_paste = set,
                     1000 | 1002 | 1003 => {
@@ -918,6 +930,7 @@ impl AnsiParser {
             6 => g.origin_mode,
             66 => g.app_keypad,
             1004 => g.focus_reporting,
+            2031 => g.report_color_scheme,
             7 => g.autowrap,
             25 => g.cursor_visible,
             47 | 1047 | 1049 => g.in_alt_screen(),
@@ -1359,7 +1372,7 @@ impl AnsiParser {
 fn is_host_input_mode(param: usize) -> bool {
     matches!(
         param,
-        1 | 66 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004
+        1 | 66 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016 | 2004 | 2031
     )
 }
 

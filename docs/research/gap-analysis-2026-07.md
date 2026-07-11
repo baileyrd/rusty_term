@@ -29,13 +29,13 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ID | Gap | Priority | Notable adopters | Size |
 |---|---|---|---|---|
 | ✅ G01 | OSC 9;4 progress reporting | P1 | Ghostty, Windows Terminal, kitty, Konsole, mintty | S–M |
-| G02 | Light/dark scheme detection + mode 2031 notify | P1 | kitty, Ghostty, Contour, foot, iTerm2 | S–M |
+| ✅ G02 | Light/dark scheme detection + mode 2031 notify | P1 | kitty, Ghostty, Contour, foot, iTerm2 | S–M |
 | ✅ G03 | DECRQSS settings report (`DCS $ q`) | P1 | xterm, kitty, foot, WezTerm | S |
 | ✅ G04 | XTSMGRAPHICS Sixel geometry query | P2 | xterm, foot, WezTerm, Contour | S |
 | G05 | DECSLRM/DECLRMM left/right margins | P3 | xterm, foot, Contour | M |
 | ✅ G06 | Bell: audible/visual/urgency handling | P1 | universal | S–M |
 | G07 | Kitty graphics: animation + Unicode placeholders | P2 | kitty, Ghostty (placeholders) | L |
-| G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
+| ✅ G08 | OSC 99 rich desktop notifications | P2 | kitty, Ghostty | S–M |
 | ✅ G09 | Primary selection + copy-on-select + OSC 52 `p` | P1 (Linux) | kitty, Alacritty, foot, WezTerm, VTE | S–M |
 | G10 | win32-input-mode (ConPTY key fidelity) | P2 | Windows Terminal, WezTerm | M |
 | G11 | Kitty keyboard flags 2/4/16 in GUI | P2 | kitty, Ghostty, WezTerm, foot | M |
@@ -53,7 +53,7 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | ✅ G23 | Drag-and-drop file → path paste | P1 | WezTerm, iTerm2, Windows Terminal, Ghostty | S |
 | G24 | Color emoji fonts (COLR/CBDT/sbix) | P1 | kitty, Ghostty, WezTerm, iTerm2, Windows Terminal | L |
 | G25 | Built-in box-drawing/Powerline glyph synthesis | P2 | Ghostty, kitty, WezTerm | M |
-| G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
+| ✅ G26 | Minimum contrast enforcement | P3 | WezTerm, Ghostty | S |
 | G27 | Pane resize / zoom / directional focus | P1 | kitty, WezTerm, iTerm2, tmux, Zellij | M |
 | G28 | Broadcast input across panes | P3 | iTerm2, Windows Terminal, tmux | S–M |
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
@@ -89,6 +89,7 @@ already has everywhere this needs to surface.
 **Size** S–M · **Deps** none (chrome rendering: `gui` feature).
 
 #### G02 — Light/dark appearance: detection, notification (mode 2031), query
+**Status: done.** `theme = "auto"` follows the OS appearance (winit theme at window creation + live `ThemeChanged` events), resolving to `theme_dark` / `theme_light` presets (defaults: built-in dark / Solarized Light). `DSR ?996n` answers `CSI ?997;1|2n` from the live default background's luminance (`Grid::appearance_is_dark`, so OSC 11 changes count too — verified on a real PTY); DEC mode 2031 is tracked (DECRQM-answerable), relayed to the host in TUI mode, and an appearance flip under `apply_theme_live` sends the unsolicited report to subscribed panes.
 **Current.** No matches for `2031`, `997`, or `996` in `src/`. Theme is a
 static config key; the terminal neither knows nor reports OS appearance.
 **Target.** Three pieces: (1) query the OS light/dark appearance (winit theme
@@ -163,6 +164,7 @@ part of "full protocol" claims.
 animation; the CPU overlay compositor exists already.
 
 #### G08 — OSC 99 (kitty desktop notifications protocol)
+**Status: done (title/body incl. multi-part + base64; actions/icons/queries out of scope).** `src/core/osc.rs`'s `99` arm parses the metadata (`i`, `d`, `p`, `e`), accumulates multi-part notifications by identifier on the grid (bounded), base64-decodes `e=1` payloads, and finalizes into the existing notification pipeline on `d=1`; non-text payload types are ignored. Relayed to the host for TUI mode.
 **Current.** Only OSC 9 (free text) and OSC 777 (`notify`) are handled
 (`src/core/osc.rs`); OSC 99 has no matches.
 **Target.** Parse OSC 99's metadata form (id, title/body parts, urgency,
@@ -377,6 +379,7 @@ Doubles as insurance for the 1024-glyph GPU atlas budget.
 **Size** M · **Deps** `gui`; CPU + GPU raster helpers.
 
 #### G26 — Minimum contrast enforcement
+**Status: done.** `core::color::{luminance, contrast_ratio, ensure_contrast}` implement WCAG contrast with a minimal-blend adjustment toward the better pole (hue-preserving, binary-searched); `minimum_contrast = <ratio>` config (clamped 1–21) lands on `Grid::min_contrast` and both renderers enforce it at the glyph pass (CPU against the cell's actually-painted background incl. cursor/selection/search swaps; GPU mirrored).
 **Current.** Cells render whatever fg/bg the app chose; unreadable
 combinations (dark-on-dark themes fighting app hardcodes) render as-is.
 **Target.** Optional `minimum_contrast = <ratio>` that nudges fg

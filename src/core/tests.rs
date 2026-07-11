@@ -4409,3 +4409,72 @@ fn osc_52_primary_selection_routes_separately() {
     assert!(!g.clipboard_query);
     let _ = g.take_host_out();
 }
+
+// ---- Wave-4 additions: color-scheme query/notify, OSC 99, contrast ----
+
+#[test]
+fn dsr_996_reports_dark_or_light_from_background() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Default theme: black background -> dark (997;1).
+    p.advance(&mut g, b"\x1b[?996n");
+    assert_eq!(p.take_responses(), b"\x1b[?997;1n");
+    // Flip to a light background via OSC 11 and ask again.
+    p.advance(&mut g, b"\x1b]11;#ffffff\x07\x1b[?996n");
+    assert_eq!(p.take_responses(), b"\x1b[?997;2n");
+}
+
+#[test]
+fn mode_2031_is_tracked_relayed_and_reported() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    assert!(!g.report_color_scheme);
+    p.advance(&mut g, b"\x1b[?2031h");
+    assert!(g.report_color_scheme);
+    assert_eq!(g.take_host_out(), b"\x1b[?2031h"); // relayed for TUI mode
+    p.advance(&mut g, b"\x1b[?2031$p");
+    assert_eq!(p.take_responses(), b"\x1b[?2031;1$y");
+    assert_eq!(g.color_scheme_report(), b"\x1b[?997;1n");
+    p.advance(&mut g, b"\x1b[?2031l");
+    assert!(!g.report_color_scheme);
+}
+
+#[test]
+fn osc_99_single_part_notification() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Bare payload (implicit p=title, d=1): surfaces as the body.
+    p.advance(&mut g, b"\x1b]99;;Build finished\x07");
+    assert_eq!(g.notifications.len(), 1);
+    assert_eq!(g.notifications[0], (String::new(), "Build finished".to_string()));
+    let _ = g.take_host_out();
+}
+
+#[test]
+fn osc_99_multipart_title_and_body_with_base64() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    // Two parts accumulate under i=x; the d=1 part finalizes. Body is base64.
+    p.advance(&mut g, b"\x1b]99;i=x:d=0:p=title;CI failed\x07");
+    assert!(g.notifications.is_empty());
+    p.advance(&mut g, b"\x1b]99;i=x:d=1:p=body:e=1;am9iIDQyMQ==\x07");
+    assert_eq!(g.notifications.len(), 1);
+    assert_eq!(g.notifications[0], ("CI failed".to_string(), "job 421".to_string()));
+    let _ = g.take_host_out();
+}
+
+#[test]
+fn osc_99_non_text_payloads_are_ignored() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]99;p=close:i=x;\x07"); // close request: untracked
+    p.advance(&mut g, b"\x1b]99;p=?;\x07"); // query: untracked
+    assert!(g.notifications.is_empty());
+    assert!(g.take_host_out().is_empty()); // not even relayed
+}
+
+#[test]
+fn min_contrast_is_off_by_default_and_settable() {
+    let g = Grid::new(4, 2);
+    assert_eq!(g.min_contrast, 1.0);
+}

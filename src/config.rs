@@ -54,6 +54,21 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Minimum WCAG contrast ratio enforced between text and its background
+    /// at render time (`minimum_contrast = 4.5`); `None`/1.0 disables. Fixes
+    /// unreadable app-hardcoded color combinations, at the cost of exact
+    /// color fidelity for the offending cells.
+    pub minimum_contrast: Option<f32>,
+    /// `theme = "auto"`: follow the OS light/dark appearance, resolving to
+    /// [`Config::theme_dark`] / [`Config::theme_light`] (windowed front-end;
+    /// TUI mode has no OS-appearance signal and keeps `theme_dark`).
+    pub theme_auto: bool,
+    /// Preset used when the OS appearance is dark under `theme = "auto"`
+    /// (`theme_dark = "name"`; default the built-in default theme).
+    pub theme_dark: Option<Theme>,
+    /// Preset used when the OS appearance is light under `theme = "auto"`
+    /// (`theme_light = "name"`; default `solarized-light`).
+    pub theme_light: Option<Theme>,
     /// Whether BEL raises an alert (windowed front-end): a window-attention
     /// request when the window is unfocused, plus a badge on the ringing tab.
     /// Default on; `bell = false` silences both. (There is no audible bell —
@@ -535,8 +550,28 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         }
         ("", "theme") => {
             let name = expect_str(key, value)?;
-            cfg.theme = preset(&name)
-                .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESETS.join(", ")))?;
+            if name.eq_ignore_ascii_case("auto") {
+                cfg.theme_auto = true;
+            } else {
+                cfg.theme = preset(&name)
+                    .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESETS.join(", ")))?;
+            }
+        }
+        ("", "theme_dark") => {
+            let name = expect_str(key, value)?;
+            cfg.theme_dark = Some(preset(&name).ok_or_else(|| format!("unknown theme `{name}`"))?);
+        }
+        ("", "theme_light") => {
+            let name = expect_str(key, value)?;
+            cfg.theme_light = Some(preset(&name).ok_or_else(|| format!("unknown theme `{name}`"))?);
+        }
+        ("", "minimum_contrast") => {
+            let ratio = match value {
+                Value::Float(f) => f as f32,
+                Value::Int(i) => i as f32,
+                _ => return Err(format!("{key}: expected a number")),
+            };
+            cfg.minimum_contrast = Some(ratio.clamp(1.0, 21.0));
         }
         ("window", "cols") => cfg.cols = Some(expect_dim(key, value)?),
         ("window", "rows") => cfg.rows = Some(expect_dim(key, value)?),
@@ -869,6 +904,22 @@ color15 = "ffffff"
         let (cfg, warns) = parse("[window]\nfont_size = 14\n");
         assert!(warns.is_empty());
         assert_eq!(cfg.font_size, Some(14.0));
+    }
+
+    #[test]
+    fn theme_auto_and_contrast_keys_parse() {
+        let (cfg, warns) =
+            parse("theme = \"auto\"\ntheme_light = \"solarized-light\"\nminimum_contrast = 4.5\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert!(cfg.theme_auto);
+        assert!(cfg.theme_light.is_some());
+        assert_eq!(cfg.minimum_contrast, Some(4.5));
+        // A named theme still resolves as before, without setting auto.
+        let (cfg2, _) = parse("theme = \"nord\"\n");
+        assert!(!cfg2.theme_auto);
+        // Out-of-range contrast clamps; integers accepted.
+        let (cfg3, _) = parse("minimum_contrast = 99\n");
+        assert_eq!(cfg3.minimum_contrast, Some(21.0));
     }
 
     #[test]

@@ -203,13 +203,20 @@ pub(crate) fn draw_grid(
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
         let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
-        let fg = if !on_status && (block_cursor(col, row) || inverted(col, row)) {
-            cell.bg
-        } else if !on_status && search_hl(col, row).is_some() {
-            SEARCH_FG
+        let (fg, under_bg) = if !on_status && block_cursor(col, row) {
+            (cell.bg, grid.cursor_color)
+        } else if !on_status && inverted(col, row) {
+            (cell.bg, cell.fg)
+        } else if !on_status
+            && let Some(cur) = search_hl(col, row)
+        {
+            (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG })
         } else {
-            cell.fg
+            (cell.fg, cell.bg)
         };
+        // Minimum-contrast enforcement (`minimum_contrast` config): nudge the
+        // glyph color against the background this cell actually painted.
+        let fg = crate::core::ensure_contrast(fg, under_bg, grid.min_contrast);
         let pen_x = ((col0 + col) * cw) as i32 + glyph.left;
         let pen_y = ((row0 + row) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, glyph, pen_x, pen_y, fg);

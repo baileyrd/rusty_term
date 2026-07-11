@@ -297,3 +297,84 @@ pub(crate) fn format_color_spec(rgb: u32) -> String {
     let (r, g, b) = ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
     format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
 }
+
+/// WCAG relative luminance of an `0xRRGGBB` color (sRGB linearized), `0.0`
+/// (black) to `1.0` (white).
+pub(crate) fn luminance(c: u32) -> f32 {
+    let lin = |v: u32| {
+        let s = (v & 0xFF) as f32 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c >> 16) + 0.7152 * lin(c >> 8) + 0.0722 * lin(c)
+}
+
+/// WCAG contrast ratio between two colors, `1.0` (identical) to `21.0`.
+pub(crate) fn contrast_ratio(a: u32, b: u32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Nudge `fg` until it has at least `min_ratio` WCAG contrast against `bg`
+/// (the `minimum_contrast` config): the foreground blends toward whichever
+/// pole (white/black) contrasts better with `bg`, by the smallest amount that
+/// meets the ratio — hue is preserved as long as possible. `min_ratio <= 1`
+/// disables. If even the pole itself can't reach the ratio (it can't, above
+/// ~21), the pole is returned.
+pub(crate) fn ensure_contrast(fg: u32, bg: u32, min_ratio: f32) -> u32 {
+    if min_ratio <= 1.0 || contrast_ratio(fg, bg) >= min_ratio {
+        return fg;
+    }
+    let pole: u32 = if luminance(bg) < 0.5 { 0xFFFFFF } else { 0x000000 };
+    let blend = |t: f32| -> u32 {
+        let ch = |shift: u32| {
+            let f = ((fg >> shift) & 0xFF) as f32;
+            let p = ((pole >> shift) & 0xFF) as f32;
+            ((f + (p - f) * t).round() as u32).min(255)
+        };
+        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    };
+    if contrast_ratio(pole, bg) < min_ratio {
+        return pole; // best achievable
+    }
+    // Binary-search the smallest blend that satisfies the ratio.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..8 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(blend(mid), bg) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    blend(hi)
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_contrast_meets_the_requested_ratio() {
+        // Dark gray on black: unreadable at 4.5:1, gets lightened.
+        let fixed = ensure_contrast(0x333333, 0x000000, 4.5);
+        assert!(contrast_ratio(fixed, 0x000000) >= 4.5, "{fixed:06x}");
+        // ...and no further than needed (well short of pure white).
+        assert!(fixed < 0xFFFFFF);
+        // Light gray on white gets darkened.
+        let fixed = ensure_contrast(0xDDDDDD, 0xFFFFFF, 4.5);
+        assert!(contrast_ratio(fixed, 0xFFFFFF) >= 4.5, "{fixed:06x}");
+        // Already-fine combinations are untouched, and ratio 1.0 disables.
+        assert_eq!(ensure_contrast(0xFFFFFF, 0x000000, 4.5), 0xFFFFFF);
+        assert_eq!(ensure_contrast(0x333333, 0x000000, 1.0), 0x333333);
+    }
+
+    #[test]
+    fn ensure_contrast_preserves_hue_direction() {
+        // A dim red on black lightens toward white but stays reddish
+        // (R stays the dominant channel).
+        let fixed = ensure_contrast(0x400000, 0x000000, 4.5);
+        let (r, g, b) = ((fixed >> 16) & 0xFF, (fixed >> 8) & 0xFF, fixed & 0xFF);
+        assert!(r > g && r > b, "{fixed:06x}");
+    }
+}
