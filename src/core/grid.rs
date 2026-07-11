@@ -76,11 +76,16 @@ const LINK_MAX: usize = 4096;
 /// glyph still renders) rather than growing the table without bound.
 const CLUSTER_MAX: usize = 8192;
 
-/// A text selection in viewport cell coordinates (`(col, row)`), set by the
-/// windowed front-end during a mouse drag and read by the renderer (to invert
-/// the highlighted cells) and by [`Grid::selected_text`] (clipboard copy).
-/// `anchor` is where the drag began, `head` where it is now; the pair is
-/// normalized into row-major order on read, so either drag direction works.
+/// A text selection in **absolute** cell coordinates (`(col, abs_row)`,
+/// where `abs_row` indexes scrollback + live screen), set by the windowed
+/// front-end (mouse drag, multi-click, copy mode) and read by the renderer
+/// (to invert the highlighted cells) and by [`Grid::selected_text`]
+/// (clipboard copy). Absolute rows keep a selection anchored to its text
+/// while the viewport scrolls; long-lived selections can still drift when
+/// scrollback evicts or a resize reflows (both clear/invalidate it in
+/// practice). `anchor` is where the drag began, `head` where it is now; the
+/// pair is normalized into row-major order on read, so either drag
+/// direction works.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     /// Cell where the drag started.
@@ -1685,8 +1690,9 @@ impl Grid {
     #[cfg(any(test, feature = "gui"))]
     fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let sel = self.selection?;
+        let total = self.scrollback.len() + self.rows;
         let clamp = |(c, r): (usize, usize)| {
-            (c.min(self.cols.saturating_sub(1)), r.min(self.rows.saturating_sub(1)))
+            (c.min(self.cols.saturating_sub(1)), r.min(total.saturating_sub(1)))
         };
         let a = clamp(sel.anchor);
         let b = clamp(sel.head);
@@ -1702,8 +1708,16 @@ impl Grid {
         let Some((start, end)) = self.selection_bounds() else {
             return false;
         };
+        let abs = self.abs_of_view_row(row);
         let lin = |c: usize, r: usize| r * self.cols + c;
-        (lin(start.0, start.1)..=lin(end.0, end.1)).contains(&lin(col, row))
+        (lin(start.0, start.1)..=lin(end.0, end.1)).contains(&lin(col, abs))
+    }
+
+    /// The absolute row (scrollback + live) a viewport row currently shows.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn abs_of_view_row(&self, vr: usize) -> usize {
+        let off = self.view_offset.min(self.scrollback.len());
+        self.scrollback.len() - off + vr
     }
 
     /// Select the "word" under `(col, row)` — the maximal run of word
@@ -1720,8 +1734,10 @@ impl Grid {
             return;
         }
         let (col, row) = (col.min(self.cols - 1), row.min(self.rows - 1));
+        let abs = self.abs_of_view_row(row);
+        let (cells, _) = self.phys_row(abs);
         let is_word = |c: usize| {
-            let cell = self.cells[row * self.cols + c];
+            let Some(cell) = cells.get(c) else { return false };
             if cell.flags & WIDE_TRAILER != 0 {
                 return true; // ride with its wide lead cell
             }
@@ -1731,7 +1747,7 @@ impl Grid {
                 || "\t\"'`()[]{}<>|;,".contains(ch))
         };
         if !is_word(col) {
-            self.selection = Some(Selection { anchor: (col, row), head: (col, row) });
+            self.selection = Some(Selection { anchor: (col, abs), head: (col, abs) });
             return;
         }
         let mut start = col;
@@ -1742,7 +1758,7 @@ impl Grid {
         while end + 1 < self.cols && is_word(end + 1) {
             end += 1;
         }
-        self.selection = Some(Selection { anchor: (start, row), head: (end, row) });
+        self.selection = Some(Selection { anchor: (start, abs), head: (end, abs) });
     }
 
     /// Select the whole logical line through screen `row` (triple-click):
@@ -1755,15 +1771,16 @@ impl Grid {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
-        let row = row.min(self.rows - 1);
-        let (mut start, mut end) = (row, row);
-        if self.view_offset == 0 {
-            while start > 0 && self.wrapped[start - 1] {
-                start -= 1;
-            }
-            while end + 1 < self.rows && self.wrapped[end] {
-                end += 1;
-            }
+        let abs = self.abs_of_view_row(row.min(self.rows - 1));
+        let total = self.scrollback.len() + self.rows;
+        let (mut start, mut end) = (abs, abs);
+        // Follow the soft-wrap bits across scrollback + screen (bounded like
+        // logical_line_of, so a degenerate fully-wrapped history stays cheap).
+        while start > 0 && abs - start < 128 && self.phys_row(start - 1).1 {
+            start -= 1;
+        }
+        while end + 1 < total && end - abs < 128 && self.phys_row(end).1 {
+            end += 1;
         }
         self.selection =
             Some(Selection { anchor: (0, start), head: (self.cols - 1, end) });
@@ -1777,15 +1794,21 @@ impl Grid {
         let (start, end) = self.selection_bounds()?;
         let mut out = String::new();
         for row in start.1..=end.1 {
+            let (cells, _) = self.phys_row(row);
             let c0 = if row == start.1 { start.0 } else { 0 };
             let c1 = if row == end.1 { end.0 } else { self.cols - 1 };
             let mut line = String::new();
-            for col in c0..=c1 {
-                let cell = self.cells[row * self.cols + col];
+            let hi = c1.min(cells.len().saturating_sub(1));
+            for cell in cells.get(c0..=hi).unwrap_or(&[]) {
                 if cell.flags & WIDE_TRAILER != 0 {
                     continue;
                 }
-                line.push_str(&self.glyph_text(col, row));
+                line.push(cell.ch);
+                if cell.cluster != 0
+                    && let Some(suffix) = self.clusters.get((cell.cluster - 1) as usize)
+                {
+                    line.push_str(suffix);
+                }
             }
             if row != start.1 {
                 out.push('\n');
@@ -2706,6 +2729,29 @@ impl Grid {
                 }
             }
         }
+    }
+
+    /// The scrollbar overlay for the current view, or `None` at the live
+    /// bottom (the bar auto-hides): `(first_row, rows, color)` — the thumb's
+    /// viewport rows plus its color (a fg/bg mix). Cell-resolution, so both
+    /// renderers can draw it without new plumbing.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn scrollbar(&self) -> Option<(usize, usize, u32)> {
+        let off = self.view_offset.min(self.scrollback.len());
+        if off == 0 || self.rows == 0 {
+            return None;
+        }
+        let total = self.scrollback.len() + self.rows;
+        let len = ((self.rows * self.rows) / total).clamp(1, self.rows);
+        // Top of the viewport in absolute rows, over the scrollable range.
+        let top = self.scrollback.len() - off;
+        let denom = (total - self.rows).max(1);
+        let first = (top * (self.rows - len)) / denom;
+        let mix = |a: u32, b: u32| {
+            let ch = |sh: u32| (((a >> sh) & 0xFF) * 2 + ((b >> sh) & 0xFF)) / 3;
+            (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        };
+        Some((first, len, mix(self.default_fg, self.default_bg)))
     }
 
     /// Apply a ConEmu OSC `9;4` progress report. State `0` (or anything

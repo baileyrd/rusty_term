@@ -108,7 +108,7 @@ pub(crate) fn draw_grid(
     let shape = grid.cursor_shape;
     let block_cursor =
         |col: usize, row: usize| shape == CursorShape::Block && cursor == Some((col, row));
-    let inverted = |col: usize, row: usize| grid.view_offset == 0 && grid.is_selected(col, row);
+    let inverted = |col: usize, row: usize| grid.is_selected(col, row);
     let search_hl = |col: usize, row: usize| grid.search_highlight(col, row);
     let status = grid.status_row();
     let last_row = grid.rows.saturating_sub(1);
@@ -321,6 +321,21 @@ pub(crate) fn draw_grid(
                 }
             }
             CursorShape::Block => {}
+        }
+    }
+
+    // Scrollbar overlay (auto-hides at the live bottom): a thin bar hugging
+    // the pane's right edge, thumb sized/positioned from the scroll state.
+    if let Some((first, len, color)) = grid.scrollbar() {
+        let bar_w = (cw / 3).max(2);
+        let x1 = ((col0 + grid.cols) * cw).min(width);
+        let x0 = x1.saturating_sub(bar_w);
+        let y0 = (row0 + first) * ch;
+        let y1 = ((row0 + first + len) * ch).min(height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                buf[y * width + x] = color;
+            }
         }
     }
 

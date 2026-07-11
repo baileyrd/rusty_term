@@ -30,7 +30,7 @@ impl Rect {
         Self { col, row, cols, rows }
     }
 
-    fn contains(&self, col: usize, row: usize) -> bool {
+    pub(crate) fn contains(&self, col: usize, row: usize) -> bool {
         col >= self.col && col < self.col + self.cols && row >= self.row && row < self.row + self.rows
     }
 }
@@ -98,6 +98,40 @@ impl Node {
             _ => unreachable!(),
         };
         a.close_child(id) || b.close_child(id)
+    }
+
+    /// Whether pane `id` is anywhere in this subtree.
+    fn contains(&self, id: u64) -> bool {
+        match self {
+            Node::Leaf(x) => *x == id,
+            Node::Split { a, b, .. } => a.contains(id) || b.contains(id),
+        }
+    }
+
+    /// Grow (`delta > 0`) or shrink pane `id` along `dir` by adjusting the
+    /// ratio of the nearest enclosing split of that axis — deepest first, so
+    /// the boundary closest to the pane moves. Returns whether any split
+    /// changed. The pane's side decides the sign: growing a first (`a`)
+    /// child raises the ratio, growing a second (`b`) child lowers it.
+    fn resize(&mut self, id: u64, dir: Dir, delta: f32) -> bool {
+        let Node::Split { dir: d, ratio, a, b } = self else {
+            return false;
+        };
+        let (child, sign): (&mut Node, f32) = if a.contains(id) {
+            (a, 1.0)
+        } else if b.contains(id) {
+            (b, -1.0)
+        } else {
+            return false;
+        };
+        if child.resize(id, dir, delta) {
+            return true;
+        }
+        if *d == dir {
+            *ratio = (*ratio + sign * delta).clamp(0.1, 0.9);
+            return true;
+        }
+        false
     }
 
     fn rects(&self, area: Rect, out: &mut Vec<(u64, Rect)>) {
@@ -186,9 +220,10 @@ impl Layout {
         out
     }
 
-    /// The pane id whose rect (within `area`) contains `(col, row)`.
-    pub fn pane_at(&self, area: Rect, col: usize, row: usize) -> Option<u64> {
-        self.rects(area).into_iter().find(|(_, r)| r.contains(col, row)).map(|(id, _)| id)
+    /// Grow (`delta > 0`) or shrink pane `id` along `dir` (see
+    /// [`Node::resize`]). Returns whether a split boundary moved.
+    pub fn resize(&mut self, id: u64, dir: Dir, delta: f32) -> bool {
+        self.root.resize(id, dir, delta)
     }
 
     /// The pane after (`forward`) or before `current` in tree order, wrapping.
@@ -272,11 +307,51 @@ mod tests {
         let mut l = Layout::single(1);
         l.split(1, 2, Dir::Vertical);
         let area = Rect::new(0, 0, 81, 24);
-        assert_eq!(l.pane_at(area, 0, 0), Some(1));
-        assert_eq!(l.pane_at(area, 41, 0), Some(2));
-        assert_eq!(l.pane_at(area, 40, 0), None); // the divider column
+        // Hit-testing goes through rects + Rect::contains (the window's
+        // zoom-aware Tab::rects wraps the same primitive).
+        let at = |l: &Layout, col: usize, row: usize| {
+            l.rects(area).into_iter().find(|(_, r)| r.contains(col, row)).map(|(id, _)| id)
+        };
+        assert_eq!(at(&l, 0, 0), Some(1));
+        assert_eq!(at(&l, 41, 0), Some(2));
+        assert_eq!(at(&l, 40, 0), None); // the divider column
         assert_eq!(l.cycle(1, true), 2);
         assert_eq!(l.cycle(2, true), 1); // wraps
         assert_eq!(l.cycle(1, false), 2); // wraps backward
+    }
+
+    #[test]
+    fn resize_adjusts_nearest_matching_split() {
+        // [1 | 2] with 2 split into 2/3 vertically again: resizing 1 moves
+        // the outer boundary; resizing 3 moves the inner one.
+        let mut l = Layout::single(1);
+        l.split(1, 2, Dir::Vertical);
+        l.split(2, 3, Dir::Vertical);
+        let area = Rect::new(0, 0, 41, 20);
+        let before = l.rects(area);
+        assert!(l.resize(1, Dir::Vertical, 0.2)); // grow pane 1 rightward
+        let after = l.rects(area);
+        let w = |rs: &Vec<(u64, Rect)>, id: u64| rs.iter().find(|(i, _)| *i == id).unwrap().1.cols;
+        assert!(w(&after, 1) > w(&before, 1));
+        // Growing pane 3 (a `b` child) lowers its split's ratio -> wider 3.
+        let before = after;
+        assert!(l.resize(3, Dir::Vertical, 0.2));
+        let after = l.rects(area);
+        assert!(w(&after, 3) > w(&before, 3));
+        // No split of the other axis exists: resize reports false.
+        assert!(!l.resize(1, Dir::Horizontal, 0.1));
+    }
+
+    #[test]
+    fn resize_clamps_ratio() {
+        let mut l = Layout::single(1);
+        l.split(1, 2, Dir::Horizontal);
+        for _ in 0..20 {
+            l.resize(1, Dir::Horizontal, 0.2);
+        }
+        let area = Rect::new(0, 0, 20, 21);
+        let rs = l.rects(area);
+        // Both panes keep at least one row even after saturating growth.
+        assert!(rs.iter().all(|(_, r)| r.rows >= 1));
     }
 }

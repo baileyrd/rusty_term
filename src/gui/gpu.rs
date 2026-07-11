@@ -501,7 +501,7 @@ impl GpuCore {
                 && let Some(cur) = grid.search_highlight(col, row)
             {
                 (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG }, 0, 0, false)
-            } else if !on_status && grid.view_offset == 0 && grid.is_selected(col, row) {
+            } else if !on_status && grid.is_selected(col, row) {
                 (cell.bg, cell.fg, 0, 0, false)
             } else {
                 (cell.fg, cell.bg, 0, 0, true)
@@ -523,6 +523,24 @@ impl GpuCore {
                 deco,
                 dcol,
             });
+        }
+        // Scrollbar overlay: cell-resolution thumb in the rightmost column
+        // (the CPU renderer draws a sub-cell pixel bar; instanced quads are
+        // whole cells, an accepted parity note like the half-block images).
+        if let Some((first, len, color)) = grid.scrollbar() {
+            for r in first..(first + len).min(grid.rows) {
+                instances.push(Instance {
+                    col: (col0 + grid.cols.saturating_sub(1)) as u32,
+                    row: (row0 + r) as u32,
+                    slot: u32::MAX, // no glyph: background quad only
+                    fg: color,
+                    bg: color,
+                    curs: 0,
+                    ccol: 0,
+                    deco: 0,
+                    dcol: 0,
+                });
+            }
         }
         if focused && !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
             let crow = grid.cursor.1;

@@ -4478,3 +4478,67 @@ fn min_contrast_is_off_by_default_and_settable() {
     let g = Grid::new(4, 2);
     assert_eq!(g.min_contrast, 1.0);
 }
+
+// ---- Wave-5 additions: absolute selection, scrollbar ----
+
+#[test]
+fn selection_stays_anchored_while_scrolling_history() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    for i in 0..20 {
+        p.advance(&mut g, format!("line{i:02}\r\n").as_bytes());
+    }
+    // Scroll 5 rows into history and select the word on the top viewport row.
+    g.scroll_view_up(5);
+    g.select_word_at(0, 0);
+    let picked = g.selected_text().unwrap();
+    assert!(picked.starts_with("line"), "{picked:?}");
+    // Scrolling further must not change what's selected (absolute coords)...
+    g.scroll_view_up(3);
+    assert_eq!(g.selected_text().unwrap(), picked);
+    // ...and the highlight follows the text: the row it appears on shifted
+    // down by exactly the extra scroll.
+    assert!(g.is_selected(0, 3));
+    assert!(!g.is_selected(0, 0));
+}
+
+#[test]
+fn select_line_follows_wraps_into_scrollback() {
+    let mut g = Grid::new(10, 3);
+    let mut p = AnsiParser::new();
+    // A 25-char run wraps over three rows, then push it into history.
+    p.advance(&mut g, b"abcdefghijklmnopqrstuvwxy\r\n");
+    for _ in 0..4 {
+        p.advance(&mut g, b"filler\r\n");
+    }
+    g.scroll_view_up(10); // far enough that the wrapped run is in view
+    // Find the viewport row showing the run's middle chunk ("klmnopqrst").
+    let vr = (0..3)
+        .find(|&r| !g.is_selected(0, r) && {
+            g.select_word_at(0, r);
+            g.selected_text().is_some_and(|t| t.contains("klmnopqrst"))
+        })
+        .unwrap_or(1);
+    g.select_line_at(vr);
+    let text = g.selected_text().unwrap().replace('\n', "");
+    assert_eq!(text, "abcdefghijklmnopqrstuvwxy");
+}
+
+#[test]
+fn scrollbar_hides_at_bottom_and_tracks_position() {
+    let mut g = Grid::new(10, 4);
+    let mut p = AnsiParser::new();
+    for i in 0..40 {
+        p.advance(&mut g, format!("l{i}\r\n").as_bytes());
+    }
+    assert_eq!(g.scrollbar(), None); // live bottom: hidden
+    g.scroll_view_up(5);
+    let (first_mid, len, _) = g.scrollbar().unwrap();
+    assert!((1..=4).contains(&len));
+    g.scroll_view_up(1000); // clamped to the top of history
+    let (first_top, _, _) = g.scrollbar().unwrap();
+    assert_eq!(first_top, 0, "thumb at the very top when fully scrolled");
+    assert!(first_mid >= first_top);
+    g.reset_view();
+    assert_eq!(g.scrollbar(), None);
+}
