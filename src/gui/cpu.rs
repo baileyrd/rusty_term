@@ -338,43 +338,11 @@ pub(crate) fn draw_grid(
     // of a virtually placed image — the placement mechanism that survives
     // multiplexers. Row/column come from the cell's diacritics; cells that
     // omit them inherit from the left/top neighbor (spec inference).
-    let mut ph: Vec<Option<(u32, u32, u32)>> = Vec::new();
-    let mut any_ph = false;
-    for row in 0..grid.rows {
-        for col in 0..grid.cols {
-            let entry = grid.placeholder_at(col, row).map(|(id, r, c)| {
-                let left = (col > 0)
-                    .then(|| ph.get(row * grid.cols + col - 1).copied().flatten())
-                    .flatten()
-                    .filter(|&(lid, _, _)| lid == id);
-                let above = (row > 0)
-                    .then(|| ph.get((row - 1) * grid.cols + col).copied().flatten())
-                    .flatten()
-                    .filter(|&(aid, _, _)| aid == id);
-                let cc = c.or_else(|| left.map(|(_, _, lc)| lc + 1)).unwrap_or(0);
-                let rr = r
-                    .or_else(|| left.map(|(_, lr, _)| lr))
-                    .or_else(|| above.map(|(_, ar, _)| ar + 1))
-                    .unwrap_or(0);
-                (id, rr, cc)
-            });
-            any_ph |= entry.is_some();
-            ph.push(entry);
-        }
-    }
-    if any_ph {
+    if let Some(ph) = grid.placeholder_map() {
         for (i, entry) in ph.iter().enumerate() {
             let Some((id, prow, pcol)) = *entry else { continue };
             let Some((iw, ihh, pixels)) = grid.kitty_frame(id) else { continue };
-            // Placement grid: explicit `c`/`r` from the virtual placement,
-            // else derived from the image and cell pixel sizes.
-            let (mut pcols, mut prows) = grid.kitty_virtual_geometry(id).unwrap_or((0, 0));
-            if pcols == 0 {
-                pcols = iw.div_ceil(cw).max(1);
-            }
-            if prows == 0 {
-                prows = ihh.div_ceil(ch).max(1);
-            }
+            let Some((pcols, prows)) = grid.placeholder_grid(id, cw, ch) else { continue };
             let (prow, pcol) = (prow as usize, pcol as usize);
             if prow >= prows || pcol >= pcols {
                 continue; // an index past the placement grid shows nothing

@@ -159,6 +159,13 @@ impl FontCache {
         })
     }
 
+    /// Whether any face has an active GSUB shaper — i.e. ligatures are enabled
+    /// in config and the font actually carries `liga`/`calt` lookups. Renderers
+    /// use this to skip run planning entirely when shaping is a 1:1 no-op.
+    pub(crate) fn has_ligatures(&self) -> bool {
+        self.shapers.iter().any(|s| s.is_some())
+    }
+
     /// The face that has a glyph for `ch` in `style`: the styled face (or regular
     /// if that variant is absent), else the first fallback font covering `ch`,
     /// else the styled face (renders notdef).
