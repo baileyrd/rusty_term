@@ -59,9 +59,9 @@ long-tail/legacy/cosmetic · **W** = watch, don't build yet.
 | G29 | Rich-text (HTML/RTF) clipboard copy | P3 | Ghostty 1.3 (macOS), iTerm2, Windows Terminal | M |
 | G30 | Quake-style quick terminal + global hotkey | P2 | Ghostty, iTerm2, Windows Terminal, Guake | M–L |
 | G31 | Single-instance / daemon mode | P2 | foot (server), kitty | M |
-| G32 | Sessions / startup layouts / workspaces | P2 | kitty 0.43, WezTerm, Windows Terminal | M–L |
+| ✅ G32 | Sessions / startup layouts / workspaces | P2 | kitty 0.43, WezTerm, Windows Terminal | M–L |
 | G33 | Remote control / scripting API | P2 | kitty `@`, WezTerm CLI, Ghostty AppleScript | M |
-| G34 | Profiles (shell+theme+font bundles) | P2 | Windows Terminal, iTerm2, Konsole, WezTerm | M |
+| ✅ G34 | Profiles (shell+theme+font bundles) | P2 | Windows Terminal, iTerm2, Konsole, WezTerm | M |
 | G35 | Multiple-cursors protocol | W | kitty 0.43 (originated) | M |
 | G36 | Cursor trail / animated cursor | P3 | kitty 0.43, neovide-inspired | S–M |
 | G37 | Fuzzing harness for hand-rolled decoders | P1 (infra) | industry practice (Alacritty, VTE fuzz targets) | M |
@@ -447,6 +447,7 @@ wants anyway.
 **Size** M · **Deps** C13 (multi-window) for full value.
 
 #### G32 — Sessions / startup layouts / workspaces
+**Status: done (declarative session files; save-current-layout deferred).** `config::load_session` parses a session file of `[tab]` sections (in order) with `profile`, `cwd`, `command` (whitespace-split argv, run in place of the shell), and `splits = "right,down,…"`; `--session <path>` or a `session` config key makes the window build its initial tab set from it (split panes inherit the tab's profile shell/cwd/theme). Same forgiving warn-and-skip contract as the config file; TUI mode warns and ignores (no tabs to build).
 **Current.** No way to declare "open these tabs/splits, in these cwds,
 running these commands" — every start is one shell.
 **Target.** A session file (TOML, matching the config dialect) describing
@@ -474,6 +475,7 @@ negotiated JSON-RPC protocol where competitors bolted on ad-hoc sockets.
 **Size** M · **Deps** `l13` feature; G31 for the socket transport.
 
 #### G34 — Profiles
+**Status: done.** `[profile.<name>]` config sections bundle `shell`, `cwd`, and `theme` (per-pane — `new_pane` now takes a theme override, so profile tabs keep their own palette). Profiles appear at the top of the `▾` launcher dropdown (`Profile: <name>`), are referenced by session tabs, and `--profile <name>` layers one onto the top-level config at startup for both front-ends — verified end-to-end (profile cwd honored through the TUI binary on a real PTY). Font-per-profile is deferred (needs per-tab glyph caches).
 **Current.** One global config; the shell-launcher dropdown (#17) picks a
 shell but carries no per-shell theme/font/cwd/args.
 **Target.** `[profile.<name>]` config sections bundling shell, args, cwd,

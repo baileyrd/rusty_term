@@ -97,6 +97,27 @@ fn main() -> Result<(), std::io::Error> {
     if let Some(v) = flag_value(args, "--opacity").and_then(|v| v.parse::<f32>().ok()) {
         config.opacity = Some(v.clamp(0.0, 1.0));
     }
+    // `--profile <name>`: layer the named `[profile.<name>]` bundle onto the
+    // top-level config, so both front-ends inherit its shell/cwd/theme.
+    if let Some(name) = flag_value(args, "--profile") {
+        match config.profile(name).cloned() {
+            Some(p) => {
+                if p.shell.is_some() {
+                    config.shell = p.shell;
+                }
+                if p.cwd.is_some() {
+                    config.cwd = p.cwd;
+                }
+                if let Some(t) = p.theme {
+                    config.theme = t;
+                }
+            }
+            None => eprintln!("rusty_term: no profile named `{name}` in the config"),
+        }
+    }
+    if let Some(path) = flag_value(args, "--session") {
+        config.session = Some(PathBuf::from(path));
+    }
     if let Some((prog, cmd_args)) = command {
         config.shell = Some(prog);
         config.command_args = cmd_args;
@@ -130,6 +151,11 @@ fn main() -> Result<(), std::io::Error> {
     if args.iter().any(|a| a == "--gui") {
         return gui::run(backend.as_ref(), &config)
             .map_err(|e| std::io::Error::other(e.to_string()));
+    }
+
+    // A session file describes tabs, which only the windowed front-end has.
+    if config.session.is_some() {
+        eprintln!("rusty_term: `session` requires the windowed front-end (--gui); ignored");
     }
 
     // Start at the host terminal's actual size, falling back to 80x24. The
