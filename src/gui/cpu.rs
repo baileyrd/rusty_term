@@ -285,6 +285,14 @@ pub(crate) fn draw_grid(
         let pane_top = (row0 * ch) as isize;
         let pane_bottom = (((row0 + grid.rows) * ch).min(height)) as isize;
         let pane_right = (((col0 + grid.cols) * cw).min(width)) as isize;
+        // An animated image (inline GIF) draws its backing animation's current
+        // frame; the stored snapshot is the fallback if the store evicted it.
+        let pixels: &[Option<u32>] = im
+            .anim
+            .and_then(|id| grid.kitty_frame(id))
+            .filter(|&(w, h, _)| w == im.pw && h == im.ph)
+            .map(|(_, _, px)| px)
+            .unwrap_or(&im.pixels);
         for dy in 0..dst_h {
             let py = y0 + dy;
             if py < pane_top || py >= pane_bottom {
@@ -297,7 +305,7 @@ pub(crate) fn draw_grid(
                     continue;
                 }
                 let sx = dx as usize * im.pw / dst_w as usize;
-                if let Some(c) = im.pixels[sy * im.pw + sx] {
+                if let Some(c) = pixels[sy * im.pw + sx] {
                     buf[py as usize * width + px as usize] = c;
                 }
             }

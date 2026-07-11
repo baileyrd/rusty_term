@@ -7,14 +7,14 @@
 //! [`Grid::render_image_sized`] (half-block cells, plus the full-res overlay
 //! under the `gui` renderer), honoring the `width`/`height`/
 //! `preserveAspectRatio` geometry hints when present; display auto-fits to
-//! the available columns otherwise, like Sixel/Kitty. GIF and WebP aren't
-//! decoded (no matches for either format's magic bytes below); animated GIF
-//! in particular would need a frame-timer this synchronous decode-and-place
-//! path has no way to drive, and WebP a decoder (lossy or lossless) this
-//! codebase doesn't have — both out of scope for now.
+//! the available columns otherwise, like Sixel/Kitty. GIF decodes via
+//! [`super::gif`] — a multi-frame GIF plays in the windowed overlay through
+//! the Kitty animation timer (TUI passthrough shows the first frame) — and
+//! lossless WebP via [`super::webp`]; lossy (VP8) WebP would need a full
+//! DCT video-intra decoder and stays out of scope.
 
 use super::grid::Grid;
-use super::{base64, jpeg, png};
+use super::{base64, gif, jpeg, png, webp};
 
 /// Cap on the decoded file size (8 MiB) so a huge payload can't exhaust memory.
 const MAX_FILE: usize = 8 * 1024 * 1024;
@@ -54,12 +54,44 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
     let Some(file) = base64::decode(b64.as_bytes()) else {
         return;
     };
+    // GIF first: it may be animated, which takes its own multi-frame path.
+    if file.starts_with(b"GIF8") {
+        if let Some(g_img) = gif::decode(&file) {
+            let frames: Vec<(Vec<Option<u32>>, u32)> =
+                g_img.frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect();
+            #[cfg(any(test, feature = "gui"))]
+            g.render_animated_image(
+                g_img.width,
+                g_img.height,
+                frames,
+                target_cols,
+                target_rows,
+                preserve_aspect,
+            );
+            // Plain TTY build: no overlay/animation timer exists — draw the
+            // first frame's half-block cells, exactly like a static image.
+            #[cfg(not(any(test, feature = "gui")))]
+            if let Some((px, _)) = frames.into_iter().next() {
+                g.render_image_sized(
+                    g_img.width,
+                    g_img.height,
+                    &px,
+                    target_cols,
+                    target_rows,
+                    preserve_aspect,
+                );
+            }
+        }
+        return;
+    }
     let decoded = if file.starts_with(&[0x89, b'P', b'N', b'G']) {
         png::decode(&file).map(|im| (im.width, im.height, im.rgba))
     } else if file.starts_with(&[0xFF, 0xD8, 0xFF]) {
         jpeg::decode(&file).map(|im| (im.width, im.height, im.rgba))
+    } else if file.starts_with(b"RIFF") {
+        webp::decode(&file).map(|im| (im.width, im.height, im.rgba))
     } else {
-        None // GIF / WebP / other formats not supported
+        None // other formats not supported
     };
     let Some((w, h, rgba)) = decoded else {
         return;

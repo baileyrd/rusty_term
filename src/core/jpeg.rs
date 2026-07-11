@@ -1,12 +1,15 @@
-//! Minimal baseline JPEG decoder (no crates) for inline images (iTerm2 OSC
-//! 1337, and any other path handed a JFIF/EXIF stream). Handles the common case:
-//! Huffman-coded baseline sequential DCT (SOF0), 8-bit precision, 1 component
-//! (grayscale) or 3 components (YCbCr) with arbitrary 4:4:4 / 4:2:2 / 4:2:0
-//! chroma subsampling, optional restart intervals.
+//! Minimal JPEG decoder (no crates) for inline images (iTerm2 OSC 1337, and
+//! any other path handed a JFIF/EXIF stream). Handles the common cases:
+//! Huffman-coded baseline sequential DCT (SOF0/SOF1) *and* progressive DCT
+//! (SOF2, with spectral selection, successive approximation, and EOB runs) —
+//! 8-bit precision, 1 component (grayscale) or 3 components (YCbCr) with
+//! arbitrary 4:4:4 / 4:2:2 / 4:2:0 chroma subsampling, optional restart
+//! intervals. Both paths decode scans into a shared raw-coefficient store
+//! that is dequantized and inverse-DCT'd once all scans have landed.
 //!
-//! Progressive (SOF2), arithmetic coding, 12-bit, and CMYK/YCCK (4-component)
-//! streams decode to `None` rather than guessing — the caller falls back to not
-//! displaying, mirroring [`super::png`].
+//! Arithmetic coding, lossless/hierarchical, 12-bit, and CMYK/YCCK
+//! (4-component) streams decode to `None` rather than guessing — the caller
+//! falls back to not displaying, mirroring [`super::png`].
 
 /// A decoded image as tightly-packed RGBA8 (`rgba.len() == width * height * 4`);
 /// JPEG is opaque so every alpha byte is 255. Shaped like [`super::png::Image`].
@@ -179,8 +182,32 @@ struct Component {
     cw: usize, // plane width in samples
 }
 
-/// Decode a baseline JPEG into RGBA8, or `None` if malformed or an unsupported
-/// variant.
+/// Which scans a `SOS` header selects and how (progressive spectral band /
+/// approximation bits; a baseline scan is `Ss=0, Se=63, Ah=Al=0`).
+struct Scan {
+    /// Indices into the component list, in scan order.
+    comps: Vec<usize>,
+    ss: usize,
+    se: usize,
+    ah: u8,
+    al: u8,
+}
+
+/// Raw (undequantized) DCT coefficients for every block of one component,
+/// on the MCU-padded block grid so interleaved and non-interleaved scans
+/// index identically.
+struct Coeffs {
+    /// Padded grid width/height in blocks (`mcus_x * h`, `mcus_y * v`).
+    bw: usize,
+    bh: usize,
+    /// Actual (image-derived) block counts, for non-interleaved scans.
+    nbw: usize,
+    nbh: usize,
+    data: Vec<i32>, // bw * bh * 64, natural (row-major) order per block
+}
+
+/// Decode a baseline or progressive JPEG into RGBA8, or `None` if malformed
+/// or an unsupported variant.
 pub(crate) fn decode(data: &[u8]) -> Option<Image> {
     if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
         return None; // not SOI
@@ -191,12 +218,15 @@ pub(crate) fn decode(data: &[u8]) -> Option<Image> {
     let mut comps: Vec<Component> = Vec::new();
     let (mut width, mut height) = (0usize, 0usize);
     let mut restart_interval = 0usize;
+    let mut progressive = false;
+    let mut coeffs: Vec<Coeffs> = Vec::new();
+    let mut any_scan = false;
 
     let mut i = 2;
     loop {
         // Markers are `FF xx`; fill bytes (extra FFs) are skipped.
         if i + 1 >= data.len() {
-            return None;
+            break; // truncated after some scans: render what landed
         }
         if data[i] != 0xFF {
             return None;
@@ -208,13 +238,13 @@ pub(crate) fn decode(data: &[u8]) -> Option<Image> {
             i += 1;
         }
         match marker {
-            0xD9 => return None, // EOI before any scan
+            0xD9 => break, // EOI
             // Standalone markers carry no payload.
             0x01 | 0xD0..=0xD7 => continue,
             _ => {}
         }
         if i + 2 > data.len() {
-            return None;
+            break;
         }
         let len = ((data[i] as usize) << 8) | data[i + 1] as usize;
         if len < 2 || i + len > data.len() {
@@ -222,34 +252,70 @@ pub(crate) fn decode(data: &[u8]) -> Option<Image> {
         }
         let seg = &data[i + 2..i + len];
         match marker {
-            0xC0 | 0xC1 => parse_sof(seg, &mut comps, &mut width, &mut height)?, // baseline / ext. sequential
-            0xC2 | 0xC3 | 0xC5..=0xCF => return None, // progressive / arithmetic / unsupported
+            0xC0 | 0xC1 => parse_sof(seg, &mut comps, &mut width, &mut height)?, // sequential
+            0xC2 => {
+                parse_sof(seg, &mut comps, &mut width, &mut height)?;
+                progressive = true;
+            }
+            0xC3 | 0xC5..=0xCF => return None, // arithmetic / lossless / unsupported
             0xC4 => parse_dht(seg, &mut dc, &mut ac)?,
             0xDB => parse_dqt(seg, &mut qt)?,
             0xDD if seg.len() >= 2 => {
                 restart_interval = ((seg[0] as usize) << 8) | seg[1] as usize;
             }
             0xDA => {
-                // Start of scan: bind Huffman tables to components, then decode
-                // the entropy data that immediately follows this header.
-                parse_sos(seg, &mut comps)?;
-                let entropy_start = i + len;
-                return decode_scan(
+                if comps.is_empty() {
+                    return None;
+                }
+                if coeffs.is_empty() {
+                    coeffs = alloc_coeffs(&comps, width, height)?;
+                }
+                let scan = parse_sos(seg, &mut comps, progressive)?;
+                i = decode_scan(
                     data,
-                    entropy_start,
+                    i + len,
                     &mut comps,
-                    &qt,
+                    &mut coeffs,
+                    &scan,
                     &dc,
                     &ac,
-                    width,
-                    height,
                     restart_interval,
-                );
+                )?;
+                any_scan = true;
+                continue; // `i` already points at the next marker's 0xFF
             }
             _ => {} // APPn, COM, DNL, etc. — skip
         }
         i += len;
     }
+    if !any_scan {
+        return None;
+    }
+    finish(&mut comps, &coeffs, &qt, width, height)
+}
+
+/// Allocate every component's coefficient store on the MCU-padded grid.
+fn alloc_coeffs(comps: &[Component], width: usize, height: usize) -> Option<Vec<Coeffs>> {
+    let hmax = comps.iter().map(|c| c.h).max()?;
+    let vmax = comps.iter().map(|c| c.v).max()?;
+    let mcus_x = width.div_ceil(hmax * 8);
+    let mcus_y = height.div_ceil(vmax * 8);
+    let mut out = Vec::with_capacity(comps.len());
+    for c in comps {
+        let bw = mcus_x * c.h;
+        let bh = mcus_y * c.v;
+        // Actual per-component sample dims (A.1.1), for non-interleaved scans.
+        let cw = (width * c.h).div_ceil(hmax);
+        let ch = (height * c.v).div_ceil(vmax);
+        out.push(Coeffs {
+            bw,
+            bh,
+            nbw: cw.div_ceil(8).min(bw),
+            nbh: ch.div_ceil(8).min(bh),
+            data: vec![0i32; bw.checked_mul(bh)?.checked_mul(64)?],
+        });
+    }
+    Some(out)
 }
 
 fn parse_sof(
@@ -355,129 +421,332 @@ fn parse_dht(mut seg: &[u8], dc: &mut [Huff; 4], ac: &mut [Huff; 4]) -> Option<(
     Some(())
 }
 
-fn parse_sos(seg: &[u8], comps: &mut [Component]) -> Option<()> {
+/// Parse a scan header, binding Huffman tables and capturing the progressive
+/// spectral-selection / successive-approximation parameters.
+fn parse_sos(seg: &[u8], comps: &mut [Component], progressive: bool) -> Option<Scan> {
     if seg.is_empty() {
         return None;
     }
     let ns = seg[0] as usize;
-    if ns == 0 || seg.len() < 1 + ns * 2 + 3 {
+    if ns == 0 || ns > 4 || seg.len() < 1 + ns * 2 + 3 {
         return None;
     }
+    let mut scan_comps = Vec::with_capacity(ns);
     for s in 0..ns {
         let cs = seg[1 + s * 2];
         let tdta = seg[2 + s * 2];
-        let comp = comps.iter_mut().find(|c| c.id == cs)?;
-        comp.td = (tdta >> 4) as usize;
-        comp.ta = (tdta & 0x0F) as usize;
+        let ci = comps.iter().position(|c| c.id == cs)?;
+        comps[ci].td = (tdta >> 4) as usize;
+        comps[ci].ta = (tdta & 0x0F) as usize;
+        scan_comps.push(ci);
     }
-    // Trailing Ss/Se/AhAl: baseline requires 0/63/0, but we don't enforce it.
-    Some(())
+    let (ss, se) = (seg[1 + ns * 2] as usize, seg[2 + ns * 2] as usize);
+    let ahal = seg[3 + ns * 2];
+    let (ah, al) = (ahal >> 4, ahal & 0x0F);
+    if progressive {
+        // Spectral band sanity (G.1): DC scans are 0..0; AC scans are
+        // single-component and never include coefficient 0.
+        if ss > 63 || se > 63 || se < ss || al > 13 {
+            return None;
+        }
+        if ss == 0 && se != 0 {
+            return None;
+        }
+        if ss > 0 && ns != 1 {
+            return None;
+        }
+        Some(Scan { comps: scan_comps, ss, se, ah, al })
+    } else {
+        // Baseline: one full-band scan regardless of what the header claims.
+        Some(Scan { comps: scan_comps, ss: 0, se: 63, ah: 0, al: 0 })
+    }
 }
 
+/// Decode one scan's entropy-coded data into the coefficient stores and
+/// return the byte offset of the next marker.
 #[allow(clippy::too_many_arguments)]
 fn decode_scan(
     data: &[u8],
     entropy_start: usize,
     comps: &mut [Component],
-    qt: &[[u16; 64]; 4],
+    coeffs: &mut [Coeffs],
+    scan: &Scan,
     dc: &[Huff; 4],
     ac: &[Huff; 4],
-    width: usize,
-    height: usize,
     restart_interval: usize,
-) -> Option<Image> {
-    let hmax = comps.iter().map(|c| c.h).max()?;
-    let vmax = comps.iter().map(|c| c.v).max()?;
-    let mcu_w = hmax * 8;
-    let mcu_h = vmax * 8;
-    let mcus_x = width.div_ceil(mcu_w);
-    let mcus_y = height.div_ceil(mcu_h);
-
-    // Allocate each component's sample plane, padded to whole MCUs.
-    for c in comps.iter_mut() {
-        c.cw = mcus_x * c.h * 8;
-        let ch = mcus_y * c.v * 8;
-        c.plane = vec![0u8; c.cw.checked_mul(ch)?];
-        c.pred = 0;
+) -> Option<usize> {
+    for &ci in &scan.comps {
+        comps.get(ci)?;
+        comps[ci].pred = 0;
     }
-
-    let cosines = idct_matrix();
-
     let mut br = BitReader::new(data, entropy_start);
-    let mut mcu = 0usize;
-    let mut block_coeffs = [0i32; 64];
-    for my in 0..mcus_y {
-        for mx in 0..mcus_x {
-            if restart_interval > 0 && mcu > 0 && mcu.is_multiple_of(restart_interval) {
-                br.restart();
-                for c in comps.iter_mut() {
-                    c.pred = 0;
-                }
-            }
-            for comp in comps.iter_mut() {
-                let (ch, cv, ctq, ctd, cta, ccw) =
-                    (comp.h, comp.v, comp.tq, comp.td, comp.ta, comp.cw);
-                for by in 0..cv {
-                    for bx in 0..ch {
-                        block_coeffs.fill(0);
-                        decode_block(
-                            &mut br,
-                            &dc[ctd],
-                            &ac[cta],
-                            &qt[ctq],
-                            &mut comp.pred,
-                            &mut block_coeffs,
-                        )?;
-                        // IDCT straight into the plane at this block's origin.
-                        let px0 = (mx * ch + bx) * 8;
-                        let py0 = (my * cv + by) * 8;
-                        idct_to_plane(&block_coeffs, &cosines, &mut comp.plane, ccw, px0, py0);
+    let mut eobrun = 0usize;
+
+    if scan.comps.len() > 1 {
+        // Interleaved (ns > 1): MCU order across the scan's components. The
+        // padded grids were allocated as `mcus * sampling`, so the MCU count
+        // falls back out of any component's grid.
+        let mcus_x = coeffs.first()?.bw / comps.first()?.h.max(1);
+        let mcus_y = coeffs.first()?.bh / comps.first()?.v.max(1);
+        let mut unit = 0usize;
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if restart_interval > 0 && unit > 0 && unit.is_multiple_of(restart_interval) {
+                    br.restart();
+                    eobrun = 0;
+                    for &ci in &scan.comps {
+                        comps[ci].pred = 0;
                     }
                 }
+                for &ci in &scan.comps {
+                    let (ch, cv) = (comps[ci].h, comps[ci].v);
+                    for by in 0..cv {
+                        for bx in 0..ch {
+                            let st = &mut coeffs[ci];
+                            let block_idx = (my * cv + by) * st.bw + (mx * ch + bx);
+                            let block = st.data.get_mut(block_idx * 64..block_idx * 64 + 64)?;
+                            decode_block_into(
+                                &mut br,
+                                block.try_into().ok()?,
+                                scan,
+                                &dc[comps[ci].td],
+                                &ac[comps[ci].ta],
+                                &mut comps[ci].pred,
+                                &mut eobrun,
+                            )?;
+                        }
+                    }
+                }
+                unit += 1;
             }
-            mcu += 1;
+        }
+    } else {
+        // Non-interleaved: the component's own (unpadded) block grid.
+        let ci = *scan.comps.first()?;
+        let (nbw, nbh, bw) = {
+            let st = &coeffs[ci];
+            (st.nbw, st.nbh, st.bw)
+        };
+        let mut unit = 0usize;
+        for by in 0..nbh {
+            for bx in 0..nbw {
+                if restart_interval > 0 && unit > 0 && unit.is_multiple_of(restart_interval) {
+                    br.restart();
+                    eobrun = 0;
+                    comps[ci].pred = 0;
+                }
+                let st = &mut coeffs[ci];
+                let block_idx = by * bw + bx;
+                let block = st.data.get_mut(block_idx * 64..block_idx * 64 + 64)?;
+                decode_block_into(
+                    &mut br,
+                    block.try_into().ok()?,
+                    scan,
+                    &dc[comps[ci].td],
+                    &ac[comps[ci].ta],
+                    &mut comps[ci].pred,
+                    &mut eobrun,
+                )?;
+                unit += 1;
+            }
         }
     }
 
-    Some(to_rgba(comps, width, height, hmax, vmax))
+    // Find the next marker after the entropy data (skipping stuffed FF 00
+    // and restart markers the bit reader may not have consumed).
+    let mut p = br.pos.min(data.len());
+    while p + 1 < data.len() {
+        if data[p] == 0xFF && data[p + 1] != 0x00 && !(0xD0..=0xD7).contains(&data[p + 1]) {
+            return Some(p);
+        }
+        p += 1;
+    }
+    Some(data.len()) // no further marker: the main loop stops and renders
 }
 
-/// Decode one 8x8 block: DC difference (predicted) then run-length AC, writing
-/// dequantized coefficients into `out` in natural (row-major) order.
-fn decode_block(
+/// Route one block through the right per-scan decoder.
+fn decode_block_into(
     br: &mut BitReader,
+    block: &mut [i32; 64],
+    scan: &Scan,
     dc: &Huff,
     ac: &Huff,
-    qt: &[u16; 64],
     pred: &mut i32,
-    out: &mut [i32; 64],
+    eobrun: &mut usize,
 ) -> Option<()> {
-    let t = dc.decode(br)?;
-    let diff = if t == 0 { 0 } else { extend(br.receive(t), t) };
-    *pred += diff;
-    out[0] = *pred * qt[0] as i32;
+    match (scan.ss, scan.ah) {
+        (0, 0) => {
+            // DC first (progressive) or a full baseline band.
+            let t = dc.decode(br)?;
+            let diff = if t == 0 { 0 } else { extend(br.receive(t), t) };
+            *pred += diff;
+            block[0] = *pred << scan.al;
+            if scan.se > 0 {
+                ac_first(br, block, 1, scan.se, 0, ac, eobrun)?;
+            }
+        }
+        (0, _) => {
+            // DC refinement: one bit per block.
+            if br.bit() == 1 {
+                block[0] |= 1 << scan.al;
+            }
+        }
+        (_, 0) => ac_first(br, block, scan.ss, scan.se, scan.al, ac, eobrun)?,
+        _ => ac_refine(br, block, scan.ss, scan.se, scan.al, ac, eobrun)?,
+    }
+    Some(())
+}
 
-    let mut k = 1usize;
-    while k < 64 {
+/// First AC pass over `ss..=se` (also the baseline AC path with `al = 0`):
+/// run-length zeros + magnitude, with progressive EOB runs.
+fn ac_first(
+    br: &mut BitReader,
+    block: &mut [i32; 64],
+    ss: usize,
+    se: usize,
+    al: u8,
+    ac: &Huff,
+    eobrun: &mut usize,
+) -> Option<()> {
+    if *eobrun > 0 {
+        *eobrun -= 1;
+        return Some(());
+    }
+    let mut k = ss;
+    while k <= se {
         let rs = ac.decode(br)?;
         let r = (rs >> 4) as usize;
         let s = rs & 0x0F;
         if s == 0 {
             if r == 15 {
-                k += 16; // ZRL: skip 16 zeros
+                k += 16; // ZRL
                 continue;
             }
-            break; // EOB
-        }
-        k += r;
-        if k >= 64 {
+            // EOBn: 2^r - 1 more blocks (this one included in the count).
+            *eobrun = (1usize << r) - 1;
+            if r > 0 {
+                *eobrun += br.receive(r as u8) as usize;
+            }
             break;
         }
-        let coeff = extend(br.receive(s), s);
-        out[ZIGZAG[k]] = coeff * qt[k] as i32;
+        k += r;
+        if k > se {
+            break; // tolerated overrun, like the baseline path
+        }
+        block[ZIGZAG[k]] = extend(br.receive(s), s) << al;
         k += 1;
     }
     Some(())
+}
+
+/// AC refinement pass (G.1.2.3): each previously-nonzero coefficient in the
+/// band takes a correction bit; newly-significant coefficients appear as
+/// ±1 << al after `r` zero-history positions.
+fn ac_refine(
+    br: &mut BitReader,
+    block: &mut [i32; 64],
+    ss: usize,
+    se: usize,
+    al: u8,
+    ac: &Huff,
+    eobrun: &mut usize,
+) -> Option<()> {
+    let p1 = 1i32 << al;
+    let m1 = -1i32 << al;
+    let mut k = ss;
+    if *eobrun == 0 {
+        while k <= se {
+            let rs = ac.decode(br)?;
+            let mut r = (rs >> 4) as i32;
+            let s = rs & 0x0F;
+            let mut newval = 0i32;
+            if s == 0 {
+                if r != 15 {
+                    *eobrun = 1usize << r;
+                    if r > 0 {
+                        *eobrun += br.receive(r as u8) as usize;
+                    }
+                    break;
+                }
+                // ZRL: skip 16 zero-history coefficients below.
+            } else {
+                if s != 1 {
+                    return None; // refinement magnitudes are always ±1
+                }
+                newval = if br.bit() == 1 { p1 } else { m1 };
+            }
+            // Advance through the band: correction bits over nonzero
+            // history, counting down `r` zero-history positions.
+            while k <= se {
+                let c = &mut block[ZIGZAG[k]];
+                if *c != 0 {
+                    if br.bit() == 1 && (*c & p1) == 0 {
+                        *c += if *c >= 0 { p1 } else { m1 };
+                    }
+                } else {
+                    if r == 0 {
+                        break;
+                    }
+                    r -= 1;
+                }
+                k += 1;
+            }
+            if newval != 0 && k <= se {
+                block[ZIGZAG[k]] = newval;
+            }
+            k += 1;
+        }
+    }
+    if *eobrun > 0 {
+        // Remaining band positions still take correction bits.
+        while k <= se {
+            let c = &mut block[ZIGZAG[k]];
+            if *c != 0 && br.bit() == 1 && (*c & p1) == 0 {
+                *c += if *c >= 0 { p1 } else { m1 };
+            }
+            k += 1;
+        }
+        *eobrun -= 1;
+    }
+    Some(())
+}
+
+/// Dequantize + inverse-DCT every block into the component planes, then
+/// upsample/convert to RGBA.
+fn finish(
+    comps: &mut [Component],
+    coeffs: &[Coeffs],
+    qt: &[[u16; 64]; 4],
+    width: usize,
+    height: usize,
+) -> Option<Image> {
+    if width == 0 || height == 0 || comps.is_empty() || coeffs.len() != comps.len() {
+        return None;
+    }
+    let hmax = comps.iter().map(|c| c.h).max()?;
+    let vmax = comps.iter().map(|c| c.v).max()?;
+    let cosines = idct_matrix();
+    let mut dq = [0i32; 64];
+    for (c, st) in comps.iter_mut().zip(coeffs) {
+        // The quant table arrives in zigzag order; the store is natural.
+        let q = qt.get(c.tq)?;
+        let mut q_nat = [0u16; 64];
+        for k in 0..64 {
+            q_nat[ZIGZAG[k]] = q[k];
+        }
+        c.cw = st.bw * 8;
+        c.plane = vec![0u8; c.cw.checked_mul(st.bh * 8)?];
+        for by in 0..st.bh {
+            for bx in 0..st.bw {
+                let block = &st.data[(by * st.bw + bx) * 64..(by * st.bw + bx) * 64 + 64];
+                for k in 0..64 {
+                    dq[k] = block[k] * q_nat[k] as i32;
+                }
+                idct_to_plane(&dq, &cosines, &mut c.plane, c.cw, bx * 8, by * 8);
+            }
+        }
+    }
+    Some(to_rgba(comps, width, height, hmax, vmax))
 }
 
 /// Separable inverse DCT of a natural-order coefficient block, writing clamped,
