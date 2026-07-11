@@ -810,10 +810,18 @@ impl GpuCore {
                 if !r.run_ok {
                     let style = Style::new(r.cell.flags & ATTR_BOLD != 0, r.cell.flags & ATTR_ITALIC != 0);
                     let ch = if r.cell.ch == '\u{10EEEE}' { ' ' } else { r.cell.ch };
-                    // Rule L4: chars in an RTL run draw their mirrored form.
+                    // Arabic contextual form first (phase 3), then rule L4
+                    // mirroring for RTL-run chars.
                     let ch = match &bidi {
-                        Some(b) if b.rtl[col] => crate::core::bidi_mirrored(ch).unwrap_or(ch),
-                        _ => ch,
+                        Some(b) => {
+                            let ch = b.shaped.as_ref().and_then(|s| s[col]).unwrap_or(ch);
+                            if b.rtl[col] {
+                                crate::core::bidi_mirrored(ch).unwrap_or(ch)
+                            } else {
+                                ch
+                            }
+                        }
+                        None => ch,
                     };
                     let (rect, is_color) = self.tile_for_char(ch, style, font);
                     let span = char_width(r.cell.ch).max(1) as u32;

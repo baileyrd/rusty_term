@@ -244,6 +244,16 @@ fn find_matches(text: &[char], at: &[(usize, usize)], q: &[char], st: &mut Searc
 /// case-insensitive beyond plain ASCII.
 #[cfg(any(test, feature = "gui"))]
 pub(crate) fn fold_char(c: char) -> char {
+    // Canonical-base fold first (bidi phase 5): precomposed and decomposed
+    // spellings — and accents generally — land on the same base char, so
+    // "e" finds "é" whether the app wrote U+00E9 or e + combining acute
+    // (whose combining mark rides in a cluster suffix the search never
+    // sees). Then the case fold as before.
+    let cp = c as u32;
+    let c = match super::canon_tables::CANON_BASE.binary_search_by_key(&cp, |&(a, _)| a) {
+        Ok(i) => char::from_u32(super::canon_tables::CANON_BASE[i].1).unwrap_or(c),
+        Err(_) => c,
+    };
     c.to_lowercase().next().unwrap_or(c)
 }
 
@@ -472,6 +482,17 @@ pub struct Grid {
     /// order regardless (see `src/core/bidi.rs`).
     #[cfg(any(test, feature = "gui"))]
     pub bidi: bool,
+    /// BDSM (ECMA-48 mode 8): `Some(true)` = the app asked for implicit
+    /// bidi, `Some(false)` = explicit (app does its own layout), `None` =
+    /// never set (defaults apply: implicit on the main screen, explicit on
+    /// the alternate screen, per the Terminal-WG recommendation).
+    pub(crate) bdsm: Option<bool>,
+    /// Paragraph-direction autodetection (Terminal-WG private mode 2501;
+    /// default on = per-line first-strong scan).
+    pub(crate) bidi_autodetect: bool,
+    /// Fixed paragraph direction while autodetect is off (ECMA-48 SCP):
+    /// `Some(true)` RTL, `Some(false)`/`None` LTR.
+    pub(crate) bidi_para_rtl: Option<bool>,
     /// In-flight multi-part OSC 99 notifications, keyed by the client's `i=`
     /// identifier: `(id, title, body)` accumulating until a `d=1` (done)
     /// part finalizes into [`Grid::notifications`]. Bounded.
@@ -798,6 +819,10 @@ pub struct BidiRow {
     pub vis2log: Vec<u16>,
     pub log2vis: Vec<u16>,
     pub rtl: Vec<bool>,
+    /// Arabic contextual forms (phase 3), per **logical** cell: `Some(ch)`
+    /// substitutes the presentation-form glyph for that cell's base char.
+    /// `None` (whole field) when the row has nothing to shape.
+    pub shaped: Option<Vec<Option<char>>>,
 }
 
 /// The product of a wrap-aware reflow: the rebuilt history, the new on-screen
@@ -1182,6 +1207,9 @@ impl Grid {
             min_contrast: 1.0,
             #[cfg(any(test, feature = "gui"))]
             bidi: false,
+            bdsm: None,
+            bidi_autodetect: true,
+            bidi_para_rtl: None,
             notif99_pending: Vec::new(),
             #[cfg(any(test, feature = "gui"))]
             command_began: None,
@@ -4079,7 +4107,10 @@ impl Grid {
     /// come out LTR and short-circuit to `None`, so the layers compose.
     #[cfg(any(test, feature = "gui"))]
     pub fn bidi_row(&self, row: usize) -> Option<BidiRow> {
-        if !self.bidi || row >= self.rows {
+        // Config is the master switch; within it BDSM (mode 8) decides, and
+        // an app that never touches it gets implicit on the main screen /
+        // explicit on the alt screen (full-screen apps lay out themselves).
+        if !self.bidi || !self.bdsm.unwrap_or(!self.in_alt_screen()) || row >= self.rows {
             return None;
         }
         // Unit per cell run: a wide lead absorbs its trailer.
@@ -4104,8 +4135,18 @@ impl Grid {
             unit_cells.push((col as u16, w as u16));
             col += w;
         }
-        let unit_map = super::bidi::visual_map(&unit_chars, None)?;
-        let levels_para = super::bidi::paragraph_level(&unit_chars);
+        // Paragraph direction: per-line first-strong when autodetect (2501)
+        // is on (the default), else the SCP-fixed direction.
+        let base = if self.bidi_autodetect {
+            None
+        } else {
+            Some(self.bidi_para_rtl.unwrap_or(false))
+        };
+        let unit_map = super::bidi::visual_map(&unit_chars, base)?;
+        let levels_para = match base {
+            Some(rtl) => rtl as u8,
+            None => super::bidi::paragraph_level(&unit_chars),
+        };
         let (levels, _) = super::bidi::reorder(&unit_chars, levels_para);
         // Expand units back to cells, visual order.
         let mut vis2log = Vec::with_capacity(self.cols);
@@ -4127,7 +4168,18 @@ impl Grid {
                 }
             }
         }
-        Some(BidiRow { vis2log, log2vis, rtl })
+        // Arabic contextual shaping (phase 3), computed on the logical
+        // sequence (joining is defined pre-reorder).
+        let shaped = super::arabic::shape_row(&unit_chars).map(|su| {
+            let mut v: Vec<Option<char>> = vec![None; self.cols];
+            for (ui, &(first, _)) in unit_cells.iter().enumerate() {
+                if su[ui] != unit_chars[ui] {
+                    v[first as usize] = Some(su[ui]);
+                }
+            }
+            v
+        });
+        Some(BidiRow { vis2log, log2vis, rtl, shaped })
     }
 
     /// Map a viewport cell the *user pointed at* (visual coordinates) to the

@@ -102,12 +102,25 @@ This scopes "normalization" down from XL-sounding to S–M with a clear test.
 
 ## Phases
 
-Status (2026-07): **phases 1–2 done** — `src/core/bidi.rs` (full UAX #9,
-2,479-case UCD conformance sample in the suite), frozen UCD 17.0.0 tables
-(`src/core/bidi_tables.rs`, generator in `tools/`), `Grid::bidi_row` /
-`logical_col`, both renderers, and the mouse paths. `bidi = "auto"` opts
-in. Wide glyphs reorder as lead+trailer units; shaped ligature runs are
-disabled on reordered rows; fold summaries compose (they're LTR).
+Status (2026-07): **all five phases done.** Phases 1–2:
+`src/core/bidi.rs` (full UAX #9, 2,479-case UCD conformance sample in the
+suite), frozen UCD 17.0.0 tables (generators in `tools/`),
+`Grid::bidi_row` / `logical_col`, both renderers, and the mouse paths;
+wide glyphs reorder as lead+trailer units, shaped ligature runs are
+disabled on reordered rows, and fold summaries compose. Phase 3:
+`src/core/arabic.rs` — joining-type analysis (ArabicShaping.txt +
+Mn/Me/Cf transparency from UnicodeData) selecting presentation forms
+(isolated/final/initial/medial) in logical order, surfaced through
+`BidiRow::shaped` to both renderers; the GSUB `init`/`medi`/`fina` path
+and the lam-alef ligature remain future refinements. Phase 4: BDSM
+(ECMA-48 mode 8, DECRQM-answerable) switches implicit/explicit; the
+alternate screen defaults to explicit so full-screen apps stay unbroken;
+SCP (`CSI Ps1;Ps2 SP k`) fixes the paragraph direction while private
+mode 2501 (autodetection, default on) is reset. Phase 5: search folds
+canonical decompositions to their base char (`fold_char` +
+`src/core/canon_tables.rs`), so "e" finds "é" in either spelling.
+`bidi = "auto"` remains opt-in; with the explicit-mode protection now in
+place, flipping the default is a product decision, not a technical one.
 
 | Phase | Deliverable | Size | Verifiable headlessly? |
 |---|---|---|---|

@@ -15,7 +15,13 @@
 //! renderer a [`DirtyFrame`] snapshot. The parser intentionally implements a
 //! pragmatic subset of the VT100/ECMA-48 escape repertoire.
 
+#[cfg(any(test, feature = "gui"))]
+mod arabic;
+#[cfg(any(test, feature = "gui"))]
+mod arabic_tables;
 mod base64;
+#[cfg(any(test, feature = "gui"))]
+mod canon_tables;
 #[cfg(any(test, feature = "gui"))]
 mod bidi;
 #[cfg(any(test, feature = "gui"))]

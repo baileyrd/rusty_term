@@ -923,6 +923,10 @@ impl AnsiParser {
                     g.left_margin = 0;
                     g.right_margin = g.cols.saturating_sub(1);
                 }
+            } else if param == 2501 {
+                // Terminal-WG bidi: paragraph-direction autodetection
+                // (default on; off = the SCP-fixed direction applies).
+                g.bidi_autodetect = set;
             } else if param == 2026 {
                 // Synchronized output: suppress render-loop wakeups until the
                 // matching reset (or a timeout) so a multi-write frame update
@@ -968,6 +972,7 @@ impl AnsiParser {
             69 => g.lr_margin_mode,
             1004 => g.focus_reporting,
             2031 => g.report_color_scheme,
+            2501 => g.bidi_autodetect,
             7 => g.autowrap,
             25 => g.cursor_visible,
             47 | 1047 | 1049 => g.in_alt_screen(),
@@ -999,6 +1004,19 @@ impl AnsiParser {
                     2
                 }
             }
+            8 => match g.bdsm {
+                Some(true) => 1,
+                Some(false) => 2,
+                // Never set: report the effective default (implicit on the
+                // main screen, explicit on the alternate screen).
+                None => {
+                    if g.in_alt_screen() {
+                        2
+                    } else {
+                        1
+                    }
+                }
+            },
             20 => {
                 if g.line_feed_new_line {
                     1
@@ -1176,6 +1194,11 @@ impl AnsiParser {
                 for param in params.iter().flatten().copied() {
                     match param {
                         4 => g.insert_mode = set,
+                        // BDSM (mode 8): implicit vs explicit bidi (the
+                        // Terminal-WG recommendation's core switch). Only
+                        // observable when the `bidi` config enables the
+                        // feature at all.
+                        8 => g.bdsm = Some(set),
                         20 => g.line_feed_new_line = set,
                         _ => {}
                     }
@@ -1236,6 +1259,19 @@ impl AnsiParser {
                 // (`CSI Ps " q`): 1 protects newly written cells against
                 // selective erase; 0/2 (and default) unprotect.
                 self.protected = p(0, 0) == 1;
+            }
+            // SCP — select character path (`CSI Ps1;Ps2 SP k`, ECMA-48):
+            // Ps1 = 1 LTR, 2 RTL, 0 implementation default. Ps2 (how the
+            // data stream maps onto the path) is accepted and ignored — the
+            // stream stays logical order here regardless, per the
+            // Terminal-WG recommendation. Effective while paragraph
+            // autodetection (private mode 2501) is off.
+            b'k' if self.csi_intermediate == b' ' => {
+                g.bidi_para_rtl = match p(0, 0) {
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => None,
+                };
             }
             b'q' if self.csi_intermediate == b' ' => {
                 // DECSCUSR — set cursor style (`CSI Ps SP q`). Odd params blink,
