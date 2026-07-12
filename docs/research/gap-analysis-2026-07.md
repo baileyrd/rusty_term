@@ -454,16 +454,28 @@ docs and chat.
 ### A.3 Application model
 
 #### G30 — Quake-style quick terminal + global hotkey
-**Status: done (2026-07, hotkey via the WM).** Landed with C13
-(multi-window): `rusty_term ctl quake` toggles a dropdown window — borderless,
-docked to the top of the primary monitor, full monitor width, height a
-`[window] quake_height` fraction (0.1–1.0, default 0.4), kept above other
-windows (`WindowLevel::AlwaysOnTop`) — creating it on first use and
-show/hide+focusing it after. Global hotkeys stay out of process: OS-level
-hotkey registration is per-platform code beyond winit, and every desktop
-environment can already bind a key to a command — pointing one at
-`rusty_term ctl quake` gives the summon-from-anywhere behavior with a
-running `--single-instance` instance serving the socket.
+**Status: done (2026-07, hotkey via the WM on Unix; in-process on Windows).**
+Landed with C13 (multi-window): `rusty_term ctl quake` toggles a dropdown
+window — borderless, docked to the top of the primary monitor, full monitor
+width, height a `[window] quake_height` fraction (0.1–1.0, default 0.4),
+kept above other windows (`WindowLevel::AlwaysOnTop`) — creating it on first
+use and show/hide+focusing it after; verified free of Windows-specific gaps
+(winit's `MonitorHandle`/`WindowLevel` abstractions handle per-monitor DPI
+correctly, and the undecorated-shadow touch already covers Windows' DWM). On
+Unix, global hotkeys stay out of process: every desktop environment can
+already bind a key to a command, so pointing one at `rusty_term ctl quake`
+gives the summon-from-anywhere behavior with a running `--single-instance`
+instance serving the socket. On Windows, where there's no equivalent
+system-wide keybinding UI to point at a CLI, `[window] quake_hotkey =
+"win+grave"` (`src/gui/hotkey.rs`) registers a real global hotkey via
+`RegisterHotKey` and a `winit` `with_msg_hook` callback that catches
+`WM_HOTKEY` before winit does (posted to the thread's queue, not a window's,
+since hotkeys aren't window-scoped); a malformed spec warns at startup and
+the app runs on without one. Verified live: valid and invalid specs both
+behave correctly (silent registration vs. the expected warning), and the
+parser is unit-tested; the actual key-press → toggle path is unverified
+end-to-end — this environment can't sustain a real interactive window
+session to press the key against (see G31's note on the same limitation).
 **Current.** One normal window per process; no global-hotkey or slide-down
 mode.
 **Target.** A summonable overlay window (top-of-screen slide-down) bound to

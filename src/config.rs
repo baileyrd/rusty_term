@@ -94,6 +94,11 @@ pub struct Config {
     /// height, `0.1..=1.0` (`[window] quake_height`; default 0.4). The window
     /// itself is created/toggled with `rusty_term ctl quake`.
     pub quake_height: Option<f32>,
+    /// Global hotkey that toggles the quake window without an external
+    /// binding tool (`[window] quake_hotkey`, e.g. `"win+grave"`; Windows
+    /// only — Unix desktops bind `rusty_term ctl quake` at the WM/DE level
+    /// instead). A malformed spec is a startup warning, not a hard error.
+    pub quake_hotkey: Option<String>,
     /// Named launch profiles (`[profile.<name>]` sections): a shell + cwd +
     /// theme bundle, surfaced in the shell-launcher dropdown and selectable
     /// at startup with `--profile <name>`.
@@ -227,6 +232,7 @@ impl Config {
 # launch_mode = "maximized" # or "fullscreen"
 # opacity = 0.9            # 0.0-1.0; GPU renderer (--features gui-gpu) only
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
+# quake_hotkey = "win+grave" # global hotkey toggling the quake window (Windows only)
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
 # cursor_trail = true       # fading trail when the cursor jumps
@@ -701,6 +707,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             }
             cfg.quake_height = Some(v as f32);
         }
+        ("window", "quake_hotkey") => cfg.quake_hotkey = Some(expect_str(key, value)?),
         ("colors", "foreground") => cfg.theme.fg = expect_color(key, value)?,
         ("colors", "background") => cfg.theme.bg = expect_color(key, value)?,
         ("colors", "cursor") => cfg.theme.cursor = expect_color(key, value)?,
