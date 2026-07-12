@@ -998,10 +998,26 @@ impl WindowState<'_> {
         };
         let size = window.inner_size();
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        // Taskbar progress (G01 stretch, Windows only): resolved once per
+        // frame like the title below, from the same winit `Window`.
+        #[cfg(windows)]
+        let hwnd = {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            window.window_handle().ok().and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(h) => {
+                    Some(h.hwnd.get() as windows_sys::Win32::Foundation::HWND)
+                }
+                _ => None,
+            })
+        };
         if let Some(p) = tab.focused() {
             let g = p.grid.lock();
             let fallback = self.config.title.as_deref().unwrap_or("rusty_term");
             window.set_title(if g.title.is_empty() { fallback } else { &g.title });
+            #[cfg(windows)]
+            if let Some(hwnd) = hwnd {
+                super::taskbar::sync(hwnd, g.progress);
+            }
         }
         // Lock each pane's grid for the frame, then hand the renderer offset views
         // (the chrome bar occupies screen row 0, so panes start at row 1).
