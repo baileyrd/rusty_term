@@ -27,6 +27,7 @@ mod mouse;
 mod render;
 mod settings;
 mod shape;
+mod taskbar;
 mod window;
 
 pub use window::run;
