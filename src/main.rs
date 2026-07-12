@@ -147,10 +147,9 @@ fn main() -> Result<(), std::io::Error> {
     // rendering into the host terminal. Requires the `gui` feature.
     #[cfg(feature = "gui")]
     if args.iter().any(|a| a == "--gui") {
-        // Single-instance: if a control socket answers, hand this launch to
-        // the running instance as a new tab and exit instead of opening a
-        // second window.
-        #[cfg(unix)]
+        // Single-instance: if a control socket/pipe answers, hand this
+        // launch to the running instance as a new tab and exit instead of
+        // opening a second window.
         if config.single_instance.unwrap_or(false)
             || args.iter().any(|a| a == "--single-instance")
         {
@@ -213,7 +212,7 @@ fn main() -> Result<(), std::io::Error> {
 /// `rusty_term ctl <command> [key=value]…`: forward one control request to
 /// the running instance and print its reply. Exits nonzero on `err`.
 fn run_ctl(args: &[String]) -> std::io::Result<()> {
-    #[cfg(all(unix, feature = "gui"))]
+    #[cfg(feature = "gui")]
     {
         if args.is_empty() {
             eprintln!(
@@ -241,10 +240,10 @@ fn run_ctl(args: &[String]) -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(all(unix, feature = "gui")))]
+    #[cfg(not(feature = "gui"))]
     {
         let _ = args;
-        eprintln!("rusty_term: `ctl` needs a Unix build with the `gui` feature");
+        eprintln!("rusty_term: `ctl` needs the `gui` feature");
         Err(std::io::Error::other("ctl unsupported on this build"))
     }
 }
