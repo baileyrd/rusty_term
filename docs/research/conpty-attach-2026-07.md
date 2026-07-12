@@ -184,3 +184,111 @@ child exit code (259=still running): 0
 pipe output (16 bytes): "\u{1b}[?9001h\u{1b}[?1004h"
 verdict: NOT ATTACHED
 ```
+
+---
+
+## Follow-up option (tracked, not committed): vendor OpenConsole
+
+**Status: option only — do not implement until a *stable*-Windows conhost
+regression actually bites. There is no evidence of one yet; the failure
+above is on a pre-release Insider build.**
+
+### The idea
+
+`conhost.exe` — the console host that ConPTY spins up to translate the
+legacy Win32 Console API into a VT byte stream — is open source. Microsoft
+develops it in the open as **OpenConsole** (`microsoft/terminal`, the
+`OpenConsole.exe` build target) and ships a copy inside Windows Terminal.
+ConPTY supports pointing at a *bundled* `OpenConsole.exe` instead of the
+system `conhost.exe`, so an app can pin a known-good host rather than
+depend on whatever the OS ships. Windows Terminal itself does exactly this.
+
+This is **not** "roll our own ConPTY." We are not reimplementing the
+private `\Device\ConDrv` client/server protocol, console attachment, or
+the legacy Console API surface — the undocumented, per-build-unstable
+machinery that stopped winpty and forced it into screen-scraping. We would
+be shipping *Microsoft's own* host, just a version we control instead of
+the system's.
+
+### How it wires in
+
+The pseudoconsole is created in `WindowsBackend::spawn_shell`
+(`src/backend/windows.rs`) via `CreatePseudoConsole`. Two mechanisms exist
+to redirect it to a bundled host:
+
+1. **Environment steering.** ConPTY honors the location of the current
+   process's `conhost`; launching the child-host chain against a bundled
+   binary is done by placing our `OpenConsole.exe` where the loader finds
+   it first (alongside the executable) and letting `CreatePseudoConsole`'s
+   internal host launch resolve to it. This is the low-touch path but the
+   least explicitly documented.
+2. **Explicit host handoff (the sanctioned path).** The
+   `CreatePseudoConsole` flow that Windows Terminal uses hands the ConPTY
+   an already-spawned `OpenConsole.exe --headless ...` over a
+   signal/reference-handle pair (the `PseudoConsole`/`ConptyConnection`
+   plumbing in the Terminal source). We would port the minimal slice of
+   that: spawn our bundled `OpenConsole.exe` with the pseudoconsole
+   in/out pipe handles and the `--headless --width --height --signal
+   --server` arguments, instead of calling `CreatePseudoConsole` and
+   letting it launch the system host. The rest of the backend
+   (`ReadFile`/`WriteFile` on the pipes, `ResizePseudoConsole` →
+   the signal pipe, teardown) is unchanged; only the host-spawn step moves.
+
+Either way, `BackendHandle` and everything above it stay identical — this
+is a backend-internal swap, invisible to the parser, grid, and renderers.
+
+### Why it's an option and not a plan
+
+The costs cut squarely against this project's minimal-footprint,
+everything-from-source ethos:
+
+- **A ~2 MB prebuilt binary in the tree / installer.** `OpenConsole.exe`
+  is a Microsoft C++ build we would redistribute, not build from source
+  (building it needs the full Windows Terminal toolchain — MSVC, the
+  Windows SDK, its vcpkg deps — which is not something this repo will ever
+  carry). That is a genuine "vendored blob" — the one thing the codebase
+  otherwise never does.
+- **A maintenance and update burden.** We would own tracking OpenConsole
+  releases, security fixes, and version-compatibility with our ConPTY
+  calls — the escape from "at the mercy of the system conhost" is really a
+  trade for "on the hook to update a bundled conhost."
+- **Licensing/redistribution diligence.** OpenConsole is MIT, so
+  redistribution is fine, but bundling a Microsoft binary wants an
+  explicit NOTICE/attribution entry and a provenance note (which exact
+  release, which hash).
+- **It fixes a problem we don't have.** The only observed failure is on an
+  Insider build, and it's in `CreateProcessW`'s pseudoconsole-attribute
+  handling — *upstream* of the host, so a bundled host would very likely
+  still be attached through the same broken mechanism. Vendoring insures
+  against a *system-conhost* regression specifically, which has not
+  occurred on any shipping build.
+
+### Decision criteria — when to revisit
+
+Pull this option off the shelf only if **all** of these hold:
+
+1. A reproducible ConPTY/console-host defect appears on a **stable**
+   (non-Insider) Windows release, not just a pre-release build.
+2. It is demonstrably *inside the host's* behavior (VT translation, mode
+   handling, resize) rather than upstream in `CreateProcessW`/attach — so
+   a newer host would actually fix it.
+3. No system update resolves it in a reasonable window, and an upstream
+   `microsoft/terminal` issue confirms it's host-side.
+
+Absent all three, the recommendation stands: use the system ConPTY, treat
+the Insider failure as an OS regression to wait out and report, and keep
+the tree blob-free.
+
+### Effort estimate if it is ever built
+
+- Port the explicit host-handoff spawn from the Windows Terminal source
+  into `spawn_shell` (path 2 above): **M** — mostly careful FFI mirroring
+  of an existing, working sequence, plus the signal-pipe resize plumbing.
+- Build/CI: fetch-and-verify (hash-pinned) the OpenConsole release in the
+  Windows packaging step, or check the blob in under `vendor/` with a
+  provenance record: **S**.
+- The interesting risk is not code volume but the two undocumented-ish
+  edges: exactly which `OpenConsole.exe` arguments a given release accepts,
+  and whether the headless-host handoff stays stable across OpenConsole
+  versions (the same "Microsoft may change it" caveat, just scoped to a
+  binary we pin rather than the system).
