@@ -703,6 +703,56 @@ Section B items keep their original sequencing advice; C13 (multi-window)
 gates G30/G31's full value and should precede wave 7 if the app-model work
 is prioritized.
 
+## Windows on-hardware verification sweep (2026-07)
+
+Per the Windows handoff's item 6 ("things built headlessly that have never
+been seen on a real screen"), run on the real machine this session used for
+G10/G30/G31/G01. No code changes — a status report only.
+
+**Confirmed working:**
+- `cargo test --all-features -- --ignored gpu_renders_to_texture` passes on
+  the real GPU (previously only run headless, where it's `#[ignore]`d
+  because software Vulkan crashes). First real confirmation the wgpu path
+  actually renders to a texture on real hardware.
+
+**Confirmed gap, root-caused (no visual check needed):** Windows' system
+color-emoji font renders monochrome, exactly as suspected. Verified two
+ways, not just asserted:
+- Direct table-directory inspection of `C:\Windows\Fonts\seguiemj.ttf` on
+  this machine: `COLR` and `CPAL` are present; `CBDT`/`CBLC`/`sbix` are
+  absent.
+- Code trace: `seguiemj.ttf` is in `EMOJI_FONTS` (`src/gui/font.rs`), so
+  rusty_term does look there for color glyphs, via
+  `face.glyph_raster_image()` (`ttf_parser`, bitmap-strike-only — no
+  COLR/CPAL support). That call returns `None` for every glyph in a
+  COLR-only font, `color_emoji()` returns `None` via `?`, and rendering
+  falls through to the plain `glyf` outline every glyph also has (COLR
+  fonts layer color on top of a monochrome base shape) — tinted in the
+  terminal foreground color like ordinary text, not blank and not a crash.
+  Fix would need a COLR/CPAL rasterizer (a real chunk of work: layered
+  outline compositing against the palette table, not a bitmap blit), so
+  this is filed as a follow-up rather than attempted here.
+
+**Not verifiable in this session's environment:** every check requiring a
+human to look at a rendered window — ligatures, wide CJK, Kitty image
+placement/animation, inline GIF/WebP, bidi with `bidi = "auto"`, Nerd Font
+icon constraining, fold summaries (Ctrl+Shift+U), cursor trail, HTML
+copy-paste into Word/OneNote. A `--gui` launch does start a real, visible
+top-level window here — confirmed via `EnumWindows`/`GetWindowThreadProcessId`
+against the running process's PID, which found one visible HWND — so the
+window itself isn't the blocker. What's missing is a way to *see* it:
+`Start-Process`'s `.MainWindowHandle` doesn't resolve for it (timing, not
+a real problem), and a `PrintWindow`-based screenshot attempt (full
+EnumWindows + GDI capture via .NET reflection) hit an unrelated PowerShell
+7.6 / .NET 10 `Add-Type` assembly-forwarding wall (`System.Drawing.Common`
+→ `System.Drawing.Primitives` → `System.Private.Windows.GdiPlus` →
+`System.Private.CoreLib`, each fix surfacing the next missing reference)
+that didn't resolve after several honest attempts. This is a tooling gap
+in the environment, not evidence the window itself is broken — worth
+revisiting with a browser-automation-style screenshot tool or a
+non-PowerShell capture path (e.g. a tiny compiled helper) rather than
+`Add-Type`, if this sweep is retried.
+
 ## Sources
 
 1. [Ghostty 1.3.0 Release Notes](https://ghostty.org/docs/install/release-notes/1-3-0) — scrollback search, native scrollbars, command notifications, click-to-move-cursor, AppleScript, rich-text copy
