@@ -203,7 +203,33 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         std::env::set_var("COLORTERM", "truecolor");
     }
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+    // Global quake hotkey (G30 stretch, Windows only): `with_msg_hook` sees
+    // WM_HOTKEY before winit does, since RegisterHotKey posts it to this
+    // thread's queue rather than a window's. The parsed spec can't be
+    // registered until the loop below runs on this thread, so just remember
+    // it here; a bad spec warns and the app runs on without a hotkey.
+    #[cfg(windows)]
+    let quake_hotkey = config.quake_hotkey.as_ref().and_then(|spec| match super::hotkey::parse(spec) {
+        Ok(hk) => Some(hk),
+        Err(e) => {
+            eprintln!("rusty_term: quake_hotkey `{spec}`: {e}");
+            None
+        }
+    });
+    #[cfg(windows)]
+    let hotkey_pressed = quake_hotkey.map(|_| std::rc::Rc::new(std::cell::Cell::new(false)));
+    #[cfg(windows)]
+    if let Some(pressed) = &hotkey_pressed {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop_builder.with_msg_hook(super::hotkey::make_msg_hook(pressed.clone()));
+    }
+    #[cfg(not(windows))]
+    let hotkey_pressed: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
+    let event_loop = event_loop_builder.build()?;
+    // Now that the loop's thread is established, actually register.
+    #[cfg(windows)]
+    let hotkey_registered = quake_hotkey.is_some_and(super::hotkey::register);
     let proxy = event_loop.create_proxy();
 
     // Config live reload: watch the file and wake the loop on changes.
@@ -235,6 +261,7 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         shells: crate::shells::detect_all(),
         windows: Vec::new(),
         focused_window: None,
+        quake_hotkey_pressed: hotkey_pressed,
     };
     // The first window (its OS window comes with the loop's `resumed`).
     // Building it up front surfaces font/shell errors before the loop runs.
@@ -264,6 +291,10 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
     }
     app.windows.push(first);
     event_loop.run_app(&mut app)?;
+    #[cfg(windows)]
+    if hotkey_registered {
+        super::hotkey::unregister();
+    }
     Ok(())
 }
 
@@ -3006,6 +3037,10 @@ struct App<'a> {
     /// The window that last had OS focus — control-socket commands without a
     /// window of their own (`new-tab`, `send-text`, …) act on it.
     focused_window: Option<WindowId>,
+    /// Set by the Windows global-hotkey message hook (G30 stretch) on every
+    /// press; checked and cleared in [`ApplicationHandler::about_to_wait`].
+    /// Always `None` off Windows or when no `quake_hotkey` is configured.
+    quake_hotkey_pressed: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 
 impl<'a> App<'a> {
@@ -3148,6 +3183,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     /// Drive cursor blink and Kitty animations across every window, waking at
     /// the earliest deadline any of them needs (no idle wakeups otherwise).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(pressed) = &self.quake_hotkey_pressed
+            && pressed.replace(false)
+        {
+            self.toggle_quake(event_loop);
+        }
         let now = Instant::now();
         let next = self.windows.iter_mut().filter_map(|w| w.tick(now)).min();
         event_loop.set_control_flow(match next {
