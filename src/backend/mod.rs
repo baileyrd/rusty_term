@@ -68,6 +68,37 @@ pub trait BackendHandle: Send {
     /// the blocking [`read`](Self::read)/[`write`](Self::write) instead).
     #[cfg(unix)]
     fn pty_fd(&self) -> std::os::unix::io::RawFd;
+
+    /// Reap the owned child and return its exit status as a
+    /// `std::process::exit`-compatible value: the child's own exit code on a
+    /// normal exit, or 128+signal (the sh/bash convention) on a signal death.
+    /// Called once the caller already knows the child has exited (read-EOF,
+    /// a SIGCHLD, or — Windows — the [`exit_token`](Self::exit_token) watcher
+    /// firing), so this should return promptly. `None` on a handle that
+    /// doesn't own the child (a clone), or if it races another reaper for
+    /// the same child and loses (harmless — whichever side wins reports the
+    /// status).
+    ///
+    /// Without this, the exit code was always 0 regardless of what the
+    /// child actually did — a failed `execvp` or a shell that ran a failing
+    /// command as its last action looked identical to success to anything
+    /// scripting `rusty_term -e ...`.
+    fn reap_exit_status(&mut self) -> Option<i32> {
+        None
+    }
+
+    /// The owned child's pid, for the Unix runtime's SIGCHLD watcher (see
+    /// [`crate::runtime`]): a background process that inherited the pty as
+    /// its own stdout/stderr (`nohup cmd &` then exiting the shell) never
+    /// produces read-EOF on the master, since the fd stays open via the
+    /// orphan — reaping proactively on SIGCHLD instead of only on EOF avoids
+    /// wedging shutdown forever in that case. `None` on a handle that
+    /// doesn't own the child (a clone) or on a platform where this isn't
+    /// meaningful.
+    #[cfg(unix)]
+    fn child_pid(&self) -> Option<libc::pid_t> {
+        None
+    }
 }
 
 // Each backend only compiles on its own platform — the Unix one leans on

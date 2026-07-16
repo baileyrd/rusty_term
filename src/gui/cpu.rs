@@ -37,13 +37,19 @@ pub(crate) fn render(
         return;
     }
     if !chrome.is_empty() {
-        draw_chrome(buf, width, height, chrome, font, cw, ch);
+        // The test harness draws the bar flush (no band) — band geometry is
+        // exercised through the real `CpuRenderer::render` path.
+        draw_chrome(buf, width, height, chrome, font, cw, ch, 0, 0);
     }
     let row0 = if chrome.is_empty() { 0 } else { 1 };
-    draw_grid(buf, width, height, grid, 0, row0, true, cursor_on, font);
+    draw_grid(buf, width, height, grid, 0, row0, 0, 0, true, cursor_on, None, font);
 }
 
-/// Paint the window's chrome bar (tabs + caption buttons) at pixel row 0.
+/// Paint the window's chrome bar (tabs + caption buttons): a thin
+/// strip-colored band at pixel row 0 (`inset` tall, `bar_bg`), then the
+/// chrome cells pushed down below it — so a tab's top edge reads as distinct
+/// from the window's instead of running flush into the frame.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_chrome(
     buf: &mut [u32],
     width: usize,
@@ -52,33 +58,50 @@ pub(crate) fn draw_chrome(
     font: &mut dyn GlyphSource,
     cw: usize,
     ch: usize,
+    inset: usize,
+    bar_bg: u32,
 ) {
     let baseline = font.baseline();
+    for y in 0..inset.min(height) {
+        let base = y * width;
+        for x in 0..width {
+            buf[base + x] = bar_bg;
+        }
+    }
     for (col, cell) in chrome.iter().enumerate() {
         let x0 = col * cw;
-        for y in 0..ch.min(height) {
+        for y in inset..(inset + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
                 buf[base + x] = cell.bg;
             }
+        }
+        // The active tab's accent line (and any other decorated chrome cell)
+        // rides the ordinary underline machinery; spaces included, so the
+        // line runs the tab's full width.
+        if cell.flags & ATTR_UNDERLINE != 0 {
+            let color = if cell.flags & ATTR_UNDERLINE_COLOR != 0 { cell.underline_color } else { cell.fg };
+            draw_underline(buf, width, height, x0, inset, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
         }
     }
     for (col, cell) in chrome.iter().enumerate() {
         if cell.flags & WIDE_TRAILER != 0 || cell.ch == ' ' {
             continue;
         }
-        let glyph = font.glyph(cell.ch, Style::Regular);
+        let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+        let glyph = font.glyph(cell.ch, style);
         if glyph.width == 0 {
             continue;
         }
         let pen_x = (col * cw) as i32 + glyph.left;
-        let pen_y = baseline + glyph.top;
+        let pen_y = baseline + glyph.top + inset as i32;
         blit(buf, width, height, &glyph, pen_x, pen_y, cell.fg);
     }
 }
 
-/// Composite one grid's visible cells into `buf` at cell offset `(col0, row0)`,
-/// extent `grid.cols × grid.rows`. The cursor (block / bar / underline) and IME
+/// Composite one grid's visible cells into `buf` at cell offset `(col0, row0)`
+/// plus a pixel offset `(ox, oy)` (the window padding band), extent
+/// `grid.cols × grid.rows`. The cursor (block / bar / underline) and IME
 /// preedit show only when `focused`; selection and search highlights come from
 /// the grid's own state. Cells past the buffer edge are clipped.
 #[allow(clippy::too_many_arguments)]
@@ -89,8 +112,11 @@ pub(crate) fn draw_grid(
     grid: &Grid,
     col0: usize,
     row0: usize,
+    ox: usize,
+    oy: usize,
     focused: bool,
     cursor_on: bool,
+    hover_link: Option<(usize, usize, usize)>,
     font: &mut dyn GlyphSource,
 ) {
     let (cw, ch) = font.cell_size();
@@ -136,7 +162,7 @@ pub(crate) fn draw_grid(
         } else {
             cell.bg
         };
-        let (x0, y0) = ((col0 + vis(col, row)) * cw, (row0 + row) * ch);
+        let (x0, y0) = (ox + (col0 + vis(col, row)) * cw, oy + (row0 + row) * ch);
         for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
@@ -255,8 +281,8 @@ pub(crate) fn draw_grid(
         // Minimum-contrast enforcement (`minimum_contrast` config): nudge the
         // glyph color against the background this cell actually painted.
         let fg = crate::core::ensure_contrast(fg, under_bg, grid.min_contrast);
-        let pen_x = ((col0 + vis(col, row)) * cw) as i32 + glyph.left;
-        let pen_y = ((row0 + row) * ch) as i32 + baseline + glyph.top;
+        let pen_x = (ox + (col0 + vis(col, row)) * cw) as i32 + glyph.left;
+        let pen_y = (oy + (row0 + row) * ch) as i32 + baseline + glyph.top;
         blit(buf, width, height, glyph, pen_x, pen_y, fg);
     }
 
@@ -273,7 +299,12 @@ pub(crate) fn draw_grid(
         if cell.flags & WIDE_TRAILER != 0 {
             continue;
         }
-        let underline = cell.flags & ATTR_UNDERLINE != 0;
+        // Ctrl-hovered hyperlink (G22): forces a plain underline over its
+        // column span regardless of the cell's own SGR underline attribute —
+        // the click affordance, not a text style.
+        let hovered = !on_status
+            && hover_link.is_some_and(|(hr, s, e)| row == hr && col >= s && col <= e);
+        let underline = cell.flags & ATTR_UNDERLINE != 0 || hovered;
         let strike = cell.flags & ATTR_STRIKE != 0;
         if !underline && !strike {
             continue;
@@ -286,14 +317,16 @@ pub(crate) fn draw_grid(
         } else {
             cell.fg
         };
-        let (x0, y0) = ((col0 + vis(col, row)) * cw, (row0 + row) * ch);
+        let (x0, y0) = (ox + (col0 + vis(col, row)) * cw, oy + (row0 + row) * ch);
         if underline {
-            let color = if !swapped && cell.flags & ATTR_UNDERLINE_COLOR != 0 {
+            let color = if !swapped && !hovered && cell.flags & ATTR_UNDERLINE_COLOR != 0 {
                 cell.underline_color
             } else {
                 base_fg
             };
-            draw_underline(buf, width, height, x0, y0, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
+            let style =
+                if hovered { UnderlineStyle::Straight } else { UnderlineStyle::from_attrs(cell.flags) };
+            draw_underline(buf, width, height, x0, y0, cw, ch, color, style);
         }
         if strike {
             draw_strike(buf, width, height, x0, y0, cw, ch, base_fg);
@@ -308,11 +341,11 @@ pub(crate) fn draw_grid(
         if dst_w <= 0 || dst_h <= 0 {
             continue;
         }
-        let x0 = ((col0 + im.col) * cw) as isize;
-        let y0 = (row0 as isize + grid.image_top_row(im)) * ch as isize;
-        let pane_top = (row0 * ch) as isize;
-        let pane_bottom = (((row0 + grid.rows) * ch).min(height)) as isize;
-        let pane_right = (((col0 + grid.cols) * cw).min(width)) as isize;
+        let x0 = ox as isize + ((col0 + im.col) * cw) as isize;
+        let y0 = oy as isize + (row0 as isize + grid.image_top_row(im)) * ch as isize;
+        let pane_top = (oy + row0 * ch) as isize;
+        let pane_bottom = ((oy + (row0 + grid.rows) * ch).min(height)) as isize;
+        let pane_right = ((ox + (col0 + grid.cols) * cw).min(width)) as isize;
         // An animated image (inline GIF) draws its backing animation's current
         // frame; the stored snapshot is the fallback if the store evicted it.
         let pixels: &[Option<u32>] = im
@@ -345,7 +378,7 @@ pub(crate) fn draw_grid(
         && shape != CursorShape::Block
         && !(status.is_some() && crow == last_row)
     {
-        let (x0, y0) = ((col0 + vis(ccol, crow)) * cw, (row0 + crow) * ch);
+        let (x0, y0) = (ox + (col0 + vis(ccol, crow)) * cw, oy + (row0 + crow) * ch);
         let color = grid.cursor_color;
         match shape {
             CursorShape::Underline => {
@@ -386,7 +419,7 @@ pub(crate) fn draw_grid(
             let (col, row) = (i % grid.cols, i / grid.cols);
             let (sx0, sx1) = (pcol * iw / pcols, ((pcol + 1) * iw / pcols).max(pcol * iw / pcols + 1));
             let (sy0, sy1) = (prow * ihh / prows, ((prow + 1) * ihh / prows).max(prow * ihh / prows + 1));
-            let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+            let (x0, y0) = (ox + (col0 + col) * cw, oy + (row0 + row) * ch);
             for dy in 0..ch {
                 let py = y0 + dy;
                 if py >= height {
@@ -411,10 +444,10 @@ pub(crate) fn draw_grid(
     // the pane's right edge, thumb sized/positioned from the scroll state.
     if let Some((first, len, color)) = grid.scrollbar() {
         let bar_w = (cw / 3).max(2);
-        let x1 = ((col0 + grid.cols) * cw).min(width);
+        let x1 = (ox + (col0 + grid.cols) * cw).min(width);
         let x0 = x1.saturating_sub(bar_w);
-        let y0 = (row0 + first) * ch;
-        let y1 = ((row0 + first + len) * ch).min(height);
+        let y0 = oy + (row0 + first) * ch;
+        let y1 = (oy + (row0 + first + len) * ch).min(height);
         for y in y0..y1 {
             for x in x0..x1 {
                 buf[y * width + x] = color;
@@ -426,7 +459,7 @@ pub(crate) fn draw_grid(
     if focused && !grid.ime_preedit.is_empty() && grid.view_offset == 0 {
         let crow = grid.cursor.1;
         let mut col = grid.cursor.0;
-        let y0 = (row0 + crow) * ch;
+        let y0 = oy + (row0 + crow) * ch;
         for pch in grid.ime_preedit.chars() {
             let w = char_width(pch).max(1);
             if col + w > grid.cols {
@@ -434,7 +467,7 @@ pub(crate) fn draw_grid(
             }
             let base = grid.viewport_cell(col, crow);
             let (fg, bg) = (base.bg, base.fg);
-            let x0 = (col0 + col) * cw;
+            let x0 = ox + (col0 + col) * cw;
             for y in y0..(y0 + ch).min(height) {
                 let b = y * width;
                 for x in x0..(x0 + w * cw).min(width) {
@@ -606,6 +639,8 @@ pub(crate) fn draw_trail(
     grid: &crate::core::Grid,
     col0: usize,
     row0: usize,
+    ox: usize,
+    oy: usize,
     trail: &[(usize, usize, f32)],
     font: &mut dyn GlyphSource,
 ) {
@@ -619,7 +654,7 @@ pub(crate) fn draw_trail(
             continue;
         }
         let a = alpha.clamp(0.0, 1.0);
-        let (x0, y0) = ((col0 + col) * cw, (row0 + row) * ch);
+        let (x0, y0) = (ox + (col0 + col) * cw, oy + (row0 + row) * ch);
         for y in y0..(y0 + ch).min(height) {
             for x in x0..(x0 + cw).min(width) {
                 let px = &mut buf[y * width + x];
@@ -702,12 +737,12 @@ mod tests {
         let (cw, ch) = font.cell_size();
         let (w, h) = (4 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
-        draw_trail(&mut buf, w, h, &grid, 0, 0, &[(1, 0, 0.5)], &mut font);
+        draw_trail(&mut buf, w, h, &grid, 0, 0, 0, 0, &[(1, 0, 0.5)], &mut font);
         let inside = buf[(ch / 2) * w + cw + cw / 2];
         assert!((inside >> 16) & 0xFF > 0x40, "red blended in: {inside:06x}");
         assert_eq!(buf[0], 0, "cells outside the ghost untouched");
         // Out-of-range ghosts are ignored, not panicking.
-        draw_trail(&mut buf, w, h, &grid, 0, 0, &[(99, 99, 1.0)], &mut font);
+        draw_trail(&mut buf, w, h, &grid, 0, 0, 0, 0, &[(99, 99, 1.0)], &mut font);
     }
 
     /// A deterministic 4×8 cell whose every non-space glyph is a solid 2×2 block
@@ -816,6 +851,35 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         assert_eq!(buf[6 * w], 0x0000FF);
+    }
+
+    #[test]
+    fn hovered_link_span_draws_a_stripe_even_without_sgr_underline() {
+        let mut g = Grid::new(3, 1);
+        let mut p = AnsiParser::new();
+        // Plain red text, no SGR underline (4) anywhere.
+        p.advance(&mut g, b"\x1b[38;2;255;0;0mABC");
+        let (w, h) = (4usize * 3, 8usize);
+        let mut buf = vec![0u32; w * h];
+        // Hover span covers cols 0..=1 ('A','B') on row 0.
+        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, true, false, Some((0, 0, 1)), &mut MockFont);
+        assert_eq!(buf[6 * w], 0xFF0000, "col 0 underlined even with no ATTR_UNDERLINE");
+        assert_eq!(buf[6 * w + 4], 0xFF0000, "col 1 underlined too");
+        assert_eq!(buf[6 * w + 8], 0x000000, "col 2 is outside the hover span");
+    }
+
+    #[test]
+    fn hovered_link_underline_always_uses_fg_not_underline_color() {
+        let mut g = Grid::new(1, 1);
+        let mut p = AnsiParser::new();
+        // Already has SGR underline + a colored underline (58) set — hover
+        // must still win with plain fg, since it's a click affordance, not
+        // a text style the app chose.
+        p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[4m\x1b[58;2;0;0;255m ");
+        let (w, h) = (4usize, 8usize);
+        let mut buf = vec![0u32; w * h];
+        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, true, false, Some((0, 0, 0)), &mut MockFont);
+        assert_eq!(buf[6 * w], 0xFF0000);
     }
 
     #[cfg(feature = "l13")]
@@ -979,7 +1043,7 @@ mod tests {
         let (w, h) = (3 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
         // A split pane draws its grid at a cell offset; here (1, 1).
-        draw_grid(&mut buf, w, h, &g, 1, 1, false, false, &mut MockFont);
+        draw_grid(&mut buf, w, h, &g, 1, 1, 0, 0, false, false, None, &mut MockFont);
         assert_eq!(buf[ch * w + cw], 0x0000FF, "the cell is painted at the offset");
         assert_eq!(buf[0], 0, "the origin is left untouched (a divider gap)");
     }
@@ -991,7 +1055,7 @@ mod tests {
         let (cw, ch) = (4usize, 8usize);
         let (w, h) = (4 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
-        draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut MockFont);
+        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
         // The image composites as real pixels over its reserved half-block cell.
         assert_eq!(buf[0], 0xFF0000, "image pixel composited at the origin");
     }
@@ -1010,14 +1074,14 @@ mod tests {
         let (cw, ch) = (4usize, 8usize);
         let (w, h) = (4 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
-        draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut MockFont);
+        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
         assert_eq!(buf[0], 0xFF0000, "cell (0,0) shows the red half");
         assert_eq!(buf[cw], 0x00FF00, "cell (1,0) shows the green half");
         // Inference: a third placeholder with no diacritics continues the
         // row; column 2 is past the 2-wide placement, so it paints nothing.
         p.advance(&mut g, "\u{10EEEE}".as_bytes());
         let mut buf2 = vec![0u32; w * h];
-        draw_grid(&mut buf2, w, h, &g, 0, 0, false, false, &mut MockFont);
+        draw_grid(&mut buf2, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
         assert_eq!(buf2[2 * cw], 0, "index past the placement grid stays empty");
     }
 
@@ -1100,7 +1164,7 @@ mod tests {
             p.advance(&mut g, b"fi");
             let (w, h) = (cw * 2, chh);
             let mut buf = vec![0u32; w * h];
-            draw_grid(&mut buf, w, h, &g, 0, 0, false, false, &mut fc);
+            draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, false, false, None, &mut fc);
             (buf, cw, chh)
         };
         // Count glyph (non-background) pixels in cell column `c`.

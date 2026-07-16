@@ -41,15 +41,36 @@ impl Drop for RawModeGuard<'_> {
     }
 }
 
+/// The bytes [`restore_host_modes`] writes, pulled out as a constant so its
+/// contents are assertable without capturing stdout (see the `mod tests`
+/// below). Resets: application cursor keys (`?1`), the mouse-tracking modes
+/// and their SGR/urxvt/pixel encodings (`?1000`/`?1002`/`?1003`/`?1006`/
+/// `?1015`/`?1016`), focus reporting (`?1004`), bracketed paste (`?2004`),
+/// cursor visibility (`?25h`), the Kitty keyboard protocol stack (`<128u`
+/// pop, generous enough to empty any realistic stack, then `=0;1u` to force
+/// the resulting flags to 0 regardless of stack depth), xterm
+/// `modifyOtherKeys` (`>4;0m`), and the cursor shape (`0 q`, DECSCUSR
+/// default).
+const RESTORE_HOST_MODES: &[u8] = b"\x1b[?1l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?25h\
+    \x1b[<128u\x1b[=0;1u\x1b[>4;0m\x1b[0 q";
+
 /// Reset any host-terminal input modes a runtime may have relayed on the
-/// child's behalf (mouse, focus, bracketed paste) and ensure the cursor is
-/// visible, so a child that exited without disabling them can't leave the host
-/// stuck emitting mouse escapes on every click. Called once on shutdown.
+/// child's behalf (mouse, focus, bracketed paste, the Kitty keyboard
+/// protocol, xterm `modifyOtherKeys`, and the cursor shape) and ensure the
+/// cursor is visible, so a child that exited without disabling them can't
+/// leave the host stuck misinterpreting the next program's keys or clicks.
+/// Called once on shutdown.
+///
+/// The Kitty/modifyOtherKeys/DECSCUSR resets matter as much as the
+/// mouse/paste ones already here: a child that pushed the Kitty keyboard
+/// protocol (`CSI > flags u`, e.g. neovim) and got killed rather than
+/// exiting cleanly leaves the *host* terminal's key encoding in that mode —
+/// the next thing typed at the host's own prompt (Enter, Esc, Backspace) can
+/// come through as the Kitty `CSI u` encoding instead of the plain bytes the
+/// host shell expects.
 pub(crate) fn restore_host_modes() {
     let mut out = std::io::stdout();
-    let _ = out.write_all(
-        b"\x1b[?1l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?25h",
-    );
+    let _ = out.write_all(RESTORE_HOST_MODES);
     let _ = out.flush();
 }
 
@@ -293,5 +314,39 @@ pub(crate) fn render_once(grid: &Mutex<Grid>, st: &mut RenderState) {
         st.last_cursor = Some(frame.cursor);
         draw(&frame, true);
         st.last_frame = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_host_modes_resets_kitty_modify_keys_and_cursor_shape() {
+        // A child that pushed the Kitty keyboard protocol / modifyOtherKeys /
+        // a custom cursor shape and then got killed (rather than exiting
+        // cleanly and resetting them itself) used to leave the *host*
+        // terminal stuck in that mode — the next keystroke at the host's own
+        // prompt could come through Kitty-encoded instead of as plain bytes.
+        let s = String::from_utf8_lossy(RESTORE_HOST_MODES);
+        assert!(s.contains("\x1b[<128u"), "must pop the Kitty keyboard flag stack: {s:?}");
+        assert!(
+            s.contains("\x1b[=0;1u"),
+            "must force Kitty flags to 0 regardless of stack depth: {s:?}"
+        );
+        assert!(s.contains("\x1b[>4;0m"), "must reset xterm modifyOtherKeys: {s:?}");
+        assert!(s.contains("\x1b[0 q"), "must reset the cursor shape (DECSCUSR default): {s:?}");
+    }
+
+    #[test]
+    fn restore_host_modes_still_resets_mouse_focus_paste_and_cursor_visibility() {
+        // Regression guard for the modes this already handled before adding
+        // the Kitty/modifyOtherKeys/DECSCUSR resets above.
+        let s = String::from_utf8_lossy(RESTORE_HOST_MODES);
+        for mode in ["?1000l", "?1002l", "?1003l", "?1004l", "?1006l", "?1015l", "?1016l", "?2004l"]
+        {
+            assert!(s.contains(mode), "must reset {mode}: {s:?}");
+        }
+        assert!(s.contains("?25h"), "must leave the cursor visible: {s:?}");
     }
 }

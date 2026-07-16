@@ -11,5 +11,12 @@ license = "MIT"
 # Cargo resolves every optional dependency's manifest to build the lockfile
 # regardless of active features. A git dependency only needs network access
 # to resolve, which CI has.
-rusty_lsp = { git = "https://github.com/baileyrd/rusty_lsp", tag = "v0.1.0" }
+#
+# Pinned by commit rev rather than `tag = "v0.1.0"`: a git tag is just a ref
+# and can be force-moved (deliberately or by an upstream mistake) to point at
+# a different commit without the version string changing, which would change
+# what every downstream build compiles against with no local diff to review.
+# A rev is the actual object id, so it can't be silently repointed. (Verified
+# via `git ls-remote` that this is the commit v0.1.0 currently resolves to.)
+rusty_lsp = { git = "https://github.com/baileyrd/rusty_lsp", rev = "3bdbdb44046cd7e58227543eca052cc2fe564977" }
 serde_json = "1"

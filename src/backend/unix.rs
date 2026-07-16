@@ -268,18 +268,29 @@ struct UnixHandle {
 impl crate::backend::BackendHandle for UnixHandle {
     fn read(&mut self) -> Result<Vec<u8>, std::io::Error> {
         let mut buf = vec![0u8; 4096];
-        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            // The shell closing the slave surfaces as EIO on the master; treat
-            // that as a clean end-of-file rather than a hard error.
-            if err.raw_os_error() == Some(libc::EIO) {
-                return Ok(Vec::new());
+        loop {
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                // The shell closing the slave surfaces as EIO on the master; treat
+                // that as a clean end-of-file rather than a hard error.
+                if err.raw_os_error() == Some(libc::EIO) {
+                    return Ok(Vec::new());
+                }
+                // A signal landing on this thread mid-syscall (a profiler, a
+                // debugger, anything installing a non-`SA_RESTART` handler) is
+                // not a real read error; the GUI reader thread maps any `Err`
+                // here to "child exited" and closes the tab, so an unrelated
+                // signal used to be able to kill a perfectly healthy pane.
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
             }
-            return Err(err);
+            buf.truncate(n as usize);
+            return Ok(buf);
         }
-        buf.truncate(n as usize);
-        Ok(buf)
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
@@ -340,6 +351,47 @@ impl crate::backend::BackendHandle for UnixHandle {
     fn pty_fd(&self) -> RawFd {
         self.fd
     }
+
+    fn reap_exit_status(&mut self) -> Option<i32> {
+        let pid = self.child?;
+        // A bounded, mostly-non-blocking wait: the caller already knows the
+        // child exited (read-EOF, or a SIGCHLD this handle's watcher won the
+        // race for) before calling this, so the very first `WNOHANG` poll is
+        // expected to succeed — the sleep loop only guards the rare case
+        // where the two events land in the opposite order.
+        for _ in 0..50 {
+            let mut status: libc::c_int = 0;
+            // SAFETY: WNOHANG never blocks.
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                self.child = None; // reaped: Drop must not try again
+                return Some(exit_code_from_wait_status(status));
+            }
+            if r < 0 {
+                // ECHILD: something else (the SIGCHLD watcher) already
+                // reaped it and won the race. Nothing left to report here.
+                self.child = None;
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    fn child_pid(&self) -> Option<libc::pid_t> {
+        self.child
+    }
+}
+
+/// Convert a `waitpid` status into a `std::process::exit`-compatible value:
+/// the child's own exit code on a normal exit, or 128+signal (the sh/bash
+/// convention) on a signal death.
+pub(crate) fn exit_code_from_wait_status(status: libc::c_int) -> i32 {
+    if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        128 + (status & 0x7f)
+    }
 }
 
 impl Drop for UnixHandle {
@@ -377,7 +429,7 @@ impl Drop for UnixHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::split_shell_words;
+    use super::{exit_code_from_wait_status, split_shell_words};
 
     #[test]
     fn bare_program_is_a_single_word() {
@@ -404,5 +456,115 @@ mod tests {
     fn empty_string_yields_no_words() {
         assert!(split_shell_words("").is_empty());
         assert!(split_shell_words("   ").is_empty());
+    }
+
+    #[test]
+    fn wait_status_decodes_a_normal_exit_code() {
+        // A normal exit packs the code into bits 8-15, low 7 bits (the signal
+        // field) all zero; libc's WEXITSTATUS-equivalent shift/mask.
+        assert_eq!(exit_code_from_wait_status(0), 0);
+        assert_eq!(exit_code_from_wait_status(42 << 8), 42);
+        assert_eq!(exit_code_from_wait_status(255 << 8), 255);
+    }
+
+    #[test]
+    fn wait_status_decodes_a_signal_death_as_128_plus_signal() {
+        // Killed by a signal: the low 7 bits carry the signal number (bit
+        // 0x80, set on a core dump, must not leak into the reported code).
+        assert_eq!(exit_code_from_wait_status(libc::SIGKILL), 128 + libc::SIGKILL);
+        assert_eq!(exit_code_from_wait_status(libc::SIGSEGV | 0x80), 128 + libc::SIGSEGV);
+    }
+
+    /// Smoke test: a real child spawns on a real PTY, its output reaches the
+    /// reader, and `reap_exit_status` reports the exit code it actually used
+    /// — the same shape of coverage `backend::windows` already has for
+    /// ConPTY, previously missing on the Unix side.
+    #[test]
+    fn spawned_child_output_reaches_the_reader_and_its_exit_code_is_reaped() {
+        use crate::backend::Backend as _;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let mut h = super::UnixBackend
+            .spawn_shell(80, 24, Some("/bin/sh"), &["-c".into(), "echo boot_ok; exit 7".into()], None)
+            .expect("spawn");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut rh = h.try_clone().expect("clone read handle");
+        let out2 = Arc::clone(&out);
+        let reader = std::thread::spawn(move || {
+            loop {
+                match rh.read() {
+                    Ok(b) if b.is_empty() => break, // EOF: the child exited
+                    Ok(b) => out2.lock().unwrap().extend_from_slice(&b),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        reader.join().expect("reader thread panicked");
+        let buf = out.lock().unwrap().clone();
+        assert!(
+            buf.windows(7).any(|w| w == b"boot_ok"),
+            "no child output: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // `reap_exit_status` polls WNOHANG internally, so this alone bounds
+        // the wait rather than needing our own deadline loop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(code) = h.reap_exit_status() {
+                assert_eq!(code, 7);
+                return;
+            }
+            assert!(Instant::now() < deadline, "reap_exit_status never reported an exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A cloned handle round-trips bytes written to the child back out
+    /// through the read side — `try_clone` gives the read/write split its
+    /// own independent fd, not just a second reference to the same one.
+    #[test]
+    fn a_cloned_handle_can_write_and_read_back_through_the_same_child() {
+        use crate::backend::Backend as _;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let h = super::UnixBackend
+            .spawn_shell(80, 24, Some("/bin/cat"), &[], None)
+            .expect("spawn /bin/cat");
+        let mut read_handle = h.try_clone().expect("clone read handle");
+        let mut write_handle = h.try_clone().expect("clone write handle");
+        // NOTE: `h` must stay alive until the assertions pass — the owning
+        // handle's Drop SIGHUPs (then SIGKILLs) the child, so dropping it
+        // early races cat's echo and makes the test flaky.
+
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let out2 = Arc::clone(&out);
+        std::thread::spawn(move || {
+            loop {
+                match read_handle.read() {
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => out2.lock().unwrap().extend_from_slice(&b),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        write_handle.write(b"hello cat\n").expect("write");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if out.lock().unwrap().windows(9).any(|w| w == b"hello cat") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cat never echoed the input back: {:?}",
+                String::from_utf8_lossy(&out.lock().unwrap())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

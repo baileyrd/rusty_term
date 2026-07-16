@@ -1587,7 +1587,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rusty_lsp"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rusty_lsp?tag=v0.1.0#3bdbdb44046cd7e58227543eca052cc2fe564977"
+source = "git+https://github.com/baileyrd/rusty_lsp?rev=3bdbdb44046cd7e58227543eca052cc2fe564977#3bdbdb44046cd7e58227543eca052cc2fe564977"
 dependencies = [
  "serde",
  "serde_json",

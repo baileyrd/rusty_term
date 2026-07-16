@@ -170,11 +170,17 @@ features — on by default, ignored for fonts without them). `cursor_style`
 child can still override both at runtime via DECSCUSR.
 
 The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
-actions are `copy`, `paste`, `search`, `new_tab`, `close_tab`, `next_tab`,
-`prev_tab`, `split_right`, `split_down`, `focus_next`, `open_config`, `open_settings`,
-`scroll_page_up`, `scroll_page_down`, `scroll_prompt_up`, `scroll_prompt_down`;
-a chord is `+`-separated modifiers (`ctrl`/`shift`/`alt`) plus one key — a
-printable character or `comma`/`tab`/`pageup`/`pagedown`.
+actions are `copy`, `paste`, `new_tab`, `new_window`, `fold_output`,
+`close_tab`, `next_tab`, `prev_tab`, `open_config`, `open_settings`, `search`,
+`open_links`, `copy_mode`, `broadcast`, `split_right`, `split_down`,
+`focus_next`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`resize_left`, `resize_right`, `resize_up`, `resize_down`, `zoom_pane`,
+`scroll_page_up`, `scroll_page_down`, `scroll_prompt_up`, `scroll_prompt_down`,
+`toggle_fullscreen`, `font_size_up`, `font_size_down`, `font_size_reset`; a
+chord is `+`-separated modifiers (`ctrl`/`shift`/`alt`) plus one key — a
+printable character, or `comma`/`tab`/`pageup`/`pagedown`/`left`/`right`/`up`/
+`down`/`space`/`home`/`end`/`enter` (or `return`)/`insert` (or `ins`)/`delete`
+(or `del`)/`escape` (or `esc`)/`backspace`/`f1`-`f12`.
 
 #### Live reload
 
@@ -190,28 +196,34 @@ template on first use — edit, save, watch it apply.
 #### Window backend controls (`--gui`)
 
 The window is borderless and draws its own chrome: a one-row bar across the
-top with the session **tabs** (each carrying a `×` close button), a `+` new-tab
-button, a `▾` shell-launcher / settings dropdown, and minimize/maximize/
-close. Each tab holds one or more shell sessions arranged as split panes. Drag the empty bar to move the
+top with the session **tabs** (sized to their titles, shrinking together as
+the strip fills; truncated titles end in `…`, and the `×` close button shows
+on the active and hovered tab), a `+` new-tab button, a `▾` shell-launcher /
+settings dropdown, and minimize/maximize/close. Each tab holds one or more
+shell sessions arranged as split panes. Drag the empty bar to move the
 window (double-click it to toggle maximize), and drag the thin band at the
 window edges to resize.
 
 | Input | Action |
 |-------|--------|
-| Left-drag | Select text (highlighted by inversion). |
-| Ctrl+click | Open the OSC 8 hyperlink under the cursor. |
+| Left-drag | Select text (highlighted by inversion); double/triple-click first to extend by word/line as you drag, and drag past a pane's top/bottom edge to auto-scroll. |
+| Ctrl+hover / Ctrl+click | Underline + pointer cursor over a hyperlink (OSC 8 or a detected plain-text URL), Ctrl+click opens it. |
 | Ctrl+Shift+C | Copy the selection to the system clipboard. |
 | Ctrl+Shift+V | Paste the clipboard into the shell (bracketed-paste aware). |
-| Ctrl+Shift+F | Open the in-window search bar (incremental match highlighting). |
+| Ctrl+Shift+F | Open the in-window search bar (incremental match highlighting; Ctrl+R toggles regex, Alt+C toggles case sensitivity, Ctrl+V/middle-click pastes into the query). |
 | Ctrl+Shift+, | Open the config file in your editor (created from a template on first use). |
-| Ctrl+, / `▾` menu | Open the in-app **settings page** (theme, font size, cursor, blink, ligatures, scrollback, default shell) — `←`/`→` change a row, `Esc` saves & closes. |
+| Ctrl+, / `▾` menu | Toggle the in-app **settings page** (it opens as its own tab in the strip): an Appearance / Terminal / Window sidebar covering theme, font, cursor, contrast, shell, scrollback, clipboard, padding, opacity, launch size, and more, each with a one-line description. `Tab` switches category, `↑`/`↓` pick a row, `←`/`→` (or a click on the value) change it — `Shift` steps numbers ×10, `Home`/`End` jump to the bound, `Enter` (or a typed digit) edits a number directly — type (or `/` / `Ctrl+F`) to search across every category, the wheel scrolls, `Esc` saves & closes; changes apply live. |
 | Ctrl+Shift+T / `+` | Open a new tab with the configured shell; the `▾` dropdown launches any detected shell (PowerShell, cmd, WSL, bash, …) in a new tab instead. |
-| Ctrl+Shift+W / tab `×` | Close the focused pane, or the whole tab via its `×` button (the last pane / tab closes the window). |
-| Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs. |
+| Ctrl+Shift+W / tab `×` / tab middle-click | Close the focused pane, or the whole tab via its `×` button or a middle-click on the tab (the last pane / tab closes the window). |
+| Ctrl+Tab / Ctrl+Shift+Tab | Cycle through tabs; when there are more tabs than fit, the strip scrolls to keep the active one visible and a `»N` indicator (click to advance) shows how many are hidden. |
+| Ctrl+Alt+1…9 | Jump straight to that tab (9 = the last tab, browser-style). |
+| Tab drag | Drag a tab along the strip to reorder it (it trades places as you cross a neighbor's midpoint); a plain click never reorders. |
 | Ctrl+Shift+D / Ctrl+Shift+E | Split the focused pane right / down. |
 | Ctrl+Shift+J | Move focus to the next pane. |
 | Shift+PageUp / PageDown | Scroll the scrollback by a page. |
 | Ctrl+Shift+PageUp / PageDown | Jump to the previous / next shell prompt (OSC 133). |
+| F11 | Toggle fullscreen (not for the quake window, which docks to the monitor edge instead). |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Zoom the font size up / down / reset (matches Chrome/VS Code/iTerm2/Windows Terminal). |
 
 Every shortcut above is rebindable in the `[keys]` config section (below).
 
@@ -220,8 +232,12 @@ and `cursor_blink` config keys, and the child can change them at runtime via
 DECSCUSR (`CSI Sp q`); a tab closes when its shell exits, and the window closes
 with the last tab. The window is a full participant in the input and graphics
 protocols: when a TUI app enables mouse tracking (`?1000`/`?1002`/`?1003`,
-SGR/1006) clicks and the wheel are reported to it as SGR-encoded events; OSC 52
-reads and writes the system clipboard; IME pre-edit composes inline; OSC 9/777
+SGR/1006) clicks and the wheel are reported to it as SGR-encoded events.
+Holding **Shift** during a click, drag, or scroll always bypasses app mouse
+tracking for that event — the standard xterm/iTerm2 escape hatch for
+selecting text or scrolling back while a full-screen app (vim, tmux, htop)
+has grabbed the mouse. OSC 52 reads and writes the system clipboard; IME
+pre-edit composes inline; OSC 9/777
 desktop notifications are forwarded to the OS; and Sixel / Kitty / iTerm2
 (`OSC 1337`) images render over the grid — pixel-for-pixel in the CPU renderer,
 with a half-block fallback in the GPU and TUI paths.

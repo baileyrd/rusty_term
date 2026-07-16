@@ -30,6 +30,25 @@ pub enum LaunchMode {
     Fullscreen,
 }
 
+/// OSC 52 clipboard policy (`clipboard` config key). A child program can ask
+/// the terminal to read the system clipboard back to it (`52;c;?`) — with no
+/// gate, `curl https://evil | cat` printing that escape sequence silently
+/// hands over whatever the user last copied (passwords, tokens). Mirrors the
+/// xterm `allowWindowOps` / kitty `clipboard_control` default posture: writes
+/// are allowed (a program setting the clipboard is unlikely to be malicious
+/// and is the common case — copying a command's output over SSH), reads are
+/// not, unless explicitly opted into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipboardPolicy {
+    /// Neither OSC 52 sets nor queries touch the system clipboard.
+    Off,
+    /// Sets are applied; queries are ignored. Default.
+    #[default]
+    WriteOnly,
+    /// Sets and queries are both honored.
+    ReadWrite,
+}
+
 /// One `[profile.<name>]` bundle: everything a "launch this kind of tab"
 /// action needs. Absent keys fall back to the top-level config.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -79,6 +98,10 @@ pub struct Config {
     /// has no alpha channel to composite through, so it stays fully opaque
     /// regardless of this setting (see `gui::gpu`'s uniform buffer).
     pub opacity: Option<f32>,
+    /// Inner margin in pixels around the terminal content, below the chrome
+    /// bar (`[window] padding`; default 8, 0 restores the flush layout). The
+    /// band paints in the theme background so content reads as inset.
+    pub padding: Option<u32>,
     /// Implicit bidi (`bidi = "auto"`): UAX #9 reordering of RTL-containing
     /// rows at render time (`"off"`/unset disables; storage stays logical
     /// order either way — see docs/research/bidi-scoping-2026-07.md).
@@ -90,6 +113,11 @@ pub struct Config {
     /// plain text (`copy_html`; default on). Rich-paste targets (docs, chat)
     /// get colors; plain editors still read the text flavor.
     pub copy_html: Option<bool>,
+    /// OSC 52 clipboard policy (`clipboard`; default `"write-only"` — see
+    /// [`ClipboardPolicy`]). Only consulted by the windowed front-end, which
+    /// is the one that owns the system clipboard; the TUI relays OSC 52 to
+    /// the host terminal, whose own policy applies.
+    pub clipboard: Option<ClipboardPolicy>,
     /// Height of the quake (dropdown) window as a fraction of the monitor's
     /// height, `0.1..=1.0` (`[window] quake_height`; default 0.4). The window
     /// itself is created/toggled with `rusty_term ctl quake`.
@@ -178,23 +206,22 @@ impl Config {
     /// warnings for anything skipped. A missing file yields pure defaults and
     /// no warnings; an unreadable *explicitly requested* file yields a warning.
     pub fn load(args: &[String]) -> (Config, Vec<String>) {
-        let (path, explicit) = match resolve_path(args) {
+        let (resolved, mut warnings) = resolve_path(args);
+        let (path, explicit) = match resolved {
             Some(p) => p,
-            None => return (Config::default(), Vec::new()),
+            None => return (Config::default(), warnings),
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let (cfg, mut warnings) = parse(&text);
-                for w in &mut warnings {
-                    *w = format!("{}: {}", path.display(), w);
-                }
+                let (cfg, parse_warnings) = parse(&text);
+                warnings.extend(parse_warnings.into_iter().map(|w| format!("{}: {}", path.display(), w)));
                 (cfg, warnings)
             }
-            Err(e) if explicit => (
-                Config::default(),
-                vec![format!("config {}: {}", path.display(), e)],
-            ),
-            Err(_) => (Config::default(), Vec::new()), // default path absent: fine
+            Err(e) if explicit => {
+                warnings.push(format!("config {}: {}", path.display(), e));
+                (Config::default(), warnings)
+            }
+            Err(_) => (Config::default(), warnings), // default path absent: fine
         }
     }
 
@@ -204,7 +231,7 @@ impl Config {
     /// or create it (`Ctrl+Shift+,`). `None` only when no config root exists
     /// (e.g. `%APPDATA%`/`$HOME` unset).
     pub fn file_path(args: &[String]) -> Option<PathBuf> {
-        if let Some((p, _)) = resolve_path(args) {
+        if let (Some((p, _)), _) = resolve_path(args) {
             return Some(p);
         }
         Some(default_config_dir()?.join("rusty_term").join("config.toml"))
@@ -231,10 +258,12 @@ impl Config {
 # ligatures = false        # disable programming-font ligatures (default on)
 # launch_mode = "maximized" # or "fullscreen"
 # opacity = 0.9            # 0.0-1.0; GPU renderer (--features gui-gpu) only
+# padding = 8               # pixels of inner margin around the terminal (0 = flush)
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
 # quake_hotkey = "win+grave" # global hotkey toggling the quake window (Windows only)
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
+# clipboard = "write-only"  # OSC 52 policy: "off", "write-only" (default), or "read-write"
 # cursor_trail = true       # fading trail when the cursor jumps
 # bidi = "auto"             # reorder RTL text at render time (UAX #9)
 
@@ -247,26 +276,58 @@ impl Config {
     }
 }
 
+/// A `--flag value` or `--flag=value` CLI argument's value, first match wins.
+/// Shared by the initial CLI parse (`main.rs`) and both front-ends' live
+/// config-reload paths, so a flag like `--profile` is read identically
+/// whether it's being applied at startup or reapplied after a reload.
+pub fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let eq_prefix = format!("{name}=");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            return it.next().map(String::as_str);
+        }
+        if let Some(v) = a.strip_prefix(eq_prefix.as_str()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// The config file to read, if any, and whether the user *named* it (CLI/env)
 /// rather than us probing the platform default. Explicit paths are returned
 /// even if unreadable so the caller can warn; the default path only when it
-/// exists.
-fn resolve_path(args: &[String]) -> Option<(PathBuf, bool)> {
+/// exists. A `--config` given with no following path is *not* treated as
+/// "config disabled" — it used to `return` `None` immediately from here,
+/// silently skipping the `$RUSTY_TERM_CONFIG` and platform-default fallbacks
+/// below and leaving the user's real config unloaded with no explanation.
+/// Instead it warns and falls through to the normal discovery chain.
+fn resolve_path(args: &[String]) -> (Option<(PathBuf, bool)>, Vec<String>) {
+    let mut warnings = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--config" {
-            return it.next().map(|p| (PathBuf::from(p), true));
+            match it.next() {
+                Some(p) => return (Some((PathBuf::from(p), true)), warnings),
+                None => {
+                    warnings.push(
+                        "--config given with no path; checking $RUSTY_TERM_CONFIG and the default location instead"
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
         }
         if let Some(p) = a.strip_prefix("--config=") {
-            return Some((PathBuf::from(p), true));
+            return (Some((PathBuf::from(p), true)), warnings);
         }
     }
     if let Some(p) = std::env::var_os("RUSTY_TERM_CONFIG") {
-        return Some((PathBuf::from(p), true));
+        return (Some((PathBuf::from(p), true)), warnings);
     }
-    let base = default_config_dir()?;
+    let Some(base) = default_config_dir() else { return (None, warnings) };
     let p = base.join("rusty_term").join("config.toml");
-    p.exists().then_some((p, false))
+    (p.exists().then_some((p, false)), warnings)
 }
 
 /// Platform config root: `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` (default
@@ -685,6 +746,16 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             }
             cfg.font_size = Some(px as f32);
         }
+        ("window", "padding") => {
+            let px = match value {
+                Value::Int(i) => i,
+                _ => return Err(format!("{key}: expected an integer pixel count")),
+            };
+            if !(0..=64).contains(&px) {
+                return Err(format!("{key}: {px} out of range (0-64)"));
+            }
+            cfg.padding = Some(px as u32);
+        }
         ("window", "opacity") => {
             let v = match value {
                 Value::Float(f) => f,
@@ -722,6 +793,19 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.theme.palette16[n] = expect_color(k, value)?;
         }
         ("", "copy_html") => cfg.copy_html = Some(expect_bool(key, value)?),
+        ("", "clipboard") => {
+            let name = expect_str(key, value)?;
+            cfg.clipboard = Some(match name.to_ascii_lowercase().as_str() {
+                "off" | "none" => ClipboardPolicy::Off,
+                "write-only" | "write_only" | "writeonly" => ClipboardPolicy::WriteOnly,
+                "read-write" | "read_write" | "readwrite" | "rw" => ClipboardPolicy::ReadWrite,
+                _ => {
+                    return Err(format!(
+                        "unknown {key} `{name}` (off, write-only, or read-write)"
+                    ));
+                }
+            });
+        }
         ("", "cursor_trail") => cfg.cursor_trail = Some(expect_bool(key, value)?),
         ("", "bidi") => {
             cfg.bidi = Some(match expect_str(key, value)?.as_str() {
@@ -977,6 +1061,32 @@ impl Config {
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.name.eq_ignore_ascii_case(name))
     }
+
+    /// Layer the named `[profile.<name>]` bundle onto `self` (shell/cwd/theme,
+    /// each only where the profile actually sets it). The single source of
+    /// truth for applying `--profile`, used both for the initial CLI parse
+    /// and for reapplying the same override after a live config reload —
+    /// reload re-reads the file from scratch, and without reapplying the
+    /// profile here, a running session's `--profile`-selected theme would
+    /// silently revert to the file's top-level default on every save.
+    /// Returns a warning (not applied) if `name` doesn't match any profile.
+    pub fn apply_profile(&mut self, name: &str) -> Option<String> {
+        match self.profile(name).cloned() {
+            Some(p) => {
+                if p.shell.is_some() {
+                    self.shell = p.shell;
+                }
+                if p.cwd.is_some() {
+                    self.cwd = p.cwd;
+                }
+                if let Some(t) = p.theme {
+                    self.theme = t;
+                }
+                None
+            }
+            None => Some(format!("no profile named `{name}` in the config")),
+        }
+    }
 }
 
 /// Parse a session file: each `[tab]` (or `[tab.<label>]`) section starts a
@@ -1130,6 +1240,44 @@ color15 = "ffffff"
     }
 
     #[test]
+    fn apply_profile_layers_only_the_fields_the_profile_actually_sets() {
+        let (mut cfg, warns) = parse(
+            "shell = \"/bin/zsh\"\ntheme = \"nord\"\n[profile.dev]\ncwd = \"/src\"\ntheme = \"gruvbox-dark\"\n",
+        );
+        assert!(warns.is_empty(), "{warns:?}");
+        let base_shell = cfg.shell.clone();
+        let base_theme = cfg.theme;
+
+        let w = cfg.apply_profile("dev");
+        assert!(w.is_none(), "{w:?}");
+        // The profile didn't set `shell`, so the top-level value survives.
+        assert_eq!(cfg.shell, base_shell);
+        assert_eq!(cfg.cwd.as_deref(), Some(std::path::Path::new("/src")));
+        // The profile's theme wins over the top-level one.
+        assert_ne!(cfg.theme.bg, base_theme.bg);
+    }
+
+    #[test]
+    fn apply_profile_warns_and_leaves_config_untouched_for_an_unknown_name() {
+        let (mut cfg, warns) = parse("shell = \"/bin/zsh\"\n");
+        assert!(warns.is_empty());
+        let before = cfg.shell.clone();
+        let w = cfg.apply_profile("does-not-exist");
+        assert_eq!(w, Some("no profile named `does-not-exist` in the config".to_string()));
+        assert_eq!(cfg.shell, before);
+    }
+
+    #[test]
+    fn flag_value_reads_both_space_and_equals_forms() {
+        let space = vec!["--profile".to_string(), "dev".to_string()];
+        assert_eq!(flag_value(&space, "--profile"), Some("dev"));
+        let eq = vec!["--profile=dev".to_string()];
+        assert_eq!(flag_value(&eq, "--profile"), Some("dev"));
+        let absent = vec!["--other".to_string()];
+        assert_eq!(flag_value(&absent, "--profile"), None);
+    }
+
+    #[test]
     fn session_file_parses_tabs_in_order() {
         let dir = std::env::temp_dir().join(format!("rt_session_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1274,6 +1422,24 @@ color15 = "ffffff"
     }
 
     #[test]
+    fn clipboard_key_parses_all_policies_and_rejects_unknown() {
+        let (cfg, warns) = parse("clipboard = \"off\"\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.clipboard, Some(ClipboardPolicy::Off));
+        let (cfg2, warns2) = parse("clipboard = \"write-only\"\n");
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert_eq!(cfg2.clipboard, Some(ClipboardPolicy::WriteOnly));
+        let (cfg3, warns3) = parse("clipboard = \"read-write\"\n");
+        assert!(warns3.is_empty(), "{warns3:?}");
+        assert_eq!(cfg3.clipboard, Some(ClipboardPolicy::ReadWrite));
+        let (cfg4, warns4) = parse("clipboard = \"bogus\"\n");
+        assert_eq!(cfg4.clipboard, None);
+        assert_eq!(warns4.len(), 1);
+        let (cfg5, _) = parse("");
+        assert_eq!(cfg5.clipboard, None); // default is write-only at the consuming site
+    }
+
+    #[test]
     fn quake_height_parses_and_rejects_out_of_range() {
         let (cfg, warns) = parse("[window]\nquake_height = 0.3\n");
         assert!(warns.is_empty(), "{warns:?}");
@@ -1354,9 +1520,28 @@ color15 = "ffffff"
     #[test]
     fn cli_flag_resolves_explicit_path() {
         let args = vec!["--config".to_string(), "x.toml".to_string()];
-        assert_eq!(resolve_path(&args), Some((PathBuf::from("x.toml"), true)));
+        assert_eq!(resolve_path(&args), (Some((PathBuf::from("x.toml"), true)), Vec::new()));
         let args = vec!["--config=y.toml".to_string()];
-        assert_eq!(resolve_path(&args), Some((PathBuf::from("y.toml"), true)));
+        assert_eq!(resolve_path(&args), (Some((PathBuf::from("y.toml"), true)), Vec::new()));
+    }
+
+    #[test]
+    fn valueless_config_flag_warns_and_falls_back_to_discovery() {
+        // `--config` with nothing after it used to `return None` immediately,
+        // skipping the `$RUSTY_TERM_CONFIG` / platform-default fallbacks and
+        // silently leaving the user's default config unloaded. It must warn
+        // and still try those instead.
+        let args = vec!["--config".to_string()];
+        let (resolved, warnings) = resolve_path(&args);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("--config"), "{warnings:?}");
+        // With no env var and (most likely) no default config file present in
+        // a test environment, this resolves to the platform-default path
+        // absent — never the old unconditional `None` from the CLI branch
+        // alone. We can't assert the exact platform-default result here
+        // without touching the real filesystem/env, so just confirm the
+        // warning fired and the function didn't panic reaching this far.
+        let _ = resolved;
     }
 
     #[test]

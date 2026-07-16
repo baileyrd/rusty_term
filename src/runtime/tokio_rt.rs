@@ -111,20 +111,30 @@ fn open_tty_nonblocking() -> std::io::Result<OwnedFd> {
 /// Read whatever is available from a non-blocking fd. `Ok(empty)` signals EOF
 /// (a zero-length read, or `EIO` on a PTY master after the slave closed);
 /// `EAGAIN` surfaces as `WouldBlock` so the caller's `AsyncFd` guard re-arms.
+/// `EINTR` (a signal landing on this thread mid-syscall — a profiler, a
+/// debugger, anything installing a non-`SA_RESTART` handler) is retried
+/// rather than surfaced as a hard error: the parser/input tasks treat any
+/// `Err` here as "child exited" and tear down the whole session, so an
+/// unrelated signal used to be able to kill a perfectly healthy terminal.
 #[cfg(unix)]
 fn read_nonblocking(fd: RawFd) -> std::io::Result<Vec<u8>> {
     let mut buf = [0u8; 4096];
-    // SAFETY: writing into a stack buffer of the given length.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        // The shell closing the slave surfaces as EIO on the master: clean EOF.
-        if err.raw_os_error() == Some(libc::EIO) {
-            return Ok(Vec::new());
+    loop {
+        // SAFETY: writing into a stack buffer of the given length.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            // The shell closing the slave surfaces as EIO on the master: clean EOF.
+            if err.raw_os_error() == Some(libc::EIO) {
+                return Ok(Vec::new());
+            }
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
         }
-        return Err(err);
+        return Ok(buf[..n as usize].to_vec());
     }
-    Ok(buf[..n as usize].to_vec())
 }
 
 /// Issue one `write`, retrying `EINTR`. `EAGAIN` surfaces as `WouldBlock`.
@@ -163,13 +173,21 @@ async fn write_all(afd: &AsyncFd<FdRef>, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Build a small multi-threaded tokio runtime and drive the terminal on it.
+/// Runs the TUI to completion and returns the child shell's exit status as a
+/// `std::process::exit`-compatible value (the caller is expected to exit the
+/// process with it) — its own exit code on a normal exit, 128+signal on a
+/// signal death, or `0` if it couldn't be determined (the rare case where
+/// neither read-EOF nor a SIGCHLD race let either side reap it before
+/// shutdown). Without threading this through, `rusty_term -e false` (or a
+/// child whose spawn itself failed, e.g. a bad `--cwd`) always looked like
+/// success to a script checking `$?`.
 pub fn run(
     backend: Box<dyn Backend>,
     grid: Arc<Mutex<Grid>>,
     init_cols: u16,
     init_rows: u16,
     config: crate::config::Config,
-) -> std::io::Result<()> {
+) -> std::io::Result<i32> {
     // Spawn the shell *before* the runtime exists. On Unix this keeps the
     // fork single-threaded: POSIX only guarantees async-signal-safe calls
     // between fork and exec in a multithreaded process, and a worker thread
@@ -193,20 +211,42 @@ pub fn run(
 /// Live config reload for the TUI: watch the config file and, on each save,
 /// re-read it and apply what can change live — theme (parser palette + grid
 /// recolor) and the scrollback cap. Shell/font/window-size remain launch-time
-/// choices. Wakes the render loop through `frame` for a repaint; reload
-/// warnings go to stderr like startup ones (cosmetic in raw mode, but real).
+/// choices. Wakes the render loop through `frame` for a repaint.
+///
+/// `Config::load` only knows the reload's own `--config <path>` args, so a
+/// `--profile` given at launch is reapplied explicitly below — otherwise a
+/// running session's profile-selected theme would silently revert to the
+/// file's top-level default on every save (the same fix as `gui::window`'s
+/// `reload_config`, sharing `Config::apply_profile`).
+///
+/// Reload warnings can't just `eprintln!`: this runs with the host terminal
+/// in raw mode mid-session, so a bare `\n` staircases instead of returning to
+/// column 1, and — worse — the renderer's dirty-row diffing has no way to
+/// know those rows now need repainting, so the stray text can persist
+/// indefinitely rather than being overwritten by the next frame. Printing
+/// with an explicit `\r\n` and forcing a full repaint (`force_full_repaint`)
+/// fixes both.
 fn watch_config(parser: Arc<Mutex<AnsiParser>>, grid: Arc<Mutex<Grid>>, frame: Arc<Notify>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = crate::config::Config::file_path(&args) else {
         return;
     };
+    let profile = crate::config::flag_value(&args, "--profile").map(str::to_string);
     let reload_args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
     crate::config::watch(path, move || {
-        let (new, warnings) = crate::config::Config::load(&reload_args);
-        for w in &warnings {
-            eprintln!("rusty_term: {w}");
+        let (mut new, mut warnings) = crate::config::Config::load(&reload_args);
+        if let Some(name) = &profile
+            && let Some(w) = new.apply_profile(name)
+        {
+            warnings.push(w);
         }
         let mut g = grid.lock();
+        if !warnings.is_empty() {
+            for w in &warnings {
+                eprint!("rusty_term: {w}\r\n");
+            }
+            g.force_full_repaint();
+        }
         let old = parser.lock().retheme(new.theme);
         if old != new.theme {
             g.retheme(&old, &new.theme);
@@ -220,10 +260,10 @@ fn watch_config(parser: Arc<Mutex<AnsiParser>>, grid: Arc<Mutex<Grid>>, frame: A
 #[cfg(unix)]
 async fn run_async(
     backend: Box<dyn Backend>,
-    reader: Box<dyn crate::backend::BackendHandle>,
+    mut reader: Box<dyn crate::backend::BackendHandle>,
     grid: Arc<Mutex<Grid>>,
     config: crate::config::Config,
-) -> std::io::Result<()> {
+) -> std::io::Result<i32> {
     // Raw mode for the host terminal; restored on drop (any exit path).
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
@@ -243,6 +283,12 @@ async fn run_async(
 
     let running = Arc::new(AtomicBool::new(true));
     let frame = Arc::new(Notify::new());
+    // Populated by whichever path reaps the child first: read-EOF (the
+    // common case, resolved via `reader.reap_exit_status()` below) or the
+    // SIGCHLD watcher just below (needed when EOF never comes — see its
+    // comment). A plain `Option`, not raced meaningfully: at most one side
+    // ever calls `waitpid` successfully for a given pid.
+    let exit_status: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
     {
         let mut out = std::io::stdout();
@@ -254,6 +300,43 @@ async fn run_async(
     // it briefly on a config save to retheme (see `watch_config`).
     let parser = Arc::new(Mutex::new(AnsiParser::with_theme(config.theme)));
     watch_config(Arc::clone(&parser), Arc::clone(&grid), Arc::clone(&frame));
+
+    // --- SIGCHLD watcher: reap our own child proactively ---
+    // Read-EOF alone can wedge shutdown forever: EOF on the master only
+    // fires once *every* slave fd is closed, and a background process the
+    // shell spawned (`nohup cmd &`, then `exit`) can inherit the pty as its
+    // own stdout/stderr and keep it open long after the shell itself is
+    // gone. Watching for our specific child's exit via SIGCHLD lets us force
+    // shutdown instead of waiting on an EOF that, in that case, never comes.
+    let sigchld_task = {
+        let running = Arc::clone(&running);
+        let frame = Arc::clone(&frame);
+        let exit_status = Arc::clone(&exit_status);
+        let pid = reader.child_pid();
+        tokio::spawn(async move {
+            let Some(pid) = pid else { return };
+            let Ok(mut sigchld) = signal(SignalKind::child()) else { return };
+            loop {
+                if sigchld.recv().await.is_none() {
+                    break;
+                }
+                let mut status: libc::c_int = 0;
+                // SAFETY: WNOHANG never blocks; `pid` is a plain pid_t value
+                // (not an owned resource), so reaping it here is sound even
+                // though this task doesn't hold the owning `BackendHandle`.
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r == pid {
+                    *exit_status.lock() =
+                        Some(crate::backend::unix::exit_code_from_wait_status(status));
+                    running.store(false, Ordering::Relaxed);
+                    frame.notify_one();
+                    break;
+                }
+                // Some *other* child was reaped (e.g. a background process
+                // the shell spawned and detached) — keep watching for ours.
+            }
+        })
+    };
 
     // --- Parser task: PTY master -> Grid (+ DA/DSR replies) ---
     let parser_task = {
@@ -437,11 +520,15 @@ async fn run_async(
     }
 
     // Stop the tasks; their dropped fds deregister and close. `reader` (this
-    // scope) reaps the child; `_raw_guard` restores cooked mode on return.
+    // scope) reaps the child (if the SIGCHLD watcher didn't already win that
+    // race) on the explicit call below and on drop; `_raw_guard` restores
+    // cooked mode on return.
     parser_task.abort();
     input_task.abort();
+    sigchld_task.abort();
     restore_host_modes();
-    Ok(())
+    let code = exit_status.lock().take().or_else(|| reader.reap_exit_status()).unwrap_or(0);
+    Ok(code)
 }
 
 /// Windows ConPTY driver: the pipes are synchronous (no readiness-pollable fd),
@@ -451,10 +538,10 @@ async fn run_async(
 #[cfg(windows)]
 async fn run_async(
     backend: Box<dyn Backend>,
-    reader: Box<dyn crate::backend::BackendHandle>,
+    mut reader: Box<dyn crate::backend::BackendHandle>,
     grid: Arc<Mutex<Grid>>,
     config: crate::config::Config,
-) -> std::io::Result<()> {
+) -> std::io::Result<i32> {
     let _raw_guard = RawModeGuard::enable(backend.as_ref())?;
 
     // `reader` (the shell, spawned before the runtime started) owns the
@@ -488,8 +575,16 @@ async fn run_async(
         let _ = out.flush();
     }
 
-    // PTY output: a blocking `ReadFile` thread feeds the async side.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // PTY output: a blocking `ReadFile` thread feeds the async side. Bounded
+    // (unlike the unbounded channel this used to be) so a shell that floods
+    // output (`yes`, `cat` on a huge file) can't grow this buffer without
+    // limit while the render loop is busy — `blocking_send` simply pauses the
+    // `ReadFile` loop once the channel fills, which is exactly the
+    // backpressure we want: the OS pipe buffer absorbs the rest upstream.
+    // 64 * 4096-byte reads is 256 KiB of slack, comfortably more than one
+    // frame's worth of output at any reasonable render cadence.
+    const OUTPUT_CHANNEL_CAPACITY: usize = 64;
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
     {
         let running = Arc::clone(&running);
         std::thread::spawn(move || {
@@ -497,7 +592,7 @@ async fn run_async(
             loop {
                 match read_handle.read() {
                     Ok(data) if !data.is_empty() => {
-                        if out_tx.send(data).is_err() {
+                        if out_tx.blocking_send(data).is_err() {
                             break;
                         }
                     }
@@ -658,5 +753,10 @@ async fn run_async(
     }
 
     restore_host_modes();
-    Ok(())
+    // The `exit_token` watcher thread above only stops the event loop; it
+    // doesn't fetch the exit code (`WaitForSingleObject` isn't
+    // `GetExitCodeProcess`), so ask the owning handle directly. By now the
+    // process has certainly signaled, so this returns promptly.
+    let code = reader.reap_exit_status().unwrap_or(0);
+    Ok(code)
 }

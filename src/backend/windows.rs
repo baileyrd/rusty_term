@@ -30,8 +30,9 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 /// Unit type implementing [`Backend`](crate::backend::Backend) for Windows.
@@ -441,6 +442,26 @@ impl BackendHandle for WindowsHandle {
         }
         let waitable = Waitable(dup);
         Some(Box::new(move || waitable.wait()))
+    }
+
+    fn reap_exit_status(&mut self) -> Option<i32> {
+        // Only the owning handle holds the child process handle.
+        if self.process.is_null() {
+            return None;
+        }
+        unsafe {
+            // By the time the runtime calls this, the `exit_token` watcher
+            // (if one was started) has already observed the process signal,
+            // so this wait is expected to return immediately; the bound just
+            // guards against calling this directly without going through
+            // that watcher first.
+            WaitForSingleObject(self.process, 2000);
+            let mut code: u32 = 0;
+            if GetExitCodeProcess(self.process, &mut code) == 0 {
+                return None;
+            }
+            Some(code as i32)
+        }
     }
 }
 
