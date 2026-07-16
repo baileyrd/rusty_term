@@ -50,16 +50,19 @@ pub(crate) struct PaneFrame<'a> {
 
 /// A present target: paint one frame of the tab's `panes` at the given pixel
 /// size. `chrome` is the window's own top bar (tabs + caption buttons) as one
-/// pre-laid cell row at the top; `divider` fills the gaps between panes; `bg`
-/// fills everything else — the `pad`-pixel band inset around the pane area
-/// (`[window] padding`) and any right/bottom slack, so content reads as
-/// floating on the terminal background. The chrome bar stays flush.
+/// pre-laid cell row at the top; `status` is the bottom status ribbon (cwd,
+/// git branch, exit pill, …) as one pre-laid cell row flush with the window's
+/// bottom edge (empty when disabled); `divider` fills the gaps between panes;
+/// `bg` fills everything else — the `pad`-pixel band inset around the pane
+/// area (`[window] padding`) and any right/bottom slack, so content reads as
+/// floating on the terminal background. Both bars stay flush.
 pub(crate) trait Renderer {
     #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         panes: &[PaneFrame],
         chrome: &[Cell],
+        status: &[Cell],
         font: &mut FontCache,
         width: u32,
         height: u32,
@@ -103,6 +106,7 @@ impl Renderer for CpuRenderer {
         &mut self,
         panes: &[PaneFrame],
         chrome: &[Cell],
+        status: &[Cell],
         font: &mut FontCache,
         width: u32,
         height: u32,
@@ -145,6 +149,11 @@ impl Renderer for CpuRenderer {
         }
         if !chrome.is_empty() {
             cpu::draw_chrome(&mut buffer, w, h, chrome, font, cw, ch, inset, bar_bg);
+        }
+        // The status ribbon sits flush with the window's bottom edge; the
+        // grid was sized one row shorter, so it never paints under it.
+        if !status.is_empty() && h >= ch {
+            cpu::draw_bar(&mut buffer, w, h, status, font, cw, ch, h - ch);
         }
         for p in panes {
             cpu::draw_grid(

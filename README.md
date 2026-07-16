@@ -114,7 +114,7 @@ theme = "gruvbox-dark"   # preset: default, gruvbox-dark, dracula,
                          # solarized-dark, solarized-light, nord, one-dark,
                          # catppuccin-mocha, catppuccin-latte, tokyo-night,
                          # tokyo-night-storm, monokai, rose-pine,
-                         # github-dark, kanagawa
+                         # github-dark, kanagawa, nebula
 ```
 
 On Windows, `shell` accepts a bare name resolved through the standard search
@@ -137,6 +137,7 @@ font_fallback = "/path/to/cjk.ttf"  # glyphs the main font lacks (CJK, symbols)
 ligatures = true                    # GSUB liga/calt ligatures; default on
 cursor_style = "bar"                # block (default) | bar | underline
 cursor_blink = true                 # default off
+status_bar = false                  # hide the bottom status ribbon; default on
 
 [keys]                   # rebind window shortcuts as  action = "chord"
 search = "Ctrl+Shift+F"
@@ -168,6 +169,14 @@ regular face), `font_fallback` covers glyphs the main font lacks, and
 features — on by default, ignored for fonts without them). `cursor_style`
 (`block`/`bar`/`underline`) and `cursor_blink` set the startup cursor; the
 child can still override both at runtime via DECSCUSR.
+
+The windowed front-end also draws a one-row **status ribbon** flush with the
+window's bottom edge: the focused pane's working directory (OSC 7, home
+shortened to `~`), its git branch (read straight from `.git/HEAD`, no `git`
+subprocess), the last command's exit code as a green `✓` / red `✗` pill
+(OSC 133 shell integration), the scrollback position while scrolled back,
+and the grid size. `status_bar = false` under `[window]` (or the settings
+page's Window → Status bar toggle) hides it and returns the row to the grid.
 
 The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
 actions are `copy`, `paste`, `new_tab`, `new_window`, `fold_output`,

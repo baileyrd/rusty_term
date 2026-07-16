@@ -534,6 +534,10 @@ struct WindowState<'a> {
     /// the top of the monitor, kept above other windows, toggled with
     /// `rusty_term ctl quake`.
     quake: bool,
+    /// Cached git branch for the status ribbon: `(cwd it was resolved for,
+    /// branch or None, when)`. `.git/HEAD` is re-read at most every
+    /// [`GIT_BRANCH_TTL`] instead of on every frame.
+    git_branch: Option<(std::path::PathBuf, Option<String>, Instant)>,
 }
 
 impl WindowState<'_> {
@@ -1054,7 +1058,10 @@ impl WindowState<'_> {
         let inner_w = (px_w as usize).saturating_sub(2 * self.pad);
         let inner_h = (px_h as usize).saturating_sub(2 * self.pad);
         let cols = ((inner_w / self.cell_w).max(1)) as u16;
-        let rows = (((inner_h / self.cell_h).saturating_sub(1)).max(1)) as u16;
+        // One screen row goes to the chrome bar; one more to the status
+        // ribbon when it's on.
+        let bars = 1 + usize::from(self.status_enabled());
+        let rows = (((inner_h / self.cell_h).saturating_sub(bars)).max(1)) as u16;
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
             self.rows = rows;
@@ -1067,6 +1074,7 @@ impl WindowState<'_> {
     /// Paint the chrome bar + the active tab's panes through the renderer.
     fn redraw(&mut self) {
         let chrome = self.chrome_row();
+        let status = self.status_row();
         let divider = mix(self.theme.bg, self.theme.fg, 60);
         if self.overlay.is_some() {
             let page = self.build_overlay_grid();
@@ -1086,6 +1094,7 @@ impl WindowState<'_> {
             renderer.render(
                 std::slice::from_ref(&frame),
                 &chrome,
+                &status,
                 &mut self.font,
                 size.width,
                 size.height,
@@ -1177,6 +1186,7 @@ impl WindowState<'_> {
         renderer.render(
             &frames,
             &chrome,
+            &status,
             &mut self.font,
             size.width,
             size.height,
@@ -1217,6 +1227,97 @@ impl WindowState<'_> {
             return (c, c);
         }
         (px.div_ceil(self.cell_w), px / self.cell_w)
+    }
+
+    /// Whether the bottom status ribbon is on (`[window] status_bar`,
+    /// default on).
+    fn status_enabled(&self) -> bool {
+        self.config.status_bar.unwrap_or(true)
+    }
+
+    /// Lay out the bottom status ribbon: the focused pane's cwd and git
+    /// branch on the left; the last command's exit pill, the scrollback
+    /// position, and the grid size on the right. Empty when disabled — the
+    /// renderers skip an empty row and the grid keeps the space.
+    fn status_row(&mut self) -> Vec<Cell> {
+        if !self.status_enabled() {
+            return Vec::new();
+        }
+        let (paint_cols, cols) = self.bar_cells();
+        let bar_bg = mix(self.theme.bg, self.theme.fg, 48);
+        let dim_fg = mix(self.theme.fg, self.theme.bg, 110);
+        let mut row = vec![Cell::blank(); paint_cols];
+        for c in &mut row {
+            c.fg = dim_fg;
+            c.bg = bar_bg;
+        }
+        // Everything below reads the focused pane's grid; a window with no
+        // panes (mid-teardown) shows a bare bar.
+        let Some(pane) = self.pane() else { return row };
+        let (cwd, last_exit, view_offset, gcols, grows) = {
+            let g = pane.grid.lock();
+            (g.cwd.clone(), g.last_command_exit(), g.view_offset, g.cols, g.rows)
+        };
+        let cwd = path_from_file_uri(&cwd);
+        let branch = cwd.as_deref().and_then(|d| self.git_branch_for(d));
+
+        // Right side, innermost first: grid size, scrollback position, exit
+        // pill. Each segment carries its own color.
+        let ok = self.theme.palette16[2];
+        let err = self.theme.palette16[1];
+        let warn = self.theme.palette16[3];
+        let mut right: Vec<(String, u32)> = Vec::new();
+        right.push((format!("{gcols}\u{00d7}{grows} "), dim_fg));
+        if view_offset > 0 {
+            right.push((format!("\u{2191}{view_offset}  "), warn));
+        }
+        match last_exit {
+            Some(0) => right.push(("\u{2713} 0  ".into(), ok)),
+            Some(code) => right.push((format!("\u{2717} {code}  "), err)),
+            None => {}
+        }
+        let right_len: usize = right.iter().map(|(s, _)| s.chars().count()).sum();
+
+        // Left side: cwd (home shortened to ~, long paths trimmed from the
+        // left so the leaf stays visible), then the git branch in the accent.
+        let mut hits = vec![Hit::Drag; paint_cols]; // discarded: the ribbon is inert
+        let limit = cols.saturating_sub(right_len);
+        let mut col = 0;
+        if let Some(dir) = &cwd {
+            let mut text = display_path(dir);
+            let branch_len = branch.as_ref().map(|b| b.chars().count() + 3).unwrap_or(0);
+            let avail = limit.saturating_sub(2 + branch_len);
+            let count = text.chars().count();
+            if count > avail && avail > 1 {
+                let tail: String = text.chars().skip(count - (avail - 1)).collect();
+                text = format!("\u{2026}{tail}");
+            }
+            put_text(&mut row, &mut hits, &mut col, limit, &format!(" {text}"), self.theme.fg, bar_bg, Hit::Drag);
+            if let Some(b) = &branch {
+                let accent = self.theme.cursor;
+                put_text(&mut row, &mut hits, &mut col, limit, &format!("  \u{2387} {b}"), accent, bar_bg, Hit::Drag);
+            }
+        }
+        let mut rcol = cols.saturating_sub(right_len);
+        for (text, color) in &right {
+            put_text(&mut row, &mut hits, &mut rcol, cols, text, *color, bar_bg, Hit::Drag);
+        }
+        row
+    }
+
+    /// The git branch for `cwd` (walking up to the repository root), cached
+    /// for [`GIT_BRANCH_TTL`] so the per-frame status ribbon doesn't hit the
+    /// filesystem on every redraw. `None` outside a repository.
+    fn git_branch_for(&mut self, cwd: &std::path::Path) -> Option<String> {
+        if let Some((dir, branch, at)) = &self.git_branch
+            && dir == cwd
+            && at.elapsed() < GIT_BRANCH_TTL
+        {
+            return branch.clone();
+        }
+        let branch = read_git_branch(cwd);
+        self.git_branch = Some((cwd.to_path_buf(), branch.clone(), Instant::now()));
+        branch
     }
 
     fn chrome_row(&mut self) -> Vec<Cell> {
@@ -2607,14 +2708,17 @@ impl WindowState<'_> {
             }
         }
         self.theme = new.theme;
+        let status_changed =
+            new.status_bar.unwrap_or(true) != self.config.status_bar.unwrap_or(true);
         self.config = new;
         let new_pad = self.config.padding.unwrap_or(DEFAULT_PAD) as usize;
         let pad_changed = new_pad != self.pad;
         self.pad = new_pad;
-        if pad_changed
+        if (pad_changed || status_changed)
             && let Some(size) = self.window.as_ref().map(|w| w.inner_size())
         {
-            // The band grew or shrank; refit the grid to the same window.
+            // The band / status ribbon grew or shrank; refit the grid to the
+            // same window.
             self.apply_size(size.width, size.height);
         }
         if let Some(window) = &self.window {
@@ -2981,6 +3085,7 @@ impl WindowState<'_> {
         let click_to_move = s.click_to_move();
         let bell = s.bell();
         let padding = s.padding();
+        let status_bar = s.status_bar();
         let opacity = s.opacity();
         let launch_mode = s.launch_mode_value();
         let cols = s.cols_value();
@@ -3032,6 +3137,13 @@ impl WindowState<'_> {
                 self.pad = padding as usize;
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
                     // The band grew or shrank; refit the grid to the same window.
+                    self.apply_size(size.width, size.height);
+                }
+            }
+            Field::StatusBar => {
+                self.config.status_bar = Some(status_bar);
+                if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
+                    // The ribbon claimed or released a row; refit the grid.
                     self.apply_size(size.width, size.height);
                 }
             }
@@ -3681,6 +3793,64 @@ fn accumulate_scroll_lines(accum: f64, raw_lines: f64) -> (isize, f64) {
 
 /// Per-channel mix of `t/255` of `b` into `a` (`0xRRGGBB`) — used to derive
 /// the chrome bar's bg and dimmed text from the theme without new config keys.
+/// How long a resolved git branch is trusted before `.git/HEAD` is re-read
+/// (the status ribbon repaints far more often than branches change).
+const GIT_BRANCH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A path for the status ribbon: the home directory shortened to `~`.
+fn display_path(p: &std::path::Path) -> String {
+    let text = p.display().to_string();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(home) = home
+        && let Ok(rest) = p.strip_prefix(&home)
+    {
+        let rest = rest.display().to_string();
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+        };
+    }
+    text
+}
+
+/// The current git branch for `dir`: walk up to the nearest `.git`, follow a
+/// worktree/submodule `gitdir:` file if that's what it is, and parse `HEAD` —
+/// `ref: refs/heads/<name>` yields the name, a detached head yields the
+/// short hash. Pure file reads (no `git` subprocess), `None` outside a repo
+/// or on any parse surprise.
+fn read_git_branch(dir: &std::path::Path) -> Option<String> {
+    let mut cur = Some(dir);
+    let git = loop {
+        let d = cur?;
+        let candidate = d.join(".git");
+        if candidate.exists() {
+            break candidate;
+        }
+        cur = d.parent();
+    };
+    let head_path = if git.is_file() {
+        // A worktree/submodule: `.git` is a one-line `gitdir: <path>` file.
+        let text = std::fs::read_to_string(&git).ok()?;
+        let target = text.strip_prefix("gitdir:")?.trim();
+        let target = std::path::Path::new(target);
+        let base =
+            if target.is_absolute() { target.to_path_buf() } else { git.parent()?.join(target) };
+        base.join("HEAD")
+    } else {
+        git.join("HEAD")
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(r) => Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string()),
+        None if head.len() >= 8 => Some(head[..8].to_string()),
+        None => None,
+    }
+}
+
 fn mix(a: u32, b: u32, t: u32) -> u32 {
     let chan = |s: u32| {
         let av = (a >> s) & 0xff;
@@ -3814,8 +3984,10 @@ impl WindowState<'_> {
             self.rescale_font_cache(px, ligatures, target_scale);
         }
         let width = (self.cols as usize * self.cell_w + 2 * self.pad) as u32;
-        // One extra cell row on top for the chrome bar, plus the padding band.
-        let height = ((self.rows as usize + 1) * self.cell_h + 2 * self.pad) as u32;
+        // One extra cell row on top for the chrome bar (plus one at the bottom
+        // for the status ribbon when it's on), plus the padding band.
+        let bars = 1 + usize::from(self.status_enabled());
+        let height = ((self.rows as usize + bars) * self.cell_h + 2 * self.pad) as u32;
         // `--title` (or a config `title` key) seeds the initial title; the
         // child's own OSC 0/2 still wins once it emits one (see the per-frame
         // `set_title` above).
@@ -4549,6 +4721,7 @@ impl<'a> App<'a> {
             cursor_prev: None,
             trail: None,
             quake,
+            git_branch: None,
         })
     }
 
@@ -5186,7 +5359,8 @@ mod tests {
         SETTINGS_ROW_H, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
         SETTINGS_SEARCH_W, arrow_presses, drag_scroll_direction, encode_paste,
         ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,
-        pane_pixel_point, path_from_file_uri, put_text, settings_hit, settings_value_end,
+        display_path, pane_pixel_point, path_from_file_uri, put_text, read_git_branch,
+        settings_hit, settings_value_end,
         settings_visible, shell_menu_items, tab_drag_target, tab_spans, tab_widths,
         visible_tab_range, widget_text,
     };
@@ -5643,5 +5817,48 @@ mod tests {
         assert_eq!(shell_quote("/tmp/plain"), "'/tmp/plain'");
         assert_eq!(shell_quote("/tmp/with space"), "'/tmp/with space'");
         assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
+    }
+
+    #[test]
+    fn read_git_branch_walks_up_and_parses_head() {
+        let root = std::env::temp_dir().join(format!("rt_git_test_{}", std::process::id()));
+        let sub = root.join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // A symbolic ref resolves to the branch name, from a subdirectory.
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature/status-bar\n").unwrap();
+        assert_eq!(read_git_branch(&sub).as_deref(), Some("feature/status-bar"));
+        // A detached head shows the short hash.
+        std::fs::write(root.join(".git/HEAD"), "0123456789abcdef0123456789abcdef01234567\n")
+            .unwrap();
+        assert_eq!(read_git_branch(&sub).as_deref(), Some("01234567"));
+        // A worktree-style `.git` *file* follows its gitdir pointer.
+        let wt = std::env::temp_dir().join(format!("rt_git_wt_{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", root.join(".git").display()))
+            .unwrap();
+        assert_eq!(read_git_branch(&wt).as_deref(), Some("01234567"));
+        // Outside any repository: None.
+        let bare = std::env::temp_dir().join(format!("rt_git_none_{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(read_git_branch(&bare), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn display_path_shortens_home_to_tilde() {
+        // Only meaningful where a home directory is defined (CI always has one).
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        let Some(home) = home.map(std::path::PathBuf::from) else { return };
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(
+            display_path(&home.join("projects")),
+            format!("~{}projects", std::path::MAIN_SEPARATOR)
+        );
+        // A path outside home passes through unchanged.
+        let other = std::path::Path::new("/definitely/not/home");
+        assert_eq!(display_path(other), other.display().to_string());
     }
 }

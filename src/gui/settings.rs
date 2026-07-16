@@ -78,6 +78,7 @@ pub(crate) enum Field {
     Bell,
     // Window
     Padding,
+    StatusBar,
     Opacity,
     LaunchMode,
     Cols,
@@ -107,6 +108,7 @@ impl Field {
             ],
             Category::Window => &[
                 Field::Padding,
+                Field::StatusBar,
                 Field::Opacity,
                 Field::LaunchMode,
                 Field::Cols,
@@ -132,6 +134,7 @@ impl Field {
             Field::ClickToMove => "Click to move cursor",
             Field::Bell => "Bell alert",
             Field::Padding => "Padding",
+            Field::StatusBar => "Status bar",
             Field::Opacity => "Opacity",
             Field::LaunchMode => "Launch mode",
             Field::Cols => "Columns",
@@ -156,6 +159,7 @@ impl Field {
             Field::ClickToMove => "Click at the prompt moves the input cursor",
             Field::Bell => "BEL requests attention and badges the tab",
             Field::Padding => "Inner margin around the terminal, in pixels",
+            Field::StatusBar => "Bottom ribbon: cwd, git branch, last exit code",
             Field::Opacity => "Window background opacity",
             Field::LaunchMode => "How new windows open",
             Field::Cols => "Initial width in cells",
@@ -246,6 +250,7 @@ pub(crate) struct Settings {
     click_to_move: bool,
     bell: bool,
     padding: u32,
+    status_bar: bool,
     opacity: f32,
     /// `None` = normal window.
     launch_mode: Option<LaunchMode>,
@@ -315,6 +320,7 @@ impl Settings {
             click_to_move: cfg.click_to_move.unwrap_or(true),
             bell: cfg.bell.unwrap_or(true),
             padding: cfg.padding.unwrap_or(DEFAULT_PAD),
+            status_bar: cfg.status_bar.unwrap_or(true),
             opacity: cfg.opacity.unwrap_or(1.0),
             launch_mode: cfg.launch_mode,
             cols: cfg.cols.unwrap_or(DEFAULT_COLS),
@@ -564,6 +570,7 @@ impl Settings {
             Field::ClickToMove => !self.click_to_move,
             Field::Bell => !self.bell,
             Field::Padding => self.padding != DEFAULT_PAD,
+            Field::StatusBar => !self.status_bar,
             Field::Opacity => self.opacity != 1.0,
             Field::LaunchMode => self.launch_mode.is_some(),
             Field::Cols => self.cols != DEFAULT_COLS,
@@ -669,6 +676,7 @@ impl Settings {
                     self.padding.saturating_sub(PAD_STEP)
                 };
             }
+            Field::StatusBar => self.status_bar = !self.status_bar,
             Field::Opacity => {
                 // Step in integer percent so a config-seeded 0.87 lands on
                 // the 85/90 grid (float step-and-round accumulates noise like
@@ -727,6 +735,9 @@ impl Settings {
     }
     pub(crate) fn cursor_trail(&self) -> bool {
         self.cursor_trail
+    }
+    pub(crate) fn status_bar(&self) -> bool {
+        self.status_bar
     }
     /// The chosen contrast ratio, `None` when off.
     pub(crate) fn min_contrast(&self) -> Option<f32> {
@@ -829,6 +840,7 @@ impl Settings {
             Field::ClickToMove => Widget::Toggle(self.click_to_move),
             Field::Bell => Widget::Toggle(self.bell),
             Field::Padding => Widget::Number(format!("{} px", self.padding)),
+            Field::StatusBar => Widget::Toggle(self.status_bar),
             Field::Opacity => Widget::Number(format!("{}%", (self.opacity * 100.0).round())),
             Field::LaunchMode => Widget::Choice(launch_mode_name(self.launch_mode).to_string()),
             Field::Cols => Widget::Number(self.cols.to_string()),
@@ -927,6 +939,12 @@ impl Settings {
                 key: "padding",
                 value: Some(self.padding.to_string()),
                 insert: self.padding != DEFAULT_PAD,
+            },
+            SettingEdit {
+                section: "window",
+                key: "status_bar",
+                value: Some(self.status_bar.to_string()),
+                insert: !self.status_bar, // default is on
             },
             SettingEdit {
                 section: "window",
@@ -1073,7 +1091,7 @@ mod tests {
                 "{f:?} appears exactly once",
             );
         }
-        assert_eq!(all.len(), 18, "all fields are reachable from the sidebar");
+        assert_eq!(all.len(), 19, "all fields are reachable from the sidebar");
     }
 
     #[test]

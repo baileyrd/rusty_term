@@ -93,7 +93,11 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     // (the sole occupant of cell row 0) stays horizontally flush but sits
     // bar_inset px below the top edge, so the strip band shows above the
     // tabs. The band quad itself carries deco bit 7 and stays absolute.
-    if (inst.row > 0u) {
+    // Status-ribbon cells carry deco bit 6: anchored flush to the window's
+    // bottom edge, exempt from both the padding origin and the bar inset.
+    if ((inst.deco & 64u) != 0u) {
+        px.y = u.screen.y - u.cell.y + corner.y * u.cell.y;
+    } else if (inst.row > 0u) {
         px = px + u.origin;
     } else if ((inst.deco & 128u) == 0u) {
         px.y = px.y + u.bar_inset;
@@ -745,6 +749,22 @@ impl GpuCore {
         }
     }
 
+    /// Append the bottom status ribbon's cells: like [`Self::append_chrome`]
+    /// but every instance carries deco bit 6, which the vertex shader anchors
+    /// flush to the window's bottom edge (see the `SHADER` source).
+    fn append_status(&mut self, frame: &mut FrameLists, status: &[Cell], font: &mut FontCache) {
+        for (col, cell) in status.iter().enumerate() {
+            if cell.flags & WIDE_TRAILER != 0 {
+                continue;
+            }
+            let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+            let (rect, color) = self.tile_for_char(cell.ch, style, font);
+            let fg = if color { 0xFFFFFF } else { cell.fg };
+            let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, true, false);
+            frame.base.push(Self::base_inst(col as u32, 0, char_width(cell.ch).max(1) as u32, rect, fg, cell.bg, 0, 0, deco | 64, dcol));
+        }
+    }
+
     /// Append `grid`'s cell, ligature-run, image, and IME-preedit draws at
     /// cell offset `(col0, row0)`. The cursor and preedit show only when
     /// `focused`; selection and search highlights come from the grid's state.
@@ -1134,6 +1154,7 @@ impl GpuCore {
         height: u32,
         panes: &[super::render::PaneFrame],
         chrome: &[Cell],
+        status: &[Cell],
         font: &mut FontCache,
         divider: u32,
         bg: u32,
@@ -1152,6 +1173,7 @@ impl GpuCore {
             frame.base.push(Self::base_inst(0, 0, span, rect, bar_bg, bar_bg, 0, 0, 128, 0));
         }
         self.append_chrome(&mut frame, chrome, font);
+        self.append_status(&mut frame, status, font);
         // The clear paints the padding band (and slack) in the terminal
         // background; gaps *between* panes still show the divider, via a
         // divider-colored fill under the panes' bounding box (the grids
@@ -1311,6 +1333,7 @@ impl Renderer for GpuRenderer {
         &mut self,
         panes: &[super::render::PaneFrame],
         chrome: &[Cell],
+        status: &[Cell],
         font: &mut FontCache,
         width: u32,
         height: u32,
@@ -1348,7 +1371,7 @@ impl Renderer for GpuRenderer {
             return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render_panes(&view, width, height, panes, chrome, font, divider, bg, bar_bg, pad);
+        self.core.render_panes(&view, width, height, panes, chrome, status, font, divider, bg, bar_bg, pad);
         frame.present();
     }
 

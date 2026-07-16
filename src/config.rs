@@ -109,6 +109,11 @@ pub struct Config {
     /// Whether the cursor leaves a brief fading trail when it jumps
     /// (`cursor_trail`; default off) — pure renderer eye candy (G36).
     pub cursor_trail: Option<bool>,
+    /// Bottom status ribbon (windowed front-end): cwd, git branch, last
+    /// command's exit status, scrollback position, and grid size in a
+    /// one-cell bar flush with the window's bottom edge (`[window]
+    /// status_bar`; default on, `false` restores the bar-less layout).
+    pub status_bar: Option<bool>,
     /// Whether Ctrl+Shift+C also puts styled HTML on the clipboard alongside
     /// plain text (`copy_html`; default on). Rich-paste targets (docs, chat)
     /// get colors; plain editors still read the text flavor.
@@ -261,6 +266,7 @@ impl Config {
 # padding = 8               # pixels of inner margin around the terminal (0 = flush)
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
 # quake_hotkey = "win+grave" # global hotkey toggling the quake window (Windows only)
+# status_bar = false        # hide the bottom status ribbon (default on)
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
 # clipboard = "write-only"  # OSC 52 policy: "off", "write-only" (default), or "read-write"
@@ -727,6 +733,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             cfg.font_fallback = Some(PathBuf::from(expect_str(key, value)?))
         }
         ("window", "ligatures") => cfg.ligatures = Some(expect_bool(key, value)?),
+        ("window", "status_bar") => cfg.status_bar = Some(expect_bool(key, value)?),
         ("window", "launch_mode") => {
             let name = expect_str(key, value)?;
             cfg.launch_mode = Some(match name.to_ascii_lowercase().as_str() {
@@ -914,7 +921,7 @@ fn expect_color(key: &str, v: Value) -> Result<u32, String> {
 pub const PRESETS: &[&str] = &[
     "default", "gruvbox-dark", "dracula", "solarized-dark", "solarized-light", "nord", "one-dark",
     "catppuccin-mocha", "catppuccin-latte", "tokyo-night", "tokyo-night-storm", "monokai",
-    "rose-pine", "github-dark", "kanagawa",
+    "rose-pine", "github-dark", "kanagawa", "nebula",
 ];
 
 /// A built-in theme preset by (case/sep-insensitive) name, or `None`. Colors
@@ -1050,6 +1057,19 @@ pub fn preset(name: &str) -> Option<Theme> {
             [
                 0x090618, 0xc34043, 0x76946a, 0xc0a36e, 0x7e9cd8, 0x957fb8, 0x6a9589, 0xc8c093,
                 0x727169, 0xe82424, 0x98bb6c, 0xe6c384, 0x7fb4ca, 0x938aa9, 0x7aa89f, 0xdcd7ba,
+            ],
+        ),
+        // The "Nebula" design-system palette: a deep near-black base with a
+        // cyan glow accent (also the cursor), amber highlight, and the spec's
+        // semantic success/warning/error colors on the ANSI slots. Blue and
+        // magenta are derived from the same saturation/brightness family.
+        "nebula" => t(
+            0xe8e8f0,
+            0x0a0a0f,
+            0x4ce1f7,
+            [
+                0x14141c, 0xff5f5f, 0x4cf7a2, 0xf7c14c, 0x4c86f7, 0xb44cf7, 0x4ce1f7, 0xc8c8d8,
+                0x55556a, 0xff8585, 0x7df9bc, 0xf9d67f, 0x7fa8f9, 0xc77ff9, 0x7feaf9, 0xe8e8f0,
             ],
         ),
         _ => return None,
@@ -1585,6 +1605,7 @@ color15 = "ffffff"
             ("rose-pine", 0x191724, 0xe0def4, 1, 0xeb6f92),
             ("github-dark", 0x0d1117, 0xc9d1d9, 2, 0x3fb950),
             ("kanagawa", 0x1f1f28, 0xdcd7ba, 5, 0x957fb8),
+            ("nebula", 0x0a0a0f, 0xe8e8f0, 6, 0x4ce1f7),
         ];
         for &(name, bg, fg, slot, color) in expect {
             let theme = preset(name).unwrap_or_else(|| panic!("preset `{name}` missing"));
@@ -1596,6 +1617,15 @@ color15 = "ffffff"
         for &name in PRESETS {
             assert!(preset(name).is_some(), "advertised preset `{name}` missing");
         }
+    }
+
+    #[test]
+    fn status_bar_key_parses() {
+        let (cfg, warns) = parse("[window]\nstatus_bar = false\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.status_bar, Some(false));
+        let (cfg, _) = parse("");
+        assert_eq!(cfg.status_bar, None, "unset stays None (default on)");
     }
 
     #[test]
