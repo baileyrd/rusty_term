@@ -138,6 +138,13 @@ const OSC_MAX: usize = 4096;
 /// the `1337;File=` prefix so ordinary OSC strings keep the tight [`OSC_MAX`] cap.
 const OSC_IMAGE_MAX: usize = 8 * 1024 * 1024;
 
+/// Upper bound on an OSC 52 clipboard string (`OSC 52 ; <selection> ;
+/// <base64>`). The generic [`OSC_MAX`] (4 KiB) silently truncated any copy
+/// past ~3 KiB of decoded text — real terminals allow copying far more than a
+/// window title's worth. Matched on the `52;` prefix, same pattern as the
+/// image cap above.
+const OSC_CLIPBOARD_MAX: usize = 1024 * 1024;
+
 /// Upper bound on the bytes buffered for a single DCS string. Sixel images can
 /// be large but are bounded here; past this we keep consuming but stop storing.
 const DCS_MAX: usize = 4 * 1024 * 1024;
@@ -419,11 +426,14 @@ impl AnsiParser {
                     0x1b => self.state = ParserState::OscEsc, // possible ST (ESC \)
                     _ => {
                         // Accumulate the payload byte, bounded. iTerm2 inline
-                        // images (`1337;File=`) get a much larger cap; the cheap
-                        // length check short-circuits for every ordinary OSC.
+                        // images (`1337;File=`) and OSC 52 clipboard payloads
+                        // get much larger caps; the cheap length check
+                        // short-circuits for every ordinary OSC.
                         if self.osc_buffer.len() < OSC_MAX
                             || (self.osc_buffer.len() < OSC_IMAGE_MAX
                                 && self.osc_buffer.starts_with(b"1337;File="))
+                            || (self.osc_buffer.len() < OSC_CLIPBOARD_MAX
+                                && self.osc_buffer.starts_with(b"52;"))
                         {
                             self.osc_buffer.push(b);
                         }
@@ -839,14 +849,27 @@ impl AnsiParser {
             self.report_dec_mode(g, mode);
             return;
         }
-        // DSR ?996n (Contour dark/light extension): report the current
-        // color-scheme preference as `CSI ? 997 ; 1|2 n` (1 dark, 2 light),
-        // derived from the live default background's luminance.
+        // Private-form DSR (`CSI ? Ps n`): ?996n (Contour dark/light
+        // extension) reports the current color-scheme preference as
+        // `CSI ? 997 ; 1|2 n` (1 dark, 2 light), derived from the live
+        // default background's luminance; ?6n (DECXCPR, extended cursor
+        // position report) answers with the private-marker CPR form
+        // (`CSI ? row ; col ; page R`) — without this, a program that probed
+        // with the private form (rather than plain `CSI 6 n`, also handled
+        // below) would block forever waiting for a reply that never came.
+        // Other private DSR requests are silently ignored rather than
+        // answered with something we'd have to make up.
         if self.csi_marker == b'?' && cmd == b'n' {
             let param = self.parse_params().first().copied().flatten().unwrap_or(0);
-            if param == 996 {
-                let report = g.color_scheme_report();
-                self.responses.extend_from_slice(&report);
+            match param {
+                996 => self.responses.extend_from_slice(&g.color_scheme_report()),
+                6 => {
+                    let (cx, cy) = g.cursor;
+                    self.responses.extend_from_slice(
+                        format!("\x1b[?{};{};1R", cy + 1, cx + 1).as_bytes(),
+                    );
+                }
+                _ => {}
             }
             return;
         }
@@ -1334,11 +1357,14 @@ impl AnsiParser {
             }
             b'c' => {
                 // DA1 (Primary Device Attributes). Only the default/`0` form is
-                // a query; reply that we're a VT100 with Advanced Video Option,
-                // a level apps widely accept. A program that sent this would
-                // otherwise block waiting for the answer.
+                // a query; reply that we're a VT100 with Advanced Video Option
+                // plus Sixel graphics (attribute `4`) — this terminal decodes
+                // Sixel and answers XTSMGRAPHICS, but omitting `4` here made
+                // apps that gate Sixel on DA1 containing it (some versions of
+                // img2sixel/chafa/mpv) conclude it wasn't supported. A program
+                // that sent this would otherwise block waiting for the answer.
                 if p(0, 0) == 0 {
-                    self.responses.extend_from_slice(b"\x1b[?1;2c");
+                    self.responses.extend_from_slice(b"\x1b[?1;2;4c");
                 }
             }
             b'n' => match p(0, 0) {

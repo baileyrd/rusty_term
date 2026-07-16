@@ -76,9 +76,17 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_UI_Shell",
+    "Win32_Graphics_Dwm",
 ] }
 
 [dev-dependencies]
 # The core test suite exercises the search's regex mode without the `gui`
 # feature, so the engine is also a dev-dependency.
+#
+# Being a git dependency means `cargo test` (even for the default,
+# non-`gui` build) needs network access the first time it resolves this
+# crate — there's no crates.io fallback. Harmless in CI and any normal dev
+# machine, but worth knowing if `cargo test` is ever run somewhere
+# deliberately offline/air-gapped: it'll fail at dependency resolution,
+# not at a test, which can look confusing out of context.
 rusty_regx = { git = "https://github.com/baileyrd/rusty_regx", rev = "1249a62de68f68e821c13cecd3838d49e52e22b6" }

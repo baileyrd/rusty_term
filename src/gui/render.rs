@@ -14,6 +14,15 @@ use crate::core::{Cell, Grid};
 use super::cpu;
 use super::font::{FontCache, GlyphSource};
 
+/// Pixels of strip-colored band above the chrome bar's tabs, so a tab's top
+/// edge is visibly distinct from the window's (the tabs otherwise run flush
+/// into the frame and read as sliced off). Bounded by the window padding so
+/// the pushed-down bar can never overlap the grid, which starts a full cell
+/// row plus `pad` below the top.
+pub(super) fn bar_inset(pad: usize, cell_h: usize) -> usize {
+    pad.min(cell_h / 6)
+}
+
 /// Search-match highlight, shared by both renderers: amber for a match, orange
 /// for the active one, with a dark glyph so text stays legible on either.
 pub(super) const SEARCH_BG: u32 = 0xFFD24A;
@@ -33,12 +42,20 @@ pub(crate) struct PaneFrame<'a> {
     /// `0.0..=1.0`, blended in the cursor color. Empty when the trail is off
     /// or expired.
     pub trail: Vec<(usize, usize, f32)>,
+    /// A Ctrl-hovered hyperlink's `(row, start_col, end_col)` (inclusive),
+    /// underlined for the click affordance — `None` when nothing's hovered
+    /// or Ctrl isn't held. Cell coordinates, in this pane's own frame.
+    pub hover_link: Option<(usize, usize, usize)>,
 }
 
 /// A present target: paint one frame of the tab's `panes` at the given pixel
 /// size. `chrome` is the window's own top bar (tabs + caption buttons) as one
-/// pre-laid cell row at the top; `divider` fills the gaps between panes.
+/// pre-laid cell row at the top; `divider` fills the gaps between panes; `bg`
+/// fills everything else — the `pad`-pixel band inset around the pane area
+/// (`[window] padding`) and any right/bottom slack, so content reads as
+/// floating on the terminal background. The chrome bar stays flush.
 pub(crate) trait Renderer {
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         panes: &[PaneFrame],
@@ -47,6 +64,9 @@ pub(crate) trait Renderer {
         width: u32,
         height: u32,
         divider: u32,
+        bg: u32,
+        bar_bg: u32,
+        pad: usize,
     );
 
     /// Set the window background opacity (`[window] opacity`), `0.0`-`1.0`.
@@ -54,6 +74,13 @@ pub(crate) trait Renderer {
     /// alpha channel to composite through, so only the GPU renderer overrides
     /// this — see `GpuRenderer`'s impl and `GpuCore::alpha_mode`.
     fn set_opacity(&mut self, _opacity: f32) {}
+
+    /// Whether [`set_opacity`](Self::set_opacity) actually does anything.
+    /// The settings page uses this to render the opacity row as disabled
+    /// (instead of silently inert) when the CPU renderer is presenting.
+    fn supports_opacity(&self) -> bool {
+        false
+    }
 }
 
 /// CPU compositor presented through `softbuffer`.
@@ -80,6 +107,9 @@ impl Renderer for CpuRenderer {
         width: u32,
         height: u32,
         divider: u32,
+        bg: u32,
+        bar_bg: u32,
+        pad: usize,
     ) {
         let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
@@ -90,15 +120,38 @@ impl Renderer for CpuRenderer {
         let Ok(mut buffer) = self.surface.buffer_mut() else {
             return;
         };
-        buffer.fill(divider); // gaps between panes show the divider color
+        buffer.fill(bg); // the padding band (and any slack) is background
         let (w, h) = (width as usize, height as usize);
+        let (cw, ch) = font.cell_size();
+        // The chrome bar sits `inset` px below the window's top edge (the
+        // strip band shows above it); the grid shifts down by the same
+        // amount so the pad-sized gap between bar and content survives —
+        // the bottom pad absorbs the difference.
+        let inset = if chrome.is_empty() { 0 } else { bar_inset(pad, ch) };
+        let oy = pad + inset;
+        // Gaps between panes show the divider: fill the panes' bounding box
+        // with it, then let the grids overpaint everything but the gaps.
+        if let (Some(x1), Some(y1)) = (
+            panes.iter().map(|p| p.col0 + p.grid.cols).max(),
+            panes.iter().map(|p| p.row0 + p.grid.rows).max(),
+        ) {
+            let y0 = panes.iter().map(|p| p.row0).min().unwrap_or(0) * ch + oy;
+            for y in y0..(y1 * ch + oy).min(h) {
+                let base = y * w;
+                for x in pad..(x1 * cw + pad).min(w) {
+                    buffer[base + x] = divider;
+                }
+            }
+        }
         if !chrome.is_empty() {
-            let (cw, ch) = font.cell_size();
-            cpu::draw_chrome(&mut buffer, w, h, chrome, font, cw, ch);
+            cpu::draw_chrome(&mut buffer, w, h, chrome, font, cw, ch, inset, bar_bg);
         }
         for p in panes {
-            cpu::draw_grid(&mut buffer, w, h, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
-            cpu::draw_trail(&mut buffer, w, h, p.grid, p.col0, p.row0, &p.trail, font);
+            cpu::draw_grid(
+                &mut buffer, w, h, p.grid, p.col0, p.row0, pad, oy, p.focused, p.cursor_on,
+                p.hover_link, font,
+            );
+            cpu::draw_trail(&mut buffer, w, h, p.grid, p.col0, p.row0, pad, oy, &p.trail, font);
         }
         let _ = buffer.present();
     }

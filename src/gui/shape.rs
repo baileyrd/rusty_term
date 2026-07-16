@@ -13,6 +13,9 @@
 //! no-ops (the run renders unshaped), matching the "skip what we can't do"
 //! stance of the image decoders.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use ttf_parser::gsub::{LigatureSubstitution, SingleSubstitution, SubstitutionSubtable};
 use ttf_parser::opentype_layout::{
     ChainedContextLookup, ContextLookup, LayoutTable, SequenceLookupRecord,
@@ -22,12 +25,29 @@ use ttf_parser::{Face, GlyphId, Tag};
 /// Recursion cap for nested contextual lookups (real fonts are shallow).
 const MAX_DEPTH: u8 = 8;
 
+/// Cap on memoized `shape()` results per [`Shaper`] before the cache is
+/// cleared and rebuilt from scratch. Bounds worst-case memory (a screen of
+/// entirely unique runs) at the cost of occasional re-shaping in that
+/// pathological case; the steady state — a mostly-static screen redrawn every
+/// frame with no per-row dirty tracking yet — stays cheap either way.
+const SHAPE_CACHE_MAX: usize = 4096;
+
 /// One face's ligature shaper: the font bytes (re-parsed per call, since
-/// `ttf-parser` borrows the data) plus the GSUB lookup indices enabled by the
+/// `ttf-parser` borrows the data and a self-referential `Face` can't be
+/// stored without unsafe code) plus the GSUB lookup indices enabled by the
 /// `liga` and `calt` features, in application order.
 pub(crate) struct Shaper {
     data: Vec<u8>,
     lookups: Vec<u16>,
+    /// Memoizes `shape()` by input glyph-id run. Both renderers re-shape
+    /// every eligible run of every visible row on every frame (no per-row
+    /// dirty tracking yet), and each miss here both re-parses the font and
+    /// re-walks GSUB from scratch — measurable CPU on a full, ligature-heavy
+    /// screen at 60fps. Real terminal content is dominated by
+    /// repeated/unchanged runs (blank padding, prompts, a static buffer
+    /// between keystrokes), so this alone removes most of the redundant work
+    /// even before dirty-row tracking lands.
+    cache: RefCell<HashMap<Vec<u16>, Vec<(u16, u8)>>>,
 }
 
 impl Shaper {
@@ -56,7 +76,13 @@ impl Shaper {
         if lookups.is_empty() {
             return None;
         }
-        Some(Shaper { data, lookups })
+        Some(Shaper { data, lookups, cache: RefCell::new(HashMap::new()) })
+    }
+
+    /// Number of memoized `shape()` runs (test-only introspection).
+    #[cfg(test)]
+    pub(crate) fn cache_len(&self) -> usize {
+        self.cache.borrow().len()
     }
 
     /// The glyph id for `ch` via the face cmap (0 = `.notdef` / not in the font).
@@ -70,18 +96,25 @@ impl Shaper {
 
     /// Apply the enabled GSUB lookups to `input` glyph ids, returning each output
     /// glyph with the number of input glyphs it consumed (`span`). The summed
-    /// spans always equal `input.len()`.
+    /// spans always equal `input.len()`. Memoized (see [`Self::cache`]) — a
+    /// cache hit skips both the font re-parse and the GSUB walk entirely.
     pub(crate) fn shape(&self, input: &[u16]) -> Vec<(u16, u8)> {
-        let mut buf: Vec<(u16, u8)> = input.iter().map(|&g| (g, 1)).collect();
-        let Ok(face) = Face::parse(&self.data, 0) else {
-            return buf;
-        };
-        let Some(gsub) = face.tables().gsub else {
-            return buf;
-        };
-        for &li in &self.lookups {
-            apply_lookup_scan(&gsub, li, &mut buf);
+        if let Some(hit) = self.cache.borrow().get(input) {
+            return hit.clone();
         }
+        let mut buf: Vec<(u16, u8)> = input.iter().map(|&g| (g, 1)).collect();
+        if let Ok(face) = Face::parse(&self.data, 0)
+            && let Some(gsub) = face.tables().gsub
+        {
+            for &li in &self.lookups {
+                apply_lookup_scan(&gsub, li, &mut buf);
+            }
+        }
+        let mut cache = self.cache.borrow_mut();
+        if cache.len() >= SHAPE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(input.to_vec(), buf.clone());
         buf
     }
 }
@@ -458,5 +491,22 @@ mod tests {
         let s = shaper();
         assert_eq!(s.shape(&[5, 2]), vec![(5, 1), (2, 1)]); // f =
         assert_eq!(s.shape(&[]), vec![]);
+    }
+
+    #[test]
+    fn shape_result_is_memoized_and_repeat_calls_hit_the_cache() {
+        // Real terminal content redraws the same runs (blank padding, static
+        // rows between keystrokes) every frame with no per-row dirty tracking
+        // yet; a repeat call for an already-seen run must not grow the cache
+        // or re-derive a different result.
+        let s = shaper();
+        assert_eq!(s.cache_len(), 0);
+        let a = s.shape(&[5, 6]);
+        assert_eq!(s.cache_len(), 1);
+        let b = s.shape(&[5, 6]);
+        assert_eq!(a, b);
+        assert_eq!(s.cache_len(), 1, "repeat call must hit the cache, not add an entry");
+        s.shape(&[4, 2]); // a distinct run does add an entry
+        assert_eq!(s.cache_len(), 2);
     }
 }

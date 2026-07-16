@@ -39,33 +39,74 @@ use std::path::PathBuf;
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, Window, WindowId};
 
 use crate::backend::{Backend, BackendHandle};
-use crate::config::{Config, LaunchMode};
-use crate::core::{AnsiParser, Cell, Grid, Selection, Theme, WIDE_TRAILER, char_width};
+use crate::config::{ClipboardPolicy, Config, LaunchMode};
+use crate::core::{
+    ATTR_BOLD, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, AnsiParser, Cell, Grid, Selection, Theme,
+    WIDE_TRAILER, char_width,
+};
 use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseButtonKind, MouseEvent, MousePoint, SgrEncoder};
 use super::font::{self, FontCache, GlyphSource};
 use super::layout::{Dir, Layout, Rect};
 use super::render::{CpuRenderer, PaneFrame, Renderer};
-use super::settings::{Field, Settings};
+use super::settings::{CATEGORIES, Field, Settings, Widget};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
 const FONT_PX: f32 = 18.0;
+/// Step for the Ctrl+=/Ctrl+- runtime font zoom (`Action::FontSizeUp/Down`).
+const FONT_ZOOM_STEP: f32 = 1.0;
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
 /// Pixel band at the window edges acting as a resize handle (the native frame
 /// is gone with decorations off).
 const RESIZE_BORDER: f64 = 6.0;
-/// Total cell budget for one tab in the chrome bar (label plus its × button).
+/// Widest a chrome-bar tab grows (label plus its × button); tabs size to
+/// their titles between [`TAB_MIN`] and this.
 const TAB_CELLS: usize = 26;
+/// Narrowest a tab shrinks when the strip crowds before falling back to the
+/// scrolled uniform-width strip: room for the ×, padding, and a few label
+/// characters.
+const TAB_MIN: usize = 12;
 /// Grid row where overlay (menu / settings) list rows begin (header sits above).
 const OVERLAY_ITEMS_TOP: usize = 2;
+/// Settings-page layout (cells): the category sidebar's width, the rows one
+/// setting card occupies (title+widget, description, spacing), and the rows
+/// reserved below the list (a blank spacer plus the key-hint footer).
+const SETTINGS_SIDEBAR_W: usize = 16;
+const SETTINGS_ROW_H: usize = 3;
+const SETTINGS_FOOTER_H: usize = 2;
+/// First content row of the settings page: one blank row of breathing space
+/// under the chrome bar, so the sidebar band and page title don't sit flush
+/// against the tab strip.
+const SETTINGS_TOP: usize = 1;
+/// First grid row of the setting cards: the page title + its rule sit on
+/// the two rows above (the strip tab names the page, so no header row).
+const SETTINGS_CARDS_TOP: usize = SETTINGS_TOP + 2;
+/// Width of the clickable `/ search` affordance at the title row's right.
+const SETTINGS_SEARCH_W: usize = 14;
+/// First column of a setting card's text (right of the sidebar + separator).
+const SETTINGS_CARD_X: usize = SETTINGS_SIDEBAR_W + 3;
+/// Cells left free at the cards' right edge (the value widget ends here).
+const SETTINGS_RIGHT_PAD: usize = 3;
+/// Cap on the card column's width. On a wide window an uncapped card puts
+/// the value ~200 cells from its label — the eye loses the pairing — so the
+/// content column stays readable-width like a settings page, not a table.
+const SETTINGS_CARD_W_MAX: usize = 80;
 /// Two clicks on the drag strip within this window toggle maximize.
 const DOUBLE_CLICK_MS: u128 = 400;
+/// Default inner margin around the pane area (`[window] padding` overrides).
+const DEFAULT_PAD: u32 = 8;
 
 /// One pane-resize keypress moves the split boundary by this ratio fraction.
 const RESIZE_STEP: f32 = 0.05;
 /// Scrollback lines moved per mouse-wheel notch.
 const WHEEL_LINES: isize = 3;
+/// Dragging a selection past a pane's top/bottom edge by more than this many
+/// pixels auto-scrolls the viewport, so text beyond what's currently visible
+/// can still be reached — matches most editors/terminals with a scrollback.
+const DRAG_SCROLL_MARGIN: f64 = 24.0;
+/// Auto-scroll step cadence while the pointer is held past the edge.
+const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Wakeups sent from per-tab PTY reader threads into the winit loop, tagged
 /// with the tab id they concern.
@@ -106,6 +147,14 @@ enum Hit {
     Close,
     /// Empty bar: drag moves the window, double-click toggles maximize.
     Drag,
+    /// Overflow indicator: more tabs exist than fit in the strip. Clicking
+    /// cycles to the next tab, scrolling the strip to reveal it.
+    MoreTabs,
+    /// The settings page's own strip tab, shown while the page is open
+    /// (already active; clicking it is a no-op).
+    SettingsTab,
+    /// Close the settings page (the settings tab's × button).
+    CloseSettings,
 }
 
 /// A transient full-window page drawn over the active tab while open: the shell
@@ -252,10 +301,12 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
         }
     }
 
+    let profile_override = crate::config::flag_value(&args, "--profile").map(str::to_string);
     let mut app = App {
         backend,
         config: config.clone(),
         config_path,
+        profile_override,
         proxy,
         next_id: std::rc::Rc::new(std::cell::Cell::new(0)),
         shells: crate::shells::detect_all(),
@@ -338,6 +389,17 @@ fn reader_loop(
     let _ = proxy.send_event(UserEvent::Exit(id));
 }
 
+/// An in-progress drag-to-reorder of chrome-bar tabs: pressing a tab arms
+/// it, and once the pointer travels past a small slop (so a plain click
+/// never reorders) the tab follows the pointer, trading places as it
+/// crosses its neighbors' midpoints. `idx` tracks the dragged tab's current
+/// position across those moves; releasing the button clears the state.
+struct TabDrag {
+    idx: usize,
+    press_x: f64,
+    moving: bool,
+}
+
 /// One top-level OS window: its tabs/panes, renderer, chrome, and every bit
 /// of per-window UI state (selection, overlays, search, copy mode, …). The
 /// [`App`] router owns one of these per open window and dispatches winit
@@ -349,6 +411,10 @@ struct WindowState<'a> {
     config: Config,
     /// The config file in effect, for the open shortcut + reload re-reads.
     config_path: Option<std::path::PathBuf>,
+    /// The `--profile <name>` this instance was launched with, if any —
+    /// reapplied after every `reload_config()` re-read (see its doc comment)
+    /// so the launch-time profile override survives a config-file save.
+    profile_override: Option<String>,
     tabs: Vec<Tab>,
     /// Index into `tabs` of the session being shown and fed input.
     active: usize,
@@ -359,6 +425,10 @@ struct WindowState<'a> {
     font: FontCache,
     cell_w: usize,
     cell_h: usize,
+    /// Inner margin in pixels around the pane area (`[window] padding`). The
+    /// chrome bar stays flush; the grid sits inset by this on the other three
+    /// sides (and below the bar), painted in the theme background.
+    pad: usize,
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
     mods: ModifiersState,
@@ -371,6 +441,13 @@ struct WindowState<'a> {
     clipboard: Option<arboard::Clipboard>,
     /// Current pointer position in physical pixels, used for hit-testing.
     mouse_pos: (f64, f64),
+    /// Fractional remainder of the last `MouseWheel` delta-to-lines
+    /// conversion. High-resolution wheels and slow trackpad flicks emit many
+    /// events with less than one line's worth of delta each; rounding each
+    /// event independently (the old behavior) dropped all of them on the
+    /// floor and slow scrolling didn't move anything. Accumulating instead
+    /// means every bit of delta eventually turns into a scrolled line.
+    scroll_accum: f64,
     /// Whether the left button is held (a drag-selection is in progress).
     selecting: bool,
     /// Physical button currently held, if any — drives `?1002` drag-motion
@@ -384,6 +461,17 @@ struct WindowState<'a> {
     sel_anchor: Option<(usize, usize)>,
     /// Per-cell click actions for the chrome bar, rebuilt with each layout.
     hits: Vec<Hit>,
+    /// An in-progress tab drag (press on a tab arms it; releasing clears).
+    tab_drag: Option<TabDrag>,
+    /// Chrome-bar element under the pointer, for hover feedback. `None` when
+    /// the pointer is below the bar or over an inert (drag-strip) cell.
+    hover: Option<Hit>,
+    /// A Ctrl-hovered hyperlink under the pointer in the focused pane's grid,
+    /// `(row, start_col, end_col)` — drives the pointer cursor and hover
+    /// underline (G22). Recomputed on every `CursorMoved`/`ModifiersChanged`;
+    /// `None` when Ctrl isn't held, the pointer is off the grid, or there's
+    /// no link there.
+    hover_link: Option<(usize, usize, usize)>,
     /// Time of the last single click on the drag strip (double-click detect).
     last_strip_click: Option<Instant>,
     /// Whether the window currently has OS focus. Gates the `?1004` focus
@@ -394,6 +482,10 @@ struct WindowState<'a> {
     /// instead of plain text. Toggled with Ctrl+R inside search mode;
     /// remembered across searches.
     search_regex: bool,
+    /// Whether the find bar's match is case-sensitive (skips Unicode case
+    /// folding). Toggled with Alt+C inside search mode; remembered across
+    /// searches, mirroring `search_regex`.
+    search_case_sensitive: bool,
     /// Broadcast input (G28): while set, keystrokes and pastes go to every
     /// pane in the active tab (multi-host workflows), not just the focused
     /// one. Toggled per-window; the active tab shows a `⇉` marker.
@@ -420,6 +512,12 @@ struct WindowState<'a> {
     overlay: Option<Overlay>,
     /// Current font size in px, tracked so the settings page can rebuild it.
     font_px: f32,
+    /// The window's current monitor DPI scale factor (1.0 = 100%), tracked so
+    /// `WindowEvent::ScaleFactorChanged` can rescale `font_px` proportionally
+    /// instead of leaving text rendered at the wrong physical size after a
+    /// cross-monitor move. Winit reports this at window creation and on every
+    /// change; there is no ambient way to query it in between.
+    scale_factor: f64,
     /// Set when this window should close (last tab closed, × button, OS close
     /// request); the [`App`] router drops it and exits the loop when none are
     /// left.
@@ -951,8 +1049,12 @@ impl WindowState<'_> {
     /// Recompute the cell grid from the window's pixel size (minus the chrome
     /// row) and relay it to every pane of every tab.
     fn apply_size(&mut self, px_w: u32, px_h: u32) {
-        let cols = ((px_w as usize / self.cell_w).max(1)) as u16;
-        let rows = (((px_h as usize / self.cell_h).saturating_sub(1)).max(1)) as u16;
+        // The padding band surrounds the pane area on three sides plus the
+        // gap under the (flush, full-width) chrome bar.
+        let inner_w = (px_w as usize).saturating_sub(2 * self.pad);
+        let inner_h = (px_h as usize).saturating_sub(2 * self.pad);
+        let cols = ((inner_w / self.cell_w).max(1)) as u16;
+        let rows = (((inner_h / self.cell_h).saturating_sub(1)).max(1)) as u16;
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
             self.rows = rows;
@@ -979,6 +1081,7 @@ impl WindowState<'_> {
                 focused: false,
                 cursor_on: false,
                 trail: Vec::new(),
+                hover_link: None,
             };
             renderer.render(
                 std::slice::from_ref(&frame),
@@ -987,6 +1090,9 @@ impl WindowState<'_> {
                 size.width,
                 size.height,
                 divider,
+                self.theme.bg,
+                mix(self.theme.bg, self.theme.fg, 48),
+                self.pad,
             );
             return;
         }
@@ -1065,9 +1171,20 @@ impl WindowState<'_> {
                 focused: *foc,
                 cursor_on: blink,
                 trail: if *foc { std::mem::take(&mut ghosts) } else { Vec::new() },
+                hover_link: if *foc { self.hover_link } else { None },
             })
             .collect();
-        renderer.render(&frames, &chrome, &mut self.font, size.width, size.height, divider);
+        renderer.render(
+            &frames,
+            &chrome,
+            &mut self.font,
+            size.width,
+            size.height,
+            divider,
+            self.theme.bg,
+            mix(self.theme.bg, self.theme.fg, 48),
+            self.pad,
+        );
     }
 
     /// The active tab's focused pane — the input, cursor, and search target.
@@ -1088,11 +1205,25 @@ impl WindowState<'_> {
     /// Lay out the chrome bar for the current tabs/size: tab labels and the
     /// `+` on the left, the caption buttons (─ □ ×) right-aligned, drag strip
     /// between. Rebuilds the per-cell hit map as it goes.
+    /// Cells the chrome bar spans. The bar is flush with the window (unlike
+    /// the pad-inset grid), so its width comes from the window's pixels, not
+    /// `self.cols`: `paint` cells cover the full width (the last may clip at
+    /// the edge), while controls lay out within `layout` whole cells so the
+    /// caption buttons reach the right edge without being cut.
+    fn bar_cells(&self) -> (usize, usize) {
+        let px = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0) as usize;
+        if px == 0 || self.cell_w == 0 {
+            let c = self.cols as usize;
+            return (c, c);
+        }
+        (px.div_ceil(self.cell_w), px / self.cell_w)
+    }
+
     fn chrome_row(&mut self) -> Vec<Cell> {
-        let cols = self.cols as usize;
+        let (paint_cols, cols) = self.bar_cells();
         if let Some(query) = self.searching.clone() {
-            let mut row = vec![Cell::blank(); cols];
-            let bar_bg = mix(self.theme.bg, self.theme.fg, 45);
+            let mut row = vec![Cell::blank(); paint_cols];
+            let bar_bg = mix(self.theme.bg, self.theme.fg, 48);
             for c in &mut row {
                 c.fg = self.theme.fg;
                 c.bg = bar_bg;
@@ -1104,7 +1235,7 @@ impl WindowState<'_> {
                 None => " no matches ".to_string(),
             };
             let limit = cols.saturating_sub(count.chars().count());
-            let mut hits = vec![Hit::Drag; cols];
+            let mut hits = vec![Hit::Drag; paint_cols];
             let mut col = 0;
             let mode = if self.search_regex { " Find(re): " } else { " Find: " };
             put_text(&mut row, &mut hits, &mut col, limit, &format!("{mode}{query}"), self.theme.fg, bar_bg, Hit::Drag);
@@ -1114,13 +1245,13 @@ impl WindowState<'_> {
             return row;
         }
         if self.copy_mode.is_some() {
-            let mut row = vec![Cell::blank(); cols];
-            let bar_bg = mix(self.theme.bg, self.theme.fg, 45);
+            let mut row = vec![Cell::blank(); paint_cols];
+            let bar_bg = mix(self.theme.bg, self.theme.fg, 48);
             for c in &mut row {
                 c.fg = self.theme.fg;
                 c.bg = bar_bg;
             }
-            let mut hits = vec![Hit::Drag; cols];
+            let mut hits = vec![Hit::Drag; paint_cols];
             let mut col = 0;
             put_text(
                 &mut row,
@@ -1135,55 +1266,117 @@ impl WindowState<'_> {
             self.hits = hits;
             return row;
         }
-        let bar_bg = mix(self.theme.bg, self.theme.fg, 30);
+        // Three contrast tiers give the strip depth: the empty band tints
+        // hardest, inactive tabs sit on it as lighter chips, hover lightens
+        // further, and the active tab adopts the terminal background outright
+        // — so a tab is always distinguishable from the strip it sits on, in
+        // light and dark themes alike. The accent line follows the cursor
+        // color rather than adding config keys.
+        let bar_bg = mix(self.theme.bg, self.theme.fg, 48);
+        let tab_bg = mix(self.theme.bg, self.theme.fg, 20);
         let dim_fg = mix(self.theme.fg, self.theme.bg, 110);
-        let mut row: Vec<Cell> = vec![Cell::blank(); cols];
+        let hover = self.hover;
+        let hover_bg = mix(self.theme.bg, self.theme.fg, 10);
+        let btn_hover_bg = mix(bar_bg, self.theme.fg, 35);
+        let accent = self.theme.cursor;
+        let mut row: Vec<Cell> = vec![Cell::blank(); paint_cols];
         for c in &mut row {
             c.fg = self.theme.fg;
             c.bg = bar_bg;
         }
-        let mut hits = vec![Hit::Drag; cols];
+        let mut hits = vec![Hit::Drag; paint_cols];
 
         // Caption buttons get the last 12 cells (4 each); the `+` / `▾` buttons
         // sit just left of them, and the tabs fill the rest without overrunning.
         let btn0 = cols.saturating_sub(12);
-        let tab_limit = btn0.saturating_sub(8);
+        // The open settings page is a peer of the shells, not a veil over
+        // one: it gets its own (active) strip tab, and the shell tabs render
+        // inactive behind it. The chip's room comes off the tab budget.
+        let settings_open = matches!(self.overlay, Some(Overlay::Settings(_)));
+        const SETTINGS_TAB_W: usize = 12; // " Settings" + " × "
+        let tab_limit = btn0
+            .saturating_sub(8)
+            .saturating_sub(if settings_open { SETTINGS_TAB_W + 1 } else { 0 });
 
         // The active tab of a focused window is being watched; its badge is
-        // stale by definition.
+        // stale by definition. (Cleared before labels are gathered below.)
         if self.focused
             && let Some(tab) = self.tabs.get_mut(self.active)
         {
             tab.attention = false;
         }
-        let close_w = 3; // " × " on each tab
-        let mut col = 0usize;
-        for (i, tab) in self.tabs.iter().enumerate() {
-            if col >= tab_limit {
-                break; // out of room; the rest stay reachable by keyboard
-            }
-            let is_active = i == self.active;
-            // The active tab adopts the terminal background, visually merging
-            // with the grid below; inactive ones sit dimmed on the bar.
-            let (fg, bg) = if is_active { (self.theme.fg, self.theme.bg) } else { (dim_fg, bar_bg) };
-            let (title, progress) = {
+
+        // First pass: every tab's label, so widths can adapt to the titles.
+        // OSC 9;4 progress rides the label: ` 42%`, `!42%` on error/paused,
+        // `…` while indeterminate; an attention badge prepends `•` in the
+        // alert color (painted separately, but its width counts here).
+        let close_w = 3; // " × " on a tab that shows its close button
+        let infos: Vec<(String, bool)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
                 let state = tab.focused().map(|p| {
                     let g = p.grid.lock();
                     (g.title.clone(), g.progress)
                 });
                 let (label, progress) = state.unwrap_or_default();
-                (if label.is_empty() { format!("shell {}", i + 1) } else { label }, progress)
+                let title = if label.is_empty() { format!("shell {}", i + 1) } else { label };
+                let suffix = match progress {
+                    Some((2 | 4, pct)) => format!(" !{pct}%"),
+                    Some((3, _)) => " …".to_string(),
+                    Some((_, pct)) => format!(" {pct}%"),
+                    None => String::new(),
+                };
+                let cast = if i == self.active && self.broadcast { "⇉ " } else { "" };
+                (format!(" {cast}{title}{suffix}"), tab.attention)
+            })
+            .collect();
+        let desired: Vec<usize> = infos
+            .iter()
+            .map(|(label, attention)| {
+                label.chars().count() + if *attention { 2 } else { 0 } + close_w
+            })
+            .collect();
+
+        // Tabs size to their titles (clamped, shrinking together as the
+        // strip crowds); once even minimum-width tabs can't fit, fall back
+        // to the uniform-width strip scrolled to keep the active tab
+        // visible, with a `»N` overflow badge for the hidden rest.
+        const OVERFLOW_INDICATOR_W: usize = 4; // " »N"-ish
+        let (tab_start, widths, hidden) = match tab_widths(&desired, tab_limit) {
+            Some(widths) => (0, widths, 0),
+            None => {
+                let strip = tab_limit.saturating_sub(OVERFLOW_INDICATOR_W);
+                let (start, end) = visible_tab_range(self.active, self.tabs.len(), strip);
+                (start, vec![TAB_CELLS; end - start], self.tabs.len() - (end - start))
+            }
+        };
+        let strip_limit =
+            if hidden > 0 { tab_limit.saturating_sub(OVERFLOW_INDICATOR_W) } else { tab_limit };
+
+        let mut col = 0usize;
+        for (vi, &w) in widths.iter().enumerate() {
+            let i = tab_start + vi;
+            if col >= strip_limit {
+                break; // out of room; the rest stay reachable by keyboard
+            }
+            // While the settings page is open its own chip is the active
+            // one; every shell tab renders inactive behind it.
+            let is_active = i == self.active && !settings_open;
+            let tab_hovered = hover == Some(Hit::Tab(i)) || hover == Some(Hit::CloseTab(i));
+            // The active tab adopts the terminal background, visually merging
+            // with the grid below; inactive ones sit dimmed on the bar and
+            // light up (full fg on a lighter bg) under the pointer.
+            let (fg, bg) = if is_active {
+                (self.theme.fg, self.theme.bg)
+            } else if tab_hovered {
+                (self.theme.fg, hover_bg)
+            } else {
+                (dim_fg, tab_bg)
             };
-            // OSC 9;4 progress rides the label: ` 42%`, `!42%` on error/
-            // paused, `…` while indeterminate. An attention badge prepends
-            // `•` in the alert color.
-            let suffix = match progress {
-                Some((2 | 4, pct)) => format!(" !{pct}%"),
-                Some((3, _)) => " …".to_string(),
-                Some((_, pct)) => format!(" {pct}%"),
-                None => String::new(),
-            };
-            let tab_end = (col + TAB_CELLS).min(tab_limit);
+            let (label, attention) = (&infos[i].0, infos[i].1);
+            let tab_end = (col + w).min(strip_limit);
             // Paint the whole tab span in its color and make it activate on click.
             for c in col..tab_end {
                 row[c] = Cell::blank();
@@ -1191,36 +1384,124 @@ impl WindowState<'_> {
                 row[c].bg = bg;
                 hits[c] = Hit::Tab(i);
             }
-            // Title text, leaving room for the per-tab close button when wide enough.
-            let has_close = tab_end - col > close_w + 1;
-            let label_end = if has_close { tab_end - close_w } else { tab_end };
-            let mut tcol = col;
-            if tab.attention {
+            // The close button shows on the active and hovered tabs only — a
+            // full strip of × is a row of misclicks right where tabs are
+            // clicked to switch. Width still reserves its cells, so the label
+            // doesn't reflow when the × appears.
+            let has_close = (is_active || tab_hovered) && tab_end - col > close_w + 1;
+            let label_end = if has_close { tab_end - close_w } else { tab_end - close_w.min(tab_end - col) };
+            // A title that doesn't fit ends in an ellipsis, not a hard cut.
+            let badge_w = if attention { 2 } else { 0 };
+            let space = label_end.saturating_sub(col + badge_w);
+            let shown: String = if label.chars().count() > space {
+                let mut t: String = label.chars().take(space.saturating_sub(1)).collect();
+                t.push('…');
+                t
+            } else {
+                label.clone()
+            };
+            // Center the label in the chip: the reserved (hidden) close cells
+            // then read as padding rather than a hole after the title. The
+            // cap keeps the label out of the close slot, and the lead doesn't
+            // depend on `has_close`, so hovering (which reveals the ×) never
+            // reflows the title.
+            let content = badge_w + shown.chars().count();
+            let lead = (tab_end.saturating_sub(col).saturating_sub(content) / 2)
+                .min(label_end.saturating_sub(col).saturating_sub(content));
+            let mut tcol = col + lead;
+            if attention {
                 let alert = self.theme.palette16[1]; // ANSI red
                 put_text(&mut row, &mut hits, &mut tcol, label_end, " •", alert, bg, Hit::Tab(i));
             }
-            let cast = if is_active && self.broadcast { "⇉ " } else { "" };
-            let label: String = format!(" {cast}{title}{suffix}")
-                .chars()
-                .take(label_end.saturating_sub(tcol))
-                .collect();
-            put_text(&mut row, &mut hits, &mut tcol, label_end, &label, fg, bg, Hit::Tab(i));
+            put_text(&mut row, &mut hits, &mut tcol, label_end, &shown, fg, bg, Hit::Tab(i));
             if has_close {
                 let mut ccol = tab_end - close_w;
-                put_text(&mut row, &mut hits, &mut ccol, tab_end, " × ", fg, bg, Hit::CloseTab(i));
+                let (cfg, cbg) = if hover == Some(Hit::CloseTab(i)) {
+                    (self.theme.fg, mix(bg, self.theme.fg, 55))
+                } else {
+                    (fg, bg)
+                };
+                put_text(&mut row, &mut hits, &mut ccol, tab_end, " × ", cfg, cbg, Hit::CloseTab(i));
+            }
+            // Active tab: bold label plus an accent underline under the label
+            // area — stopping before the ×, so it reads as the tab's title
+            // marker rather than underlining the close control.
+            if is_active {
+                for c in &mut row[col..label_end.max(col)] {
+                    c.flags |= ATTR_BOLD | ATTR_UNDERLINE | ATTR_UNDERLINE_COLOR;
+                    c.underline_color = accent;
+                }
             }
             col = tab_end;
-            if col < tab_limit {
-                col += 1; // one bar-colored cell as a tab separator
+            if col < strip_limit {
+                col += 1; // strip-colored gap; the darker band edges each chip
             }
         }
-        put_text(&mut row, &mut hits, &mut col, btn0, " + ", self.theme.fg, bar_bg, Hit::NewTab);
-        put_text(&mut row, &mut hits, &mut col, btn0, " ▾ ", self.theme.fg, bar_bg, Hit::ShellMenu);
+        if hidden > 0 {
+            let (ifg, ibg) = if hover == Some(Hit::MoreTabs) {
+                (self.theme.fg, btn_hover_bg)
+            } else {
+                (dim_fg, bar_bg)
+            };
+            let indicator_end = (col + OVERFLOW_INDICATOR_W).min(btn0);
+            for c in col..indicator_end {
+                row[c] = Cell::blank();
+                row[c].fg = ifg;
+                row[c].bg = ibg;
+                hits[c] = Hit::MoreTabs;
+            }
+            put_text(&mut row, &mut hits, &mut col, indicator_end, &format!(" »{hidden}"), ifg, ibg, Hit::MoreTabs);
+            col = indicator_end;
+        }
+        // The settings page's own chip: rendered exactly like an active tab
+        // (terminal bg, bold, accent underline) with its × closing the page.
+        if settings_open {
+            let start = col;
+            let end = (col + SETTINGS_TAB_W).min(btn0);
+            let bg = self.theme.bg;
+            for c in start..end {
+                row[c] = Cell::blank();
+                row[c].fg = self.theme.fg;
+                row[c].bg = bg;
+                hits[c] = Hit::SettingsTab;
+            }
+            let label_end = end.saturating_sub(close_w);
+            let mut tcol = start;
+            put_text(&mut row, &mut hits, &mut tcol, label_end, " Settings", self.theme.fg, bg, Hit::SettingsTab);
+            let (cfg, cbg) = if hover == Some(Hit::CloseSettings) {
+                (self.theme.fg, mix(bg, self.theme.fg, 55))
+            } else {
+                (self.theme.fg, bg)
+            };
+            let mut ccol = label_end;
+            put_text(&mut row, &mut hits, &mut ccol, end, " × ", cfg, cbg, Hit::CloseSettings);
+            for c in &mut row[start..label_end.max(start)] {
+                c.flags |= ATTR_BOLD | ATTR_UNDERLINE | ATTR_UNDERLINE_COLOR;
+                c.underline_color = accent;
+            }
+            col = end;
+            if col < btn0 {
+                col += 1;
+            }
+        }
+        let btn_bg = |hit: Hit| if hover == Some(hit) { btn_hover_bg } else { bar_bg };
+        put_text(&mut row, &mut hits, &mut col, btn0, " + ", self.theme.fg, btn_bg(Hit::NewTab), Hit::NewTab);
+        put_text(&mut row, &mut hits, &mut col, btn0, " ▾ ", self.theme.fg, btn_bg(Hit::ShellMenu), Hit::ShellMenu);
 
         let mut bcol = btn0;
-        put_text(&mut row, &mut hits, &mut bcol, btn0 + 4, "  ─ ", self.theme.fg, bar_bg, Hit::Minimize);
-        put_text(&mut row, &mut hits, &mut bcol, btn0 + 8, "  □ ", self.theme.fg, bar_bg, Hit::Maximize);
-        put_text(&mut row, &mut hits, &mut bcol, cols, "  × ", self.theme.fg, bar_bg, Hit::Close);
+        put_text(&mut row, &mut hits, &mut bcol, btn0 + 4, "  ─ ", self.theme.fg, btn_bg(Hit::Minimize), Hit::Minimize);
+        put_text(&mut row, &mut hits, &mut bcol, btn0 + 8, "  □ ", self.theme.fg, btn_bg(Hit::Maximize), Hit::Maximize);
+        // The caption close button hovers native-red, matching Windows 11.
+        let (close_fg, close_bg) =
+            if hover == Some(Hit::Close) { (0xFFFFFF, 0xC42B1C) } else { (self.theme.fg, bar_bg) };
+        put_text(&mut row, &mut hits, &mut bcol, cols, "  × ", close_fg, close_bg, Hit::Close);
+        // Any partial cell past the last whole one still belongs to the ×:
+        // the window's top-right corner should always close (Fitts's law),
+        // never fall through to the drag strip.
+        for c in bcol..paint_cols {
+            row[c].bg = close_bg;
+            hits[c] = Hit::Close;
+        }
 
         self.hits = hits;
         row
@@ -1245,11 +1526,19 @@ impl WindowState<'_> {
         }
     }
 
+    /// The grid content's vertical pixel offset: the padding band plus the
+    /// chrome bar's own downward inset (the strip band above the tabs pushes
+    /// the bar — and everything under it — down; see `render::bar_inset`).
+    fn grid_oy(&self) -> usize {
+        self.pad + super::render::bar_inset(self.pad, self.cell_h)
+    }
+
     /// Map a physical pixel position to a clamped `(col, row)` *grid* cell
     /// (the chrome bar occupies the screen row above grid row 0).
     fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
-        let col = (px.max(0.0) as usize / self.cell_w).min((self.cols as usize).saturating_sub(1));
-        let row = (py.max(0.0) as usize / self.cell_h)
+        let pad = self.pad as f64;
+        let col = ((px - pad).max(0.0) as usize / self.cell_w).min((self.cols as usize).saturating_sub(1));
+        let row = ((py - self.grid_oy() as f64).max(0.0) as usize / self.cell_h)
             .saturating_sub(1)
             .min((self.rows as usize).saturating_sub(1));
         (col, row)
@@ -1264,8 +1553,13 @@ impl WindowState<'_> {
         }
         let size = window.inner_size();
         let (w, h) = (size.width as f64, size.height as f64);
-        let (l, r) = (x < RESIZE_BORDER, x > w - RESIZE_BORDER);
-        let (t, b) = (y < RESIZE_BORDER, y > h - RESIZE_BORDER);
+        // `x`/`y` are physical pixels (as is `inner_size()`); scale the grab
+        // zone by the monitor's DPI factor so it stays a consistent *logical*
+        // size instead of shrinking to a barely-hittable sliver on HiDPI
+        // displays (6 physical px is ~3 logical px at 200%).
+        let border = RESIZE_BORDER * self.scale_factor;
+        let (l, r) = (x < border, x > w - border);
+        let (t, b) = (y < border, y > h - border);
         Some(match (l, r, t, b) {
             (true, _, true, _) => ResizeDirection::NorthWest,
             (_, true, true, _) => ResizeDirection::NorthEast,
@@ -1293,7 +1587,7 @@ impl WindowState<'_> {
             return self.on_bar_click(x);
         }
         if self.overlay.is_some() {
-            return self.overlay_click(y);
+            return self.overlay_click(x, y);
         }
         if let Some(id) = self.pane_under(x, y)
             && let Some(tab) = self.tabs.get_mut(self.active)
@@ -1320,14 +1614,16 @@ impl WindowState<'_> {
         // Click-to-move-cursor (G21): a plain first click at the shell
         // prompt sends the arrow presses that walk the readline cursor to
         // the clicked cell. Mouse-tracking apps own their clicks, so this
-        // only fires when reporting is off; drag-selection still arms below
-        // (the arrows only ever move within the prompt's own line).
+        // only fires when reporting is off — or Shift bypasses it, same as
+        // `report_mouse`'s escape hatch below; drag-selection still arms
+        // below either way (the arrows only ever move within the prompt's
+        // own line).
         if self.config.click_to_move.unwrap_or(true)
             && let Some(p) = self.pane()
         {
             let moves = {
                 let g = p.grid.lock();
-                if g.mouse_modes.active() {
+                if g.mouse_modes.active() && !self.mods.shift_key() {
                     None
                 } else {
                     g.prompt_cursor_moves(cell.0, cell.1).map(|m| (m, g.app_cursor_keys))
@@ -1353,7 +1649,12 @@ impl WindowState<'_> {
         self.last_grid_click = Some((now, cell));
         self.sel_anchor =
             self.pane().map(|p| (cell.0, p.grid.lock().abs_of_view_row(cell.1)));
-        self.selecting = self.click_streak == 1;
+        // Every streak arms a drag now, not just a plain click: dragging
+        // after a double/triple click extends the selection by whole
+        // word/line (`CursorMoved` below reads `click_streak` to pick the
+        // granularity), instead of the drag being inert past the initial
+        // word/line as it was before.
+        self.selecting = true;
         if let Some(p) = self.pane() {
             let mut g = p.grid.lock();
             match self.click_streak {
@@ -1381,8 +1682,18 @@ impl WindowState<'_> {
 
     /// Map pixel `(px, py)` to a cell within the *focused* pane, clamped to it.
     fn cell_in_focused(&self, px: f64, py: f64) -> (usize, usize) {
+        match self.tabs.get(self.active) {
+            Some(tab) => self.cell_in_pane(tab.focus, px, py),
+            None => self.cell_at(px, py),
+        }
+    }
+
+    /// Map pixel `(px, py)` to a cell within pane `id`, clamped to it. Used
+    /// both for the focused pane (`cell_in_focused`) and for routing wheel
+    /// events to whichever pane is under the pointer, regardless of focus.
+    fn cell_in_pane(&self, id: u64, px: f64, py: f64) -> (usize, usize) {
         let (col, row) = self.cell_at(px, py);
-        if let Some(r) = self.focused_pane_rect() {
+        if let Some(r) = self.pane_rect(id) {
             return (
                 col.saturating_sub(r.col).min(r.cols.saturating_sub(1)),
                 row.saturating_sub(r.row).min(r.rows.saturating_sub(1)),
@@ -1394,9 +1705,77 @@ impl WindowState<'_> {
     /// The focused pane's cell rect within the window's grid area, `None`
     /// before any tab exists.
     fn focused_pane_rect(&self) -> Option<Rect> {
+        let tab = self.tabs.get(self.active)?;
+        self.pane_rect(tab.focus)
+    }
+
+    /// Pane `id`'s cell rect within the window's grid area, `None` if `id`
+    /// isn't a pane of the active tab.
+    fn pane_rect(&self, id: u64) -> Option<Rect> {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         let tab = self.tabs.get(self.active)?;
-        tab.rects(area).into_iter().find(|(id, _)| *id == tab.focus).map(|(_, r)| r)
+        tab.rects(area).into_iter().find(|(pid, _)| *pid == id).map(|(_, r)| r)
+    }
+
+    /// The focused pane's id, `None` before any tab exists.
+    fn focused_pane_id(&self) -> Option<u64> {
+        self.tabs.get(self.active).map(|t| t.focus)
+    }
+
+    /// Update the in-progress drag-selection's head to the cell at pixel
+    /// `(hx, hy)` (clamped to the focused pane), applying word/line
+    /// extension per `click_streak`. Returns whether a selection was
+    /// updated. Shared by `CursorMoved`'s live drag and the edge-auto-scroll
+    /// tick below, which re-applies it each scroll step at the pointer's
+    /// last known (off-pane) position.
+    fn update_drag_selection_head(&mut self, hx: f64, hy: f64) -> bool {
+        let (Some(anchor), Some(p)) = (self.sel_anchor, self.pane()) else {
+            return false;
+        };
+        let (hc, hr) = self.cell_in_focused(hx, hy);
+        let mut g = p.grid.lock();
+        let hc = g.logical_col(hc, hr);
+        let head = (hc, g.abs_of_view_row(hr));
+        match self.click_streak {
+            2 => g.extend_word_selection(anchor, head),
+            3 => g.extend_line_selection(anchor.1, head.1),
+            _ => g.selection = Some(Selection { anchor, head }),
+        }
+        true
+    }
+
+    /// While dragging a selection with the pointer past the focused pane's
+    /// top/bottom edge, scroll the viewport one line into/out of history so
+    /// text beyond what's currently visible can still be reached, extending
+    /// the selection to the new edge row. Returns whether it scrolled, so
+    /// `tick` knows to keep waking up at `DRAG_SCROLL_INTERVAL` — held past
+    /// the edge with the pointer stationary should keep scrolling, not just
+    /// scroll once per `CursorMoved`.
+    fn drag_edge_autoscroll(&mut self) -> bool {
+        if !self.selecting {
+            return false;
+        }
+        let Some(r) = self.focused_pane_rect() else { return false };
+        let top_px = (self.grid_oy() + (r.row + 1) * self.cell_h) as f64;
+        let bottom_px = (self.grid_oy() + (r.row + r.rows + 1) * self.cell_h) as f64;
+        let Some(scroll_up) =
+            drag_scroll_direction(self.mouse_pos.1, top_px, bottom_px, DRAG_SCROLL_MARGIN)
+        else {
+            return false;
+        };
+        let Some(p) = self.pane() else { return false };
+        let moved = {
+            let mut g = p.grid.lock();
+            if scroll_up { g.scroll_view_up(1) } else { g.scroll_view_down(1) }
+        };
+        if !moved {
+            return false;
+        }
+        self.update_drag_selection_head(self.mouse_pos.0, self.mouse_pos.1);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
     }
 
     /// Dispatch a click on the chrome bar through the hit map.
@@ -1414,6 +1793,9 @@ impl WindowState<'_> {
                 if i < self.tabs.len() && i != self.active {
                     self.active = i;
                 }
+                // Arm drag-to-reorder; it only engages past the slop, so a
+                // plain click stays a plain click.
+                self.tab_drag = Some(TabDrag { idx: i, press_x: x, moving: false });
                 window.request_redraw();
             }
             Hit::CloseTab(i) => {
@@ -1439,6 +1821,14 @@ impl WindowState<'_> {
             Hit::Minimize => window.set_minimized(true),
             Hit::Maximize => window.set_maximized(!window.is_maximized()),
             Hit::Close => self.closed = true,
+            // The settings chip is already the active "tab"; only its ×
+            // does anything (closing the page saves it).
+            Hit::SettingsTab => {}
+            Hit::CloseSettings => self.close_overlay(),
+            Hit::MoreTabs => {
+                self.close_overlay();
+                self.cycle_tab(true);
+            }
             Hit::Drag => {
                 let now = Instant::now();
                 if self
@@ -1452,6 +1842,23 @@ impl WindowState<'_> {
                     let _ = window.drag_window();
                 }
             }
+        }
+    }
+
+    /// Middle-click on the chrome bar closes the tab under the pointer
+    /// (browser tab-strip convention), or does nothing over a non-tab
+    /// element (new-tab/menu/caption buttons/drag strip) — those don't have
+    /// a meaningful middle-click action.
+    fn on_bar_middle_click(&mut self, x: f64) {
+        if self.hits.is_empty() {
+            return;
+        }
+        let col = (x.max(0.0) as usize / self.cell_w).min(self.hits.len() - 1);
+        if let Hit::Tab(i) | Hit::CloseTab(i) = self.hits[col]
+            && i < self.tabs.len()
+        {
+            self.close_overlay();
+            self.close_tab_at(i);
         }
     }
 
@@ -1477,7 +1884,16 @@ impl WindowState<'_> {
     /// A set copies the child's text to the system clipboard; a query replies to
     /// the child from the system clipboard. Called on a tab's output, so
     /// background tabs are serviced too.
+    ///
+    /// Gated by the `clipboard` config policy (default write-only): with no
+    /// gate, any program that can write to the pty could read `52;c;?` and
+    /// have the terminal hand back whatever the user last copied — passwords,
+    /// tokens, anything on the clipboard — with zero user interaction. Sets
+    /// are lower-risk (the common case is a program copying its own output,
+    /// e.g. over SSH) so they're allowed by default; queries require opting
+    /// into `clipboard = "read-write"`.
     fn service_clipboard(&mut self, id: u64) {
+        let policy = self.config.clipboard.unwrap_or_default();
         let (set, set_primary, query, query_primary) = {
             let Some(p) = self.pane_by_id(id) else { return };
             let mut g = p.grid.lock();
@@ -1495,12 +1911,19 @@ impl WindowState<'_> {
                 std::mem::take(&mut g.clipboard_query_primary),
             )
         };
-        if let Some(text) = set
+        // Drain the pending request regardless of policy (above) so a denied
+        // request doesn't re-fire on every subsequent poll; only actually
+        // touch the clipboard when the policy allows it.
+        let allow_write = policy != ClipboardPolicy::Off;
+        let allow_read = policy == ClipboardPolicy::ReadWrite;
+        if allow_write
+            && let Some(text) = set
             && let Some(cb) = self.clipboard.as_mut()
         {
             let _ = cb.set_text(text);
         }
-        if let Some(text) = set_primary
+        if allow_write
+            && let Some(text) = set_primary
             && let Some(cb) = self.clipboard.as_mut()
         {
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -1511,7 +1934,8 @@ impl WindowState<'_> {
             #[cfg(not(all(unix, not(target_os = "macos"))))]
             let _ = cb.set_text(text); // no primary selection: best effort
         }
-        if query
+        if allow_read
+            && query
             && let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok())
         {
             let reply = osc52_reply('c', &text);
@@ -1519,7 +1943,8 @@ impl WindowState<'_> {
                 let _ = p.writer.write(&reply);
             }
         }
-        if query_primary
+        if allow_read
+            && query_primary
             && let Some(text) = self.primary_text()
         {
             let reply = osc52_reply('p', &text);
@@ -1657,7 +2082,38 @@ impl WindowState<'_> {
             Action::ScrollPageDown => self.scroll_key(false, false),
             Action::ScrollPromptUp => self.scroll_key(true, true),
             Action::ScrollPromptDown => self.scroll_key(true, false),
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::FontSizeUp => self.zoom_font(FONT_ZOOM_STEP),
+            Action::FontSizeDown => self.zoom_font(-FONT_ZOOM_STEP),
+            Action::FontSizeReset => {
+                let px = self.config.font_size.unwrap_or(FONT_PX);
+                let ligatures = self.config.ligatures.unwrap_or(true);
+                self.rebuild_font(px, ligatures);
+            }
         }
+    }
+
+    /// Flip the window in/out of fullscreen (F11 / Alt+Enter conventions —
+    /// previously only reachable via `launch_mode` at startup). A quake
+    /// window docks to the monitor edge instead and never toggles.
+    fn toggle_fullscreen(&mut self) {
+        if self.quake {
+            return;
+        }
+        let Some(window) = &self.window else { return };
+        let now_fullscreen = window.fullscreen().is_some();
+        window.set_fullscreen(
+            (!now_fullscreen).then_some(Fullscreen::Borderless(None)),
+        );
+    }
+
+    /// Grow/shrink the font by `delta` px (Ctrl+=/Ctrl+-, the Chrome/VS Code/
+    /// iTerm2/Windows Terminal convention), clamped to the same range the
+    /// settings overlay enforces.
+    fn zoom_font(&mut self, delta: f32) {
+        let px = (self.font_px + delta).clamp(super::settings::FONT_MIN, super::settings::FONT_MAX);
+        let ligatures = self.config.ligatures.unwrap_or(true);
+        self.rebuild_font(px, ligatures);
     }
 
     /// Enter incremental scrollback-search mode with an empty query.
@@ -1698,6 +2154,14 @@ impl WindowState<'_> {
                 self.search_regex = !self.search_regex;
                 self.run_search();
             }
+            Key::Character(s) if self.mods.alt_key() && !self.mods.control_key() && s.as_str() == "c" => {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                self.run_search();
+            }
+            Key::Character(s) if self.mods.control_key() && s.as_str() == "v" => {
+                let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
+                self.paste_into_search(text);
+            }
             Key::Character(s) if !self.mods.control_key() && !self.mods.alt_key() => {
                 if let Some(q) = self.searching.as_mut() {
                     q.push_str(s);
@@ -1715,9 +2179,25 @@ impl WindowState<'_> {
     /// Re-run the active tab's search for the current query.
     fn run_search(&mut self) {
         let q = self.searching.clone().unwrap_or_default();
-        let regex = self.search_regex;
+        let (regex, case_sensitive) = (self.search_regex, self.search_case_sensitive);
         if let Some(p) = self.pane() {
-            p.grid.lock().search_with(&q, regex);
+            p.grid.lock().search_with_case(&q, regex, case_sensitive);
+        }
+    }
+
+    /// Append clipboard text into the find bar's query — Ctrl+V (regular
+    /// clipboard) or a middle-click while it's open (PRIMARY selection,
+    /// mirroring `paste_primary`'s convention). Only the first line
+    /// contributes: a query is one line, and a pasted multi-line clipboard
+    /// would otherwise produce a query no match could ever satisfy.
+    fn paste_into_search(&mut self, text: Option<String>) {
+        let Some(text) = text.filter(|t| !t.is_empty()) else { return };
+        if let Some(q) = self.searching.as_mut() {
+            q.push_str(text.lines().next().unwrap_or(""));
+        }
+        self.run_search();
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -1744,6 +2224,30 @@ impl WindowState<'_> {
         }
     }
 
+    /// Jump straight to tab `i` (Ctrl+Alt+digit); out-of-range is ignored.
+    fn select_tab(&mut self, i: usize) {
+        if i < self.tabs.len() && i != self.active {
+            self.active = i;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Move tab `from` to position `to` (one drag-reorder step). The dragged
+    /// tab is the active one (pressing it activated it), so activity follows.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = to;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Tell the IME where the text cursor is, so its candidate/composition popup
     /// appears at the terminal cursor rather than the window origin.
     fn update_ime_area(&self) {
@@ -1751,9 +2255,21 @@ impl WindowState<'_> {
             return;
         };
         let (col, row) = p.grid.lock().cursor;
-        let x = (col * self.cell_w) as f64;
-        // +1 cell row for the chrome bar above the grid.
-        let y = ((row + 1) * self.cell_h) as f64;
+        // The cursor is pane-local; add the focused pane's own rect offset
+        // within the split layout, or the popup lands at the cursor's
+        // position within an unsplit *first* pane regardless of which split
+        // pane is actually focused (e.g. a right/bottom split composing IME
+        // would show the candidate window over the wrong pane entirely).
+        let (base_col, base_row) =
+            self.focused_pane_rect().map_or((0, 0), |r| (r.col, r.row));
+        let (x, y) = ime_cursor_area_origin(
+            self.pad,
+            self.grid_oy(),
+            self.cell_w,
+            self.cell_h,
+            (base_col, base_row),
+            (col, row),
+        );
         window.set_ime_cursor_area(
             winit::dpi::PhysicalPosition::new(x, y),
             winit::dpi::PhysicalSize::new(self.cell_w as u32, self.cell_h as u32),
@@ -1828,6 +2344,10 @@ impl WindowState<'_> {
         let bracketed = p.grid.lock().bracketed_paste;
         let bytes = encode_paste(&text, bracketed);
         self.write_child(&bytes);
+        // Middle-click paste (`paste_primary`) already does this; pasting
+        // while scrolled into history left the viewport there, so the user
+        // couldn't see what they'd just pasted appear at the live prompt.
+        self.snap_to_bottom();
     }
 
     /// Encode a native mouse event as SGR/1006 and send it to the active tab's
@@ -1835,28 +2355,45 @@ impl WindowState<'_> {
     /// `?1003`). `build` turns the cell under the pointer into the event. Returns
     /// whether bytes were sent, so the wheel path can fall back to local
     /// scrollback browsing when the child isn't tracking the mouse.
-    fn report_mouse(&mut self, build: impl FnOnce(usize, usize) -> MouseEvent) -> bool {
-        let Some(p) = self.pane() else { return false };
+    ///
+    /// Holding Shift bypasses app mouse tracking entirely, the same escape
+    /// hatch xterm/iTerm2/gnome-terminal have used for decades: a mouse-
+    /// tracking full-screen app (vim, tmux, htop) grabs every click, so
+    /// without this there would be no way to select text or scroll the
+    /// scrollback at all while one is running.
+    ///
+    /// `id` is the pane the event is addressed to — the focused pane for
+    /// press/release/drag-motion (a click already refocuses to the pane
+    /// under the pointer in `on_left_press`, so "focused" and "under
+    /// pointer" agree by the time this runs), or whichever pane is under
+    /// the pointer for wheel events, which don't go through `on_left_press`
+    /// and so would otherwise always report to the wrong pane in a split.
+    fn report_mouse(&mut self, id: Option<u64>, build: impl FnOnce(usize, usize) -> MouseEvent) -> bool {
+        if self.mods.shift_key() {
+            return false;
+        }
+        let Some(id) = id else { return false };
+        let Some(p) = self.pane_by_id(id) else { return false };
         let modes = p.grid.lock().mouse_modes;
         if !modes.active() {
             return false;
         }
-        let (col, row) = self.cell_in_focused(self.mouse_pos.0, self.mouse_pos.1);
+        let (col, row) = self.cell_in_pane(id, self.mouse_pos.0, self.mouse_pos.1);
         // Bidi: apps address cells in logical order; a click on a reordered
         // row reports the logical cell shown at the pointer's visual slot.
         let col = p.grid.lock().logical_col(col, row);
         let mut e = build(col, row);
         // SGR-pixel mode (`?1016`): the same SGR encoding, but the position
-        // is the pointer's pixel offset within the focused pane's text area
+        // is the pointer's pixel offset within the target pane's text area
         // (this pane is its own terminal, so pane-relative is the analogue of
         // xterm's text-area-relative pixels). The chrome bar above the grid
         // is one cell row tall, hence the +1 on the pane's row origin.
         if modes.extended & 8 != 0
-            && let Some(r) = self.focused_pane_rect()
+            && let Some(r) = self.pane_rect(id)
         {
             e.point = pane_pixel_point(
                 self.mouse_pos,
-                (r.col * self.cell_w, (r.row + 1) * self.cell_h),
+                (self.pad + r.col * self.cell_w, self.pad + (r.row + 1) * self.cell_h),
                 (r.cols * self.cell_w, r.rows * self.cell_h),
             );
         }
@@ -1865,7 +2402,7 @@ impl WindowState<'_> {
         if out.is_empty() {
             return false;
         }
-        let Some(p) = self.pane_mut() else { return false };
+        let Some(p) = self.pane_by_id_mut(id) else { return false };
         let _ = p.writer.write(&out);
         true
     }
@@ -1884,6 +2421,33 @@ impl WindowState<'_> {
             g.link_at(col, row).map(str::to_owned).or_else(|| g.url_at(col, row))
         };
         url.is_some_and(|u| open_url(&u))
+    }
+
+    /// Recompute `hover_link` for the pointer's current position: only set
+    /// while Ctrl is held and the pointer is over grid content (not the
+    /// chrome bar), and only when a hyperlink is actually there — mirrors
+    /// `open_link_under_pointer`'s OSC-8-then-plain-text lookup, but via
+    /// `hover_link_at` for the column span instead of a single cell.
+    /// Returns whether the value changed, so callers know whether to
+    /// repaint.
+    fn update_hover_link(&mut self) -> bool {
+        let (x, y) = self.mouse_pos;
+        let new = if self.mods.control_key() && (y.max(0.0) as usize) >= self.cell_h {
+            self.pane().and_then(|p| {
+                let (col, row) = self.cell_in_focused(x, y);
+                let g = p.grid.lock();
+                let col = g.logical_col(col, row);
+                g.hover_link_at(col, row).map(|(start, end, _)| (row, start, end))
+            })
+        } else {
+            None
+        };
+        if new != self.hover_link {
+            self.hover_link = new;
+            true
+        } else {
+            false
+        }
     }
 
     /// Open a dropdown listing every link visible in the focused pane —
@@ -1918,39 +2482,43 @@ impl WindowState<'_> {
     }
 
     /// Whether alternate scroll mode (`?1007`) should intercept wheel input
-    /// for the focused pane right now: the mode is on *and* its alternate
-    /// screen is active (mode 1007 only ever applies there — the primary
-    /// screen keeps browsing rusty_term's own scrollback, same as xterm).
-    fn alt_scroll_active(&self) -> bool {
-        self.pane().is_some_and(|p| {
+    /// for pane `id` right now: the mode is on *and* its alternate screen is
+    /// active (mode 1007 only ever applies there — the primary screen keeps
+    /// browsing rusty_term's own scrollback, same as xterm).
+    fn alt_scroll_active(&self, id: u64) -> bool {
+        self.pane_by_id(id).is_some_and(|p| {
             let g = p.grid.lock();
             g.alt_scroll && g.in_alt_screen()
         })
     }
 
     /// Translate a wheel scroll into repeated Up/Down (DECCKM-aware) key
-    /// presses for alternate scroll mode (`?1007`), so the wheel drives a
-    /// pager (`less`, `man`, …) that never registered native mouse support.
-    fn send_alt_scroll_keys(&mut self, lines: isize) {
-        let app_cursor = self.pane().is_some_and(|p| p.grid.lock().app_cursor_keys);
+    /// presses for alternate scroll mode (`?1007`) on pane `id`, so the wheel
+    /// drives a pager (`less`, `man`, …) that never registered native mouse
+    /// support.
+    fn send_alt_scroll_keys(&mut self, id: u64, lines: isize) {
+        let app_cursor = self.pane_by_id(id).is_some_and(|p| p.grid.lock().app_cursor_keys);
         let seq: &[u8] = match (lines >= 0, app_cursor) {
             (true, true) => b"\x1bOA",
             (true, false) => b"\x1b[A",
             (false, true) => b"\x1bOB",
             (false, false) => b"\x1b[B",
         };
-        if let Some(p) = self.pane_mut() {
+        if let Some(p) = self.pane_by_id_mut(id) {
             for _ in 0..lines.unsigned_abs() {
                 let _ = p.writer.write(seq);
             }
         }
     }
 
-    /// Browse the active tab's scrollback: move the viewport by `lines`
-    /// (positive = up into history, negative = back toward the live bottom),
-    /// clamped to the available history. Repaints if the view actually moved.
-    fn scroll_active(&mut self, lines: isize) {
-        let Some(p) = self.pane() else { return };
+    /// Browse pane `id`'s scrollback: move the viewport by `lines` (positive
+    /// = up into history, negative = back toward the live bottom), clamped to
+    /// the available history. Repaints if the view actually moved. Takes a
+    /// pane id (rather than always the focused pane) so wheel-scroll can
+    /// target whichever pane is under the pointer, tmux/iTerm2-style, without
+    /// stealing focus.
+    fn scroll_active(&mut self, id: u64, lines: isize) {
+        let Some(p) = self.pane_by_id(id) else { return };
         let moved = {
             let mut g = p.grid.lock();
             if lines >= 0 {
@@ -2010,10 +2578,21 @@ impl WindowState<'_> {
     /// and scrollback cap. Shell changes apply to tabs opened afterwards;
     /// font and window size are launch-time choices. Parse warnings go to
     /// stderr, same as at startup.
+    ///
+    /// `Config::load` only sees this reload's own `--config <path>` args, so
+    /// a `--profile` given at launch is reapplied via `profile_override`
+    /// below — otherwise this window's profile-selected theme would silently
+    /// revert to the file's top-level default on every save (mirrors
+    /// `runtime::tokio_rt::watch_config`'s fix for the TUI front-end).
     fn reload_config(&mut self) {
         let Some(path) = self.config_path.clone() else { return };
         let args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
-        let (new, warnings) = crate::config::Config::load(&args);
+        let (mut new, mut warnings) = crate::config::Config::load(&args);
+        if let Some(name) = &self.profile_override
+            && let Some(w) = new.apply_profile(name)
+        {
+            warnings.push(w);
+        }
         for w in &warnings {
             eprintln!("rusty_term: {w}");
         }
@@ -2029,6 +2608,15 @@ impl WindowState<'_> {
         }
         self.theme = new.theme;
         self.config = new;
+        let new_pad = self.config.padding.unwrap_or(DEFAULT_PAD) as usize;
+        let pad_changed = new_pad != self.pad;
+        self.pad = new_pad;
+        if pad_changed
+            && let Some(size) = self.window.as_ref().map(|w| w.inner_size())
+        {
+            // The band grew or shrank; refit the grid to the same window.
+            self.apply_size(size.width, size.height);
+        }
         if let Some(window) = &self.window {
             apply_chrome(window, &self.theme);
             window.request_redraw();
@@ -2040,15 +2628,20 @@ impl WindowState<'_> {
     /// Open the in-app settings page over the active tab, seeded from the live
     /// configuration. `Ctrl+,` and the dropdown's *Settings* entry route here.
     fn open_settings(&mut self) {
+        // Ctrl+, toggles: with the page already open, close (and save) it
+        // instead of silently rebuilding it and losing the user's position.
+        if matches!(self.overlay, Some(Overlay::Settings(_))) {
+            self.close_overlay();
+            return;
+        }
+        let opacity_supported =
+            self.renderer.as_ref().is_some_and(|r| r.supports_opacity());
         let s = Settings::new(
+            &self.config,
             &self.theme,
             self.font_px,
-            self.config.cursor_style.unwrap_or_default(),
-            self.config.cursor_blink.unwrap_or(false),
-            self.config.ligatures.unwrap_or(true),
-            self.config.scrollback.unwrap_or(crate::core::SCROLLBACK_MAX),
-            self.config.shell.as_deref(),
             &self.shells,
+            opacity_supported,
         );
         self.overlay = Some(Overlay::Settings(s));
         if let Some(window) = &self.window {
@@ -2068,10 +2661,13 @@ impl WindowState<'_> {
 
     /// Close any open overlay, persisting settings changes on the way out.
     fn close_overlay(&mut self) {
-        if let Some(Overlay::Settings(s)) = self.overlay.take()
-            && s.dirty
-        {
-            self.persist_settings(&s);
+        if let Some(Overlay::Settings(mut s)) = self.overlay.take() {
+            // A still-pending number edit commits like any blur; its live
+            // apply comes from the reload watcher re-reading the save.
+            s.commit_edit();
+            if s.dirty {
+                self.persist_settings(&s);
+            }
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -2089,29 +2685,123 @@ impl WindowState<'_> {
 
     /// Route a key to the open overlay (it owns all input while up): arrows
     /// navigate / change, Enter activates, digits pick a menu row, Esc closes.
+    /// The settings page has richer input (search typing, number editing) and
+    /// routes through [`Self::settings_key`].
     fn overlay_key(&mut self, event: &KeyEvent) {
         use winit::keyboard::{Key, NamedKey};
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => self.close_overlay(),
-            Key::Named(NamedKey::ArrowUp) => self.overlay_move(false),
-            Key::Named(NamedKey::ArrowDown) => self.overlay_move(true),
-            Key::Named(NamedKey::ArrowLeft) => self.overlay_change(false),
-            Key::Named(NamedKey::ArrowRight) => self.overlay_change(true),
-            Key::Named(NamedKey::Enter) => self.overlay_activate(),
-            Key::Character(s) => {
-                if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
-                    self.menu_pick_index(d as usize);
+        if matches!(self.overlay, Some(Overlay::Settings(_))) {
+            self.settings_key(event);
+        } else {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => self.close_overlay(),
+                Key::Named(NamedKey::ArrowUp) => self.overlay_move(false),
+                Key::Named(NamedKey::ArrowDown) => self.overlay_move(true),
+                Key::Named(NamedKey::Enter) => self.overlay_activate(),
+                Key::Character(s) => {
+                    if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                        self.menu_pick_index(d as usize);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
-    /// Move the highlight within the overlay.
+    /// Keys on the settings page. An in-progress number edit owns the
+    /// keyboard first (digits, Backspace, Enter commit, Esc cancel); then
+    /// Esc peels one layer at a time (edit → filter → page); typing filters
+    /// (or, digits on a number row, starts an edit); the rest navigates.
+    fn settings_key(&mut self, event: &KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(Overlay::Settings(s)) = &mut self.overlay else { return };
+        let editing = s.editing.is_some();
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                if editing {
+                    s.cancel_edit();
+                } else if s.filter.is_some() {
+                    s.clear_filter();
+                } else {
+                    self.close_overlay();
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                if editing {
+                    let field = s.commit_edit();
+                    if let Some(field) = field {
+                        self.apply_setting(field);
+                    }
+                } else if !s.begin_edit(None) {
+                    // Not an editable number: Enter cycles, mirroring →.
+                    self.overlay_change(true);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if editing {
+                    s.edit_backspace();
+                } else {
+                    s.filter_backspace();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => self.overlay_move(false),
+            Key::Named(NamedKey::ArrowDown) => self.overlay_move(true),
+            Key::Named(NamedKey::ArrowLeft) if !editing => self.overlay_change(false),
+            Key::Named(NamedKey::ArrowRight) if !editing => self.overlay_change(true),
+            // Sidebar: Tab / Shift+Tab steps the category (dropping any
+            // filter — the user is navigating away from the results).
+            Key::Named(NamedKey::Tab) => {
+                let forward = !self.mods.shift_key();
+                if let Some(Overlay::Settings(s)) = &mut self.overlay {
+                    s.clear_filter();
+                    s.cycle_category(forward);
+                }
+            }
+            // Numbers: Home/End jump to the bound.
+            Key::Named(NamedKey::Home) if !editing => self.overlay_jump(false),
+            Key::Named(NamedKey::End) if !editing => self.overlay_jump(true),
+            // Space extends an active search query ("click to move"); it
+            // arrives as a named key, not a Character.
+            Key::Named(NamedKey::Space) if !editing && s.filter.is_some() => {
+                s.filter_input(' ');
+            }
+            Key::Character(text) => {
+                let Some(c) = text.chars().next() else { return };
+                if self.mods.control_key() {
+                    // Ctrl+F opens the search, matching the find bar.
+                    if text.as_str() == "f"
+                        && let Some(Overlay::Settings(s)) = &mut self.overlay
+                    {
+                        s.start_filter();
+                    }
+                    return;
+                }
+                if editing {
+                    s.edit_input(c);
+                } else if c.is_ascii_digit() && s.filter.is_none() {
+                    // A digit on a number row starts an edit with that digit;
+                    // on anything else it falls through to the filter.
+                    if !s.begin_edit(Some(c)) {
+                        s.filter_input(c);
+                    }
+                } else if c == '/' && s.filter.is_none() {
+                    // `/` opens the search (vim/less convention) rather than
+                    // becoming the query's first character.
+                    s.start_filter();
+                } else if !c.is_control() {
+                    s.filter_input(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the highlight within the overlay. Moving off a number row with
+    /// an edit in progress commits it (blur), like any form.
     fn overlay_move(&mut self, forward: bool) {
+        let mut committed = None;
         match &mut self.overlay {
             Some(Overlay::Menu { items, sel }) => {
                 let n = items.len();
@@ -2119,18 +2809,42 @@ impl WindowState<'_> {
                     *sel = if forward { (*sel + 1) % n } else { (*sel + n - 1) % n };
                 }
             }
-            Some(Overlay::Settings(s)) => s.move_sel(forward),
+            Some(Overlay::Settings(s)) => {
+                committed = s.commit_edit();
+                s.move_sel(forward);
+                let visible = settings_visible(self.rows as usize);
+                s.ensure_visible(visible);
+            }
             None => {}
+        }
+        if let Some(field) = committed {
+            self.apply_setting(field);
         }
     }
 
-    /// Change the highlighted setting (no effect on the menu) and apply it live.
+    /// Change the highlighted setting (no effect on the menu) and apply it
+    /// live. Shift multiplies a stepped number's step by 10.
     fn overlay_change(&mut self, forward: bool) {
+        let big = self.mods.shift_key();
         let field = match &mut self.overlay {
-            Some(Overlay::Settings(s)) => s.change(forward),
+            Some(Overlay::Settings(s)) => s.change_by(forward, big),
             _ => return,
         };
-        self.apply_setting(field);
+        if let Some(field) = field {
+            self.apply_setting(field);
+        }
+    }
+
+    /// Jump the highlighted stepped number to its bound (Home/End) and apply
+    /// it live; no effect on choices, toggles, or the menu.
+    fn overlay_jump(&mut self, to_max: bool) {
+        let field = match &mut self.overlay {
+            Some(Overlay::Settings(s)) => s.jump(to_max),
+            _ => return,
+        };
+        if let Some(field) = field {
+            self.apply_setting(field);
+        }
     }
 
     /// Activate the highlighted overlay row: pick a menu item, or cycle the
@@ -2184,23 +2898,60 @@ impl WindowState<'_> {
         }
     }
 
-    /// Handle a click in the overlay body (below the chrome bar): select the row
-    /// under the pointer, activating it for a menu.
-    fn overlay_click(&mut self, y: f64) {
-        let screen_row = (y.max(0.0) as usize) / self.cell_h;
-        let Some(grid_row) = screen_row.checked_sub(1) else { return };
-        let Some(i) = grid_row.checked_sub(OVERLAY_ITEMS_TOP) else { return };
-        let activate = match &mut self.overlay {
-            Some(Overlay::Menu { items, sel }) if i < items.len() => {
-                *sel = i;
-                true
+    /// The overlay-grid cell under window pixel `(x, y)`, `None` above the
+    /// chrome bar. Mirrors the overlay's own layout: the bar takes the first
+    /// cell row flush, the grid sits below it inset by `pad`.
+    fn overlay_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let col = ((x - self.pad as f64).max(0.0) as usize) / self.cell_w;
+        let screen_row = ((y - self.grid_oy() as f64).max(0.0) as usize) / self.cell_h;
+        Some((col, screen_row.checked_sub(1)?))
+    }
+
+    /// Handle a click in the overlay body (below the chrome bar): select the
+    /// row under the pointer (activating it for a menu); on the settings page
+    /// also switch sidebar categories and cycle a clicked value widget.
+    fn overlay_click(&mut self, x: f64, y: f64) {
+        let Some((col, grid_row)) = self.overlay_cell(x, y) else { return };
+        let mut apply: Vec<Field> = Vec::new();
+        let mut activate = false;
+        match &mut self.overlay {
+            Some(Overlay::Menu { items, sel }) => {
+                if let Some(i) = grid_row.checked_sub(OVERLAY_ITEMS_TOP)
+                    && i < items.len()
+                {
+                    *sel = i;
+                    activate = true;
+                }
             }
-            Some(Overlay::Settings(s)) if i < s.len() => {
-                s.select(i);
-                false
+            Some(Overlay::Settings(s)) => {
+                // A click anywhere blurs an in-progress number edit,
+                // committing it first (like any form).
+                apply.extend(s.commit_edit());
+                let grid_rows = self.rows as usize;
+                let grid_cols = self.cols as usize;
+                match settings_hit(col, grid_row, grid_cols, grid_rows, s.scroll, s.len()) {
+                    SettingsHit::Category(i) => s.set_category(i),
+                    SettingsHit::Search => s.start_filter(),
+                    SettingsHit::Row(i) => {
+                        s.select(i);
+                        // Inside the value widget: the left arrow cell cycles
+                        // back, anywhere else forward (toggles just flip).
+                        let row = &s.rows()[i];
+                        let wtext = widget_text(&row.widget, true);
+                        let value_end = settings_value_end(grid_cols);
+                        let wcol = value_end.saturating_sub(wtext.chars().count());
+                        if col >= wcol && col < value_end {
+                            apply.extend(s.change(col != wcol));
+                        }
+                    }
+                    SettingsHit::None => {}
+                }
             }
-            _ => false,
-        };
+            None => {}
+        }
+        for field in apply {
+            self.apply_setting(field);
+        }
         if activate {
             self.overlay_activate();
         }
@@ -2211,6 +2962,9 @@ impl WindowState<'_> {
 
     /// Apply a just-changed setting to the running terminal. Values are
     /// snapshotted first so the overlay borrow ends before we mutate `self`.
+    /// Launch-time fields (launch mode, cols, rows) only update the config —
+    /// their rows say "applies at next launch" — but still count as applied
+    /// so persistence picks them up on close.
     fn apply_setting(&mut self, field: Field) {
         let Some(Overlay::Settings(s)) = self.overlay.as_ref() else { return };
         let theme = crate::config::preset(s.theme_name());
@@ -2218,8 +2972,19 @@ impl WindowState<'_> {
         let cursor = s.cursor();
         let blink = s.blink();
         let ligatures = s.ligatures();
+        let cursor_trail = s.cursor_trail();
+        let min_contrast = s.min_contrast();
         let scrollback = s.scrollback();
         let shell = s.shell_path();
+        let copy_html = s.copy_html();
+        let clipboard = s.clipboard();
+        let click_to_move = s.click_to_move();
+        let bell = s.bell();
+        let padding = s.padding();
+        let opacity = s.opacity();
+        let launch_mode = s.launch_mode_value();
+        let cols = s.cols_value();
+        let rows = s.rows_value();
         match field {
             Field::Theme => {
                 if let Some(t) = theme {
@@ -2227,6 +2992,7 @@ impl WindowState<'_> {
                 }
             }
             Field::FontSize => self.rebuild_font(font_size, self.config.ligatures.unwrap_or(true)),
+            Field::Ligatures => self.rebuild_font(self.font_px, ligatures),
             Field::Cursor => {
                 self.config.cursor_style = Some(cursor);
                 let blink = self.config.cursor_blink.unwrap_or(false);
@@ -2237,7 +3003,16 @@ impl WindowState<'_> {
                 let shape = self.config.cursor_style.unwrap_or_default();
                 self.set_cursor_all(shape, blink);
             }
-            Field::Ligatures => self.rebuild_font(self.font_px, ligatures),
+            // Read live at draw time; updating the config is the whole apply.
+            Field::CursorTrail => self.config.cursor_trail = Some(cursor_trail),
+            Field::MinContrast => {
+                self.config.minimum_contrast = min_contrast;
+                for tab in &self.tabs {
+                    for p in &tab.panes {
+                        p.grid.lock().min_contrast = min_contrast.unwrap_or(1.0);
+                    }
+                }
+            }
             Field::Scrollback => {
                 self.config.scrollback = Some(scrollback);
                 for tab in &self.tabs {
@@ -2247,6 +3022,27 @@ impl WindowState<'_> {
                 }
             }
             Field::Shell => self.config.shell = shell,
+            // Read live at copy/paste/alert time; the config *is* the state.
+            Field::CopyHtml => self.config.copy_html = Some(copy_html),
+            Field::Clipboard => self.config.clipboard = Some(clipboard),
+            Field::ClickToMove => self.config.click_to_move = Some(click_to_move),
+            Field::Bell => self.config.bell = Some(bell),
+            Field::Padding => {
+                self.config.padding = Some(padding);
+                self.pad = padding as usize;
+                if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
+                    // The band grew or shrank; refit the grid to the same window.
+                    self.apply_size(size.width, size.height);
+                }
+            }
+            Field::Opacity => {
+                self.config.opacity = Some(opacity);
+                self.apply_opacity();
+            }
+            // Launch-time only: persisted on close, applied by the next launch.
+            Field::LaunchMode => self.config.launch_mode = launch_mode,
+            Field::Cols => self.config.cols = Some(cols),
+            Field::Rows => self.config.rows = Some(rows),
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -2322,8 +3118,38 @@ impl WindowState<'_> {
     }
 
     /// Rebuild the glyph cache at `px` / `ligatures`, re-fit the grid to the new
-    /// cell size, and rebuild the renderer (the GPU atlas is font-bound).
+    /// cell size, and rebuild the renderer (the GPU atlas is font-bound). This
+    /// is the user-driven entry point (settings overlay font-size/ligatures
+    /// fields): it persists `px` as the configured font size. A monitor-DPI
+    /// change should *not* overwrite that preference — see
+    /// [`Self::on_scale_factor_changed`], which calls [`Self::rebuild_font_at`]
+    /// directly instead.
     fn rebuild_font(&mut self, px: f32, ligatures: bool) {
+        if self.rebuild_font_at(px, ligatures) {
+            self.config.font_size = Some(px);
+            self.config.ligatures = Some(ligatures);
+        }
+    }
+
+    /// Core of [`Self::rebuild_font`], minus persisting to config: rebuild the
+    /// glyph cache at `px` / `ligatures` (at the current `scale_factor`),
+    /// re-fit the grid to the new cell size, and rebuild the renderer (the
+    /// GPU atlas is font-bound). Returns whether the font actually rebuilt (a
+    /// missing/unparseable font leaves state untouched).
+    fn rebuild_font_at(&mut self, px: f32, ligatures: bool) -> bool {
+        if !self.rescale_font_cache(px, ligatures, self.scale_factor) {
+            return false;
+        }
+        self.after_font_rescale();
+        true
+    }
+
+    /// Rebuild just the glyph cache / cell size / tracked scale factor — no
+    /// renderer rebuild or grid re-fit, so this is safe to call before an OS
+    /// window exists (see the HiDPI sizing in `ensure_window`). Returns
+    /// whether it succeeded (a missing/unparseable font leaves state
+    /// untouched).
+    fn rescale_font_cache(&mut self, px: f32, ligatures: bool, scale_factor: f64) -> bool {
         let Some(font_set) = font::load_set(
             self.config.font.as_deref(),
             self.config.font_bold.as_deref(),
@@ -2331,17 +3157,22 @@ impl WindowState<'_> {
             self.config.font_bold_italic.as_deref(),
             self.config.font_fallback.as_deref(),
         ) else {
-            return;
+            return false;
         };
-        let Some(font) = FontCache::new(font_set, px, ligatures) else { return };
+        let Some(font) = FontCache::new(font_set, px, ligatures) else { return false };
         let (cw, ch) = font.cell_size();
         self.font = font;
         self.cell_w = cw.max(1);
         self.cell_h = ch.max(1);
         self.font_px = px;
-        self.config.font_size = Some(px);
-        self.config.ligatures = Some(ligatures);
-        // Keep every pane's XTWINOPS pixel-size answer (14t/16t) current.
+        self.scale_factor = scale_factor;
+        true
+    }
+
+    /// The renderer-facing tail of a font rescale: keep every pane's XTWINOPS
+    /// pixel-size answer (14t/16t) current, and — once an OS window exists —
+    /// rebuild the renderer and re-fit the grid to the new cell size.
+    fn after_font_rescale(&mut self) {
         let cell_px = Some((self.cell_w as u16, self.cell_h as u16));
         for tab in &self.tabs {
             for pane in &tab.panes {
@@ -2355,6 +3186,33 @@ impl WindowState<'_> {
             self.apply_opacity();
             let size = window.inner_size();
             self.apply_size(size.width, size.height);
+        }
+    }
+
+    /// Handle `WindowEvent::ScaleFactorChanged` (the window moved to a monitor
+    /// with a different DPI scale, or the OS scale setting changed). Winit
+    /// reports `inner_size()` and pointer coordinates in physical pixels
+    /// throughout this file, but font rasterization was never scaled by the
+    /// monitor's factor — dragging the window from a 100% to a 200% display
+    /// used to render text at half the intended visual size. Rescale the
+    /// *current* physical font size proportionally to the factor change
+    /// rather than recomputing from the configured (logical, monitor-
+    /// independent) `font_size`, so the user's chosen size is preserved
+    /// exactly when they move back to the original monitor. This
+    /// deliberately does not touch `self.config.font_size` — a DPI move is
+    /// not a user preference change.
+    fn on_scale_factor_changed(&mut self, new_scale: f64) {
+        if !(new_scale > 0.0) || (new_scale - self.scale_factor).abs() < 1e-9 {
+            return;
+        }
+        let ratio = new_scale / self.scale_factor;
+        let ligatures = self.config.ligatures.unwrap_or(true);
+        let px = ((self.font_px as f64) * ratio) as f32;
+        if self.rescale_font_cache(px, ligatures, new_scale) {
+            self.after_font_rescale();
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -2389,22 +3247,243 @@ impl WindowState<'_> {
                 write_row(&mut g, footer, 2, "Up/Down select   Enter/1-9 open   Esc close", dim, bg);
             }
             Some(Overlay::Settings(s)) => {
-                write_row(&mut g, 0, 2, "Settings", fg, bg);
-                for (i, (label, value)) in s.display().into_iter().enumerate() {
-                    let r = OVERLAY_ITEMS_TOP + i;
-                    if r >= footer {
+                // No header row: the strip's own "Settings" tab names the
+                // page, so the content starts at the top and the save state
+                // lives in the footer.
+                let footer_top = rows.saturating_sub(SETTINGS_FOOTER_H);
+                // Selection tints hard, hover barely — the two must never
+                // read as the same state when both are on screen.
+                let sel_bg = mix(bg, fg, 56);
+                let hover_bg = mix(bg, fg, 14);
+                // Selected-card description: brighter than dim (it sits on
+                // the tinted band, where dim text loses its contrast).
+                let mid = mix(fg, bg, 60);
+                let accent = self.theme.cursor;
+
+                // Category sidebar: active gets an accent bar + tint (flush
+                // to the `│` rule separating it from the cards), the rest
+                // render dim; a category holding modified settings carries an
+                // accent dot. While a search is on, results span categories,
+                // so no sidebar entry is "the" active one.
+                let filtering = s.filter.is_some();
+                for (i, (cat, label)) in CATEGORIES.iter().enumerate() {
+                    let r = SETTINGS_TOP + i * 2;
+                    if r >= footer_top {
                         break;
                     }
-                    let on = i == s.sel;
-                    let (rfg, rbg) = if on { (bg, self.theme.fg) } else { (fg, bg) };
-                    if on {
-                        fill_row(&mut g, r, 0, bar, rfg, rbg);
+                    let active = i == s.cat && !filtering;
+                    let (cfg, cbg) = if active {
+                        fill_row(&mut g, r, 0, SETTINGS_SIDEBAR_W + 1, fg, sel_bg);
+                        write_row(&mut g, r, 0, "\u{258C}", fg, sel_bg);
+                        (fg, sel_bg)
+                    } else {
+                        (dim, bg)
+                    };
+                    write_row(&mut g, r, 2, label, cfg, cbg);
+                    if s.category_modified(*cat) {
+                        let dcol = 2 + label.chars().count() + 1;
+                        write_row(&mut g, r, dcol, "\u{2022}", accent, cbg);
                     }
-                    write_row(&mut g, r, 2, label, rfg, rbg);
-                    let value = if on { format!("< {value} >") } else { format!("  {value}") };
-                    write_row(&mut g, r, 22, &value, rfg, rbg);
                 }
-                write_row(&mut g, footer, 2, "Up/Down select   Left/Right change   Esc close & save", dim, bg);
+                for r in SETTINGS_TOP..footer_top {
+                    write_row(&mut g, r, SETTINGS_SIDEBAR_W + 1, "\u{2502}", dim, bg);
+                }
+                // The sidebar's idle bottom answers "what file does Esc save
+                // into, and which build is this" without opening the docs.
+                if footer_top >= 2 {
+                    if let Some(name) =
+                        self.config_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+                    {
+                        let shown: String = name.chars().take(SETTINGS_SIDEBAR_W - 2).collect();
+                        write_row(&mut g, footer_top - 2, 2, &shown, dim, bg);
+                    }
+                    write_row(
+                        &mut g,
+                        footer_top - 1,
+                        2,
+                        concat!("v", env!("CARGO_PKG_VERSION")),
+                        dim,
+                        bg,
+                    );
+                }
+
+                // Title row: the active category's name — or the search
+                // result count — left, and the search affordance right (the
+                // live query while one is active, a dim `/ search` invite
+                // otherwise). The rule underneath anchors the column width.
+                let value_end = settings_value_end(cols);
+                let title = if filtering {
+                    match s.len() {
+                        0 => "No settings match".to_string(),
+                        1 => "1 result".to_string(),
+                        n => format!("{n} results"),
+                    }
+                } else {
+                    CATEGORIES[s.cat].1.to_string()
+                };
+                write_row(&mut g, SETTINGS_TOP, SETTINGS_CARD_X, &title, fg, bg);
+                match &s.filter {
+                    Some(q) => {
+                        let qcol = value_end.saturating_sub(q.chars().count() + 2);
+                        write_row(&mut g, SETTINGS_TOP, qcol, &format!("/{q}"), fg, bg);
+                        write_row(&mut g, SETTINGS_TOP, value_end.saturating_sub(1), "_", dim, bg);
+                    }
+                    None => {
+                        let t = "/ search";
+                        write_row(&mut g, SETTINGS_TOP, value_end.saturating_sub(t.len()), t, dim, bg);
+                    }
+                }
+                let rule_w = value_end.saturating_sub(SETTINGS_CARD_X);
+                write_row(&mut g, SETTINGS_TOP + 1, SETTINGS_CARD_X, &"\u{2500}".repeat(rule_w), dim, bg);
+
+                // Setting cards: title + right-aligned value widget, then a
+                // dim one-line description. Highlight bands stop at the card
+                // column's edge, not the window's. The scroll clamp guards a
+                // scroll left past the end by a resize.
+                let visible = settings_visible(rows);
+                let list = s.rows();
+                let scroll = s.scroll.min(list.len().saturating_sub(1));
+                for (vi, row) in list.iter().enumerate().skip(scroll).take(visible) {
+                    let top = SETTINGS_CARDS_TOP + (vi - scroll) * SETTINGS_ROW_H;
+                    let selected = vi == s.sel;
+                    let hovered = s.hover == Some(vi);
+                    let rbg = if selected {
+                        sel_bg
+                    } else if hovered {
+                        hover_bg
+                    } else {
+                        bg
+                    };
+                    if rbg != bg {
+                        fill_row(&mut g, top, SETTINGS_SIDEBAR_W + 2, value_end + 1, fg, rbg);
+                        fill_row(&mut g, top + 1, SETTINGS_SIDEBAR_W + 2, value_end + 1, fg, rbg);
+                    }
+                    if selected {
+                        write_row(&mut g, top, SETTINGS_SIDEBAR_W + 2, "\u{258C}", fg, rbg);
+                    }
+                    let label_fg = if row.disabled { dim } else { fg };
+                    write_row(&mut g, top, SETTINGS_CARD_X, row.label, label_fg, rbg);
+                    // An accent dot marks a value changed from its default —
+                    // the same gate that decides what lands in the config
+                    // file, so customizations are visible at a glance.
+                    let mut after = SETTINGS_CARD_X + row.label.chars().count();
+                    if row.modified {
+                        write_row(&mut g, top, after + 1, "\u{2022}", accent, rbg);
+                        after += 2;
+                    }
+                    // Search results span categories; tag each row with its
+                    // home so "Scrollback" isn't ambiguous out of context.
+                    if let Some(cat) = row.category {
+                        write_row(&mut g, top, after + 2, &format!("\u{B7} {cat}"), dim, rbg);
+                    }
+                    let desc_fg = if selected { mid } else { dim };
+                    write_row(&mut g, top + 1, SETTINGS_CARD_X, row.description, desc_fg, rbg);
+                    // The theme row previews its palette: the 16 ANSI colors
+                    // as swatches on the description row, so cycling themes
+                    // is a visual choice rather than a name lottery. Skipped
+                    // when a narrow column would run them into the
+                    // description text — a broken overlap is worse than no
+                    // preview.
+                    let swatch0 = value_end.saturating_sub(16);
+                    if row.field == Field::Theme
+                        && swatch0 >= SETTINGS_CARD_X + row.description.chars().count() + 2
+                        && let Some(t) = crate::config::preset(s.theme_name())
+                    {
+                        for (k, color) in t.palette16.iter().enumerate() {
+                            let mut cell = Cell::blank();
+                            cell.ch = '\u{2588}';
+                            cell.fg = *color;
+                            cell.bg = rbg;
+                            g.set_cell(swatch0 + k, top + 1, cell);
+                        }
+                    }
+                    // An in-progress edit shows the typed buffer + a cursor
+                    // cell in place of the value.
+                    let editing_this = selected && s.editing.is_some();
+                    // Hover gets the `< >` affordance too — but never on a
+                    // disabled row, which renders inert.
+                    let active = (selected || hovered) && !row.disabled && !editing_this;
+                    let wtext = match (&s.editing, editing_this) {
+                        (Some(buf), true) => format!("{buf}_"),
+                        _ => widget_text(&row.widget, active),
+                    };
+                    let wlen = wtext.chars().count();
+                    let wcol = value_end.saturating_sub(wlen);
+                    let wfg = if row.disabled {
+                        dim
+                    } else {
+                        match row.widget {
+                            Widget::Toggle(false) if !editing_this => dim,
+                            _ => fg,
+                        }
+                    };
+                    write_row(&mut g, top, wcol, &wtext, wfg, rbg);
+                    if active && matches!(row.widget, Widget::Choice(_) | Widget::Number(_)) {
+                        // The cycle arrows read as controls, not value text.
+                        write_row(&mut g, top, wcol, "<", dim, rbg);
+                        write_row(&mut g, top, value_end.saturating_sub(1), ">", dim, rbg);
+                    }
+                    // "next launch" tag: scannable, out of the description.
+                    if row.next_launch && !editing_this {
+                        let tag = "next launch";
+                        let tcol = wcol.saturating_sub(tag.len() + 2);
+                        write_row(&mut g, top, tcol, tag, dim, rbg);
+                    }
+                }
+                // Proportional scrollbar when the list continues past the
+                // window: position and extent at a glance, not just "more".
+                if list.len() > visible && visible > 0 {
+                    let track_top = SETTINGS_CARDS_TOP;
+                    let track_h = (visible * SETTINGS_ROW_H).saturating_sub(1).max(1);
+                    let thumb_h = (track_h * visible / list.len()).max(1);
+                    let denom = (list.len() - visible).max(1);
+                    let thumb_top = track_top + (track_h - thumb_h) * scroll / denom;
+                    for r in track_top..track_top + track_h {
+                        let (ch, color) = if (thumb_top..thumb_top + thumb_h).contains(&r) {
+                            ('\u{2590}', dim) // ▐ thumb
+                        } else {
+                            ('\u{2502}', mix(bg, fg, 40)) // │ track
+                        };
+                        let mut cell = Cell::blank();
+                        cell.ch = ch;
+                        cell.fg = color;
+                        cell.bg = bg;
+                        g.set_cell(value_end + 2, r, cell);
+                    }
+                }
+                // Footer: keycap-styled contextual hints (keys bright, verbs
+                // dim, so the eye can find the key it needs) with the save
+                // state at the right — live changes persist on close, so
+                // "modified" is a promise, not a warning.
+                let hints: &[(&str, &str)] = if s.editing.is_some() {
+                    &[("Enter", "apply"), ("Esc", "keep old value")]
+                } else if filtering {
+                    &[("type", "to refine"), ("Up/Down", "result"), ("Esc", "back")]
+                } else {
+                    &[
+                        ("Tab", "category"),
+                        ("Up/Down", "row"),
+                        ("Left/Right", "change"),
+                        ("/", "search"),
+                        ("Enter", "edit"),
+                        ("Esc", "close & save"),
+                    ]
+                };
+                let status = if s.dirty { "modified - saves on close" } else { "saved" };
+                let hrow = rows.saturating_sub(1);
+                let limit = cols.saturating_sub(status.chars().count() + 4);
+                let mut hcol = 2;
+                for (key, verb) in hints {
+                    if hcol + key.chars().count() + verb.chars().count() + 4 > limit {
+                        break; // drop trailing hints rather than clip mid-word
+                    }
+                    write_row(&mut g, hrow, hcol, key, fg, bg);
+                    hcol += key.chars().count() + 1;
+                    write_row(&mut g, hrow, hcol, verb, dim, bg);
+                    hcol += verb.chars().count() + 3;
+                }
+                let scol = cols.saturating_sub(status.chars().count() + 2);
+                write_row(&mut g, hrow, scol, status, if s.dirty { fg } else { dim }, bg);
             }
             None => {}
         }
@@ -2433,6 +3512,90 @@ fn shell_menu_items(
     items.push(MenuItem { label: "Settings".to_string(), kind: MenuKind::Settings });
     items.push(MenuItem { label: "Open config file".to_string(), kind: MenuKind::EditConfig });
     items
+}
+
+/// How many setting cards fit in a `grid_rows`-tall overlay grid.
+fn settings_visible(grid_rows: usize) -> usize {
+    grid_rows.saturating_sub(SETTINGS_CARDS_TOP + SETTINGS_FOOTER_H) / SETTINGS_ROW_H
+}
+
+/// The column a card's value widget ends at (exclusive): the window's right
+/// pad, or the card-width cap on a wide window — whichever is nearer.
+fn settings_value_end(cols: usize) -> usize {
+    (cols.saturating_sub(SETTINGS_RIGHT_PAD)).min(SETTINGS_SIDEBAR_W + 2 + SETTINGS_CARD_W_MAX)
+}
+
+/// What a settings-page cell `(col, row)` lands on, for clicks and hover.
+/// `scroll`/`len` describe the active category's list; `Row` carries the
+/// *list* index (scroll already added). `cols` sizes the search affordance's
+/// zone at the title row's right edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsHit {
+    Category(usize),
+    Row(usize),
+    /// The `/ search` affordance on the title row.
+    Search,
+    None,
+}
+
+fn settings_hit(
+    col: usize,
+    row: usize,
+    cols: usize,
+    grid_rows: usize,
+    scroll: usize,
+    len: usize,
+) -> SettingsHit {
+    let footer = grid_rows.saturating_sub(SETTINGS_FOOTER_H);
+    if row < SETTINGS_TOP || row >= footer {
+        return SettingsHit::None;
+    }
+    if col < SETTINGS_SIDEBAR_W {
+        // Sidebar entries sit on every other row, and the whole strip is
+        // clickable: the gap row belongs to the entry above it.
+        let i = (row - SETTINGS_TOP) / 2;
+        if i < CATEGORIES.len() {
+            return SettingsHit::Category(i);
+        }
+        return SettingsHit::None;
+    }
+    // Title row: its right end is the search affordance.
+    let value_end = settings_value_end(cols);
+    if row == SETTINGS_TOP {
+        if col >= value_end.saturating_sub(SETTINGS_SEARCH_W) && col < value_end {
+            return SettingsHit::Search;
+        }
+        return SettingsHit::None;
+    }
+    // Card area (below the page title + rule): a card's title and
+    // description rows both count; the spacing row between cards is dead.
+    let Some(r) = row.checked_sub(SETTINGS_CARDS_TOP) else { return SettingsHit::None };
+    let card = r / SETTINGS_ROW_H;
+    if r % SETTINGS_ROW_H < 2 && card < settings_visible(grid_rows) {
+        let i = scroll + card;
+        if i < len {
+            return SettingsHit::Row(i);
+        }
+    }
+    SettingsHit::None
+}
+
+/// A value widget's cell text. Toggles render a block-glyph switch (boxdraw
+/// synthesizes U+2588/2591, so no font dependency); a selected *or hovered*
+/// choice/number grows `< value >` cycle arrows — hover gets the affordance
+/// too, so values don't read as static text until clicked.
+fn widget_text(w: &Widget, active: bool) -> String {
+    match w {
+        Widget::Toggle(true) => "[\u{2588}\u{2588}] on".to_string(),
+        Widget::Toggle(false) => "[\u{2591}\u{2591}] off".to_string(),
+        Widget::Choice(v) | Widget::Number(v) => {
+            if active {
+                format!("< {v} >")
+            } else {
+                v.clone()
+            }
+        }
+    }
 }
 
 /// Write ASCII `text` into grid `row` from `col` (width-1 cells) in the given
@@ -2504,6 +3667,18 @@ fn put_text(
     }
 }
 
+/// Fold a wheel/trackpad delta (already converted to a "lines" unit) plus a
+/// carried fractional remainder into a whole line count and the remainder to
+/// carry into the next event. Pulled out as a pure function (rather than
+/// inlined in the `MouseWheel` handler) so the accumulation math — the fix
+/// for slow scrolling silently doing nothing — is unit-testable without a
+/// live window.
+fn accumulate_scroll_lines(accum: f64, raw_lines: f64) -> (isize, f64) {
+    let total = accum + raw_lines;
+    let lines = total.trunc() as isize;
+    (lines, total - lines as f64)
+}
+
 /// Per-channel mix of `t/255` of `b` into `a` (`0xRRGGBB`) — used to derive
 /// the chrome bar's bg and dimmed text from the theme without new config keys.
 fn mix(a: u32, b: u32, t: u32) -> u32 {
@@ -2516,14 +3691,34 @@ fn mix(a: u32, b: u32, t: u32) -> u32 {
 }
 
 /// Paint the window border with the theme background so the frame reads as
-/// part of the terminal (the title bar itself is ours now). Windows 11 only
-/// (DWM ignores the attribute on 10); a no-op on other platforms.
+/// part of the terminal (the title bar itself is ours now), and ask DWM to
+/// round the window corners so the borderless frame matches native Windows 11
+/// windows. Both are Windows 11 only (DWM ignores the attributes on 10);
+/// a no-op on other platforms.
 fn apply_chrome(window: &Window, theme: &Theme) {
     #[cfg(target_os = "windows")]
     {
         use winit::platform::windows::{Color, WindowExtWindows};
         let c = |rgb: u32| Color::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
         window.set_border_color(Some(c(theme.bg)));
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = window.window_handle()
+            && let RawWindowHandle::Win32(h) = handle.as_raw()
+        {
+            use windows_sys::Win32::Graphics::Dwm::{
+                DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+            };
+            let pref: i32 = DWMWCP_ROUND;
+            // SAFETY: a live HWND from winit; DWM copies the 4-byte value.
+            unsafe {
+                DwmSetWindowAttribute(
+                    h.hwnd.get() as windows_sys::Win32::Foundation::HWND,
+                    DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                    &pref as *const i32 as *const core::ffi::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2567,6 +3762,12 @@ impl WindowState<'_> {
             }
             return Some(now + ANIM);
         }
+        // Dragging a selection past the pane's edge keeps scrolling on its
+        // own timer as long as the pointer stays there, even with no new
+        // `CursorMoved` events (the pointer held stationary past the edge).
+        if self.drag_edge_autoscroll() {
+            return Some(now + DRAG_SCROLL_INTERVAL);
+        }
         if !blinking && !animating {
             self.cursor_blink_on = true;
             return None;
@@ -2594,9 +3795,27 @@ impl WindowState<'_> {
             self.theme = self.auto_theme(None);
             self.config.theme = self.theme;
         }
-        let width = (self.cols as usize * self.cell_w) as u32;
-        // One extra cell row on top for the chrome bar.
-        let height = ((self.rows as usize + 1) * self.cell_h) as u32;
+        // Size the font for the monitor this window is about to land on
+        // *before* computing its pixel size below. `font_px`/`cell_w`/`cell_h`
+        // were computed assuming scale factor 1.0 (`new_window_state` runs
+        // before any OS window — and thus any monitor — exists); launching
+        // directly on a HiDPI display without this would start with text at
+        // half the intended visual size, and no `ScaleFactorChanged` event
+        // ever fires to correct it if the window never changes monitors.
+        let target_scale = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next())
+            .map(|m| m.scale_factor())
+            .unwrap_or(1.0);
+        if (target_scale - self.scale_factor).abs() > 1e-9 {
+            let ratio = target_scale / self.scale_factor;
+            let px = ((self.font_px as f64) * ratio) as f32;
+            let ligatures = self.config.ligatures.unwrap_or(true);
+            self.rescale_font_cache(px, ligatures, target_scale);
+        }
+        let width = (self.cols as usize * self.cell_w + 2 * self.pad) as u32;
+        // One extra cell row on top for the chrome bar, plus the padding band.
+        let height = ((self.rows as usize + 1) * self.cell_h + 2 * self.pad) as u32;
         // `--title` (or a config `title` key) seeds the initial title; the
         // child's own OSC 0/2 still wins once it emits one (see the per-frame
         // `set_title` above).
@@ -2721,7 +3940,20 @@ impl WindowState<'_> {
                     window.request_redraw();
                 }
             }
-            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.on_scale_factor_changed(scale_factor);
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.mods = mods.state();
+                // Ctrl pressed/released with the pointer stationary should
+                // show/hide the link affordance immediately, not wait for
+                // the next `CursorMoved`.
+                if self.update_hover_link()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     // Key releases are terminal input only under win32-input-
@@ -2796,6 +4028,32 @@ impl WindowState<'_> {
                         return;
                     }
                 }
+                // Ctrl+Alt+1..9 jump straight to that tab (the Windows
+                // Terminal convention; 9 = last tab, browser-style). After
+                // the keymap lookup so a user chord still wins, and on the
+                // Ctrl+Alt layer so plain Ctrl+digit stays encodable to
+                // kitty-protocol apps.
+                if self.mods.control_key() && self.mods.alt_key() && !self.mods.shift_key()
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
+                    let digit = match code {
+                        KeyCode::Digit1 => Some(0),
+                        KeyCode::Digit2 => Some(1),
+                        KeyCode::Digit3 => Some(2),
+                        KeyCode::Digit4 => Some(3),
+                        KeyCode::Digit5 => Some(4),
+                        KeyCode::Digit6 => Some(5),
+                        KeyCode::Digit7 => Some(6),
+                        KeyCode::Digit8 => Some(7),
+                        KeyCode::Digit9 => Some(usize::MAX), // last tab
+                        _ => None,
+                    };
+                    if let Some(d) = digit {
+                        let i = if d == usize::MAX { self.tabs.len().saturating_sub(1) } else { d };
+                        self.select_tab(i);
+                        return;
+                    }
+                }
                 // While the IME is composing, it owns key input; don't also
                 // encode it (the committed text arrives via `WindowEvent::Ime`).
                 if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
@@ -2861,11 +4119,38 @@ impl WindowState<'_> {
                     }
                 }
                 Ime::Commit(text) => {
-                    if let Some(p) = self.pane_mut() {
+                    if let Some(p) = self.pane() {
                         p.grid.lock().ime_preedit.clear();
-                        let _ = p.writer.write(text.as_bytes());
                     }
-                    self.snap_to_bottom();
+                    // The find bar owns composed text while it's open — mirror
+                    // `search_key`'s `Key::Character` arm above instead of
+                    // leaking the committed IME text into the background
+                    // shell underneath it. An open overlay (settings/shell
+                    // menu) or copy mode has no free-text field of its own,
+                    // so committed text is simply dropped rather than
+                    // reaching the child either.
+                    match ime_commit_target(
+                        self.searching.is_some(),
+                        self.overlay.is_some(),
+                        self.copy_mode.is_some(),
+                    ) {
+                        ImeCommitTarget::SearchBar => {
+                            if let Some(q) = self.searching.as_mut() {
+                                q.push_str(&text);
+                            }
+                            self.run_search();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        ImeCommitTarget::Pane => {
+                            if let Some(p) = self.pane_mut() {
+                                let _ = p.writer.write(text.as_bytes());
+                            }
+                            self.snap_to_bottom();
+                        }
+                        ImeCommitTarget::Dropped => {}
+                    }
                 }
                 Ime::Enabled => {}
                 Ime::Disabled => {
@@ -2877,11 +4162,96 @@ impl WindowState<'_> {
                     }
                 }
             },
+            WindowEvent::CursorLeft { .. } => {
+                // Drop any chrome hover highlight when the pointer leaves.
+                if self.hover.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+                if self.hover_link.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
+                // Tab drag-to-reorder: past the slop, the pressed tab trades
+                // places as the pointer crosses its neighbors' midpoints. The
+                // spans come from the painted hit map, so the drop math can't
+                // disagree with what's on screen.
+                if self.mouse_button_down == Some(MouseButtonKind::Left)
+                    && self.tab_drag.is_some()
+                    && !self.hits.is_empty()
+                {
+                    let (mut moving, press_x, from) = {
+                        let d = self.tab_drag.as_ref().unwrap();
+                        (d.moving, d.press_x, d.idx)
+                    };
+                    if !moving && (position.x - press_x).abs() > self.cell_w as f64 {
+                        moving = true;
+                    }
+                    let mut to = from;
+                    if moving {
+                        let col =
+                            (position.x.max(0.0) as usize / self.cell_w).min(self.hits.len() - 1);
+                        to = tab_drag_target(col, &tab_spans(&self.hits), from);
+                    }
+                    if let Some(d) = &mut self.tab_drag {
+                        d.moving = moving;
+                        d.idx = to;
+                    }
+                    if to != from {
+                        self.reorder_tab(from, to);
+                    }
+                }
+                // Chrome-bar hover feedback: track the element under the
+                // pointer and repaint when it changes (drag-strip cells and
+                // anything below the bar count as no hover).
+                let hover = if (position.y.max(0.0) as usize) < self.cell_h && !self.hits.is_empty() {
+                    let col = (position.x.max(0.0) as usize / self.cell_w).min(self.hits.len() - 1);
+                    match self.hits[col] {
+                        Hit::Drag => None,
+                        h => Some(h),
+                    }
+                } else {
+                    None
+                };
+                if hover != self.hover {
+                    self.hover = hover;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                // Settings-page hover: highlight the card under the pointer.
+                if let Some((col, grid_row)) = self.overlay_cell(position.x, position.y) {
+                    let grid_rows = self.rows as usize;
+                    let grid_cols = self.cols as usize;
+                    if let Some(Overlay::Settings(s)) = &mut self.overlay {
+                        let hovered =
+                            match settings_hit(col, grid_row, grid_cols, grid_rows, s.scroll, s.len()) {
+                                SettingsHit::Row(i) => Some(i),
+                                _ => None,
+                            };
+                        if hovered != s.hover {
+                            s.hover = hovered;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                }
+                if self.update_hover_link()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
                 // The edge band shows a resize cursor; over pane content (below
-                // the chrome bar) the child's OSC 22 request wins if it made
-                // one; everywhere else (the chrome bar itself) default.
+                // the chrome bar) a Ctrl-hovered hyperlink shows a pointer, the
+                // child's OSC 22 request wins if it made one, and plain grid
+                // text otherwise gets the usual I-beam (any other text area);
+                // everywhere else (the chrome bar itself) default.
                 let icon = match self.resize_zone(position.x, position.y) {
                     Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
                         CursorIcon::NwseResize
@@ -2891,37 +4261,41 @@ impl WindowState<'_> {
                     }
                     Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
                     Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
-                    None if (position.y.max(0.0) as usize) >= self.cell_h => self
-                        .pane()
-                        .and_then(|p| p.grid.lock().cursor_icon.as_deref().and_then(parse_cursor_icon))
-                        .unwrap_or(CursorIcon::Default),
+                    // An open overlay (menu / settings) is a page of controls,
+                    // not selectable text — the I-beam below would mislead.
+                    None if self.overlay.is_some() => CursorIcon::Default,
+                    None if (position.y.max(0.0) as usize) >= self.cell_h => {
+                        if self.hover_link.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            self.pane()
+                                .and_then(|p| {
+                                    p.grid.lock().cursor_icon.as_deref().and_then(parse_cursor_icon)
+                                })
+                                .unwrap_or(CursorIcon::Text)
+                        }
+                    }
                     None => CursorIcon::Default,
                 };
                 if let Some(window) = &self.window {
                     window.set_cursor(icon);
                 }
                 if self.selecting
-                    && let Some(anchor) = self.sel_anchor
-                    && let Some(p) = self.pane()
+                    && self.update_drag_selection_head(position.x, position.y)
+                    && let Some(window) = &self.window
                 {
-                    let (hc, hr) = self.cell_in_focused(position.x, position.y);
-                    let mut g = p.grid.lock();
-                    let hc = g.logical_col(hc, hr);
-                    let head = (hc, g.abs_of_view_row(hr));
-                    g.selection = Some(Selection { anchor, head });
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    window.request_redraw();
                 }
                 // Motion reporting (`?1002` while a button is held, `?1003`
                 // regardless) is independent of the local drag-selection
-                // above — both can be active at once, same as other
-                // terminals that don't force Shift to bypass app mouse mode.
+                // above — both can be active at once. `report_mouse` bypasses
+                // itself when Shift is held, so a Shift-drag is pure local
+                // selection with nothing forwarded to the app.
                 let (sh, al, ct) =
                     (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
                 let dragging = self.mouse_button_down.is_some();
                 let button = self.mouse_button_down.unwrap_or_default();
-                self.report_mouse(|c, r| {
+                self.report_mouse(self.focused_pane_id(), |c, r| {
                     MouseEvent::new_point(c, r)
                         .with_move(dragging)
                         .with_button_kind(button)
@@ -2949,16 +4323,32 @@ impl WindowState<'_> {
                             }
                             self.on_left_press();
                         }
-                        if kind == MouseButtonKind::Middle
-                            && !self.pane().is_some_and(|p| p.grid.lock().mouse_modes.active())
-                        {
-                            self.paste_primary();
-                            return;
+                        if kind == MouseButtonKind::Middle {
+                            // Middle-click on the chrome bar closes the tab
+                            // under the pointer (browser convention) instead
+                            // of falling through to PRIMARY-paste, which
+                            // previously happened regardless of y-position —
+                            // the chrome bar was never even consulted.
+                            if (self.mouse_pos.1.max(0.0) as usize) < self.cell_h {
+                                self.on_bar_middle_click(self.mouse_pos.0);
+                                return;
+                            }
+                            if self.searching.is_some() {
+                                let text = self.primary_text();
+                                self.paste_into_search(text);
+                                return;
+                            }
+                            if self.mods.shift_key()
+                                || !self.pane().is_some_and(|p| p.grid.lock().mouse_modes.active())
+                            {
+                                self.paste_primary();
+                                return;
+                            }
                         }
                         self.mouse_button_down = Some(kind);
                         let (sh, al, ct) =
                             (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
-                        self.report_mouse(|c, r| {
+                        self.report_mouse(self.focused_pane_id(), |c, r| {
                             MouseEvent::new_point(c, r)
                                 .with_button(true)
                                 .with_button_kind(kind)
@@ -2971,13 +4361,14 @@ impl WindowState<'_> {
                                 self.copy_selection_primary(); // copy-on-select
                             }
                             self.selecting = false;
+                            self.tab_drag = None; // a reorder drag ends with the button
                         }
                         if self.mouse_button_down == Some(kind) {
                             self.mouse_button_down = None;
                         }
                         let (sh, al, ct) =
                             (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
-                        self.report_mouse(|c, r| {
+                        self.report_mouse(self.focused_pane_id(), |c, r| {
                             MouseEvent::new_point(c, r)
                                 .with_button(false)
                                 .with_button_kind(kind)
@@ -2989,25 +4380,53 @@ impl WindowState<'_> {
             // Wheel up browses into scrollback history, wheel down back toward
             // the live bottom. A notch is `WHEEL_LINES`; trackpads report pixels.
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y.round() as isize * WHEEL_LINES,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h as f64).round() as isize,
+                // Accumulate fractional delta across events instead of
+                // rounding each one independently — a high-resolution wheel
+                // or a slow trackpad flick emits many sub-line events, and
+                // rounding per-event dropped all of them (scrolling did
+                // nothing until a large enough single delta arrived).
+                let raw_lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64 * WHEEL_LINES as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y / self.cell_h as f64,
                 };
+                let (lines, remainder) = accumulate_scroll_lines(self.scroll_accum, raw_lines);
+                self.scroll_accum = remainder;
                 if lines == 0 {
                     return;
                 }
+                // The settings overlay owns the wheel while it's up: scroll
+                // its list (wheel-up = toward the top, like the scrollback).
+                if let Some(Overlay::Settings(s)) = &mut self.overlay {
+                    let visible = settings_visible(self.rows as usize);
+                    s.scroll_by(-lines, visible);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                if self.overlay.is_some() {
+                    return; // the menu has no scroll; don't scroll the pane under it
+                }
+                // Unlike click/drag (which already refocus to the pane under
+                // the pointer via `on_left_press`), the wheel never changes
+                // focus — it targets whichever pane the pointer happens to
+                // be over, tmux/iTerm2-style, without stealing focus from
+                // whatever the user was typing into.
+                let Some(id) = self.pane_under(self.mouse_pos.0, self.mouse_pos.1) else {
+                    return;
+                };
                 let (sh, al, ct) =
                     (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
-                if self.report_mouse(|c, r| {
+                if self.report_mouse(Some(id), |c, r| {
                     MouseEvent::new_point(c, r).with_scroll(lines).with_modifiers(sh, al, ct)
                 }) {
                     return;
                 }
-                if self.alt_scroll_active() {
-                    self.send_alt_scroll_keys(lines);
+                if self.alt_scroll_active(id) {
+                    self.send_alt_scroll_keys(id, lines);
                     return;
                 }
-                self.scroll_active(lines);
+                self.scroll_active(id, lines);
             }
             _ => {}
         }
@@ -3045,6 +4464,9 @@ struct App<'a> {
     /// The launch config, template for every new window.
     config: Config,
     config_path: Option<std::path::PathBuf>,
+    /// The `--profile <name>` this instance was launched with, if any; copied
+    /// into every [`WindowState`] (see its field doc).
+    profile_override: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     /// Shared pane-id source (see [`WindowState::next_id`]).
     next_id: std::rc::Rc<std::cell::Cell<u64>>,
@@ -3080,6 +4502,7 @@ impl<'a> App<'a> {
             backend: self.backend,
             config: self.config.clone(),
             config_path: self.config_path.clone(),
+            profile_override: self.profile_override.clone(),
             tabs: Vec::new(),
             active: 0,
             next_id: self.next_id.clone(),
@@ -3087,6 +4510,7 @@ impl<'a> App<'a> {
             font,
             cell_w: cell_w.max(1),
             cell_h: cell_h.max(1),
+            pad: self.config.padding.unwrap_or(DEFAULT_PAD) as usize,
             window: None,
             renderer: None,
             mods: ModifiersState::empty(),
@@ -3095,9 +4519,13 @@ impl<'a> App<'a> {
             theme: self.config.theme,
             clipboard: arboard::Clipboard::new().ok(),
             mouse_pos: (0.0, 0.0),
+            scroll_accum: 0.0,
             selecting: false,
+            hover: None,
+            hover_link: None,
             focused: true,
             search_regex: false,
+            search_case_sensitive: false,
             broadcast: false,
             copy_mode: None,
             last_grid_click: None,
@@ -3105,6 +4533,7 @@ impl<'a> App<'a> {
             mouse_button_down: None,
             sel_anchor: None,
             hits: Vec::new(),
+            tab_drag: None,
             last_strip_click: None,
             cursor_blink_on: true,
             last_blink: Instant::now(),
@@ -3112,6 +4541,9 @@ impl<'a> App<'a> {
             shells: self.shells.clone(),
             overlay: None,
             font_px,
+            // Updated to the real value once the OS window exists (see
+            // `ensure_window`); 1.0 is the correct assumption until then.
+            scale_factor: 1.0,
             closed: false,
             wants_new_window: false,
             cursor_prev: None,
@@ -3292,7 +4724,15 @@ impl ApplicationHandler<UserEvent> for App<'_> {
 /// Encode clipboard `text` for the child: normalize line endings to CR, and
 /// when `bracketed` wrap it in `ESC[200~`/`ESC[201~`, stripping any embedded
 /// end marker first so the payload can't close the bracket early (a
-/// paste-injection guard).
+/// paste-injection guard). Without bracketed-paste support to tell the child
+/// "this is literal data, don't interpret it", C0/DEL control bytes are
+/// stripped instead — otherwise a paste containing a hidden `ESC` (trivial to
+/// embed in text copied from a web page, and invisible in the source) could
+/// smuggle an arbitrary escape sequence into the child's input, or a hidden
+/// bell/backspace could do something surprising at the prompt. `\t` and the
+/// `\r` newlines were just normalized to are kept — running each pasted line
+/// as its own command is the expected, visible behavior for an app with no
+/// bracketed-paste support, not something this needs to guard against.
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
@@ -3309,7 +4749,7 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
         out.extend_from_slice(b"\x1b[201~");
         out
     } else {
-        text.into_bytes()
+        text.bytes().filter(|&b| b == b'\t' || b == b'\r' || !b.is_ascii_control()).collect()
     }
 }
 
@@ -3349,6 +4789,159 @@ fn arrow_presses(dx: isize, dy: isize, app_cursor: bool) -> Vec<u8> {
 /// clamped into the pane (`0..size-1` per axis) so a pointer over the chrome
 /// or a divider never reports an out-of-pane position. 0-based; the SGR
 /// encoder adds the protocol's 1-basing.
+/// Where committed IME text should go, given which UI layer currently owns
+/// keyboard input. Pulled out of the `Ime::Commit` handler as a pure
+/// decision so the routing (find bar > pane, overlay/copy-mode swallow it)
+/// is unit-testable without a live `WindowState`.
+#[derive(Debug, PartialEq, Eq)]
+enum ImeCommitTarget {
+    /// The find bar is open: append to its query string.
+    SearchBar,
+    /// Nothing else owns the keyboard: forward to the focused pane's child.
+    Pane,
+    /// An overlay (settings/shell menu) or copy mode owns the keyboard and
+    /// has no free-text field of its own — the committed text is dropped
+    /// rather than leaking into the background shell underneath it.
+    Dropped,
+}
+
+fn ime_commit_target(searching: bool, overlay: bool, copy_mode: bool) -> ImeCommitTarget {
+    if searching {
+        ImeCommitTarget::SearchBar
+    } else if overlay || copy_mode {
+        ImeCommitTarget::Dropped
+    } else {
+        ImeCommitTarget::Pane
+    }
+}
+
+/// The IME candidate-popup origin, in physical pixels, for a cursor at
+/// pane-local `(col, row)` within the pane whose rect starts at
+/// `pane_origin` (in cells) — pulled out of `update_ime_area` so the split
+/// offset math is unit-testable without a live `winit::Window`.
+fn ime_cursor_area_origin(
+    pad: usize,
+    oy: usize,
+    cell_w: usize,
+    cell_h: usize,
+    pane_origin: (usize, usize),
+    cursor: (usize, usize),
+) -> (f64, f64) {
+    let (base_col, base_row) = pane_origin;
+    let (col, row) = cursor;
+    let x = (pad + (base_col + col) * cell_w) as f64;
+    // +1 cell row for the chrome bar above the grid, plus the grid's own
+    // vertical offset (padding band + the bar's inset).
+    let y = (oy + (base_row + row + 1) * cell_h) as f64;
+    (x, y)
+}
+
+/// Which of `total` tabs are shown in the chrome bar right now: `[start,
+/// end)` indices, sized to fit within `available_cells` (the tab strip's
+/// pixel-cell budget, before the overflow indicator / `+`/`▾`/caption
+/// buttons) and always including `active` — recomputed fresh each frame from
+/// the current active tab (no persisted scroll state needed), so clicking
+/// or cycling to an off-screen tab scrolls the minimal amount to reveal it,
+/// instead of the strip always starting at tab 0 and silently truncating
+/// the rest with no way to reach or even see the truncated ones.
+/// The visible tabs' strip spans, recovered from a laid-out chrome hit map:
+/// each entry is `(tab index, start col, end col)` (end exclusive), a tab's
+/// label and close-button cells merged. Drag-to-reorder consumes these, so
+/// the drop math always agrees with what was actually painted.
+fn tab_spans(hits: &[Hit]) -> Vec<(usize, usize, usize)> {
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    for (c, h) in hits.iter().enumerate() {
+        let i = match h {
+            Hit::Tab(i) | Hit::CloseTab(i) => *i,
+            _ => continue,
+        };
+        match spans.last_mut() {
+            Some((li, _, end)) if *li == i && *end == c => *end = c + 1,
+            _ => spans.push((i, c, c + 1)),
+        }
+    }
+    spans
+}
+
+/// Where a dragged tab should sit for pointer column `col`: the position of
+/// the nearest span (moving out from the dragged tab's own) whose *midpoint*
+/// the pointer has crossed, returned as the tab index currently holding that
+/// position. Midpoint-based so unequal adaptive widths can't oscillate — a
+/// swap only fires once the pointer is past the point where swapping back
+/// would immediately retrigger. `from` when nothing was crossed.
+fn tab_drag_target(col: usize, spans: &[(usize, usize, usize)], from: usize) -> usize {
+    let Some(pos) = spans.iter().position(|&(i, _, _)| i == from) else {
+        return from;
+    };
+    let mid = |s: &(usize, usize, usize)| (s.1 + s.2) / 2;
+    // Leftmost span left of the drag whose midpoint the pointer sits left of…
+    for s in spans.iter().take(pos) {
+        if col < mid(s) {
+            return s.0;
+        }
+    }
+    // …else the rightmost span right of it whose midpoint the pointer passed.
+    for s in spans.iter().skip(pos + 1).rev() {
+        if col > mid(s) {
+            return s.0;
+        }
+    }
+    from
+}
+
+/// Adaptive tab widths: each tab wants `desired` cells (its label plus the
+/// close button), clamped to `[TAB_MIN, TAB_CELLS]`. When the clamped sum
+/// (plus the 1-cell gaps) overflows `strip`, every tab shares the largest
+/// uniform cap that fits, down to `TAB_MIN`; wanting less than the cap keeps
+/// costing less (short titles don't pad out to the cap). Returns `None` when
+/// even `TAB_MIN`-wide tabs overflow — the caller falls back to the scrolled
+/// uniform strip.
+fn tab_widths(desired: &[usize], strip: usize) -> Option<Vec<usize>> {
+    if desired.is_empty() {
+        return Some(Vec::new());
+    }
+    let gaps = desired.len() - 1;
+    let fits = |cap: usize| {
+        desired.iter().map(|&d| d.clamp(TAB_MIN, cap)).sum::<usize>() + gaps <= strip
+    };
+    if !fits(TAB_MIN) {
+        return None;
+    }
+    // Largest cap that still fits; the range is small, so a scan reads
+    // clearer than a binary search.
+    let cap = (TAB_MIN..=TAB_CELLS).rev().find(|&c| fits(c)).unwrap_or(TAB_MIN);
+    Some(desired.iter().map(|&d| d.clamp(TAB_MIN, cap)).collect())
+}
+
+fn visible_tab_range(active: usize, total: usize, available_cells: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let per_tab = TAB_CELLS + 1; // the tab's own width plus its separator
+    let capacity = (available_cells / per_tab).max(1).min(total);
+    if total <= capacity {
+        return (0, total);
+    }
+    let max_start = total - capacity;
+    let start = active.saturating_sub(capacity - 1).min(active).min(max_start);
+    (start, start + capacity)
+}
+
+/// Whether a drag-selection past a pane's `[top_px, bottom_px]` edge should
+/// auto-scroll: `Some(true)` above the top margin, `Some(false)` below the
+/// bottom margin, `None` within the pane (plus its margin) so the caller
+/// does nothing. Pulled out of `drag_edge_autoscroll` for unit testing
+/// without a live `WindowState`.
+fn drag_scroll_direction(y: f64, top_px: f64, bottom_px: f64, margin: f64) -> Option<bool> {
+    if y < top_px - margin {
+        Some(true)
+    } else if y > bottom_px + margin {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn pane_pixel_point(pos: (f64, f64), origin: (usize, usize), size: (usize, usize)) -> MousePoint {
     let clamp = |v: f64, o: usize, s: usize| {
         ((v.max(0.0) as usize).saturating_sub(o)).min(s.saturating_sub(1))
@@ -3513,6 +5106,25 @@ fn chord_key(code: KeyCode) -> Option<crate::keymap::Key> {
         KeyCode::ArrowUp => Key::Up,
         KeyCode::ArrowDown => Key::Down,
         KeyCode::Space => Key::Space,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Insert => Key::Insert,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Escape => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::F1 => Key::F1,
+        KeyCode::F2 => Key::F2,
+        KeyCode::F3 => Key::F3,
+        KeyCode::F4 => Key::F4,
+        KeyCode::F5 => Key::F5,
+        KeyCode::F6 => Key::F6,
+        KeyCode::F7 => Key::F7,
+        KeyCode::F8 => Key::F8,
+        KeyCode::F9 => Key::F9,
+        KeyCode::F10 => Key::F10,
+        KeyCode::F11 => Key::F11,
+        KeyCode::F12 => Key::F12,
         KeyCode::Comma => Key::Char(','),
         KeyCode::Period => Key::Char('.'),
         KeyCode::KeyA => Key::Char('a'),
@@ -3570,12 +5182,122 @@ fn osc52_reply(sel: char, text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, MenuKind, arrow_presses, encode_paste, is_openable_url, mix, osc52_reply, pane_pixel_point,
-        path_from_file_uri, put_text, shell_menu_items,
+        Hit, ImeCommitTarget, MenuKind, OVERLAY_ITEMS_TOP, SETTINGS_CARDS_TOP, SETTINGS_FOOTER_H,
+        SETTINGS_ROW_H, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
+        SETTINGS_SEARCH_W, arrow_presses, drag_scroll_direction, encode_paste,
+        ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,
+        pane_pixel_point, path_from_file_uri, put_text, settings_hit, settings_value_end,
+        settings_visible, shell_menu_items, tab_drag_target, tab_spans, tab_widths,
+        visible_tab_range, widget_text,
     };
     #[cfg(not(windows))]
     use super::shell_quote;
     use crate::core::Cell;
+
+    #[test]
+    fn settings_visible_scales_with_the_window_and_never_underflows() {
+        // 24 grid rows: 1 top pad + 2 title/rule + 2 footer leaves 19, at
+        // 3 rows per card = 6.
+        assert_eq!(settings_visible(24), 6);
+        // A taller window fits another card.
+        assert_eq!(settings_visible(26), 7);
+        // A tiny window still returns 0 rather than wrapping.
+        assert_eq!(settings_visible(0), 0);
+        assert_eq!(settings_visible(SETTINGS_CARDS_TOP + SETTINGS_FOOTER_H), 0);
+    }
+
+    #[test]
+    fn settings_value_end_caps_the_card_column_on_a_wide_window() {
+        // Narrow window: the right pad governs.
+        assert_eq!(settings_value_end(80), 77);
+        // Wide window: the card-width cap governs, so the value stays near
+        // its label instead of drifting to the window edge.
+        assert_eq!(settings_value_end(240), SETTINGS_SIDEBAR_W + 2 + 80);
+    }
+
+    #[test]
+    fn settings_hit_maps_sidebar_cards_search_and_dead_space() {
+        let (cols, rows) = (100, 24); // 6 visible cards (see above)
+        // The top-pad row is dead everywhere.
+        assert_eq!(settings_hit(2, 0, cols, rows, 0, 7), SettingsHit::None);
+        // Sidebar: categories every other row, with the gap row belonging to
+        // the entry above it — the whole strip is clickable.
+        let t = super::SETTINGS_TOP;
+        assert_eq!(settings_hit(2, t, cols, rows, 0, 7), SettingsHit::Category(0));
+        assert_eq!(settings_hit(2, t + 1, cols, rows, 0, 7), SettingsHit::Category(0));
+        assert_eq!(settings_hit(0, t + 2, cols, rows, 0, 7), SettingsHit::Category(1));
+        assert_eq!(settings_hit(2, t + 4, cols, rows, 0, 7), SettingsHit::Category(2));
+        // Below the last category the strip is dead.
+        assert_eq!(settings_hit(2, t + 6, cols, rows, 0, 7), SettingsHit::None);
+        // The title row's right end is the search affordance; its left is dead.
+        let value_end = settings_value_end(cols);
+        assert_eq!(settings_hit(value_end - 1, t, cols, rows, 0, 7), SettingsHit::Search);
+        assert_eq!(
+            settings_hit(value_end - SETTINGS_SEARCH_W, t, cols, rows, 0, 7),
+            SettingsHit::Search,
+        );
+        assert_eq!(settings_hit(SETTINGS_SIDEBAR_W + 4, t, cols, rows, 0, 7), SettingsHit::None);
+        // Card area starts below the title + rule; the rule row and the
+        // spacer between cards are dead.
+        let x = SETTINGS_SIDEBAR_W + 4;
+        assert_eq!(settings_hit(x, t + 1, cols, rows, 0, 7), SettingsHit::None);
+        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 0, 7), SettingsHit::Row(0));
+        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP + 1, cols, rows, 0, 7), SettingsHit::Row(0));
+        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP + 2, cols, rows, 0, 7), SettingsHit::None);
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP + SETTINGS_ROW_H, cols, rows, 0, 7),
+            SettingsHit::Row(1),
+        );
+        // Scroll offsets the list index the same card resolves to.
+        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 3, 7), SettingsHit::Row(3));
+        // Past the end of a short list: dead.
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP + SETTINGS_ROW_H, cols, rows, 0, 1),
+            SettingsHit::None,
+        );
+        // Footer rows never hit.
+        assert_eq!(settings_hit(x, rows - 1, cols, rows, 0, 7), SettingsHit::None);
+    }
+
+    #[test]
+    fn widget_text_grows_cycle_arrows_only_when_selected() {
+        let choice = Widget::Choice("dracula".into());
+        assert_eq!(widget_text(&choice, false), "dracula");
+        assert_eq!(widget_text(&choice, true), "< dracula >");
+        // Toggles render the same switch either way — selection flips, it
+        // doesn't cycle.
+        let on = Widget::Toggle(true);
+        assert_eq!(widget_text(&on, false), widget_text(&on, true));
+        assert!(widget_text(&on, true).ends_with("on"));
+        assert!(widget_text(&Widget::Toggle(false), true).ends_with("off"));
+    }
+
+    #[test]
+    fn scroll_accumulator_carries_sub_line_deltas_instead_of_dropping_them() {
+        // Five events at 0.3 lines each used to round to 0 individually and
+        // scroll nothing; accumulated, they must eventually emit whole lines
+        // and the running remainder must never lose or invent a line.
+        let mut accum = 0.0;
+        let mut total_lines = 0isize;
+        for _ in 0..5 {
+            let (lines, next) = accumulate_scroll_lines(accum, 0.3);
+            accum = next;
+            total_lines += lines;
+        }
+        assert_eq!(total_lines, 1, "5 * 0.3 == 1.5, so exactly one whole line has fired so far");
+        assert!((accum - 0.5).abs() < 1e-9, "the remaining 0.5 must still be carried: {accum}");
+    }
+
+    #[test]
+    fn scroll_accumulator_handles_a_single_large_delta_and_negative_direction() {
+        assert_eq!(accumulate_scroll_lines(0.0, 3.0), (3, 0.0));
+        let (lines, remainder) = accumulate_scroll_lines(0.0, -0.7);
+        assert_eq!(lines, 0);
+        assert!((remainder + 0.7).abs() < 1e-9);
+        let (lines, remainder) = accumulate_scroll_lines(remainder, -0.7);
+        assert_eq!(lines, -1);
+        assert!((remainder + 0.4).abs() < 1e-9);
+    }
 
     #[test]
     fn paste_normalizes_newlines_to_cr() {
@@ -3609,6 +5331,34 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_plain_text() {
         assert_eq!(encode_paste("ls", true), b"\x1b[200~ls\x1b[201~");
+    }
+
+    #[test]
+    fn unbracketed_paste_strips_hidden_control_bytes() {
+        // With no bracketed-paste support, the child interprets pasted text
+        // as if it were typed — a hidden ESC (trivially embedded in text
+        // copied from a web page, and invisible in the source) could smuggle
+        // an arbitrary escape sequence, and a hidden BEL/backspace could do
+        // something surprising at the prompt. Both must be stripped.
+        assert_eq!(encode_paste("a\x1bb", false), b"ab");
+        assert_eq!(encode_paste("rm\x07 -rf ~", false), b"rm -rf ~");
+        assert_eq!(encode_paste("a\x08b", false), b"ab"); // backspace
+        assert_eq!(encode_paste("a\x7fb", false), b"ab"); // DEL
+    }
+
+    #[test]
+    fn unbracketed_paste_keeps_tabs_and_newlines() {
+        // Newlines (normalized to CR) running each pasted line as its own
+        // command is the expected, visible behavior without bracketed-paste
+        // support — not something the control-byte filter should touch.
+        assert_eq!(encode_paste("a\tb\nc\r\nd", false), b"a\tb\rc\rd");
+    }
+
+    #[test]
+    fn unbracketed_paste_preserves_multibyte_utf8() {
+        // UTF-8 continuation/lead bytes (>= 0x80) are never mistaken for the
+        // ASCII control bytes the filter strips.
+        assert_eq!(encode_paste("héllo→wörld", false), "héllo→wörld".as_bytes());
     }
 
     #[test]
@@ -3745,6 +5495,146 @@ mod tests {
         assert_eq!((p.col, p.row), (0, 0));
         let p = pane_pixel_point((500.0, 500.0), (10, 16), (100, 80));
         assert_eq!((p.col, p.row), (99, 79));
+    }
+
+    #[test]
+    fn ime_cursor_area_origin_is_window_relative_for_an_unsplit_pane() {
+        // Unsplit pane origin (0, 0): matches the pre-fix single-pane math
+        // exactly, including the chrome-bar +1 row and the padding band.
+        let (x, y) = ime_cursor_area_origin(4, 4, 10, 20, (0, 0), (3, 2));
+        assert_eq!((x, y), ((4 + 3 * 10) as f64, (4 + (2 + 1) * 20) as f64));
+    }
+
+    #[test]
+    fn ime_cursor_area_origin_adds_the_split_panes_own_offset() {
+        // A pane starting at cell (40, 0) in a right-hand split: the popup
+        // must land at the *pane's* cursor position, not the cursor's
+        // position within an imaginary pane at the window origin — this is
+        // the bug: before the fix, a right/bottom split's IME popup always
+        // appeared over the leftmost/topmost pane instead.
+        let unsplit = ime_cursor_area_origin(4, 4, 10, 20, (0, 0), (3, 2));
+        let split = ime_cursor_area_origin(4, 4, 10, 20, (40, 0), (3, 2));
+        assert_eq!(split.0 - unsplit.0, 40.0 * 10.0);
+        assert_eq!(split.1, unsplit.1); // same row offset, no vertical split here
+    }
+
+    #[test]
+    fn ime_commit_routes_to_the_find_bar_when_searching() {
+        // Regardless of overlay/copy-mode state, an open find bar wins — it's
+        // the innermost, most specific input owner.
+        assert_eq!(ime_commit_target(true, false, false), ImeCommitTarget::SearchBar);
+        assert_eq!(ime_commit_target(true, true, true), ImeCommitTarget::SearchBar);
+    }
+
+    #[test]
+    fn ime_commit_is_dropped_under_an_overlay_or_copy_mode() {
+        assert_eq!(ime_commit_target(false, true, false), ImeCommitTarget::Dropped);
+        assert_eq!(ime_commit_target(false, false, true), ImeCommitTarget::Dropped);
+    }
+
+    #[test]
+    fn ime_commit_reaches_the_pane_only_when_nothing_else_owns_the_keyboard() {
+        assert_eq!(ime_commit_target(false, false, false), ImeCommitTarget::Pane);
+    }
+
+    #[test]
+    fn tab_spans_merge_label_and_close_cells_and_split_on_gaps() {
+        // [Tab0 Tab0 Close0 Close0] gap [Tab1 Tab1] then chrome buttons.
+        let hits = vec![
+            Hit::Tab(0),
+            Hit::Tab(0),
+            Hit::CloseTab(0),
+            Hit::CloseTab(0),
+            Hit::Drag,
+            Hit::Tab(1),
+            Hit::Tab(1),
+            Hit::NewTab,
+        ];
+        assert_eq!(tab_spans(&hits), vec![(0, 0, 4), (1, 5, 7)]);
+    }
+
+    #[test]
+    fn tab_drag_target_fires_on_midpoint_crossings_only() {
+        // Three 10-cell tabs with 1-cell gaps: spans at 0..10, 11..21, 22..32
+        // (midpoints 5, 16, 27).
+        let spans = vec![(0, 0, 10), (1, 11, 21), (2, 22, 32)];
+        // Dragging tab 0 right: nothing until past tab 1's midpoint…
+        assert_eq!(tab_drag_target(15, &spans, 0), 0);
+        assert_eq!(tab_drag_target(17, &spans, 0), 1);
+        // …and crossing tab 2's midpoint targets the far slot directly.
+        assert_eq!(tab_drag_target(28, &spans, 0), 2);
+        // Dragging tab 1 left: fires only left of tab 0's midpoint.
+        assert_eq!(tab_drag_target(5, &spans, 1), 1);
+        assert_eq!(tab_drag_target(4, &spans, 1), 0);
+        // Pointer inside the dragged tab's own span: stay put.
+        assert_eq!(tab_drag_target(13, &spans, 1), 1);
+        // A dragged tab that isn't in the spans (scrolled out): no move.
+        assert_eq!(tab_drag_target(4, &spans, 7), 7);
+    }
+
+    #[test]
+    fn tab_widths_size_to_titles_within_the_clamp() {
+        // Plenty of room: a short title floors at TAB_MIN, a long one caps
+        // at TAB_CELLS, one in between keeps its exact desired width.
+        let w = tab_widths(&[5, 18, 60], 200).unwrap();
+        assert_eq!(w, vec![super::TAB_MIN, 18, super::TAB_CELLS]);
+    }
+
+    #[test]
+    fn tab_widths_shrink_together_when_the_strip_crowds() {
+        // Four tabs wanting the max: 4*26 + 3 gaps = 107 > 80, so all share
+        // the largest uniform cap that fits (4*cap + 3 <= 80 -> cap = 19).
+        let w = tab_widths(&[60, 60, 60, 60], 80).unwrap();
+        assert_eq!(w, vec![19, 19, 19, 19]);
+        // A short tab keeps costing less than the cap.
+        let w = tab_widths(&[60, 5, 60, 60], 80).unwrap();
+        assert_eq!(w[1], super::TAB_MIN);
+        assert!(w[0] > 19, "the freed cells go back to the wide tabs: {w:?}");
+        // The chosen widths actually fit.
+        assert!(w.iter().sum::<usize>() + 3 <= 80);
+    }
+
+    #[test]
+    fn tab_widths_give_up_when_even_minimum_tabs_overflow() {
+        // 10 tabs at TAB_MIN=12 need 129 cells; 100 can't hold them.
+        assert!(tab_widths(&[20; 10], 100).is_none());
+        // The empty strip trivially fits.
+        assert_eq!(tab_widths(&[], 10), Some(vec![]));
+    }
+
+    #[test]
+    fn visible_tab_range_shows_everything_when_it_all_fits() {
+        // TAB_CELLS=26, so +1 separator = 27 cells/tab; 4 tabs need 4*27-1=107.
+        assert_eq!(visible_tab_range(0, 4, 200), (0, 4));
+        assert_eq!(visible_tab_range(3, 4, 200), (0, 4));
+    }
+
+    #[test]
+    fn visible_tab_range_scrolls_minimally_to_keep_active_in_view() {
+        // Room for 3 tabs (3*27-1=80 fits in 90), 10 tabs total.
+        assert_eq!(visible_tab_range(0, 10, 90), (0, 3)); // active at the start
+        assert_eq!(visible_tab_range(2, 10, 90), (0, 3)); // still within the first window
+        assert_eq!(visible_tab_range(5, 10, 90), (3, 6)); // scrolled to bring 5 into view
+        assert_eq!(visible_tab_range(9, 10, 90), (7, 10)); // last tab: pinned to the end
+    }
+
+    #[test]
+    fn visible_tab_range_never_leaves_dead_space_past_the_last_tab() {
+        // 5 tabs, room for 3: clicking back to an early tab shouldn't scroll
+        // past what's needed, but the window also never runs past total.
+        assert_eq!(visible_tab_range(4, 5, 90), (2, 5));
+        assert_eq!(visible_tab_range(0, 5, 90), (0, 3));
+    }
+
+    #[test]
+    fn drag_scroll_direction_fires_only_past_the_margin() {
+        // Pane spans pixel rows [20, 100); a 5px margin around it.
+        let (top, bottom, margin) = (20.0, 100.0, 5.0);
+        assert_eq!(drag_scroll_direction(60.0, top, bottom, margin), None); // well inside
+        assert_eq!(drag_scroll_direction(16.0, top, bottom, margin), None); // inside the margin
+        assert_eq!(drag_scroll_direction(14.0, top, bottom, margin), Some(true)); // past it: scroll up
+        assert_eq!(drag_scroll_direction(104.0, top, bottom, margin), None); // inside the margin
+        assert_eq!(drag_scroll_direction(106.0, top, bottom, margin), Some(false)); // past it: scroll down
     }
 
     #[cfg(not(windows))]

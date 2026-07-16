@@ -41,6 +41,16 @@ pub enum Action {
     ScrollPageDown,
     ScrollPromptUp,
     ScrollPromptDown,
+    /// Toggle fullscreen at runtime (F11 / the near-universal terminal/
+    /// browser convention). Previously only reachable via `launch_mode` at
+    /// startup — there was no way to flip it once the window was open.
+    ToggleFullscreen,
+    /// Grow/shrink/reset the font size (Ctrl+=/Ctrl+-/Ctrl+0, matching
+    /// Chrome/VS Code/iTerm2/Windows Terminal). Previously only reachable
+    /// through the settings overlay.
+    FontSizeUp,
+    FontSizeDown,
+    FontSizeReset,
 }
 
 /// The non-modifier key of a chord, independent of any windowing toolkit.
@@ -56,6 +66,25 @@ pub enum Key {
     Up,
     Down,
     Space,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Home,
+    End,
+    Enter,
+    Insert,
+    Delete,
+    Escape,
+    Backspace,
 }
 
 /// A key chord: modifier state plus one [`Key`].
@@ -118,6 +147,14 @@ impl Default for Keymap {
                 (c(false, true, PageDown), ScrollPageDown),
                 (c(true, true, PageUp), ScrollPromptUp),
                 (c(true, true, PageDown), ScrollPromptDown),
+                (c(false, false, Key::F11), ToggleFullscreen),
+                (c(true, false, Char('=')), FontSizeUp),
+                // Ctrl+Shift+= (i.e. Ctrl+Plus without needing the shift-less
+                // `=`/`+` key some layouts split across two physical keys) —
+                // the same binding Chrome/VS Code offer alongside Ctrl+=.
+                (c(true, true, Char('=')), FontSizeUp),
+                (c(true, false, Char('-')), FontSizeDown),
+                (c(true, false, Char('0')), FontSizeReset),
             ],
         }
     }
@@ -172,14 +209,19 @@ pub fn parse_action(name: &str) -> Option<Action> {
         "scroll_page_down" => Action::ScrollPageDown,
         "scroll_prompt_up" => Action::ScrollPromptUp,
         "scroll_prompt_down" => Action::ScrollPromptDown,
+        "toggle_fullscreen" => Action::ToggleFullscreen,
+        "font_size_up" => Action::FontSizeUp,
+        "font_size_down" => Action::FontSizeDown,
+        "font_size_reset" => Action::FontSizeReset,
         _ => return None,
     })
 }
 
 /// Parse a chord string like `"Ctrl+Shift+C"` or `"Shift+PageUp"`. Modifiers are
 /// `ctrl`/`control`, `shift`, `alt`/`option` (case-insensitive); the final token
-/// is the key — a single printable character, or one of `comma`, `tab`,
-/// `pageup`/`pgup`, `pagedown`/`pgdn`.
+/// is the key — a single printable character, one of `comma`, `tab`,
+/// `pageup`/`pgup`, `pagedown`/`pgdn`, `home`, `end`, `enter`/`return`,
+/// `insert`/`ins`, `delete`/`del`, `escape`/`esc`, `backspace`, or `f1`-`f12`.
 pub fn parse_chord(s: &str) -> Result<Chord, String> {
     let (mut ctrl, mut shift, mut alt) = (false, false, false);
     let mut key = None;
@@ -201,11 +243,35 @@ pub fn parse_chord(s: &str) -> Result<Chord, String> {
             "up" => key = Some(Key::Up),
             "down" => key = Some(Key::Down),
             "space" => key = Some(Key::Space),
+            "home" => key = Some(Key::Home),
+            "end" => key = Some(Key::End),
+            "enter" | "return" => key = Some(Key::Enter),
+            "insert" | "ins" => key = Some(Key::Insert),
+            "delete" | "del" => key = Some(Key::Delete),
+            "escape" | "esc" => key = Some(Key::Escape),
+            "backspace" => key = Some(Key::Backspace),
+            "f1" => key = Some(Key::F1),
+            "f2" => key = Some(Key::F2),
+            "f3" => key = Some(Key::F3),
+            "f4" => key = Some(Key::F4),
+            "f5" => key = Some(Key::F5),
+            "f6" => key = Some(Key::F6),
+            "f7" => key = Some(Key::F7),
+            "f8" => key = Some(Key::F8),
+            "f9" => key = Some(Key::F9),
+            "f10" => key = Some(Key::F10),
+            "f11" => key = Some(Key::F11),
+            "f12" => key = Some(Key::F12),
             other => {
                 let mut chars = other.chars();
                 let c = chars.next().unwrap(); // `t` is non-empty
                 if chars.next().is_some() {
-                    return Err(format!("unknown key `{t}` in chord `{s}`"));
+                    return Err(format!(
+                        "unknown key `{t}` in chord `{s}` (expected a single character, or one \
+                         of: comma, tab, pageup/pgup, pagedown/pgdn, left, right, up, down, \
+                         space, home, end, enter/return, insert/ins, delete/del, escape/esc, \
+                         backspace, f1-f12)"
+                    ));
                 }
                 key = Some(Key::Char(c));
             }
@@ -237,6 +303,18 @@ mod tests {
     }
 
     #[test]
+    fn defaults_bind_fullscreen_and_font_zoom() {
+        // These were previously unreachable at runtime at all — fullscreen
+        // was launch_mode-only, and font size only adjustable via the
+        // settings overlay.
+        let km = Keymap::default();
+        assert_eq!(km.action(Chord::new(false, false, false, Key::F11)), Some(Action::ToggleFullscreen));
+        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('='))), Some(Action::FontSizeUp));
+        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('-'))), Some(Action::FontSizeDown));
+        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('0'))), Some(Action::FontSizeReset));
+    }
+
+    #[test]
     fn set_rebinds_and_clears_old_chord_and_action() {
         let mut km = Keymap::default();
         let new = Chord::new(true, false, true, Key::Char('y'));
@@ -264,8 +342,26 @@ mod tests {
     #[test]
     fn parse_chord_rejects_garbage() {
         assert!(parse_chord("Ctrl+").is_err()); // empty key token
-        assert!(parse_chord("Ctrl+Home").is_err()); // unsupported named key
+        assert!(parse_chord("Ctrl+Foo").is_err()); // unsupported named key
         assert!(parse_chord("Ctrl+Shift").is_err()); // modifiers only, no key
+    }
+
+    #[test]
+    fn parse_chord_handles_newly_supported_named_keys() {
+        // F-keys, navigation keys, and editing keys were previously
+        // unbindable at all (only letters/digits/comma/tab/pageup/pagedown/
+        // arrows/space worked) — `[keys] copy = "Ctrl+F5"` failed with
+        // "unknown key" and there was no escape hatch to spare function keys.
+        assert_eq!(parse_chord("Ctrl+F5"), Ok(Chord::new(true, false, false, Key::F5)));
+        assert_eq!(parse_chord("F11"), Ok(Chord::new(false, false, false, Key::F11)));
+        assert_eq!(parse_chord("Ctrl+Home"), Ok(Chord::new(true, false, false, Key::Home)));
+        assert_eq!(parse_chord("Shift+End"), Ok(Chord::new(false, true, false, Key::End)));
+        assert_eq!(parse_chord("Ctrl+Enter"), Ok(Chord::new(true, false, false, Key::Enter)));
+        assert_eq!(parse_chord("Alt+Return"), Ok(Chord::new(false, false, true, Key::Enter)));
+        assert_eq!(parse_chord("Ctrl+Delete"), Ok(Chord::new(true, false, false, Key::Delete)));
+        assert_eq!(parse_chord("Ctrl+Insert"), Ok(Chord::new(true, false, false, Key::Insert)));
+        assert_eq!(parse_chord("Ctrl+Escape"), Ok(Chord::new(true, false, false, Key::Escape)));
+        assert_eq!(parse_chord("Ctrl+Backspace"), Ok(Chord::new(true, false, false, Key::Backspace)));
     }
 
     #[test]
@@ -275,6 +371,10 @@ mod tests {
         assert_eq!(parse_action("fold_output"), Some(Action::FoldOutput));
         assert_eq!(parse_action("scroll_prompt_down"), Some(Action::ScrollPromptDown));
         assert_eq!(parse_action("open_settings"), Some(Action::OpenSettings));
+        assert_eq!(parse_action("toggle_fullscreen"), Some(Action::ToggleFullscreen));
+        assert_eq!(parse_action("font_size_up"), Some(Action::FontSizeUp));
+        assert_eq!(parse_action("font_size_down"), Some(Action::FontSizeDown));
+        assert_eq!(parse_action("font_size_reset"), Some(Action::FontSizeReset));
         assert_eq!(parse_action("nonsense"), None);
     }
 

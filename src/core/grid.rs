@@ -6,6 +6,7 @@
 //! [`DirtyFrame`] snapshot for the renderer.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 #[cfg(any(test, feature = "gui"))]
 use std::collections::HashMap;
 
@@ -408,10 +409,18 @@ pub struct Grid {
     /// `links[n - 1]` (`0` means no link). Append-only and bounded by
     /// [`LINK_MAX`], so ids stay stable for cells held in scrollback.
     pub(crate) links: Vec<String>,
+    /// An `Arc` snapshot of `links`, rebuilt only in `intern_link` when a new
+    /// URI is actually appended — every rendered frame (`snapshot_dirty`/
+    /// `snapshot_viewport`) previously deep-cloned the whole `Vec<String>`
+    /// (each frame, forever, even though the table almost never changes
+    /// between frames); cloning this `Arc` instead is an `O(1)` refcount bump.
+    pub(crate) links_arc: Arc<[String]>,
     /// Interned grapheme-continuation strings; a [`Cell::cluster`] of `n` refers
     /// to `clusters[n - 1]` (`0` means a lone `ch`). Append-only and bounded by
     /// [`CLUSTER_MAX`], so ids stay stable for cells held in scrollback.
     pub(crate) clusters: Vec<String>,
+    /// `Arc` snapshot of `clusters`, mirroring `links_arc`.
+    pub(crate) clusters_arc: Arc<[String]>,
     /// The hyperlink id stamped onto cells written while an OSC 8 link is open
     /// (`0` when none). Set by the parser via [`Grid::set_link`].
     current_link: u16,
@@ -1197,7 +1206,9 @@ impl Grid {
             images: Vec::new(),
             host_out: Vec::new(),
             links: Vec::new(),
+            links_arc: Arc::from(Vec::<String>::new()),
             clusters: Vec::new(),
+            clusters_arc: Arc::from(Vec::<String>::new()),
             current_link: 0,
             tab_stops: default_tab_stops(cols),
             cursor_visible: true,
@@ -1629,7 +1640,16 @@ impl Grid {
                 }
             }
         };
-        let cell_rows = th.div_ceil(2);
+        // `th`/`rows` come straight from untrusted OSC 1337 `height=` or Kitty
+        // `r=` hints and are otherwise unclamped (unlike `tw`, which is always
+        // bounded by `avail`). Without a cap here, a single escape sequence
+        // requesting an absurd height (e.g. `height=999999999`) would drive
+        // this function's `newline()` loop below billions of times. Nothing
+        // past what could ever be visible or retained in scrollback needs to
+        // be drawn, so crop to that — same "clip, don't rescale" convention
+        // `tw` already uses against `avail`.
+        let max_cell_rows = self.rows.saturating_add(self.scrollback_max).max(1);
+        let cell_rows = th.div_ceil(2).min(max_cell_rows);
         #[cfg(any(test, feature = "gui"))]
         self.store_image(width, height, pixels, origin, tw, cell_rows);
 
@@ -2177,6 +2197,21 @@ impl Grid {
         }
         let (col, row) = (col.min(self.cols - 1), row.min(self.rows - 1));
         let abs = self.abs_of_view_row(row);
+        let (start, end) = self.word_bounds_at(abs, col);
+        self.selection = Some(Selection { anchor: (start, abs), head: (end, abs) });
+    }
+
+    /// Word-character bounds `(start_col, end_col)` inclusive, containing
+    /// `col` on absolute row `abs` — `(col, col)` if `col` itself isn't a
+    /// word character. Pulled out of `select_word_at` so drag-extension
+    /// (`extend_word_selection`) can reuse the same word-boundary logic
+    /// without re-selecting just the single word at the drag point.
+    #[cfg(any(test, feature = "gui"))]
+    fn word_bounds_at(&self, abs: usize, col: usize) -> (usize, usize) {
+        if self.cols == 0 {
+            return (col, col);
+        }
+        let col = col.min(self.cols - 1);
         let (cells, _) = self.phys_row(abs);
         let is_word = |c: usize| {
             let Some(cell) = cells.get(c) else { return false };
@@ -2184,13 +2219,10 @@ impl Grid {
                 return true; // ride with its wide lead cell
             }
             let ch = cell.ch;
-            !(ch == ' '
-                || ch == '\0'
-                || "\t\"'`()[]{}<>|;,".contains(ch))
+            !(ch == ' ' || ch == '\0' || "\t\"'`()[]{}<>|;,".contains(ch))
         };
         if !is_word(col) {
-            self.selection = Some(Selection { anchor: (col, abs), head: (col, abs) });
-            return;
+            return (col, col);
         }
         let mut start = col;
         while start > 0 && is_word(start - 1) {
@@ -2200,7 +2232,32 @@ impl Grid {
         while end + 1 < self.cols && is_word(end + 1) {
             end += 1;
         }
-        self.selection = Some(Selection { anchor: (start, abs), head: (end, abs) });
+        (start, end)
+    }
+
+    /// Extend a double-click word selection as the drag moves: the
+    /// initially-clicked word (at `anchor`) and the word under the current
+    /// drag point (`head`) both stay whole, with everything between them
+    /// included — reading-order aware, so dragging back past the click
+    /// point flips which end is anchor vs. head instead of ever shrinking
+    /// the selection below the single originally-clicked word. `anchor` and
+    /// `head` are `(col, abs_row)`, matching `Selection`'s fields.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn extend_word_selection(&mut self, anchor: (usize, usize), head: (usize, usize)) {
+        let (a_col, a_row) = anchor;
+        let (h_col, h_row) = head;
+        let (a_start, a_end) = self.word_bounds_at(a_row, a_col);
+        let (h_start, h_end) = self.word_bounds_at(h_row, h_col);
+        // Reading-order (row, then col) comparison: whichever side of the
+        // anchor word the drag point falls on decides which end of each
+        // word bounds the union.
+        let dragging_back = (h_row, h_col) < (a_row, a_col);
+        let (anchor_out, head_out) = if dragging_back {
+            ((a_end, a_row), (h_start, h_row))
+        } else {
+            ((a_start, a_row), (h_end, h_row))
+        };
+        self.selection = Some(Selection { anchor: anchor_out, head: head_out });
     }
 
     /// Select the whole logical line through screen `row` (triple-click):
@@ -2214,6 +2271,16 @@ impl Grid {
             return;
         }
         let abs = self.abs_of_view_row(row.min(self.rows - 1));
+        let (start, end) = self.line_bounds_at(abs);
+        self.selection = Some(Selection { anchor: (0, start), head: (self.cols - 1, end) });
+    }
+
+    /// The absolute-row span `(start_abs, end_abs)` inclusive of the
+    /// soft-wrapped logical line containing absolute row `abs`. Pulled out
+    /// of `select_line_at` so drag-extension (`extend_line_selection`) can
+    /// reuse the same wrap-following logic.
+    #[cfg(any(test, feature = "gui"))]
+    fn line_bounds_at(&self, abs: usize) -> (usize, usize) {
         let total = self.scrollback.len() + self.rows;
         let (mut start, mut end) = (abs, abs);
         // Follow the soft-wrap bits across scrollback + screen (bounded like
@@ -2224,8 +2291,20 @@ impl Grid {
         while end + 1 < total && end - abs < 128 && self.phys_row(end).1 {
             end += 1;
         }
+        (start, end)
+    }
+
+    /// Extend a triple-click line selection as the drag moves, analogous to
+    /// `extend_word_selection` but at whole-(soft-wrapped)-line granularity.
+    /// `anchor_row`/`head_row` are absolute rows.
+    #[cfg(any(test, feature = "gui"))]
+    pub fn extend_line_selection(&mut self, anchor_row: usize, head_row: usize) {
+        let (a_start, a_end) = self.line_bounds_at(anchor_row);
+        let (h_start, h_end) = self.line_bounds_at(head_row);
+        let dragging_back = head_row < anchor_row;
+        let (start_row, end_row) = if dragging_back { (h_start, a_end) } else { (a_start, h_end) };
         self.selection =
-            Some(Selection { anchor: (0, start), head: (self.cols - 1, end) });
+            Some(Selection { anchor: (0, start_row), head: (self.cols.saturating_sub(1), end_row) });
     }
 
     /// The selected text, or `None` when nothing is selected. Lines join with
@@ -2394,6 +2473,7 @@ impl Grid {
             return 0;
         }
         self.clusters.push(suffix);
+        self.clusters_arc = Arc::from(self.clusters.clone());
         self.clusters.len() as u16
     }
 
@@ -2991,9 +3071,16 @@ impl Grid {
             let n = n.min(self.scroll_bottom + 1 - cy);
             let (l, r) = (self.left_margin, self.right_margin.min(self.cols - 1));
             let blank = self.erase_cell();
-            for y in cy..=(self.scroll_bottom - n) {
-                for x in l..=r {
-                    self.cells[y * self.cols + x] = self.cells[(y + n) * self.cols + x];
+            // `n` can reach `scroll_bottom + 1 - cy` (deleting the whole
+            // region), at which point `scroll_bottom - n` underflows when
+            // `cy == 0` — e.g. `CSI 9999 M` with DECSLRM margins active and
+            // the cursor parked on row 0. `checked_sub` skips the copy
+            // instead of panicking; there's nothing to shift up in that case.
+            if let Some(copy_end) = self.scroll_bottom.checked_sub(n) {
+                for y in cy..=copy_end {
+                    for x in l..=r {
+                        self.cells[y * self.cols + x] = self.cells[(y + n) * self.cols + x];
+                    }
                 }
             }
             for y in (self.scroll_bottom + 1 - n)..=self.scroll_bottom {
@@ -3306,6 +3393,17 @@ impl Grid {
     /// Clear all per-row dirty flags. Call after handing a frame to the renderer.
     pub fn clear_dirty(&mut self) {
         self.dirty.iter_mut().for_each(|d| *d = false);
+    }
+
+    /// Mark every row dirty without touching any cell. Used when something
+    /// outside the grid's own model wrote to the host terminal directly (e.g.
+    /// a config-reload warning printed mid-session, in the TUI's raw-mode
+    /// host-passthrough path) — the dirty-row diffing in
+    /// [`Self::snapshot_dirty`] has no way to know those rows now need
+    /// repainting on their own, so the next frame must be forced to redraw
+    /// everything rather than skip rows it thinks are unchanged.
+    pub fn force_full_repaint(&mut self) {
+        self.dirty = vec![true; self.rows];
     }
 
     /// Overlay a status line at the bottom of the screen (L13 `render/set_status`),
@@ -3834,8 +3932,8 @@ impl Grid {
         DirtyFrame {
             cursor: self.cursor,
             rows,
-            links: self.links.clone(),
-            clusters: self.clusters.clone(),
+            links: self.links_arc.clone(),
+            clusters: self.clusters_arc.clone(),
             line_attrs: self.line_attrs.clone(),
         }
     }
@@ -3901,17 +3999,28 @@ impl Grid {
     /// Search the scrollback + live screen for `query`. `regex = true` compiles the
     /// query with the from-scratch engine (`core::rx`) and matches per
     /// logical line (`^`/`$` anchor to the line); a malformed pattern finds
-    /// nothing, which the find bar shows as "no matches". Both modes fold
-    /// case (simple Unicode folding, not just ASCII).
+    /// nothing, which the find bar shows as "no matches". Case-insensitive
+    /// (simple Unicode folding, not just ASCII) — a thin wrapper over
+    /// `search_with_case` for every existing caller, which never needed a
+    /// case-sensitive option.
     #[cfg(any(test, feature = "gui"))]
     pub fn search_with(&mut self, query: &str, regex: bool) -> usize {
+        self.search_with_case(query, regex, false)
+    }
+
+    /// `search_with`, but `case_sensitive` skips the Unicode case folding on
+    /// both the query/pattern and the haystack — the find bar's case-
+    /// sensitivity toggle (Alt+C).
+    #[cfg(any(test, feature = "gui"))]
+    pub fn search_with_case(&mut self, query: &str, regex: bool, case_sensitive: bool) -> usize {
+        let fold = |c: char| if case_sensitive { c } else { fold_char(c) };
         self.search = None;
         let re = if regex {
             // Fold the pattern like the haystack, so literals match
             // case-insensitively. Safe for POSIX ERE: folding never touches
             // metacharacters, and the engine has no `\D`-style classes whose
             // meaning a case change could invert.
-            let folded: String = query.chars().map(fold_char).collect();
+            let folded: String = query.chars().map(fold).collect();
             match rusty_regx::Regex::new_posix(&folded) {
                 Ok(re) => Some((re, folded.starts_with('^'))),
                 Err(_) => {
@@ -3923,7 +4032,7 @@ impl Grid {
         } else {
             None
         };
-        let q: Vec<char> = query.chars().map(fold_char).collect();
+        let q: Vec<char> = query.chars().map(fold).collect();
         if q.is_empty() {
             self.dirty.iter_mut().for_each(|d| *d = true);
             return 0;
@@ -3938,7 +4047,7 @@ impl Grid {
                 if cell.flags & WIDE_TRAILER != 0 {
                     continue;
                 }
-                text.push(fold_char(cell.ch));
+                text.push(fold(cell.ch));
                 at.push((abs, col));
             }
             if wrapped {
@@ -4320,6 +4429,46 @@ impl Grid {
         self.links.get(id.checked_sub(1)?).map(String::as_str)
     }
 
+    /// The column span `(start_col, end_col)` inclusive, plus URL, of the
+    /// hyperlink (OSC 8 or detected plain-text) under viewport `(col, row)` —
+    /// clamped to the visual row it's hovered on, unlike `link_at`/`url_at`
+    /// which only test single-cell membership. Powers the hover
+    /// underline/pointer-cursor affordance in the windowed front-end; a
+    /// wrapped plain-text URL only underlines on the hovered row, which is a
+    /// fine simplification since the full URL still opens correctly either
+    /// way (this only feeds the *visual* hint).
+    #[cfg(any(test, feature = "gui"))]
+    pub fn hover_link_at(&self, col: usize, row: usize) -> Option<(usize, usize, String)> {
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        let id = self.viewport_cell(col, row).link as usize;
+        if id != 0 {
+            let url = self.links.get(id - 1)?.clone();
+            let mut start = col;
+            while start > 0 && self.viewport_cell(start - 1, row).link as usize == id {
+                start -= 1;
+            }
+            let mut end = col;
+            while end + 1 < self.cols && self.viewport_cell(end + 1, row).link as usize == id {
+                end += 1;
+            }
+            return Some((start, end, url));
+        }
+        let abs = self.abs_of_view_row(row);
+        let (text, at) = self.logical_line_of(abs);
+        let idx = at.iter().position(|&(a, c)| a == abs && c == col)?;
+        let (s, e, url) = detect_urls(&text).into_iter().find(|&(s, e, _)| idx >= s && idx < e)?;
+        let (mut start, mut end) = (col, col);
+        for &(a, c) in &at[s..e] {
+            if a == abs {
+                start = start.min(c);
+                end = end.max(c);
+            }
+        }
+        Some((start, end, url))
+    }
+
     /// Snapshot the entire visible viewport, compositing scrollback history
     /// above the live grid according to [`Grid::view_offset`]. Every row is
     /// included. History lines are padded/truncated to the current width.
@@ -4360,8 +4509,8 @@ impl Grid {
         DirtyFrame {
             cursor: self.cursor,
             rows,
-            links: self.links.clone(),
-            clusters: self.clusters.clone(),
+            links: self.links_arc.clone(),
+            clusters: self.clusters_arc.clone(),
             line_attrs: attrs,
         }
     }
@@ -4402,6 +4551,7 @@ impl Grid {
             return 0;
         }
         self.links.push(uri.to_string());
+        self.links_arc = Arc::from(self.links.clone());
         self.links.len() as u16
     }
 }
@@ -4485,12 +4635,14 @@ pub struct DirtyFrame {
     /// Dirty rows as `(row_index, cells)` pairs.
     pub rows: Vec<(usize, Vec<Cell>)>,
     /// Interned hyperlink URIs (OSC 8); a [`Cell::link`] of `n` indexes
-    /// `links[n - 1]`. Cloned so the renderer can resolve links without the lock.
-    pub links: Vec<String>,
+    /// `links[n - 1]`. An `Arc` clone (O(1)) of the grid's cached snapshot, so
+    /// the renderer can resolve links without the lock and without the O(n)
+    /// deep string clone this used to be on every single frame.
+    pub links: Arc<[String]>,
     /// Interned grapheme continuations (see [`Grid::clusters`]); a
-    /// [`Cell::cluster`] of `n` indexes `clusters[n - 1]`. Cloned so the renderer
-    /// can resolve glyphs without holding the grid lock.
-    pub clusters: Vec<String>,
+    /// [`Cell::cluster`] of `n` indexes `clusters[n - 1]`. An `Arc` clone
+    /// (O(1)) of the grid's cached snapshot, mirroring [`Self::links`].
+    pub clusters: Arc<[String]>,
     /// Per-row line size attributes (DECDWL/DECDHL), indexed by each row's `y`
     /// in [`rows`](Self::rows). Cloned so the renderer can relay them to the host.
     pub line_attrs: Vec<LineAttr>,

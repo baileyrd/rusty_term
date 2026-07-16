@@ -928,11 +928,13 @@ fn dcs_string_aborted_by_can() {
 fn da1_query_is_answered_and_not_printed() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
-    // Both the bare and explicit-0 forms are queries.
+    // Both the bare and explicit-0 forms are queries. Attribute `4` (Sixel)
+    // is advertised since this terminal actually decodes Sixel — apps that
+    // gate Sixel support on DA1 containing it need to see it here.
     p.advance(&mut g, b"\x1b[c");
-    assert_eq!(p.take_responses(), b"\x1b[?1;2c");
+    assert_eq!(p.take_responses(), b"\x1b[?1;2;4c");
     p.advance(&mut g, b"\x1b[0c");
-    assert_eq!(p.take_responses(), b"\x1b[?1;2c");
+    assert_eq!(p.take_responses(), b"\x1b[?1;2;4c");
     // Nothing leaked onto the grid.
     assert_eq!(g.cells[0].ch, ' ');
     assert_eq!(g.cursor, (0, 0));
@@ -1054,6 +1056,18 @@ fn dsr_cursor_position_report_uses_one_based_coords() {
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"\x1b[6n");
     assert_eq!(p.take_responses(), b"\x1b[10;5R"); // row 10, col 5 (1-based)
+}
+
+#[test]
+fn decxcpr_private_form_is_answered_with_the_private_marker() {
+    // `CSI ? 6 n` (DECXCPR) is the private-marker form of CPR; a program
+    // that probes with it (rather than the plain `CSI 6 n` above) used to
+    // get no reply at all and could block forever waiting for one.
+    let mut g = Grid::new(80, 24);
+    g.cursor = (4, 9); // col 4, row 9 (0-based)
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b[?6n");
+    assert_eq!(p.take_responses(), b"\x1b[?10;5;1R"); // row 10, col 5, page 1
 }
 
 #[test]
@@ -1460,6 +1474,20 @@ fn osc_52_set_is_forwarded_to_host_and_not_printed() {
 }
 
 #[test]
+fn osc_52_set_is_not_truncated_at_the_old_4kb_cap() {
+    // The generic OSC_MAX (4 KiB) used to truncate any clipboard set past
+    // ~3 KiB of decoded text; OSC 52 needs its own, much larger cap so a
+    // real (not just a title-sized) copy survives intact.
+    let text = "x".repeat(10_000); // well past the old 4096-byte OSC_MAX
+    let b64 = base64::encode(text.as_bytes());
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    let osc = [b"\x1b]52;c;".as_slice(), b64.as_bytes(), b"\x07"].concat();
+    p.advance(&mut g, &osc);
+    assert_eq!(g.clipboard_set.as_deref(), Some(text.as_str()));
+}
+
+#[test]
 fn osc_52_query_is_not_forwarded() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
@@ -1549,6 +1577,55 @@ fn link_at_resolves_covered_cells() {
     // Out-of-bounds coordinates are safe.
     assert_eq!(g.link_at(999, 0), None);
     assert_eq!(g.link_at(0, 999), None);
+}
+
+#[test]
+fn links_arc_and_clusters_arc_stay_in_sync_with_the_backing_vecs() {
+    // snapshot_dirty/snapshot_viewport hand out links_arc/clusters_arc instead
+    // of cloning links/clusters directly (an O(1) Arc clone vs. an O(n) deep
+    // Vec<String> clone on every rendered frame); the cache must actually
+    // track the source of truth or the renderer silently sees stale data.
+    let mut g = Grid::new(20, 3);
+    assert_eq!(g.links_arc.len(), g.links.len());
+    assert_eq!(g.clusters_arc.len(), g.clusters.len());
+
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]8;;http://example.com\x1b\\hi\x1b]8;;\x1b\\");
+    assert_eq!(g.links.len(), 1, "the link should have been interned");
+    assert_eq!(g.links_arc.len(), g.links.len());
+    assert_eq!(&*g.links_arc, &g.links[..]);
+
+    // "e\u{0301}" is 'e' + combining acute accent: the accent is a grapheme
+    // continuation, interned into `clusters`.
+    p.advance(&mut g, "e\u{0301}".as_bytes());
+    assert_eq!(g.clusters.len(), 1, "the combining accent should be interned");
+    assert_eq!(g.clusters_arc.len(), g.clusters.len());
+    assert_eq!(&*g.clusters_arc, &g.clusters[..]);
+}
+
+#[test]
+fn force_full_repaint_marks_every_row_dirty_even_after_a_clear() {
+    let mut g = Grid::new(10, 4);
+    g.clear_dirty();
+    assert!(g.dirty.iter().all(|&d| !d), "clear_dirty should have cleared everything");
+    g.force_full_repaint();
+    assert_eq!(g.dirty.len(), 4);
+    assert!(g.dirty.iter().all(|&d| d));
+}
+
+#[test]
+fn hover_link_at_spans_the_whole_osc8_link_on_its_row() {
+    let g = parse(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\C", 80, 24);
+    assert_eq!(
+        g.hover_link_at(0, 0),
+        Some((0, 1, "http://example.com".to_string()))
+    );
+    assert_eq!(
+        g.hover_link_at(1, 0),
+        Some((0, 1, "http://example.com".to_string()))
+    );
+    assert_eq!(g.hover_link_at(2, 0), None); // C is after the close
+    assert_eq!(g.hover_link_at(999, 0), None); // out of bounds is safe
 }
 
 #[test]
@@ -3391,6 +3468,18 @@ fn render_image_sized_contain_fits_within_both_axes_preserving_aspect() {
 }
 
 #[test]
+fn render_image_sized_clamps_absurd_height_hint() {
+    // An untrusted `height=` hint in the billions (iTerm2 OSC 1337, or a
+    // Kitty `r=` count) used to drive the newline() loop that many times —
+    // a single escape sequence could hang the terminal for minutes. It must
+    // instead clamp to whatever could ever be visible or retained in
+    // scrollback, not the attacker-chosen request.
+    let mut g = Grid::new(4, 3);
+    g.render_image_sized(1, 1, &[Some(0xFF0000)], None, Some(2_000_000_000), true);
+    assert!(g.scrollback.len() <= g.rows + g.scrollback_max);
+}
+
+#[test]
 fn kitty_raw_rgba_renders() {
     // f=32 (RGBA), 1×1 red, transmit+display. `/wAA/w==` = [ff,00,00,ff].
     let g = parse(b"\x1b_Gf=32,s=1,v=1,a=T;/wAA/w==\x1b\\", 80, 24);
@@ -4429,6 +4518,51 @@ fn select_line_at_follows_soft_wraps() {
     assert_eq!(g.selected_text().as_deref(), Some("second"));
 }
 
+#[test]
+fn extend_word_selection_keeps_both_words_whole_and_everything_between() {
+    let mut g = Grid::new(80, 24);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"ls /tmp/dir-1/file.txt \"quoted\"");
+    // Click lands in "ls" (cols 0-1); drag point lands in the path
+    // (cols 3-21) — dragging forward from the first word to a later one.
+    g.select_word_at(0, 0);
+    let anchor = g.selection.unwrap().anchor;
+    g.extend_word_selection(anchor, (8, 0));
+    assert_eq!(g.selected_text().as_deref(), Some("ls /tmp/dir-1/file.txt"));
+
+    // Same two words, but the *click* is in the path and the drag point
+    // moves back onto "ls" — dragging backward past the anchor must yield
+    // the identical union, not just the first word.
+    g.select_word_at(8, 0);
+    let anchor = g.selection.unwrap().anchor;
+    g.extend_word_selection(anchor, (0, 0));
+    assert_eq!(g.selected_text().as_deref(), Some("ls /tmp/dir-1/file.txt"));
+
+    // Dragging within the same word never shrinks below the clicked word.
+    g.select_word_at(8, 0);
+    let anchor = g.selection.unwrap().anchor;
+    g.extend_word_selection(anchor, (15, 0));
+    assert_eq!(g.selected_text().as_deref(), Some("/tmp/dir-1/file.txt"));
+}
+
+#[test]
+fn extend_line_selection_spans_whole_wrapped_lines_either_drag_direction() {
+    let mut g = Grid::new(10, 5);
+    let mut p = AnsiParser::new();
+    // Row 0 wraps onto row 1; row 2 is a separate hard-broken line.
+    p.advance(&mut g, b"abcdefghijklmno\r\nsecond");
+    g.select_line_at(0);
+    let anchor_row = g.selection.unwrap().anchor.1;
+    g.extend_line_selection(anchor_row, 2);
+    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno\nsecond"));
+
+    // Same span, dragging from the last line back up to the first.
+    g.select_line_at(2);
+    let anchor_row = g.selection.unwrap().anchor.1;
+    g.extend_line_selection(anchor_row, 0);
+    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno\nsecond"));
+}
+
 // ---- Wave-3 additions: regex search (rusty_regx) ----
 
 #[test]
@@ -4484,6 +4618,20 @@ fn url_at_detects_plain_text_urls_across_wraps() {
     assert_eq!(g.url_at(6, 0).as_deref(), Some("https://example.com/a/long/path"));
     assert_eq!(g.url_at(2, 1).as_deref(), Some("https://example.com/a/long/path"));
     assert_eq!(g.url_at(0, 0), None); // "see" is not a URL
+}
+
+#[test]
+fn hover_link_at_clamps_a_wrapped_plain_text_url_to_the_hovered_row() {
+    let mut g = Grid::new(20, 5);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"see https://example.com/a/long/path now");
+    // Row 0: the URL runs from col 4 (right after "see ") to the row's last
+    // column (it continues onto row 1); row 1: it resumes at col 0 and ends
+    // before " now".
+    let url = "https://example.com/a/long/path".to_string();
+    assert_eq!(g.hover_link_at(6, 0), Some((4, 19, url.clone())));
+    assert_eq!(g.hover_link_at(2, 1), Some((0, 14, url)));
+    assert_eq!(g.hover_link_at(0, 0), None); // "see" is not a URL
 }
 
 #[test]
@@ -4911,6 +5059,23 @@ fn side_margins_limit_il_dl_to_the_band() {
     // IL with the cursor outside the side margins is a no-op.
     p.advance(&mut g, b"\x1b[2;1H\x1b[1L");
     assert_eq!(g.cells[g.cols + 2].ch, 'b');
+}
+
+#[test]
+fn delete_lines_with_side_margins_and_cursor_at_top_does_not_panic() {
+    // DL's DECSLRM branch computed `scroll_bottom - n` directly; with the
+    // cursor on row 0 (== scroll_top) and a count covering the whole region,
+    // `n` reaches `scroll_bottom + 1`, underflowing that subtraction. Any
+    // program sending an oversized `CSI Pn M` with margins active and the
+    // cursor parked at the top must not crash the terminal.
+    let mut g = Grid::new(10, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+    p.advance(&mut g, b"\x1b[?69h\x1b[3;8s\x1b[1;3H"); // margins cols 2..=7 (0-based), cursor row 0 in band
+    p.advance(&mut g, b"\x1b[9999M"); // DL count far exceeding the region height
+    // The whole band is blanked; outside the margins is untouched.
+    assert_eq!(g.cells[2].ch, ' ');
+    assert_eq!(g.cells[0].ch, 'a'); // col 0, outside the left margin, unaffected
 }
 
 #[test]
@@ -5441,6 +5606,21 @@ fn search_folds_canonical_accents_together() {
     // And the reverse: an accented query finds plain text.
     assert_eq!(g.search_with("t\u{EC}me", false), 1, "accented query folds too");
     assert_eq!(g.search_with("xyz", false), 0);
+}
+
+#[test]
+fn search_with_case_skips_folding_in_plain_and_regex_mode() {
+    let mut g = Grid::new(20, 3);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"Error: bad\r\nerror: fine");
+    // Case-insensitive (the default `search_with` behavior): both lines match.
+    assert_eq!(g.search_with_case("error", false, false), 2);
+    // Case-sensitive: only the lowercase line matches.
+    assert_eq!(g.search_with_case("error", false, true), 1);
+    assert_eq!(g.search_with_case("Error", false, true), 1);
+    // Same distinction in regex mode.
+    assert_eq!(g.search_with_case("^error", true, false), 2);
+    assert_eq!(g.search_with_case("^error", true, true), 1);
 }
 
 #[test]

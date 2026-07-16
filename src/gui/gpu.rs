@@ -43,7 +43,7 @@ const ATLAS_MAX: u32 = 2048;
 const IMG_CACHE_MAX: usize = 32;
 
 const SHADER: &str = r#"
-struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, atlas: vec2<f32>, opacity: f32, _pad: f32 };
+struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, atlas: vec2<f32>, origin: vec2<f32>, opacity: f32, bar_inset: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(2) var atlas_smp: sampler;
@@ -88,7 +88,16 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
     let corner = corners[vi];
     let span = f32(max(inst.span, 1u));
-    let px = (vec2<f32>(f32(inst.col), f32(inst.row)) + corner * vec2(span, 1.0)) * u.cell;
+    var px = (vec2<f32>(f32(inst.col), f32(inst.row)) + corner * vec2(span, 1.0)) * u.cell;
+    // The window-padding inset applies to grid content only; the chrome bar
+    // (the sole occupant of cell row 0) stays horizontally flush but sits
+    // bar_inset px below the top edge, so the strip band shows above the
+    // tabs. The band quad itself carries deco bit 7 and stays absolute.
+    if (inst.row > 0u) {
+        px = px + u.origin;
+    } else if ((inst.deco & 128u) == 0u) {
+        px.y = px.y + u.bar_inset;
+    }
     let ndc = vec2(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
     let uv0 = vec2(f32(inst.uv_xy >> 16u), f32(inst.uv_xy & 0xffffu));
     let uvd = vec2(f32(inst.uv_wh >> 16u), f32(inst.uv_wh & 0xffffu));
@@ -162,7 +171,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const IMG_SHADER: &str = r#"
-struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, atlas: vec2<f32>, opacity: f32, _pad: f32 };
+struct Uniforms { screen: vec2<f32>, cell: vec2<f32>, atlas: vec2<f32>, origin: vec2<f32>, opacity: f32, bar_inset: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(2) var smp: sampler;
 @group(1) @binding(0) var img: texture_2d<f32>;
@@ -186,7 +195,8 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
     let corner = corners[vi];
     let size = vec2(f32(inst.cols), f32(inst.rows));
-    let px = (vec2(f32(inst.col), f32(inst.row)) + corner * size) * u.cell;
+    // Images live in grid content, never the chrome row: always inset.
+    let px = (vec2(f32(inst.col), f32(inst.row)) + corner * size) * u.cell + u.origin;
     let ndc = vec2(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
     var out: VsOut;
     out.pos = vec4(ndc, 0.0, 1.0);
@@ -243,12 +253,18 @@ struct Uniforms {
     screen: [f32; 2],
     cell: [f32; 2],
     atlas: [f32; 2],
+    /// Pixel inset of grid content (`[window] padding`); the vertex shaders
+    /// add it to everything except the chrome row.
+    origin: [f32; 2],
     /// Window background opacity (`[window] opacity` config key), `0.0`-`1.0`.
     /// Written as every base fragment's alpha; only visible when the surface
     /// was configured for straight-alpha compositing (see
     /// `GpuCore::alpha_mode`).
     opacity: f32,
-    _pad: f32,
+    /// Pixels the chrome row is pushed down from the window's top edge, so a
+    /// strip-colored band (drawn separately, exempt via deco bit 7) shows
+    /// above the tabs. See `render::bar_inset`.
+    bar_inset: f32,
 }
 
 /// A glyph's identity in the atlas: plain chars by `(char, style)`, shaped
@@ -656,13 +672,18 @@ impl GpuCore {
         self.opacity = opacity.clamp(0.0, 1.0);
     }
 
-    fn write_uniforms(&self, width: u32, height: u32) {
+    fn write_uniforms(&self, width: u32, height: u32, pad: usize, chrome: bool) {
+        // With a chrome bar, the bar sits `bar_inset` px below the top edge
+        // and the grid shifts down by the same amount, preserving the
+        // pad-sized gap between them (the bottom pad absorbs it).
+        let inset = if chrome { super::render::bar_inset(pad, self.cell_h as usize) } else { 0 };
         let uniforms = Uniforms {
             screen: [width.max(1) as f32, height.max(1) as f32],
             cell: [self.cell_w as f32, self.cell_h as f32],
             atlas: [self.atlas_w as f32, self.atlas_h as f32],
+            origin: [pad as f32, (pad + inset) as f32],
             opacity: self.opacity,
-            _pad: 0.0,
+            bar_inset: inset as f32,
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -701,11 +722,11 @@ impl GpuCore {
         font: &mut FontCache,
         cursor_on: bool,
     ) {
-        self.write_uniforms(width, height);
+        self.write_uniforms(width, height, 0, !chrome.is_empty());
         let row_off = if chrome.is_empty() { 0 } else { 1 };
         let mut frame = FrameLists::default();
         self.append_chrome(&mut frame, chrome, font);
-        self.append_grid(&mut frame, grid, 0, row_off, true, cursor_on, font);
+        self.append_grid(&mut frame, grid, 0, row_off, true, cursor_on, None, font);
         self.draw_frame(view, &frame, 0x000000);
     }
 
@@ -714,9 +735,13 @@ impl GpuCore {
             if cell.flags & WIDE_TRAILER != 0 {
                 continue;
             }
-            let (rect, color) = self.tile_for_char(cell.ch, Style::Regular, font);
+            let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+            let (rect, color) = self.tile_for_char(cell.ch, style, font);
             let fg = if color { 0xFFFFFF } else { cell.fg };
-            frame.base.push(Self::base_inst(col as u32, 0, char_width(cell.ch).max(1) as u32, rect, fg, cell.bg, 0, 0, 0, 0));
+            // Chrome cells carry underline state for the active tab's accent
+            // line; `plain` — no cursor/selection swap happens up here.
+            let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, true, false);
+            frame.base.push(Self::base_inst(col as u32, 0, char_width(cell.ch).max(1) as u32, rect, fg, cell.bg, 0, 0, deco, dcol));
         }
     }
 
@@ -732,6 +757,7 @@ impl GpuCore {
         row0: usize,
         focused: bool,
         cursor_on: bool,
+        hover_link: Option<(usize, usize, usize)>,
         font: &mut FontCache,
     ) {
         let cursor = (focused && grid.cursor_visible && grid.view_offset == 0 && cursor_on)
@@ -791,7 +817,9 @@ impl GpuCore {
                 // Minimum-contrast enforcement (`minimum_contrast` config),
                 // mirroring the CPU renderer's glyph pass.
                 let fg = crate::core::ensure_contrast(fg, bg, grid.min_contrast);
-                let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, plain);
+                let hovered = !on_status
+                    && hover_link.is_some_and(|(hr, s, e)| row == hr && col >= s && col <= e);
+                let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, plain, hovered);
                 // Same run eligibility as the CPU renderer's ligature plan.
                 let run_ok = plain
                     && cell.cluster == 0
@@ -1098,6 +1126,7 @@ impl GpuCore {
 
     /// Render a tab's `panes` into `view`, filling the gaps with `divider`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_panes(
         &mut self,
         view: &wgpu::TextureView,
@@ -1107,12 +1136,38 @@ impl GpuCore {
         chrome: &[Cell],
         font: &mut FontCache,
         divider: u32,
+        bg: u32,
+        bar_bg: u32,
+        pad: usize,
     ) {
-        self.write_uniforms(width, height);
+        self.write_uniforms(width, height, pad, !chrome.is_empty());
         let mut frame = FrameLists::default();
+        // The strip-colored band above the chrome (see `render::bar_inset`):
+        // a full-width quad at the window's top edge, exempt from the
+        // bar-inset shift via deco bit 7. Drawn before the chrome cells, so
+        // they overpaint everything below the inset.
+        if !chrome.is_empty() {
+            let (rect, _) = self.tile_for_char(' ', Style::Regular, font);
+            let span = width.div_ceil(self.cell_w.max(1));
+            frame.base.push(Self::base_inst(0, 0, span, rect, bar_bg, bar_bg, 0, 0, 128, 0));
+        }
         self.append_chrome(&mut frame, chrome, font);
+        // The clear paints the padding band (and slack) in the terminal
+        // background; gaps *between* panes still show the divider, via a
+        // divider-colored fill under the panes' bounding box (the grids
+        // overpaint everything except the gaps).
+        if let (Some(x1), Some(y0), Some(y1)) = (
+            panes.iter().map(|p| p.col0 + p.grid.cols).max(),
+            panes.iter().map(|p| p.row0).min(),
+            panes.iter().map(|p| p.row0 + p.grid.rows).max(),
+        ) {
+            let (rect, _) = self.tile_for_char(' ', Style::Regular, font);
+            for row in y0..y1 {
+                frame.base.push(Self::base_inst(0, row as u32, x1 as u32, rect, divider, divider, 0, 0, 0, 0));
+            }
+        }
         for p in panes {
-            self.append_grid(&mut frame, p.grid, p.col0, p.row0, p.focused, p.cursor_on, font);
+            self.append_grid(&mut frame, p.grid, p.col0, p.row0, p.focused, p.cursor_on, p.hover_link, font);
             // Cursor-trail ghosts (G36): solid cursor-colored fills on the
             // blended overlay layer, mirroring the CPU renderer's draw_trail.
             for &(col, row, alpha) in &p.trail {
@@ -1135,7 +1190,7 @@ impl GpuCore {
                 });
             }
         }
-        self.draw_frame(view, &frame, divider);
+        self.draw_frame(view, &frame, bg);
     }
 
     /// Submit the frame: base cells (opaque), overlay glyphs (blended), then
@@ -1211,12 +1266,18 @@ struct FrameLists {
 /// and pick the stripe color: `underline_color` when SGR 58 set it and `plain`
 /// (the cell isn't under the cursor, a selection, or a search highlight —
 /// those already swapped `fg` to something that should win instead).
-fn deco_for(flags: u16, underline_color: u32, fg: u32, plain: bool) -> (u32, u32) {
+/// `hovered` (a Ctrl-hovered hyperlink's cell, G22) forces a plain straight
+/// underline in `fg`, overriding the cell's own SGR underline attribute —
+/// it's a click affordance, not a text style, so it never takes
+/// `underline_color`.
+fn deco_for(flags: u16, underline_color: u32, fg: u32, plain: bool, hovered: bool) -> (u32, u32) {
     let mut deco = 0u32;
     if flags & ATTR_STRIKE != 0 {
         deco |= 8;
     }
-    if flags & ATTR_UNDERLINE != 0 {
+    if hovered {
+        deco |= 1; // Straight
+    } else if flags & ATTR_UNDERLINE != 0 {
         deco |= match UnderlineStyle::from_attrs(flags) {
             UnderlineStyle::Straight => 1,
             UnderlineStyle::Double => 2,
@@ -1225,7 +1286,7 @@ fn deco_for(flags: u16, underline_color: u32, fg: u32, plain: bool) -> (u32, u32
             UnderlineStyle::Dashed => 5,
         };
     }
-    let dcol = if plain && flags & ATTR_UNDERLINE_COLOR != 0 { underline_color } else { fg };
+    let dcol = if plain && !hovered && flags & ATTR_UNDERLINE_COLOR != 0 { underline_color } else { fg };
     (deco, dcol)
 }
 
@@ -1254,6 +1315,9 @@ impl Renderer for GpuRenderer {
         width: u32,
         height: u32,
         divider: u32,
+        bg: u32,
+        bar_bg: u32,
+        pad: usize,
     ) {
         if width == 0 || height == 0 {
             return;
@@ -1284,18 +1348,34 @@ impl Renderer for GpuRenderer {
             return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render_panes(&view, width, height, panes, chrome, font, divider);
+        self.core.render_panes(&view, width, height, panes, chrome, font, divider, bg, bar_bg, pad);
         frame.present();
     }
 
     fn set_opacity(&mut self, opacity: f32) {
         self.core.set_opacity(opacity);
     }
+
+    fn supports_opacity(&self) -> bool {
+        true
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::AnsiParser;
+
+    #[test]
+    fn deco_for_hover_forces_a_straight_underline_in_fg() {
+        // No SGR underline (flags = 0) at all — hover still underlines.
+        assert_eq!(deco_for(0, 0x0000FF, 0xFF0000, true, true), (1, 0xFF0000));
+        // Already SGR-underlined with a colored underline (58) set — hover
+        // still overrides to plain fg, not underline_color.
+        let flags = ATTR_UNDERLINE | ATTR_UNDERLINE_COLOR;
+        assert_eq!(deco_for(flags, 0x0000FF, 0xFF0000, true, true), (1, 0xFF0000));
+        // Not hovered: ordinary SGR-underline-color behavior is unchanged.
+        assert_eq!(deco_for(flags, 0x0000FF, 0xFF0000, true, false), (1, 0x0000FF));
+    }
 
     /// The adapter, WGSL shader, render pipeline, and glyph atlas all build.
     /// Skips cleanly when no font or no wgpu adapter is available. Covers the
