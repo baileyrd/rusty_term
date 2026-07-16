@@ -46,6 +46,11 @@ pub(crate) struct PaneFrame<'a> {
     /// underlined for the click affordance — `None` when nothing's hovered
     /// or Ctrl isn't held. Cell coordinates, in this pane's own frame.
     pub hover_link: Option<(usize, usize, usize)>,
+    /// Command gutter marks: `(viewport row, color)` for rows inside an
+    /// OSC 133 command block, painted as a thin stripe just left of the
+    /// pane's text (green success / red failure / accent while running).
+    /// Empty when the feature is off or nothing is marked.
+    pub marks: Vec<(usize, u32)>,
 }
 
 /// A present target: paint one frame of the tab's `panes` at the given pixel
@@ -161,6 +166,7 @@ impl Renderer for CpuRenderer {
                 p.hover_link, font,
             );
             cpu::draw_trail(&mut buffer, w, h, p.grid, p.col0, p.row0, pad, oy, &p.trail, font);
+            cpu::draw_marks(&mut buffer, w, h, p.col0, p.row0, pad, oy, &p.marks, font);
         }
         let _ = buffer.present();
     }

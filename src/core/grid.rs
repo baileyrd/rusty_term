@@ -55,6 +55,21 @@ pub(crate) struct CommandBlock {
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) folded: bool,
+    /// Exit code its OSC 133;D reported (`None` when the shell omitted one).
+    /// Colors the windowed front-end's command gutter marks.
+    pub(crate) exit: Option<i32>,
+}
+
+/// What a command gutter mark says about the viewport row it sits beside:
+/// part of a command that succeeded (exit 0), failed (non-zero), or is still
+/// running (OSC 133;C seen, no D yet). Rows outside any command block (or
+/// whose block reported no exit code) carry no mark.
+#[cfg(any(test, feature = "gui"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockMark {
+    Success,
+    Error,
+    Running,
 }
 
 /// One line of the fold-aware history view: a real scrollback line, or the
@@ -1101,7 +1116,7 @@ fn reflow_history(
         .filter_map(|b| {
             let start = remap(b.start)?;
             let end = remap(b.end.saturating_sub(1))? + 1;
-            (start < end).then_some(CommandBlock { start, end, folded: b.folded })
+            (start < end).then_some(CommandBlock { start, end, folded: b.folded, exit: b.exit })
         })
         .collect();
     if new_fold_blocks.len() > FOLD_BLOCKS_MAX {
@@ -3833,12 +3848,50 @@ impl Grid {
     /// no-op if `C` was never seen — e.g. a shell that only ever sends `D`).
     /// Silently drops the block once [`FOLD_BLOCKS_MAX`] is reached.
     #[cfg(any(test, feature = "gui"))]
-    pub(crate) fn fold_output_end(&mut self) {
+    pub(crate) fn fold_output_end(&mut self, exit: Option<i32>) {
         let Some(start) = self.fold_pending_start.take() else { return };
         let end = self.scrollback.len() + self.cursor.1;
         if start < end && self.fold_blocks.len() < FOLD_BLOCKS_MAX {
-            self.fold_blocks.push(CommandBlock { start, end, folded: false });
+            self.fold_blocks.push(CommandBlock { start, end, folded: false, exit });
         }
+    }
+
+    /// The command gutter mark beside each viewport row: which finished
+    /// command block the row's line belongs to (colored by its exit code),
+    /// or the still-running command. `None` outside any block, for blocks
+    /// whose shell reported no exit code, and everywhere on the alt screen
+    /// (full-screen apps own the whole surface; the marks are a scrollback
+    /// affordance).
+    #[cfg(any(test, feature = "gui"))]
+    pub fn viewport_block_marks(&self) -> Vec<Option<BlockMark>> {
+        if self.in_alt_screen() {
+            return vec![None; self.rows];
+        }
+        let running =
+            self.fold_pending_start.map(|s| (s, self.scrollback.len() + self.cursor.1));
+        (0..self.rows)
+            .map(|vr| {
+                let abs = self.abs_of_view_row(vr);
+                if let Some((s, e)) = running
+                    && abs >= s
+                    && abs <= e
+                {
+                    return Some(BlockMark::Running);
+                }
+                // Blocks are recorded in stream order: sorted and disjoint,
+                // so the first block whose end is past `abs` is the only
+                // candidate. A folded block's summary row maps to `start`.
+                let i = self.fold_blocks.partition_point(|b| b.end <= abs);
+                match self.fold_blocks.get(i) {
+                    Some(b) if b.start <= abs => match b.exit {
+                        Some(0) => Some(BlockMark::Success),
+                        Some(_) => Some(BlockMark::Error),
+                        None => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Toggle the fold state of whichever command block contains absolute

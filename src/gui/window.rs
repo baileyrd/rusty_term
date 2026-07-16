@@ -1090,6 +1090,7 @@ impl WindowState<'_> {
                 cursor_on: false,
                 trail: Vec::new(),
                 hover_link: None,
+                marks: Vec::new(),
             };
             renderer.render(
                 std::slice::from_ref(&frame),
@@ -1171,6 +1172,14 @@ impl WindowState<'_> {
         } else {
             self.trail = None;
         }
+        // Command gutter marks (per pane): resolve each row's BlockMark to a
+        // theme color — success green, failure red, running in the accent.
+        let marks_on = self.config.command_marks.unwrap_or(true);
+        let mark_color = |m: crate::core::BlockMark| match m {
+            crate::core::BlockMark::Success => self.theme.palette16[2],
+            crate::core::BlockMark::Error => self.theme.palette16[1],
+            crate::core::BlockMark::Running => self.theme.cursor,
+        };
         let frames: Vec<PaneFrame> = held
             .iter()
             .map(|(g, r, foc)| PaneFrame {
@@ -1181,6 +1190,15 @@ impl WindowState<'_> {
                 cursor_on: blink,
                 trail: if *foc { std::mem::take(&mut ghosts) } else { Vec::new() },
                 hover_link: if *foc { self.hover_link } else { None },
+                marks: if marks_on {
+                    g.viewport_block_marks()
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(row, m)| m.map(|m| (row, mark_color(m))))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         renderer.render(
@@ -3086,6 +3104,7 @@ impl WindowState<'_> {
         let bell = s.bell();
         let padding = s.padding();
         let status_bar = s.status_bar();
+        let command_marks = s.command_marks();
         let opacity = s.opacity();
         let launch_mode = s.launch_mode_value();
         let cols = s.cols_value();
@@ -3140,6 +3159,8 @@ impl WindowState<'_> {
                     self.apply_size(size.width, size.height);
                 }
             }
+            // Read live at draw time; updating the config is the whole apply.
+            Field::CommandMarks => self.config.command_marks = Some(command_marks),
             Field::StatusBar => {
                 self.config.status_bar = Some(status_bar);
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {

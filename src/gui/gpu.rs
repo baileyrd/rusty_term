@@ -95,7 +95,13 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Inst) -> VsOut {
     // tabs. The band quad itself carries deco bit 7 and stays absolute.
     // Status-ribbon cells carry deco bit 6: anchored flush to the window's
     // bottom edge, exempt from both the padding origin and the bar inset.
-    if ((inst.deco & 64u) != 0u) {
+    // Command gutter marks (kind 3) are a 3px stripe hugging the cell
+    // column's left edge from outside (1px gap), one cell tall, padded by
+    // the grid origin like any grid content.
+    if (inst.kind == 3u) {
+        px = vec2(f32(inst.col) * u.cell.x - 4.0 + corner.x * 3.0,
+                  (f32(inst.row) + corner.y) * u.cell.y) + u.origin;
+    } else if ((inst.deco & 64u) != 0u) {
         px.y = u.screen.y - u.cell.y + corner.y * u.cell.y;
     } else if (inst.row > 0u) {
         px = px + u.origin;
@@ -127,8 +133,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == 1u) {
         return vec4(in.fg.rgb * t.rgb, t.a);
     }
-    // Solid overlay fill (cursor-trail ghosts): fg at curs/255 alpha.
-    if (in.kind == 2u) {
+    // Solid overlay fill (cursor-trail ghosts, kind 2; command gutter
+    // stripes, kind 3): fg at curs/255 alpha.
+    if (in.kind == 2u || in.kind == 3u) {
         return vec4(in.fg.rgb, f32(in.curs) / 255.0);
     }
     let glyph = vec4(in.fg.rgb * t.rgb, 1.0);
@@ -1209,6 +1216,28 @@ impl GpuCore {
                     deco: 0,
                     dcol: 0,
                     kind: 2,
+                });
+            }
+            // Command gutter marks: kind-3 overlay stripes, positioned by
+            // the vertex shader just left of the pane's first column
+            // (mirrors the CPU renderer's `draw_marks`).
+            for &(row, color) in &p.marks {
+                if row >= p.grid.rows {
+                    continue;
+                }
+                frame.overlay.push(Instance {
+                    col: p.col0 as u32,
+                    row: (p.row0 + row) as u32,
+                    span: 1,
+                    uv_xy: 0,
+                    uv_wh: 0,
+                    fg: color,
+                    bg: 0,
+                    curs: 255,
+                    ccol: 0,
+                    deco: 0,
+                    dcol: 0,
+                    kind: 3,
                 });
             }
         }

@@ -138,6 +138,7 @@ ligatures = true                    # GSUB liga/calt ligatures; default on
 cursor_style = "bar"                # block (default) | bar | underline
 cursor_blink = true                 # default off
 status_bar = false                  # hide the bottom status ribbon; default on
+command_marks = false               # hide the per-command gutter marks; default on
 
 [keys]                   # rebind window shortcuts as  action = "chord"
 search = "Ctrl+Shift+F"
@@ -177,6 +178,15 @@ subprocess), the last command's exit code as a green `✓` / red `✗` pill
 (OSC 133 shell integration), the scrollback position while scrolled back,
 and the grid size. `status_bar = false` under `[window]` (or the settings
 page's Window → Status bar toggle) hides it and returns the row to the grid.
+
+With OSC 133 shell integration, each command's output also gets a
+**gutter mark**: a thin colored stripe just left of the pane's text spanning
+the command's rows — green for exit 0, red for a non-zero exit, the accent
+color while the command is still running. Marks follow the scrollback view
+(including folded blocks, whose summary line keeps the block's mark), stay
+out of full-screen (alt-screen) apps, and sit in the padding band so they
+never overpaint text. `command_marks = false` under `[window]` (or the
+settings page's Window → Command marks toggle) turns them off.
 
 The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
 actions are `copy`, `paste`, `new_tab`, `new_window`, `fold_output`,
