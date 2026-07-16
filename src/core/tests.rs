@@ -1889,6 +1889,49 @@ fn fold_block_toggle_finds_the_block_containing_a_line_only() {
 }
 
 #[test]
+fn fold_block_records_the_exit_code() {
+    let mut g = Grid::new(80, 8);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
+    p.advance(&mut g, b"\x1b]133;C\x07boom\r\n\x1b]133;D;127\x07");
+    p.advance(&mut g, b"\x1b]133;C\x07silent\r\n\x1b]133;D\x07"); // no code reported
+    let blocks = g.fold_blocks();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].exit, Some(0));
+    assert_eq!(blocks[1].exit, Some(127));
+    assert_eq!(blocks[2].exit, None);
+}
+
+#[test]
+fn viewport_block_marks_color_rows_by_exit_and_running_state() {
+    let mut g = Grid::new(80, 8);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07"); // block [0,1)
+    p.advance(&mut g, b"\x1b]133;C\x07boom\r\n\x1b]133;D;2\x07"); // block [1,2)
+    p.advance(&mut g, b"\x1b]133;C\x07no code\r\n\x1b]133;D\x07"); // block [2,3), exit unknown
+    p.advance(&mut g, b"\x1b]133;C\x07running...\r\n"); // pending from line 3
+    let marks = g.viewport_block_marks();
+    assert_eq!(marks[0], Some(BlockMark::Success));
+    assert_eq!(marks[1], Some(BlockMark::Error));
+    assert_eq!(marks[2], None, "a block without an exit code carries no mark");
+    assert_eq!(marks[3], Some(BlockMark::Running));
+    assert_eq!(marks[4], Some(BlockMark::Running), "the cursor line is still the command's");
+    assert_eq!(marks[5], None, "past the running command: unmarked");
+}
+
+#[test]
+fn viewport_block_marks_are_suppressed_on_the_alt_screen() {
+    let mut g = Grid::new(80, 4);
+    let mut p = AnsiParser::new();
+    p.advance(&mut g, b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
+    assert!(g.viewport_block_marks().iter().any(Option::is_some));
+    p.advance(&mut g, b"\x1b[?1049h"); // enter the alt screen
+    assert!(g.viewport_block_marks().iter().all(Option::is_none));
+    p.advance(&mut g, b"\x1b[?1049l"); // and back
+    assert!(g.viewport_block_marks().iter().any(Option::is_some));
+}
+
+#[test]
 fn fold_block_d_without_c_is_a_no_op() {
     let mut g = Grid::new(80, 2);
     let mut p = AnsiParser::new();

@@ -109,6 +109,10 @@ pub struct Config {
     /// Whether the cursor leaves a brief fading trail when it jumps
     /// (`cursor_trail`; default off) — pure renderer eye candy (G36).
     pub cursor_trail: Option<bool>,
+    /// Command gutter marks (windowed front-end): a thin colored stripe
+    /// beside each OSC 133 command block — green success, red failure, the
+    /// accent while running (`[window] command_marks`; default on).
+    pub command_marks: Option<bool>,
     /// Bottom status ribbon (windowed front-end): cwd, git branch, last
     /// command's exit status, scrollback position, and grid size in a
     /// one-cell bar flush with the window's bottom edge (`[window]
@@ -267,6 +271,7 @@ impl Config {
 # quake_height = 0.4       # dropdown-window height fraction (rusty_term ctl quake)
 # quake_hotkey = "win+grave" # global hotkey toggling the quake window (Windows only)
 # status_bar = false        # hide the bottom status ribbon (default on)
+# command_marks = false     # hide the per-command gutter marks (default on)
 
 # copy_html = false         # don't add styled HTML to Ctrl+Shift+C copies
 # clipboard = "write-only"  # OSC 52 policy: "off", "write-only" (default), or "read-write"
@@ -734,6 +739,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         }
         ("window", "ligatures") => cfg.ligatures = Some(expect_bool(key, value)?),
         ("window", "status_bar") => cfg.status_bar = Some(expect_bool(key, value)?),
+        ("window", "command_marks") => cfg.command_marks = Some(expect_bool(key, value)?),
         ("window", "launch_mode") => {
             let name = expect_str(key, value)?;
             cfg.launch_mode = Some(match name.to_ascii_lowercase().as_str() {
@@ -1626,6 +1632,15 @@ color15 = "ffffff"
         assert_eq!(cfg.status_bar, Some(false));
         let (cfg, _) = parse("");
         assert_eq!(cfg.status_bar, None, "unset stays None (default on)");
+    }
+
+    #[test]
+    fn command_marks_key_parses() {
+        let (cfg, warns) = parse("[window]\ncommand_marks = false\n");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.command_marks, Some(false));
+        let (cfg, _) = parse("");
+        assert_eq!(cfg.command_marks, None, "unset stays None (default on)");
     }
 
     #[test]

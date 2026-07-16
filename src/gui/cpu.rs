@@ -645,6 +645,48 @@ fn blend(bg: u32, fg: u32, a: u8) -> u32 {
 }
 
 
+/// Paint the command gutter marks: a 3px vertical stripe one pixel left of
+/// the pane's text edge, one per marked viewport `row`, in the mark's color
+/// (success / error / running — the window resolves [`crate::core::BlockMark`]
+/// to theme colors before handing them over). The stripe lives in the padding
+/// band (or the split-divider gap), so it never overpaints a glyph; a pane
+/// flush against the window edge (`padding = 0`) clips it away rather than
+/// wrapping.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_marks(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    col0: usize,
+    row0: usize,
+    ox: usize,
+    oy: usize,
+    marks: &[(usize, u32)],
+    font: &mut dyn GlyphSource,
+) {
+    if marks.is_empty() {
+        return;
+    }
+    let (cw, ch) = font.cell_size();
+    if cw == 0 || ch == 0 {
+        return;
+    }
+    let edge = ox + col0 * cw; // the pane's left text edge
+    if edge < 4 {
+        return;
+    }
+    let (x0, x1) = (edge - 4, edge - 1); // 3px stripe + 1px gap to the text
+    for &(row, color) in marks {
+        let y0 = oy + (row0 + row) * ch;
+        for y in y0..(y0 + ch).min(height) {
+            let base = y * width;
+            for x in x0..x1.min(width) {
+                buf[base + x] = color;
+            }
+        }
+    }
+}
+
 /// Blend the cursor-trail ghosts (G36) over the finished pane: each entry is
 /// a cell position plus an alpha, drawn as a cursor-colored block mixed into
 /// what's already there.
@@ -1069,6 +1111,23 @@ mod tests {
         assert_eq!(buf[16 * w + 3], 0x123456, "bar cell background");
         assert_eq!(buf[0], 0, "pixels above the bar untouched");
         assert_eq!(buf[15 * w], 0, "row just above the bar untouched");
+    }
+
+    #[test]
+    fn draw_marks_paints_a_stripe_left_of_the_pane() {
+        // MockFont cells are 4×8; a pane inset by ox=4 puts its text edge at
+        // x=4, so the stripe covers x 0..3 with a 1px gap at x=3.
+        let (w, h) = (12usize, 16usize);
+        let mut buf = vec![0u32; w * h];
+        draw_marks(&mut buf, w, h, 0, 0, 4, 0, &[(1, 0x00FF00)], &mut MockFont);
+        assert_eq!(buf[8 * w], 0x00FF00, "stripe starts at the marked row");
+        assert_eq!(buf[8 * w + 2], 0x00FF00, "stripe is 3px wide");
+        assert_eq!(buf[8 * w + 3], 0, "1px gap before the text edge");
+        assert_eq!(buf[0], 0, "unmarked rows untouched");
+        // A pane flush with the window edge has no room: the stripe clips away.
+        let mut flush = vec![0u32; w * h];
+        draw_marks(&mut flush, w, h, 0, 0, 0, 0, &[(0, 0xFF0000)], &mut MockFont);
+        assert!(flush.iter().all(|&p| p == 0), "no room left of the pane: nothing painted");
     }
 
     #[test]

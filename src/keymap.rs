@@ -51,6 +51,9 @@ pub enum Action {
     FontSizeUp,
     FontSizeDown,
     FontSizeReset,
+    /// Toggle the right-hand command dock: the focused pane's recent OSC 133
+    /// command blocks (exit, runtime, command line), click-to-jump.
+    ToggleDock,
 }
 
 /// The non-modifier key of a chord, independent of any windowing toolkit.
@@ -155,6 +158,7 @@ impl Default for Keymap {
                 (c(true, true, Char('=')), FontSizeUp),
                 (c(true, false, Char('-')), FontSizeDown),
                 (c(true, false, Char('0')), FontSizeReset),
+                (c(true, true, Char('k')), ToggleDock),
             ],
         }
     }
@@ -213,6 +217,7 @@ pub fn parse_action(name: &str) -> Option<Action> {
         "font_size_up" => Action::FontSizeUp,
         "font_size_down" => Action::FontSizeDown,
         "font_size_reset" => Action::FontSizeReset,
+        "toggle_dock" => Action::ToggleDock,
         _ => return None,
     })
 }
@@ -312,6 +317,7 @@ mod tests {
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char('='))), Some(Action::FontSizeUp));
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char('-'))), Some(Action::FontSizeDown));
         assert_eq!(km.action(Chord::new(true, false, false, Key::Char('0'))), Some(Action::FontSizeReset));
+        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('k'))), Some(Action::ToggleDock));
     }
 
     #[test]
@@ -375,6 +381,7 @@ mod tests {
         assert_eq!(parse_action("font_size_up"), Some(Action::FontSizeUp));
         assert_eq!(parse_action("font_size_down"), Some(Action::FontSizeDown));
         assert_eq!(parse_action("font_size_reset"), Some(Action::FontSizeReset));
+        assert_eq!(parse_action("toggle_dock"), Some(Action::ToggleDock));
         assert_eq!(parse_action("nonsense"), None);
     }
 

@@ -79,6 +79,10 @@ const SETTINGS_FOOTER_H: usize = 2;
 /// under the chrome bar, so the sidebar band and page title don't sit flush
 /// against the tab strip.
 const SETTINGS_TOP: usize = 1;
+/// Width of the command dock in cells (its divider column adds one more).
+const DOCK_CELLS: usize = 30;
+/// Narrowest pane area the dock may leave behind; below this it auto-hides.
+const DOCK_MIN_PANE: usize = 40;
 /// First grid row of the setting cards: the page title + its rule sit on
 /// the two rows above (the strip tab names the page, so no header row).
 const SETTINGS_CARDS_TOP: usize = SETTINGS_TOP + 2;
@@ -538,6 +542,14 @@ struct WindowState<'a> {
     /// branch or None, when)`. `.git/HEAD` is re-read at most every
     /// [`GIT_BRANCH_TTL`] instead of on every frame.
     git_branch: Option<(std::path::PathBuf, Option<String>, Instant)>,
+    /// Whether the right-hand command dock is open (`toggle_dock`,
+    /// Ctrl+Shift+K). It auto-hides — without flipping this — when the
+    /// window is too narrow to fit it beside a usable pane area.
+    dock_open: bool,
+    /// The dock's click map, rebuilt with each redraw: for each dock grid
+    /// row, the absolute scrollback line a click jumps the focused pane to
+    /// (`None` for headers/blank rows).
+    dock_items: Vec<Option<usize>>,
 }
 
 impl WindowState<'_> {
@@ -1032,8 +1044,25 @@ impl WindowState<'_> {
     }
 
     /// Resize tab `ti`'s panes (grids + PTYs) to their layout rectangles.
+    /// Cells the command dock currently occupies (its width plus the divider
+    /// column), `0` when closed or when opening it would squeeze the pane
+    /// area below [`DOCK_MIN_PANE`] columns.
+    fn dock_cols(&self) -> usize {
+        if self.dock_open && self.cols as usize >= DOCK_CELLS + 1 + DOCK_MIN_PANE {
+            DOCK_CELLS + 1
+        } else {
+            0
+        }
+    }
+
+    /// The cell area the tab's panes tile: the full grid minus the command
+    /// dock (which sits at the right edge, behind a one-cell divider).
+    fn pane_area(&self) -> Rect {
+        Rect::new(0, 0, (self.cols as usize).saturating_sub(self.dock_cols()), self.rows as usize)
+    }
+
     fn layout_panes(&mut self, ti: usize) {
-        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
+        let area = self.pane_area();
         let Some(tab) = self.tabs.get_mut(ti) else {
             return;
         };
@@ -1090,6 +1119,7 @@ impl WindowState<'_> {
                 cursor_on: false,
                 trail: Vec::new(),
                 hover_link: None,
+                marks: Vec::new(),
             };
             renderer.render(
                 std::slice::from_ref(&frame),
@@ -1105,6 +1135,25 @@ impl WindowState<'_> {
             );
             return;
         }
+        let area = self.pane_area();
+        // The command dock renders as one more (synthetic, unfocused) pane
+        // right of the pane area. Built before the renderer is borrowed and
+        // before the panes lock their grids — it locks the focused grid
+        // itself, and the lock isn't reentrant.
+        let dock_grid = if self.dock_cols() > 0 {
+            let built = self.pane().map(|p| {
+                let g = p.grid.lock();
+                build_dock_grid(&g, &self.theme, DOCK_CELLS, self.rows as usize)
+            });
+            let (grid, items) = built.unwrap_or_else(|| {
+                (Grid::new(DOCK_CELLS, self.rows as usize), Vec::new())
+            });
+            self.dock_items = items;
+            Some(grid)
+        } else {
+            self.dock_items = Vec::new();
+            None
+        };
         let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
             return;
         };
@@ -1112,7 +1161,6 @@ impl WindowState<'_> {
             return;
         };
         let size = window.inner_size();
-        let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         // Taskbar progress (G01 stretch, Windows only): resolved once per
         // frame like the title below, from the same winit `Window`.
         #[cfg(windows)]
@@ -1171,7 +1219,15 @@ impl WindowState<'_> {
         } else {
             self.trail = None;
         }
-        let frames: Vec<PaneFrame> = held
+        // Command gutter marks (per pane): resolve each row's BlockMark to a
+        // theme color — success green, failure red, running in the accent.
+        let marks_on = self.config.command_marks.unwrap_or(true);
+        let mark_color = |m: crate::core::BlockMark| match m {
+            crate::core::BlockMark::Success => self.theme.palette16[2],
+            crate::core::BlockMark::Error => self.theme.palette16[1],
+            crate::core::BlockMark::Running => self.theme.cursor,
+        };
+        let mut frames: Vec<PaneFrame> = held
             .iter()
             .map(|(g, r, foc)| PaneFrame {
                 grid: g,
@@ -1181,8 +1237,29 @@ impl WindowState<'_> {
                 cursor_on: blink,
                 trail: if *foc { std::mem::take(&mut ghosts) } else { Vec::new() },
                 hover_link: if *foc { self.hover_link } else { None },
+                marks: if marks_on {
+                    g.viewport_block_marks()
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(row, m)| m.map(|m| (row, mark_color(m))))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
+        if let Some(dg) = &dock_grid {
+            frames.push(PaneFrame {
+                grid: dg,
+                col0: area.cols + 1, // right of the pane area's divider column
+                row0: 1,
+                focused: false,
+                cursor_on: false,
+                trail: Vec::new(),
+                hover_link: None,
+                marks: Vec::new(),
+            });
+        }
         renderer.render(
             &frames,
             &chrome,
@@ -1690,6 +1767,22 @@ impl WindowState<'_> {
         if self.overlay.is_some() {
             return self.overlay_click(x, y);
         }
+        // A click on the command dock jumps the focused pane's scrollback to
+        // the clicked command block; dock clicks never reach the terminal.
+        if self.dock_cols() > 0 {
+            let (col, row) = self.cell_at(x, y);
+            if col >= self.pane_area().cols {
+                if let Some(abs) = self.dock_items.get(row).copied().flatten()
+                    && let Some(p) = self.pane()
+                {
+                    p.grid.lock().scroll_to_abs(abs);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                return;
+            }
+        }
         if let Some(id) = self.pane_under(x, y)
             && let Some(tab) = self.tabs.get_mut(self.active)
         {
@@ -2146,6 +2239,17 @@ impl WindowState<'_> {
                     && p.grid.lock().toggle_last_fold()
                     && let Some(window) = &self.window
                 {
+                    window.request_redraw();
+                }
+            }
+            // Toggle the command dock: the pane area shrinks/grows, so every
+            // tab relayouts (grids + PTY winsize) to the new width.
+            Action::ToggleDock => {
+                self.dock_open = !self.dock_open;
+                for ti in 0..self.tabs.len() {
+                    self.layout_panes(ti);
+                }
+                if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
@@ -3086,6 +3190,7 @@ impl WindowState<'_> {
         let bell = s.bell();
         let padding = s.padding();
         let status_bar = s.status_bar();
+        let command_marks = s.command_marks();
         let opacity = s.opacity();
         let launch_mode = s.launch_mode_value();
         let cols = s.cols_value();
@@ -3140,6 +3245,8 @@ impl WindowState<'_> {
                     self.apply_size(size.width, size.height);
                 }
             }
+            // Read live at draw time; updating the config is the whole apply.
+            Field::CommandMarks => self.config.command_marks = Some(command_marks),
             Field::StatusBar => {
                 self.config.status_bar = Some(status_bar);
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
@@ -3793,6 +3900,83 @@ fn accumulate_scroll_lines(accum: f64, raw_lines: f64) -> (isize, f64) {
 
 /// Per-channel mix of `t/255` of `b` into `a` (`0xRRGGBB`) — used to derive
 /// the chrome bar's bg and dimmed text from the theme without new config keys.
+/// Build the command dock's grid (`cols × rows`) from the focused pane's
+/// state: a header, then the running command and the finished command
+/// blocks newest-first — exit glyph (✓ green / ✗ red / · when the shell
+/// reported no code), the command line (the prompt line just above the
+/// block's output), and the runtime right-aligned. Returns the grid plus
+/// the per-row click map (the absolute line a click jumps to).
+fn build_dock_grid(
+    g: &Grid,
+    theme: &crate::core::Theme,
+    cols: usize,
+    rows: usize,
+) -> (Grid, Vec<Option<usize>>) {
+    let mut d = Grid::new(cols, rows);
+    let (fg, bg) = (theme.fg, theme.bg);
+    let dim = mix(fg, bg, 110);
+    for r in 0..rows {
+        fill_row(&mut d, r, 0, cols, fg, bg);
+    }
+    let mut items: Vec<Option<usize>> = vec![None; rows];
+    write_row(&mut d, 0, 1, "Commands", dim, bg);
+
+    // Entries newest-first: the running command (if any), then finished
+    // blocks in reverse stream order.
+    let mut entries: Vec<(char, u32, String, usize)> = Vec::new();
+    if let Some(start) = g.running_command() {
+        entries.push(('\u{25b6}', theme.cursor, "\u{2026}".to_string(), start));
+    }
+    for b in g.fold_blocks().iter().rev() {
+        let (glyph, color) = match b.exit {
+            Some(0) => ('\u{2713}', theme.palette16[2]),
+            Some(_) => ('\u{2717}', theme.palette16[1]),
+            None => ('\u{00b7}', dim),
+        };
+        let dur = b.runtime.map(fmt_runtime).unwrap_or_default();
+        entries.push((glyph, color, dur, b.start));
+    }
+
+    if entries.is_empty() {
+        write_row(&mut d, 2, 1, "No commands yet.", dim, bg);
+        write_row(&mut d, 4, 1, "Needs OSC 133 shell", dim, bg);
+        write_row(&mut d, 5, 1, "integration.", dim, bg);
+        return (d, items);
+    }
+    let mut row = 2;
+    for (glyph, color, dur, start) in entries {
+        if row >= rows {
+            break;
+        }
+        // The command's text: the prompt line just above its output (where
+        // it was typed); the first output line when there is none.
+        let mut label = g.abs_line_text(start.saturating_sub(1));
+        if label.is_empty() {
+            label = g.abs_line_text(start);
+        }
+        write_row(&mut d, row, 1, &glyph.to_string(), color, bg);
+        let label_max = cols.saturating_sub(4 + dur.chars().count() + 1);
+        let label: String = label.chars().take(label_max).collect();
+        write_row(&mut d, row, 3, &label, fg, bg);
+        let dcol = cols.saturating_sub(dur.chars().count() + 1);
+        write_row(&mut d, row, dcol, &dur, dim, bg);
+        items[row] = Some(start);
+        row += 1;
+    }
+    (d, items)
+}
+
+/// A command runtime for the dock: `<1s`, `42s`, `3m07s`, `2h05m`.
+fn fmt_runtime(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0 => "<1s".to_string(),
+        1..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
 /// How long a resolved git branch is trusted before `.git/HEAD` is re-read
 /// (the status ribbon repaints far more often than branches change).
 const GIT_BRANCH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -4722,6 +4906,8 @@ impl<'a> App<'a> {
             trail: None,
             quake,
             git_branch: None,
+            dock_open: false,
+            dock_items: Vec::new(),
         })
     }
 
@@ -5359,8 +5545,8 @@ mod tests {
         SETTINGS_ROW_H, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
         SETTINGS_SEARCH_W, arrow_presses, drag_scroll_direction, encode_paste,
         ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,
-        display_path, pane_pixel_point, path_from_file_uri, put_text, read_git_branch,
-        settings_hit, settings_value_end,
+        display_path, fmt_runtime, pane_pixel_point, path_from_file_uri, put_text,
+        read_git_branch, settings_hit, settings_value_end,
         settings_visible, shell_menu_items, tab_drag_target, tab_spans, tab_widths,
         visible_tab_range, widget_text,
     };
@@ -5817,6 +6003,49 @@ mod tests {
         assert_eq!(shell_quote("/tmp/plain"), "'/tmp/plain'");
         assert_eq!(shell_quote("/tmp/with space"), "'/tmp/with space'");
         assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
+    }
+
+    #[test]
+    fn fmt_runtime_formats_ranges() {
+        use std::time::Duration;
+        assert_eq!(fmt_runtime(Duration::from_millis(300)), "<1s");
+        assert_eq!(fmt_runtime(Duration::from_secs(42)), "42s");
+        assert_eq!(fmt_runtime(Duration::from_secs(187)), "3m07s");
+        assert_eq!(fmt_runtime(Duration::from_secs(7500)), "2h05m");
+    }
+
+    #[test]
+    fn dock_grid_lists_blocks_newest_first_with_click_map() {
+        use crate::core::AnsiParser;
+        let mut g = crate::core::Grid::new(40, 8);
+        let mut p = AnsiParser::new();
+        p.advance(&mut g, b"$ make ok\r\n\x1b]133;C\x07fine\r\n\x1b]133;D;0\x07");
+        p.advance(&mut g, b"$ make bad\r\n\x1b]133;C\x07boom\r\n\x1b]133;D;3\x07");
+        let theme = crate::core::Theme::default();
+        let (d, items) = super::build_dock_grid(&g, &theme, 30, 8);
+        // Header on row 0; entries start on row 2, newest first.
+        assert_eq!(d.viewport_cell(1, 2).ch, '\u{2717}', "newest (failed) block first");
+        assert_eq!(d.viewport_cell(1, 2).fg, theme.palette16[1], "failure glyph is red");
+        let label: String = (3..14).map(|c| d.viewport_cell(c, 2).ch).collect();
+        assert_eq!(label.trim_end(), "$ make bad", "label is the prompt line above the block");
+        assert_eq!(d.viewport_cell(1, 3).ch, '\u{2713}', "older success below");
+        assert_eq!(d.viewport_cell(1, 3).fg, theme.palette16[2], "success glyph is green");
+        // Click map: row 2 jumps to the failed block's start, row 3 to the
+        // successful one's; header/blank rows are inert.
+        assert_eq!(items[2], Some(3));
+        assert_eq!(items[3], Some(1));
+        assert_eq!(items[0], None);
+        assert_eq!(items[1], None);
+    }
+
+    #[test]
+    fn dock_grid_empty_state_has_no_click_targets() {
+        let g = crate::core::Grid::new(40, 8);
+        let theme = crate::core::Theme::default();
+        let (d, items) = super::build_dock_grid(&g, &theme, 30, 8);
+        assert!(items.iter().all(Option::is_none));
+        let msg: String = (1..17).map(|c| d.viewport_cell(c, 2).ch).collect();
+        assert_eq!(msg.trim_end(), "No commands yet.");
     }
 
     #[test]

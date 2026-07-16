@@ -327,7 +327,7 @@ fn mark_command_lifecycle(
             }
             #[cfg(any(test, feature = "gui"))]
             {
-                g.fold_output_end();
+                g.fold_output_end(exit);
                 g.command_timer_end(exit);
             }
             true
