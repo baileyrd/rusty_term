@@ -188,6 +188,14 @@ out of full-screen (alt-screen) apps, and sit in the padding band so they
 never overpaint text. `command_marks = false` under `[window]` (or the
 settings page's Window → Command marks toggle) turns them off.
 
+`Ctrl+Shift+K` (rebindable as `toggle_dock`) opens the **command dock**: a
+right-hand panel listing the focused pane's commands newest-first — the
+running one, then each finished block with its ✓/✗ exit glyph, the command
+line it was typed on, and its runtime. Clicking an entry jumps the
+scrollback to that command's output (unfolding it if collapsed). The pane
+area re-tiles around the dock, and it auto-hides on windows too narrow to
+fit it beside a usable terminal.
+
 The `[keys]` section rebinds any window shortcut as `action = "chord"`. The
 actions are `copy`, `paste`, `new_tab`, `new_window`, `fold_output`,
 `close_tab`, `next_tab`, `prev_tab`, `open_config`, `open_settings`, `search`,
@@ -195,7 +203,8 @@ actions are `copy`, `paste`, `new_tab`, `new_window`, `fold_output`,
 `focus_next`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
 `resize_left`, `resize_right`, `resize_up`, `resize_down`, `zoom_pane`,
 `scroll_page_up`, `scroll_page_down`, `scroll_prompt_up`, `scroll_prompt_down`,
-`toggle_fullscreen`, `font_size_up`, `font_size_down`, `font_size_reset`; a
+`toggle_fullscreen`, `font_size_up`, `font_size_down`, `font_size_reset`,
+`toggle_dock`; a
 chord is `+`-separated modifiers (`ctrl`/`shift`/`alt`) plus one key — a
 printable character, or `comma`/`tab`/`pageup`/`pagedown`/`left`/`right`/`up`/
 `down`/`space`/`home`/`end`/`enter` (or `return`)/`insert` (or `ins`)/`delete`

@@ -58,6 +58,9 @@ pub(crate) struct CommandBlock {
     /// Exit code its OSC 133;D reported (`None` when the shell omitted one).
     /// Colors the windowed front-end's command gutter marks.
     pub(crate) exit: Option<i32>,
+    /// How long the command ran (C to D), when the timer saw its C. Shown by
+    /// the windowed front-end's command dock.
+    pub(crate) runtime: Option<std::time::Duration>,
 }
 
 /// What a command gutter mark says about the viewport row it sits beside:
@@ -1116,7 +1119,13 @@ fn reflow_history(
         .filter_map(|b| {
             let start = remap(b.start)?;
             let end = remap(b.end.saturating_sub(1))? + 1;
-            (start < end).then_some(CommandBlock { start, end, folded: b.folded, exit: b.exit })
+            (start < end).then_some(CommandBlock {
+                start,
+                end,
+                folded: b.folded,
+                exit: b.exit,
+                runtime: b.runtime,
+            })
         })
         .collect();
     if new_fold_blocks.len() > FOLD_BLOCKS_MAX {
@@ -3852,8 +3861,18 @@ impl Grid {
         let Some(start) = self.fold_pending_start.take() else { return };
         let end = self.scrollback.len() + self.cursor.1;
         if start < end && self.fold_blocks.len() < FOLD_BLOCKS_MAX {
-            self.fold_blocks.push(CommandBlock { start, end, folded: false, exit });
+            // `command_began` is still armed here — `command_timer_end`
+            // (called right after us on the OSC 133;D path) takes it.
+            let runtime = self.command_began.map(|t| t.elapsed());
+            self.fold_blocks.push(CommandBlock { start, end, folded: false, exit, runtime });
         }
+    }
+
+    /// Absolute logical line where the currently-running command's output
+    /// began (OSC 133;C seen, no D yet), or `None` outside a command.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn running_command(&self) -> Option<usize> {
+        self.fold_pending_start
     }
 
     /// The command gutter mark beside each viewport row: which finished
@@ -3921,6 +3940,25 @@ impl Grid {
     #[allow(dead_code)] // exercised by tests; the viewport-rendering consumer is future work
     pub(crate) fn fold_blocks(&self) -> &[CommandBlock] {
         &self.fold_blocks
+    }
+
+    /// The trimmed text of absolute logical line `abs` — scrollback or the
+    /// live screen; empty when out of range. The command dock uses the line
+    /// just above a block's output start (the prompt line) as its label.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn abs_line_text(&self, abs: usize) -> String {
+        let history = self.scrollback.len();
+        let cells = if abs < history {
+            &self.scrollback[abs].cells[..]
+        } else {
+            let r = abs - history;
+            if r >= self.rows {
+                return String::new();
+            }
+            let s = r * self.cols;
+            &self.cells[s..s + self.cols]
+        };
+        row_text(cells, &self.clusters).trim().to_string()
     }
 
     /// Join the cell rows in the absolute line range `[start, cursor line)` into
@@ -4037,7 +4075,7 @@ impl Grid {
     /// down. A target hidden inside a folded command block unfolds it first
     /// (a search hit must be visible, not buried behind a summary line).
     #[cfg(any(test, feature = "gui"))]
-    fn scroll_to_abs(&mut self, abs: usize) {
+    pub(crate) fn scroll_to_abs(&mut self, abs: usize) {
         let hit = self
             .visible_folds()
             .find(|(_, b)| abs > b.start && abs < b.end)
@@ -4710,8 +4748,9 @@ pub struct DirtyFrame {
 
 /// Reconstruct a row of cells as text: base glyph plus any interned grapheme
 /// continuation, skipping wide-glyph trailers, with trailing blanks trimmed.
-/// Shared by the MCP screen/scrollback/command readers.
-#[cfg(feature = "l13")]
+/// Shared by the MCP screen/scrollback/command readers and the windowed
+/// front-end's command dock labels.
+#[cfg(any(test, feature = "gui", feature = "l13"))]
 pub(crate) fn row_text(cells: &[Cell], clusters: &[String]) -> String {
     let mut s = String::new();
     for cell in cells {

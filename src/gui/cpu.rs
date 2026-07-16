@@ -645,10 +645,6 @@ fn blend(bg: u32, fg: u32, a: u8) -> u32 {
 }
 
 
-/// Blend the cursor-trail ghosts (G36) over the finished pane: each entry is
-/// a cell position plus an alpha, drawn as a cursor-colored block mixed into
-/// what's already there.
-#[allow(clippy::too_many_arguments)]
 /// Paint the command gutter marks: a 3px vertical stripe one pixel left of
 /// the pane's text edge, one per marked viewport `row`, in the mark's color
 /// (success / error / running — the window resolves [`crate::core::BlockMark`]
@@ -691,6 +687,10 @@ pub(crate) fn draw_marks(
     }
 }
 
+/// Blend the cursor-trail ghosts (G36) over the finished pane: each entry is
+/// a cell position plus an alpha, drawn as a cursor-colored block mixed into
+/// what's already there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_trail(
     buf: &mut [u32],
     width: usize,
