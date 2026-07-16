@@ -61,16 +61,33 @@ pub(crate) fn draw_chrome(
     inset: usize,
     bar_bg: u32,
 ) {
-    let baseline = font.baseline();
     for y in 0..inset.min(height) {
         let base = y * width;
         for x in 0..width {
             buf[base + x] = bar_bg;
         }
     }
-    for (col, cell) in chrome.iter().enumerate() {
+    draw_bar(buf, width, height, chrome, font, cw, ch, inset);
+}
+
+/// Paint one pre-laid row of bar cells (chrome tabs or the bottom status
+/// ribbon) at pixel row `y0`: each cell's background, any underline
+/// decoration, then the glyphs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_bar(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    cells: &[Cell],
+    font: &mut dyn GlyphSource,
+    cw: usize,
+    ch: usize,
+    y0: usize,
+) {
+    let baseline = font.baseline();
+    for (col, cell) in cells.iter().enumerate() {
         let x0 = col * cw;
-        for y in inset..(inset + ch).min(height) {
+        for y in y0..(y0 + ch).min(height) {
             let base = y * width;
             for x in x0..(x0 + cw).min(width) {
                 buf[base + x] = cell.bg;
@@ -81,10 +98,10 @@ pub(crate) fn draw_chrome(
         // line runs the tab's full width.
         if cell.flags & ATTR_UNDERLINE != 0 {
             let color = if cell.flags & ATTR_UNDERLINE_COLOR != 0 { cell.underline_color } else { cell.fg };
-            draw_underline(buf, width, height, x0, inset, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
+            draw_underline(buf, width, height, x0, y0, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
         }
     }
-    for (col, cell) in chrome.iter().enumerate() {
+    for (col, cell) in cells.iter().enumerate() {
         if cell.flags & WIDE_TRAILER != 0 || cell.ch == ' ' {
             continue;
         }
@@ -94,7 +111,7 @@ pub(crate) fn draw_chrome(
             continue;
         }
         let pen_x = (col * cw) as i32 + glyph.left;
-        let pen_y = baseline + glyph.top + inset as i32;
+        let pen_y = baseline + glyph.top + y0 as i32;
         blit(buf, width, height, &glyph, pen_x, pen_y, cell.fg);
     }
 }
@@ -1032,6 +1049,26 @@ mod tests {
         assert_eq!(buf[7 * w + 7], 0xFF7A1A, "active match cell is orange");
         // col 0 (no match) keeps the default background.
         assert_ne!(buf[7 * w], 0xFF7A1A);
+    }
+
+    #[test]
+    fn draw_bar_paints_cells_at_the_given_pixel_row() {
+        // 2 cols × 3 cell rows (4×8 MockFont cells); the bar sits flush at the
+        // bottom, pixel row 16.
+        let (w, h) = (8usize, 24usize);
+        let mut buf = vec![0u32; w * h];
+        let mut cells = vec![Cell::blank(); 2];
+        for c in &mut cells {
+            c.fg = 0xABCDEF;
+            c.bg = 0x123456;
+        }
+        cells[0].ch = 'x';
+        draw_bar(&mut buf, w, h, &cells, &mut MockFont, 4, 8, 16);
+        // MockFont draws a 2x2 block at the cell's top-left: (0, 16) is glyph.
+        assert_eq!(buf[16 * w], 0xABCDEF, "glyph pixel at the bar row");
+        assert_eq!(buf[16 * w + 3], 0x123456, "bar cell background");
+        assert_eq!(buf[0], 0, "pixels above the bar untouched");
+        assert_eq!(buf[15 * w], 0, "row just above the bar untouched");
     }
 
     #[test]
