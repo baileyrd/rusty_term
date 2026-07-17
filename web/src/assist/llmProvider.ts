@@ -23,17 +23,31 @@ export const BASE_URL_STORAGE = 'nebula.assistBaseUrl';
 
 export const ASSIST_MODEL = 'claude-opus-4-8';
 
+/** One turn of the assist chat, as rendered and as sent to the API. */
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
 /**
- * The async twin of `AssistProvider` — network calls can't be sync. The
- * response streams: `onPartial` fires with the insights completed so far
- * (a fresh array each time, ids assigned), and the returned promise
- * resolves with the final validated set.
+ * The async twin of `AssistProvider` — network calls can't be sync. Both
+ * calls stream. `analyze`'s `onPartial` fires with the insights completed
+ * so far (a fresh array each time, ids assigned) and the promise resolves
+ * with the final validated set. `chat` answers the last user turn of
+ * `history` in the context of the session's command cards; `onDelta` fires
+ * with the assistant text accumulated so far, and the promise resolves
+ * with the complete reply.
  */
 export interface AsyncAssistProvider {
   analyze(
     commands: CommandCardProps[],
     onPartial?: (insights: AssistInsight[]) => void,
   ): Promise<AssistInsight[]>;
+  chat(
+    history: ChatMessage[],
+    commands: CommandCardProps[],
+    onDelta?: (textSoFar: string) => void,
+  ): Promise<string>;
 }
 
 export function loadApiKey(): string | null {
@@ -94,6 +108,15 @@ const SYSTEM_PROMPT = [
   'next step worth pointing out). Include suggestedCommand only when a',
   'single safe shell command directly helps; never suggest destructive',
   'commands. Titles under 8 words; bodies one to two sentences.',
+].join(' ');
+
+const CHAT_SYSTEM_PROMPT = [
+  'You are the assist chat of Nebula, a terminal emulator. The user is in a',
+  'live shell session; its recent command history (commands, exit status,',
+  'truncated output) is provided as context. Answer questions about the',
+  'session, diagnose failures from their actual output, and suggest shell',
+  'commands in fenced code blocks. Be concise — this renders in a narrow',
+  'side sheet. Never suggest destructive commands without a warning.',
 ].join(' ');
 
 /** How much session history a single analyze() call ships to the model. */
@@ -239,6 +262,39 @@ export function createLlmProvider(apiKey: string): AsyncAssistProvider {
         throw new Error('Assist response did not match the insight schema');
       }
       return withIds(parsed.insights);
+    },
+
+    async chat(
+      history: ChatMessage[],
+      commands: CommandCardProps[],
+      onDelta?: (textSoFar: string) => void,
+    ): Promise<string> {
+      const client = await clientPromise;
+      // Fresh session context rides along on the latest user turn, so the
+      // model always reasons over the cards as they are *now* — earlier
+      // turns stay as plain text.
+      const messages = history.map((m, i) => ({
+        role: m.role,
+        content:
+          i === history.length - 1 && m.role === 'user'
+            ? `Session history (newest last):\n${sessionPayload(commands)}\n\n${m.text}`
+            : m.text,
+      }));
+      const stream = client.messages.stream({
+        model: ASSIST_MODEL,
+        max_tokens: 2048,
+        thinking: { type: 'adaptive' },
+        system: CHAT_SYSTEM_PROMPT,
+        messages,
+      });
+      if (onDelta) {
+        stream.on('text', (_delta, snapshot) => onDelta(snapshot));
+      }
+      const response = await stream.finalMessage();
+      return response.content
+        .filter((block): block is Anthropic.TextBlock => block.type === 'text')
+        .map((block) => block.text)
+        .join('');
     },
   };
 }

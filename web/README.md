@@ -159,7 +159,14 @@ Real (with the bridge running, `?ws`):
   while the sheet is open. The response **streams**: each insight card
   renders the moment its object completes in the SSE stream (an incremental
   scanner in `llmProvider.ts` pulls finished array elements out of the
-  partial JSON), with a pulse line marking the in-flight tail. The key is held in `sessionStorage` only —
+  partial JSON), with a pulse line marking the in-flight tail.
+- **Chat tab**: the same sheet holds a streaming conversation with Claude
+  about the session. Each send ships the whole thread plus a fresh snapshot
+  of the recent command cards on the latest turn (earlier turns stay plain
+  text, so the model always reasons over the cards as they are *now*); the
+  reply streams token-by-token into the assistant bubble and the input
+  locks until it settles. The thread lives in memory only — closing the
+  sheet keeps it, disconnecting or reloading clears it. The key is held in `sessionStorage` only —
   never `localStorage`, never the bundle — and *disconnect* wipes it. The
   `@anthropic-ai/sdk` chunk is lazy-loaded, so nothing is fetched until a
   key is connected. For tests, `sessionStorage["nebula.assistBaseUrl"]`
