@@ -196,6 +196,9 @@ Real (with the bridge running, `?ws`):
   shortcut is captured before xterm sees it, so the chord never reaches
   the PTY. Running from the palette goes through the same submit path as
   cards and snippets.
+- **Card quick actions**: hovering a card reveals re-run (↻ — submits the
+  command through the same path as the input line), copy output (⧉ — the
+  card's output to the clipboard), and pin (⌖).
 - **Pinned snippets**: hover a command card and hit its pin (⌖) to keep the
   command in the dock; clicking a snippet (or a *recent commands* row) runs
   it through the same submit path. Pins persist in `localStorage` and can

@@ -171,6 +171,7 @@ export default function CommandStream({
                   key={c.id ?? `cmd-${i}`}
                   {...c}
                   onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
+                  onRerun={onCommandSubmit ? () => onCommandSubmit(c.command) : undefined}
                   highlighted={highlightCardId !== null && highlightCardId === c.id}
                 />
               ))}

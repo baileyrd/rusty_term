@@ -42,8 +42,9 @@ export default function CommandCard({
   startedAt,
   finishedAt,
   onPin,
+  onRerun,
   highlighted = false,
-}: CommandCardProps & { onPin?: () => void; highlighted?: boolean }) {
+}: CommandCardProps & { onPin?: () => void; onRerun?: () => void; highlighted?: boolean }) {
   const duration = formatDuration(startedAt, finishedAt);
 
   return (
@@ -61,6 +62,30 @@ export default function CommandCard({
         <span className="flex-1 truncate font-nebula-command text-sm text-nebula-text">
           {command}
         </span>
+        {onRerun && (
+          <button
+            type="button"
+            data-testid="card-rerun"
+            onClick={onRerun}
+            aria-label={`Re-run ${command}`}
+            title="Re-run in terminal"
+            className="hidden rounded-nebula-sm px-1.5 font-nebula-meta text-xs text-nebula-text/40 hover:bg-white/10 hover:text-nebula-accent group-hover:block"
+          >
+            ↻
+          </button>
+        )}
+        {output.length > 0 && (
+          <button
+            type="button"
+            data-testid="card-copy-output"
+            onClick={() => void navigator.clipboard?.writeText(output.join('\n'))}
+            aria-label={`Copy output of ${command}`}
+            title="Copy output"
+            className="hidden rounded-nebula-sm px-1.5 font-nebula-meta text-xs text-nebula-text/40 hover:bg-white/10 hover:text-nebula-accent2 group-hover:block"
+          >
+            ⧉
+          </button>
+        )}
         {onPin && (
           <button
             type="button"
