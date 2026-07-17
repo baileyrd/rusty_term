@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useOverlayEscape, useOverlayLifecycle } from './useOverlay';
 import type { CommandCardProps } from './types';
 
 /** One searchable session: a tab and its card history. */
@@ -87,29 +88,14 @@ export default function SearchOverlay({ open, onClose, sessions, onJump }: Searc
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (open) {
-      requestAnimationFrame(() => inputRef.current?.focus());
-    } else {
-      // Reset on close, not open — an open-time reset runs after paint and
-      // can wipe input typed in the first frames (same fix as the palette).
+  useOverlayLifecycle(open, {
+    onOpen: () => requestAnimationFrame(() => inputRef.current?.focus()),
+    onClose: () => {
       setQuery('');
       setCursor(0);
-    }
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [open, onClose]);
+    },
+  });
+  useOverlayEscape(open, onClose);
 
   const hits = useMemo(
     () => (open ? searchHistory(sessions, query) : []),

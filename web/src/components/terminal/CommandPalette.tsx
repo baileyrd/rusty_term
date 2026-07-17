@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
+import { useOverlayEscape, useOverlayLifecycle } from './useOverlay';
 import type { SessionTabInfo, SnippetItem } from './types';
 
 /** One row of the palette: what it shows and what happens on Enter. */
@@ -106,33 +107,14 @@ export default function CommandPalette({
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (open) {
-      // The overlay mounts on this render; focus once it exists. The query
-      // is reset on *close*, not here — this effect runs after paint, so a
-      // reset here could wipe input typed in the first frames after opening.
-      requestAnimationFrame(() => inputRef.current?.focus());
-    } else {
+  useOverlayLifecycle(open, {
+    onOpen: () => requestAnimationFrame(() => inputRef.current?.focus()),
+    onClose: () => {
       setQuery('');
       setCursor(0);
-    }
-  }, [open]);
-
-  // Esc closes no matter where focus is (it can land before the input's
-  // deferred focus, or after focus wandered) — capture phase so a focused
-  // xterm never sees the keypress while the overlay is up.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [open, onClose]);
+    },
+  });
+  useOverlayEscape(open, onClose);
 
   const items = useMemo<PaletteItem[]>(() => {
     if (!open) return [];
