@@ -32,6 +32,10 @@ export interface TerminalViewProps {
   onTransportReady?: (transport: TerminalTransport) => void;
   /** Active preset; canvas/cursor/selection colors follow it at runtime. */
   theme?: ThemeName;
+  /** Header label; defaults to "raw terminal". */
+  title?: string;
+  /** Renders a ✕ in the header — the split-pane close affordance. */
+  onClose?: () => void;
 }
 
 /**
@@ -44,6 +48,8 @@ export default function TerminalView({
   onCommandEvent,
   onTransportReady,
   theme,
+  title = 'raw terminal',
+  onClose,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -129,10 +135,24 @@ export default function TerminalView({
   }, [transport, url, onCommandEvent, onTransportReady]);
 
   return (
-    <div className="overflow-hidden rounded-nebula-md border border-white/5 bg-nebula-bg shadow-nebula-soft">
+    <div
+      data-testid="terminal-pane"
+      className="min-w-0 flex-1 overflow-hidden rounded-nebula-md border border-white/5 bg-nebula-bg shadow-nebula-soft"
+    >
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1.5 font-nebula-meta text-[11px] text-nebula-text/40">
         <span className="h-2 w-2 rounded-full bg-nebula-accent/60" />
-        raw terminal
+        <span className="truncate">{title}</span>
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={`Close ${title}`}
+            data-testid="pane-close"
+            className="ml-auto rounded-nebula-sm px-1.5 text-nebula-text/40 transition-colors duration-nebula-fast ease-nebula hover:bg-white/10 hover:text-nebula-error"
+          >
+            ✕
+          </button>
+        )}
       </div>
       <div ref={containerRef} className="h-56 p-2" />
     </div>

@@ -23,6 +23,10 @@ export interface CommandPaletteProps {
   /** Switch the visual preset ("Theme: cyberpunk" rows). */
   onSetTheme?: (theme: ThemeName) => void;
   activeTheme?: ThemeName;
+  /** Split-pane actions; paneCount gates which rows appear. */
+  paneCount?: number;
+  onSplitPane?: () => void;
+  onCloseLastPane?: () => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -67,6 +71,9 @@ export default function CommandPalette({
   onOpenAssist,
   onSetTheme,
   activeTheme,
+  paneCount = 1,
+  onSplitPane,
+  onCloseLastPane,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -81,6 +88,22 @@ export default function CommandPalette({
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
+
+  // Esc closes no matter where focus is (it can land before the input's
+  // deferred focus, or after focus wandered) — capture phase so a focused
+  // xterm never sees the keypress while the overlay is up.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [open, onClose]);
 
   const items = useMemo<PaletteItem[]>(() => {
     if (!open) return [];
@@ -131,6 +154,24 @@ export default function CommandPalette({
         },
       );
     }
+    if (onSplitPane && paneCount < 4) {
+      candidates.push({
+        id: 'pane-split',
+        group: 'actions',
+        title: 'Split terminal pane',
+        detail: `${paneCount} open`,
+        action: onSplitPane,
+      });
+    }
+    if (onCloseLastPane && paneCount > 1) {
+      candidates.push({
+        id: 'pane-close',
+        group: 'actions',
+        title: 'Close terminal pane',
+        detail: `${paneCount} open`,
+        action: onCloseLastPane,
+      });
+    }
     if (onSetTheme) {
       for (const name of THEME_NAMES) {
         candidates.push({
@@ -155,7 +196,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

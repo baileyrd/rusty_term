@@ -16,13 +16,21 @@ export interface CommandStreamProps {
   onTransportReady?: (transport: TerminalTransport) => void;
   /** Active preset, threaded to the xterm panel's runtime theme. */
   theme?: ThemeName;
+  /**
+   * Split-pane ids, primary first. Every pane is its own terminal with its
+   * own transport session; only the primary feeds the command cards and
+   * the input line.
+   */
+  panes?: string[];
+  /** Close a secondary pane (the primary has no close affordance). */
+  onClosePane?: (id: string) => void;
 }
 
 /**
  * The center column: a scrolling stream of CommandCards, the raw xterm.js
  * panel, and the command input line at the bottom.
  */
-export default function CommandStream({ commands, onCommandSubmit, onPinCommand, onCommandEvent, onTransportReady, theme }: CommandStreamProps) {
+export default function CommandStream({ commands, onCommandSubmit, onPinCommand, onCommandEvent, onTransportReady, theme, panes = ['primary'], onClosePane }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -50,7 +58,20 @@ export default function CommandStream({ commands, onCommandSubmit, onPinCommand,
           />
         ))}
 
-        <TerminalView onCommandEvent={onCommandEvent} onTransportReady={onTransportReady} theme={theme} />
+        <div className="flex gap-3">
+          {panes.map((id, i) => (
+            <TerminalView
+              key={id}
+              theme={theme}
+              // Only the primary pane feeds the card stream and input line;
+              // splits are independent sessions against the same bridge.
+              onCommandEvent={i === 0 ? onCommandEvent : undefined}
+              onTransportReady={i === 0 ? onTransportReady : undefined}
+              title={panes.length > 1 ? `pane ${i + 1}` : 'raw terminal'}
+              onClose={i > 0 && onClosePane ? () => onClosePane(id) : undefined}
+            />
+          ))}
+        </div>
       </div>
 
       <form
