@@ -5,6 +5,7 @@ import TerminalView from './TerminalView';
 import type { CommandCardProps } from './types';
 import type { CommandEvent } from './commandTracker';
 import type { TerminalTransport } from '../../transport/bridge';
+import type { ThemeName } from '../../theme/tokens';
 
 export interface CommandStreamProps {
   commands: CommandCardProps[];
@@ -13,13 +14,15 @@ export interface CommandStreamProps {
   onPinCommand?: (command: string) => void;
   onCommandEvent?: (event: CommandEvent) => void;
   onTransportReady?: (transport: TerminalTransport) => void;
+  /** Active preset, threaded to the xterm panel's runtime theme. */
+  theme?: ThemeName;
 }
 
 /**
  * The center column: a scrolling stream of CommandCards, the raw xterm.js
  * panel, and the command input line at the bottom.
  */
-export default function CommandStream({ commands, onCommandSubmit, onPinCommand, onCommandEvent, onTransportReady }: CommandStreamProps) {
+export default function CommandStream({ commands, onCommandSubmit, onPinCommand, onCommandEvent, onTransportReady, theme }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -47,7 +50,7 @@ export default function CommandStream({ commands, onCommandSubmit, onPinCommand,
           />
         ))}
 
-        <TerminalView onCommandEvent={onCommandEvent} onTransportReady={onTransportReady} />
+        <TerminalView onCommandEvent={onCommandEvent} onTransportReady={onTransportReady} theme={theme} />
       </div>
 
       <form
@@ -61,7 +64,7 @@ export default function CommandStream({ commands, onCommandSubmit, onPinCommand,
           placeholder="Type a command…"
           spellCheck={false}
           autoComplete="off"
-          className="flex-1 bg-transparent font-nebula-command text-sm text-nebula-text caret-[#4CE1F7] outline-none transition-colors duration-nebula-fast ease-nebula placeholder:text-nebula-text/25"
+          className="flex-1 bg-transparent font-nebula-command text-sm text-nebula-text caret-nebula-accent outline-none transition-colors duration-nebula-fast ease-nebula placeholder:text-nebula-text/25"
           aria-label="Command input"
         />
       </form>

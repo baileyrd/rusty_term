@@ -1,21 +1,23 @@
 import type { Config } from 'tailwindcss';
-import { colors, radii, shadows, motion, fonts } from './src/theme/tokens';
+import { radii, shadows, motion, fonts } from './src/theme/tokens';
 
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
+        // Runtime-themeable: RGB-triplet custom properties set by
+        // applyTheme() (src/theme/tokens.ts), nebula defaults in index.css.
         nebula: {
-          bg: colors.bg,
-          surface: colors.surface,
-          text: colors.text,
-          accent: colors.accent,
-          accent2: colors.accent2,
-          success: colors.success,
-          warning: colors.warning,
-          error: colors.error,
-          info: colors.info,
+          bg: 'rgb(var(--nebula-bg) / <alpha-value>)',
+          surface: 'var(--nebula-surface)',
+          text: 'rgb(var(--nebula-text) / <alpha-value>)',
+          accent: 'rgb(var(--nebula-accent) / <alpha-value>)',
+          accent2: 'rgb(var(--nebula-accent2) / <alpha-value>)',
+          success: 'rgb(var(--nebula-success) / <alpha-value>)',
+          warning: 'rgb(var(--nebula-warning) / <alpha-value>)',
+          error: 'rgb(var(--nebula-error) / <alpha-value>)',
+          info: 'rgb(var(--nebula-info) / <alpha-value>)',
         },
       },
       borderRadius: {
@@ -45,8 +47,8 @@ export default {
           to: { opacity: '1', transform: 'translateY(0)' },
         },
         'nebula-pulse': {
-          '0%, 100%': { boxShadow: '0 0 0 0 rgba(76, 225, 247, 0.45)' },
-          '50%': { boxShadow: '0 0 0 10px rgba(76, 225, 247, 0)' },
+          '0%, 100%': { boxShadow: '0 0 0 0 rgb(var(--nebula-accent) / 0.45)' },
+          '50%': { boxShadow: '0 0 0 10px rgb(var(--nebula-accent) / 0)' },
         },
       },
       animation: {

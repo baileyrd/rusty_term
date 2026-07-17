@@ -15,7 +15,7 @@ function Sparkline({ samples }: { samples: number[] }) {
       <polyline
         points={points}
         fill="none"
-        stroke="#4CE1F7"
+        style={{ stroke: 'rgb(var(--nebula-accent))' }}
         strokeWidth="1.5"
         strokeLinejoin="round"
         strokeLinecap="round"

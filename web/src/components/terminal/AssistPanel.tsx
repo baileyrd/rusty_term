@@ -351,7 +351,7 @@ export default function AssistPanel({
         </button>
       </header>
 
-      <nav className="flex border-b border-white/5 bg-nebula-surface/50">
+      <nav className="flex border-b border-white/5 bg-nebula-surface">
         {(['insights', 'chat'] as const).map((t) => (
           <button
             key={t}

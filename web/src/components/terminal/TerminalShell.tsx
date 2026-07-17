@@ -12,10 +12,24 @@ import {
   storeApiKey,
   type ChatMessage,
 } from '../../assist/llmProvider';
+import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
+import { applyTheme } from '../../theme/apply';
 import type { SnippetItem, TerminalShellProps } from './types';
 
 /** localStorage key for the pinned snippets. */
 const SNIPPETS_KEY = 'nebula.pinnedSnippets';
+
+/** localStorage key for the chosen theme preset. */
+const THEME_KEY = 'nebula.theme';
+
+function loadTheme(): ThemeName | null {
+  try {
+    const stored = localStorage.getItem(THEME_KEY);
+    return THEME_NAMES.includes(stored as ThemeName) ? (stored as ThemeName) : null;
+  } catch {
+    return null;
+  }
+}
 
 const DEFAULT_SNIPPETS: SnippetItem[] = [
   { title: 'Rebuild + test', command: 'cargo test --workspace' },
@@ -61,8 +75,9 @@ function snippetTitle(command: string): string {
  * plus a Claude-backed section when an API key is connected; its badge
  * counts failures that arrived since the panel was last opened).
  *
- * The `theme` prop is Nebula-only for now; 'cyberpunk' and 'minimal' are
- * accepted per the spec but map to the Nebula skin until those presets land.
+ * The `theme` prop is the initial preset only; the palette's "Theme: …"
+ * actions switch between nebula / cyberpunk / minimal at runtime and the
+ * choice persists in localStorage (which wins over the prop on reload).
  */
 export default function TerminalShell({
   theme = 'nebula',
@@ -72,6 +87,19 @@ export default function TerminalShell({
   onTransportReady,
   liveStats,
 }: TerminalShellProps) {
+  // The active preset: stored choice wins over the prop, which stays the
+  // initial default. applyTheme stamps the custom properties on <html> so
+  // Tailwind's var()-based colors (and the body background) all follow.
+  const [activeTheme, setActiveTheme] = useState<ThemeName>(() => loadTheme() ?? theme);
+  useEffect(() => {
+    applyTheme(activeTheme);
+    try {
+      localStorage.setItem(THEME_KEY, activeTheme);
+    } catch {
+      // Blocked storage: the choice just doesn't survive a reload.
+    }
+  }, [activeTheme]);
+
   const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
   const [assistOpen, setAssistOpen] = useState(false);
   const [seenFailures, setSeenFailures] = useState(0);
@@ -224,7 +252,7 @@ export default function TerminalShell({
 
   return (
     <div
-      data-theme={theme}
+      data-theme={activeTheme}
       className="flex h-full flex-col bg-nebula-bg text-nebula-text"
     >
       <StatusRibbon
@@ -242,6 +270,7 @@ export default function TerminalShell({
           onPinCommand={pinCommand}
           onCommandEvent={onCommandEvent}
           onTransportReady={onTransportReady}
+          theme={activeTheme}
         />
         <SideDock
           cpu={live ? (live.cpu ?? 0) : 0.34}
@@ -261,6 +290,8 @@ export default function TerminalShell({
         recentCommands={commands.map((c) => c.command)}
         onRunCommand={onCommandSubmit}
         onOpenAssist={openAssistFromPalette}
+        activeTheme={activeTheme}
+        onSetTheme={setActiveTheme}
       />
 
       {assistOpen && (

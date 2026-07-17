@@ -47,8 +47,8 @@ export default function SideDock({
     <aside className="hidden w-64 shrink-0 flex-col gap-3 overflow-y-auto border-l border-white/5 p-3 lg:flex">
       <DockSection title="Processes">
         <div className="flex flex-col gap-2.5">
-          <MeterBar label="CPU" value={cpu} color="#4CE1F7" />
-          <MeterBar label="RAM" value={ram} color="#F7C14C" />
+          <MeterBar label="CPU" value={cpu} color="rgb(var(--nebula-accent))" />
+          <MeterBar label="RAM" value={ram} color="rgb(var(--nebula-accent2))" />
         </div>
       </DockSection>
 

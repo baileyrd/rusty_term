@@ -21,8 +21,8 @@ export default function AiOrb({ unreadHints = 0, enabled = true, onClick }: AiOr
       }`}
       style={{
         background:
-          'radial-gradient(circle at 35% 30%, rgba(138, 238, 255, 0.95), rgba(76, 225, 247, 0.75) 45%, rgba(76, 225, 247, 0.25) 100%)',
-        boxShadow: '0 4px 12px rgba(0,0,0,0.35), 0 0 24px rgba(76,225,247,0.35)',
+          'radial-gradient(circle at 35% 30%, rgb(var(--nebula-accent) / 0.95), rgb(var(--nebula-accent) / 0.75) 45%, rgb(var(--nebula-accent) / 0.25) 100%)',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.35), 0 0 24px rgb(var(--nebula-accent) / 0.35)',
       }}
     >
       <span className="sr-only">AI assistant</span>
