@@ -35,7 +35,9 @@ impl crate::backend::Backend for UnixBackend {
         // --login -i"`), matching how Windows' CreateProcessW already parses
         // its whole command-line string.
         let mut words: Vec<String> = if !args.is_empty() {
-            std::iter::once(shell.clone()).chain(args.iter().cloned()).collect()
+            std::iter::once(shell.clone())
+                .chain(args.iter().cloned())
+                .collect()
         } else {
             split_shell_words(&shell)
         };
@@ -438,7 +440,10 @@ mod tests {
 
     #[test]
     fn splits_on_whitespace() {
-        assert_eq!(split_shell_words("bash --login -i"), vec!["bash", "--login", "-i"]);
+        assert_eq!(
+            split_shell_words("bash --login -i"),
+            vec!["bash", "--login", "-i"]
+        );
         assert_eq!(split_shell_words("  bash   -i  "), vec!["bash", "-i"]);
     }
 
@@ -448,7 +453,10 @@ mod tests {
             split_shell_words(r#"bash -lc "echo hi there""#),
             vec!["bash", "-lc", "echo hi there"]
         );
-        assert_eq!(split_shell_words("bash -lc 'echo hi'"), vec!["bash", "-lc", "echo hi"]);
+        assert_eq!(
+            split_shell_words("bash -lc 'echo hi'"),
+            vec!["bash", "-lc", "echo hi"]
+        );
         assert_eq!(split_shell_words(r"a\ b c"), vec!["a b", "c"]);
     }
 
@@ -471,8 +479,14 @@ mod tests {
     fn wait_status_decodes_a_signal_death_as_128_plus_signal() {
         // Killed by a signal: the low 7 bits carry the signal number (bit
         // 0x80, set on a core dump, must not leak into the reported code).
-        assert_eq!(exit_code_from_wait_status(libc::SIGKILL), 128 + libc::SIGKILL);
-        assert_eq!(exit_code_from_wait_status(libc::SIGSEGV | 0x80), 128 + libc::SIGSEGV);
+        assert_eq!(
+            exit_code_from_wait_status(libc::SIGKILL),
+            128 + libc::SIGKILL
+        );
+        assert_eq!(
+            exit_code_from_wait_status(libc::SIGSEGV | 0x80),
+            128 + libc::SIGSEGV
+        );
     }
 
     /// Smoke test: a real child spawns on a real PTY, its output reaches the
@@ -486,7 +500,13 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let mut h = super::UnixBackend
-            .spawn_shell(80, 24, Some("/bin/sh"), &["-c".into(), "echo boot_ok; exit 7".into()], None)
+            .spawn_shell(
+                80,
+                24,
+                Some("/bin/sh"),
+                &["-c".into(), "echo boot_ok; exit 7".into()],
+                None,
+            )
             .expect("spawn");
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut rh = h.try_clone().expect("clone read handle");
@@ -517,7 +537,10 @@ mod tests {
                 assert_eq!(code, 7);
                 return;
             }
-            assert!(Instant::now() < deadline, "reap_exit_status never reported an exit");
+            assert!(
+                Instant::now() < deadline,
+                "reap_exit_status never reported an exit"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }

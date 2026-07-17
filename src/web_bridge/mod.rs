@@ -81,14 +81,19 @@ pub struct BridgeConfig {
 
 impl Default for BridgeConfig {
     fn default() -> Self {
-        BridgeConfig { listen: DEFAULT_LISTEN.to_string(), shell: None }
+        BridgeConfig {
+            listen: DEFAULT_LISTEN.to_string(),
+            shell: None,
+        }
     }
 }
 
 /// Run the bridge until the process is killed: bind, accept, one independent
 /// PTY session per websocket connection.
 pub fn run(cfg: BridgeConfig) -> Result<(), Error> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let listener = TcpListener::bind(&cfg.listen).await?;
         eprintln!(
@@ -206,7 +211,8 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
                     }
                 }
                 ws::Opcode::Ping => {
-                    wr.write_all(&ws::encode_frame(ws::Opcode::Pong, &frame.payload)).await?;
+                    wr.write_all(&ws::encode_frame(ws::Opcode::Pong, &frame.payload))
+                        .await?;
                 }
                 ws::Opcode::Pong => {}
                 ws::Opcode::Close => {
@@ -264,14 +270,17 @@ async fn finish(
 ) -> Result<(), Error> {
     let code = handle.and_then(|h| h.reap_exit_status()).unwrap_or(0);
     let msg = format!("exit {code}");
-    wr.write_all(&ws::encode_frame(ws::Opcode::Text, msg.as_bytes())).await?;
+    wr.write_all(&ws::encode_frame(ws::Opcode::Text, msg.as_bytes()))
+        .await?;
     wr.write_all(&ws::close_frame(1000)).await?;
     Ok(())
 }
 
 /// Answer a bad handshake with a bare HTTP error and close.
 async fn refuse(stream: &mut TcpStream, status: &str) -> Result<(), Error> {
-    let _ = stream.write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes()).await;
+    let _ = stream
+        .write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes())
+        .await;
     Ok(())
 }
 
@@ -289,7 +298,10 @@ async fn read_handshake_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, 
             return Ok(None);
         }
         if stream.read(&mut byte).await? == 0 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "closed during handshake"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "closed during handshake",
+            ));
         }
         head.push(byte[0]);
     }
@@ -297,7 +309,10 @@ async fn read_handshake_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, 
 }
 
 fn protocol_err(e: ws::FrameError) -> Error {
-    Error::new(ErrorKind::InvalidData, format!("websocket protocol error: {e:?}"))
+    Error::new(
+        ErrorKind::InvalidData,
+        format!("websocket protocol error: {e:?}"),
+    )
 }
 
 /// Spawn the session's shell sized `cols × rows`.
@@ -416,7 +431,10 @@ mod tests {
             Ok(())
         }
         fn try_clone(&self) -> Result<Box<dyn BackendHandle>, Error> {
-            Ok(Box::new(MockHandle { log: self.log.clone(), write_delay: self.write_delay }))
+            Ok(Box::new(MockHandle {
+                log: self.log.clone(),
+                write_delay: self.write_delay,
+            }))
         }
         fn set_winsize(&mut self, _cols: u16, _rows: u16) -> Result<(), Error> {
             Ok(())
@@ -454,7 +472,10 @@ mod tests {
         // Give the background thread time to drain both writes, then check
         // they arrived, and in order.
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        assert_eq!(*log.lock().unwrap(), vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![b"hello".to_vec(), b"world".to_vec()]
+        );
     }
 
     /// A peer that never finishes the header block must eventually be cut
@@ -482,7 +503,10 @@ mod tests {
             read_handshake_head(&mut server_stream),
         )
         .await;
-        assert!(result.is_err(), "a stalled peer must time out rather than hang forever");
+        assert!(
+            result.is_err(),
+            "a stalled peer must time out rather than hang forever"
+        );
 
         client.abort();
     }
@@ -490,10 +514,20 @@ mod tests {
     #[test]
     fn commands_parse_and_clamp() {
         assert_eq!(parse_command("start 80 24"), Some(Command::Start(80, 24)));
-        assert_eq!(parse_command("resize 132 43"), Some(Command::Resize(132, 43)));
+        assert_eq!(
+            parse_command("resize 132 43"),
+            Some(Command::Resize(132, 43))
+        );
         assert_eq!(parse_command("start 1 90000"), None, "u16 overflow refused");
-        assert_eq!(parse_command("start 1 0"), Some(Command::Start(2, 2)), "floor clamp");
-        assert_eq!(parse_command("resize 4000 4000"), Some(Command::Resize(1000, 1000)));
+        assert_eq!(
+            parse_command("start 1 0"),
+            Some(Command::Start(2, 2)),
+            "floor clamp"
+        );
+        assert_eq!(
+            parse_command("resize 4000 4000"),
+            Some(Command::Resize(1000, 1000))
+        );
         assert_eq!(parse_command("start 80"), None);
         assert_eq!(parse_command("start 80 24 zsh"), None, "no trailing args");
         assert_eq!(parse_command("kill 1 2"), None);
@@ -509,8 +543,15 @@ mod tests {
         );
         assert_eq!(parse_command("cwd relative/path"), None, "must be absolute");
         assert_eq!(parse_command("cwd"), None);
-        assert_eq!(parse_command(&format!("cwd /{}", "a".repeat(5000))), None, "bounded");
-        assert_eq!(parse_command("ping 1752712345"), Some(Command::Ping("1752712345".into())));
+        assert_eq!(
+            parse_command(&format!("cwd /{}", "a".repeat(5000))),
+            None,
+            "bounded"
+        );
+        assert_eq!(
+            parse_command("ping 1752712345"),
+            Some(Command::Ping("1752712345".into()))
+        );
         assert_eq!(parse_command("ping a b"), None, "one token only");
         assert_eq!(parse_command("ping"), None);
     }

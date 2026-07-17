@@ -26,8 +26,29 @@ use super::bidi_tables::{BRACKETS, CLASS_RANGES, MIRRORED};
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Class {
-    L, R, AL, EN, ES, ET, AN, CS, NSM, BN, B, S, WS, ON,
-    LRE, RLE, LRO, RLO, PDF, LRI, RLI, FSI, PDI,
+    L,
+    R,
+    AL,
+    EN,
+    ES,
+    ET,
+    AN,
+    CS,
+    NSM,
+    BN,
+    B,
+    S,
+    WS,
+    ON,
+    LRE,
+    RLE,
+    LRO,
+    RLO,
+    PDF,
+    LRI,
+    RLI,
+    FSI,
+    PDI,
 }
 
 use Class::*;
@@ -67,7 +88,8 @@ pub(crate) fn mirrored(ch: char) -> Option<char> {
 /// Cheap pre-filter: does `text` contain anything that could produce an RTL
 /// run? Pure-LTR rows skip the whole algorithm on the strength of this.
 pub(crate) fn has_rtl(text: &[char]) -> bool {
-    text.iter().any(|&c| matches!(class(c), R | AL | AN | RLE | RLO | RLI))
+    text.iter()
+        .any(|&c| matches!(class(c), R | AL | AN | RLE | RLO | RLI))
 }
 
 /// Whether rule X9 removes this original class (retained here as
@@ -123,7 +145,11 @@ fn top_status(stack: &[Status], para: u8) -> Status {
         Some(&s) => s,
         None => {
             debug_assert!(false, "bidi status stack was unexpectedly empty");
-            Status { level: para, over: None, isolate: false }
+            Status {
+                level: para,
+                over: None,
+                isolate: false,
+            }
         }
     }
 }
@@ -137,11 +163,14 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
     let mut levels = vec![para; n];
 
     // X1–X8: explicit embeddings, overrides, isolates.
-    let mut stack = vec![Status { level: para, over: None, isolate: false }];
+    let mut stack = vec![Status {
+        level: para,
+        over: None,
+        isolate: false,
+    }];
     let (mut overflow_iso, mut overflow_emb, mut valid_iso) = (0usize, 0usize, 0usize);
-    let next_level = |cur: u8, rtl: bool| -> u8 {
-        if rtl { (cur + 1) | 1 } else { (cur + 2) & !1 }
-    };
+    let next_level =
+        |cur: u8, rtl: bool| -> u8 { if rtl { (cur + 1) | 1 } else { (cur + 2) & !1 } };
     for i in 0..n {
         let top = top_status(&stack, para);
         match orig[i] {
@@ -156,7 +185,11 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
                         LRO => Some(L),
                         _ => None,
                     };
-                    stack.push(Status { level: new, over, isolate: false });
+                    stack.push(Status {
+                        level: new,
+                        over,
+                        isolate: false,
+                    });
                 } else if overflow_iso == 0 {
                     overflow_emb += 1;
                 }
@@ -175,7 +208,11 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
                 let new = next_level(top.level, rtl);
                 if new <= MAX_DEPTH && overflow_iso == 0 && overflow_emb == 0 {
                     valid_iso += 1;
-                    stack.push(Status { level: new, over: None, isolate: true });
+                    stack.push(Status {
+                        level: new,
+                        over: None,
+                        isolate: true,
+                    });
                 } else {
                     overflow_iso += 1;
                 }
@@ -284,7 +321,8 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
         // Only start a new sequence at a run whose first char is not a PDI
         // matching some isolate initiator (those get chained onto).
         let first_k = runs[ri][0];
-        if orig[kept[first_k]] == PDI && matching_pdi.iter().any(|&(_, p)| p == Some(kept[first_k])) {
+        if orig[kept[first_k]] == PDI && matching_pdi.iter().any(|&(_, p)| p == Some(kept[first_k]))
+        {
             continue;
         }
         let mut seq: Vec<usize> = Vec::new();
@@ -297,7 +335,10 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
             // invariant broke, not a real possibility this input can
             // trigger. End the sequence rather than panic if it ever did.
             let Some(&last_k) = runs[cur].last() else {
-                debug_assert!(false, "bidi: an empty level run — X10 run-building invariant violated");
+                debug_assert!(
+                    false,
+                    "bidi: an empty level run — X10 run-building invariant violated"
+                );
                 break;
             };
             let last_i = kept[last_k];
@@ -309,7 +350,10 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
                 // present in `kept` — defensive fallback (stop chaining
                 // rather than panic) if that ever stopped holding.
                 let Some(pdi_k) = kept.iter().position(|&i| i == pdi_i) else {
-                    debug_assert!(false, "bidi: an isolate's matching PDI vanished from `kept`");
+                    debug_assert!(
+                        false,
+                        "bidi: an isolate's matching PDI vanished from `kept`"
+                    );
                     break;
                 };
                 let nxt = run_of_kpos[pdi_k];
@@ -335,18 +379,32 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
         // sequence (paragraph level at the edges; eos uses the paragraph
         // level when the sequence ends with an unmatched isolate initiator).
         let first_k = seq[0];
-        let prev_level = if first_k == 0 { para } else { levels[kept[first_k - 1]] };
-        let sos = if !seq_level.max(prev_level).is_multiple_of(2) { R } else { L };
+        let prev_level = if first_k == 0 {
+            para
+        } else {
+            levels[kept[first_k - 1]]
+        };
+        let sos = if !seq_level.max(prev_level).is_multiple_of(2) {
+            R
+        } else {
+            L
+        };
         let &last_k = seq.last().unwrap();
         let last_i = kept[last_k];
         let ends_unmatched_iso = matches!(orig[last_i], LRI | RLI | FSI)
-            && matching_pdi.iter().any(|&(ini, p)| ini == last_i && p.is_none());
+            && matching_pdi
+                .iter()
+                .any(|&(ini, p)| ini == last_i && p.is_none());
         let next_level_ = if last_k + 1 >= kept.len() || ends_unmatched_iso {
             para
         } else {
             levels[kept[last_k + 1]]
         };
-        let eos = if !levels[kept[last_k]].max(next_level_).is_multiple_of(2) { R } else { L };
+        let eos = if !levels[kept[last_k]].max(next_level_).is_multiple_of(2) {
+            R
+        } else {
+            L
+        };
 
         weak_and_neutral(seq, &kept, text, &orig, &mut types, sos, eos, seq_level);
     }
@@ -614,8 +672,16 @@ fn weak_and_neutral(
             while j < m && is_ni(types[idx[j]]) {
                 j += 1;
             }
-            let before = if start == 0 { sos } else { side(types[idx[start - 1]]).unwrap_or(e) };
-            let after = if j == m { eos } else { side(types[idx[j]]).unwrap_or(e) };
+            let before = if start == 0 {
+                sos
+            } else {
+                side(types[idx[start - 1]]).unwrap_or(e)
+            };
+            let after = if j == m {
+                eos
+            } else {
+                side(types[idx[j]]).unwrap_or(e)
+            };
             let fill = if before == after { before } else { e };
             for t in &idx[start..j] {
                 types[*t] = fill;
@@ -657,8 +723,7 @@ pub(crate) fn reorder(text: &[char], para: u8) -> (Vec<u8>, Vec<u16>) {
     // L1: segment separators and trailing whitespace (incl. isolate
     // formatting and retained X9 characters) reset to the paragraph level.
     let orig: Vec<Class> = text.iter().map(|&c| class(c)).collect();
-    let resettable =
-        |c: Class| matches!(c, WS | FSI | LRI | RLI | PDI) || removed_by_x9(c);
+    let resettable = |c: Class| matches!(c, WS | FSI | LRI | RLI | PDI) || removed_by_x9(c);
     let mut i = text.len();
     while i > 0 {
         i -= 1;
@@ -682,7 +747,12 @@ pub(crate) fn reorder(text: &[char], para: u8) -> (Vec<u8>, Vec<u16>) {
     // L2: reverse runs from the highest level down to the lowest odd level.
     let mut map: Vec<u16> = (0..text.len() as u16).collect();
     let max = *levels.iter().max().unwrap_or(&0);
-    let lowest_odd = levels.iter().copied().filter(|l| !l.is_multiple_of(2)).min().unwrap_or(1);
+    let lowest_odd = levels
+        .iter()
+        .copied()
+        .filter(|l| !l.is_multiple_of(2))
+        .min()
+        .unwrap_or(1);
     let mut lvl = max;
     while lvl >= lowest_odd && lvl > 0 {
         let mut i = 0;
@@ -757,8 +827,9 @@ mod tests {
         fn interleaved_embeddings_and_isolates_unbalanced() {
             // RLE, LRI, PDF (mismatched — closes the embedding, not the
             // isolate), PDI, PDI (extra), more content after.
-            let t: Vec<char> =
-                "\u{202B}a\u{2066}b\u{202C}\u{2069}\u{2069}c".chars().collect();
+            let t: Vec<char> = "\u{202B}a\u{2066}b\u{202C}\u{2069}\u{2069}c"
+                .chars()
+                .collect();
             no_panic(&t);
         }
 
@@ -767,7 +838,8 @@ mod tests {
             // A denser mix, repeated, so overflow/valid/embedding counters
             // all cycle through non-trivial states many times over.
             let controls = [
-                '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
+                '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+                '\u{202E}', // LRE RLE PDF LRO RLO
                 '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
             ];
             let mut t = Vec::new();
@@ -1067,17 +1139,16 @@ ogTOpUbh3Ler7+qnw/mp3PlpS1ml93Wfuj0Zu9aWnnGQRnt/JPJTVJMhlYnqGQU+X/qp9ICape9KB1/9
                     "level of char {i} in {line}"
                 );
             }
-            let removed: Vec<bool> = text
-                .iter()
-                .map(|&c| removed_by_x9(class(c)))
-                .collect();
+            let removed: Vec<bool> = text.iter().map(|&c| removed_by_x9(class(c))).collect();
             let got: Vec<usize> = map
                 .iter()
                 .map(|&l| l as usize)
                 .filter(|&l| !removed[l])
                 .collect();
-            let want: Vec<usize> =
-                f[4].split_whitespace().map(|n| n.parse().unwrap()).collect();
+            let want: Vec<usize> = f[4]
+                .split_whitespace()
+                .map(|n| n.parse().unwrap())
+                .collect();
             assert_eq!(got, want, "visual order for {line}");
             cases += 1;
         }

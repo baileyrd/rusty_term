@@ -98,7 +98,13 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8], pos: usize) -> Self {
-        BitReader { data, pos, buf: 0, cnt: 0, eos: false }
+        BitReader {
+            data,
+            pos,
+            buf: 0,
+            cnt: 0,
+            eos: false,
+        }
     }
 
     /// Next bit (0 past end of segment / at a marker — callers bound reads by the
@@ -171,8 +177,8 @@ fn extend(v: i32, n: u8) -> i32 {
 
 struct Component {
     id: u8,
-    h: usize, // horizontal sampling factor
-    v: usize, // vertical sampling factor
+    h: usize,  // horizontal sampling factor
+    v: usize,  // vertical sampling factor
     tq: usize, // quant table index
     td: usize, // DC Huffman table index (set at SOS)
     ta: usize, // AC Huffman table index (set at SOS)
@@ -460,10 +466,22 @@ fn parse_sos(seg: &[u8], comps: &mut [Component], progressive: bool) -> Option<S
         if ss > 0 && ns != 1 {
             return None;
         }
-        Some(Scan { comps: scan_comps, ss, se, ah, al })
+        Some(Scan {
+            comps: scan_comps,
+            ss,
+            se,
+            ah,
+            al,
+        })
     } else {
         // Baseline: one full-band scan regardless of what the header claims.
-        Some(Scan { comps: scan_comps, ss: 0, se: 63, ah: 0, al: 0 })
+        Some(Scan {
+            comps: scan_comps,
+            ss: 0,
+            se: 63,
+            ah: 0,
+            al: 0,
+        })
     }
 }
 
@@ -795,7 +813,11 @@ fn idct_matrix() -> [[f32; 8]; 8] {
     let mut m = [[0f32; 8]; 8];
     let pi = std::f32::consts::PI;
     for (u, row) in m.iter_mut().enumerate() {
-        let cu = if u == 0 { std::f32::consts::FRAC_1_SQRT_2 } else { 1.0 };
+        let cu = if u == 0 {
+            std::f32::consts::FRAC_1_SQRT_2
+        } else {
+            1.0
+        };
         for (x, val) in row.iter_mut().enumerate() {
             *val = 0.5 * cu * ((2 * x + 1) as f32 * u as f32 * pi / 16.0).cos();
         }
@@ -837,5 +859,9 @@ fn to_rgba(comps: &[Component], width: usize, height: usize, hmax: usize, vmax: 
             rgba[o + 3] = 255;
         }
     }
-    Image { width, height, rgba }
+    Image {
+        width,
+        height,
+        rgba,
+    }
 }

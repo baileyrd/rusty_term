@@ -21,11 +21,11 @@ mod arabic;
 mod arabic_tables;
 mod base64;
 #[cfg(any(test, feature = "gui"))]
-mod canon_tables;
-#[cfg(any(test, feature = "gui"))]
 mod bidi;
 #[cfg(any(test, feature = "gui"))]
 mod bidi_tables;
+#[cfg(any(test, feature = "gui"))]
+mod canon_tables;
 mod cell;
 mod charset;
 mod color;
@@ -43,29 +43,29 @@ mod png;
 mod sixel;
 mod webp;
 
+#[cfg(any(feature = "gui", feature = "web-bridge"))]
+pub(crate) use base64::encode as base64_encode;
+#[cfg(feature = "gui")]
+pub(crate) use bidi::mirrored as bidi_mirrored;
 pub use cell::{
     ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_MASK, ATTR_REVERSE,
     ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, UnderlineStyle, WIDE_TRAILER,
 };
+#[cfg(feature = "gui")]
+pub use cell::{Cell, char_width};
 pub use color::Theme;
 #[cfg(feature = "gui")]
 pub(crate) use color::ensure_contrast;
-pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
-#[cfg(any(test, feature = "gui"))]
-pub use grid::BlockMark;
 #[cfg(any(test, feature = "gui"))]
 pub use grid::BidiRow;
-#[cfg(feature = "gui")]
-pub(crate) use bidi::mirrored as bidi_mirrored;
-#[cfg(feature = "gui")]
-pub use cell::{Cell, char_width};
+#[cfg(any(test, feature = "gui"))]
+pub use grid::BlockMark;
+pub use grid::{CursorShape, DirtyFrame, Grid, LineAttr, SCROLLBACK_MAX};
 #[cfg(feature = "gui")]
 pub use grid::{MouseModes, Selection};
-#[cfg(any(feature = "gui", feature = "web-bridge"))]
-pub(crate) use base64::encode as base64_encode;
+pub use parser::AnsiParser;
 #[cfg(feature = "gui")]
 pub(crate) use png::decode as png_decode;
-pub use parser::AnsiParser;
 
 #[cfg(test)]
 mod tests;

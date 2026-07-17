@@ -303,7 +303,11 @@ pub(crate) fn format_color_spec(rgb: u32) -> String {
 pub(crate) fn luminance(c: u32) -> f32 {
     let lin = |v: u32| {
         let s = (v & 0xFF) as f32 / 255.0;
-        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
     };
     0.2126 * lin(c >> 16) + 0.7152 * lin(c >> 8) + 0.0722 * lin(c)
 }
@@ -327,7 +331,11 @@ pub(crate) fn ensure_contrast(fg: u32, bg: u32, min_ratio: f32) -> u32 {
     if min_ratio <= 1.0 || contrast_ratio(fg, bg) >= min_ratio {
         return fg;
     }
-    let pole: u32 = if luminance(bg) < 0.5 { 0xFFFFFF } else { 0x000000 };
+    let pole: u32 = if luminance(bg) < 0.5 {
+        0xFFFFFF
+    } else {
+        0x000000
+    };
     let blend = |t: f32| -> u32 {
         let ch = |shift: u32| {
             let f = ((fg >> shift) & 0xFF) as f32;

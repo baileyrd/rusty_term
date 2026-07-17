@@ -49,7 +49,11 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: usize, h: usize) -> Self {
-        Canvas { w, h, px: vec![0; w * h] }
+        Canvas {
+            w,
+            h,
+            px: vec![0; w * h],
+        }
     }
 
     /// Light stroke thickness, scaled to the cell.
@@ -77,7 +81,14 @@ impl Canvas {
     }
 
     fn into_glyph(self, baseline: i32) -> Glyph {
-        Glyph { width: self.w, height: self.h, left: 0, top: -baseline, coverage: self.px, color: None }
+        Glyph {
+            width: self.w,
+            height: self.h,
+            left: 0,
+            top: -baseline,
+            coverage: self.px,
+            color: None,
+        }
     }
 }
 
@@ -210,10 +221,10 @@ fn draw_box(c: &mut Canvas, cp: u32) -> Option<()> {
 
     // Dashed variants: the arm pattern of the solid char, gapped.
     let dashes: Option<(u32, usize)> = match cp {
-        0x2504 | 0x2505 => Some((cp - 4, 3)),        // triple dash horizontal
-        0x2508 | 0x2509 => Some((cp - 8, 4)),        // quadruple dash horizontal
-        0x2506 | 0x2507 => Some((cp - 4, 3)),        // triple dash vertical
-        0x250A | 0x250B => Some((cp - 8, 4)),        // quadruple dash vertical
+        0x2504 | 0x2505 => Some((cp - 4, 3)), // triple dash horizontal
+        0x2508 | 0x2509 => Some((cp - 8, 4)), // quadruple dash horizontal
+        0x2506 | 0x2507 => Some((cp - 4, 3)), // triple dash vertical
+        0x250A | 0x250B => Some((cp - 8, 4)), // quadruple dash vertical
         0x254C | 0x254D => Some((cp - 0x4C, 2)), // double dash horiz -> 2500/2501
         0x254E | 0x254F => Some((cp - 0x4C + 0x02, 2)), // double dash vert -> 2502/2503
         _ => None,
@@ -316,7 +327,11 @@ fn draw_box(c: &mut Canvas, cp: u32) -> Option<()> {
             // A double crossing needs arms to reach the far rail.
             if cross_double { 2 * lt } else { t_of(wt) / 2 }
         };
-        let cross_is_double = if vertical { left == 3 || right == 3 } else { up == 3 || down == 3 };
+        let cross_is_double = if vertical {
+            left == 3 || right == 3
+        } else {
+            up == 3 || down == 3
+        };
         let over = reach(weight, cross_is_double);
         if weight == 3 {
             // Two rails, centered lt*1.5 either side of the midline.
@@ -327,12 +342,20 @@ fn draw_box(c: &mut Canvas, cp: u32) -> Option<()> {
             };
             if vertical {
                 for (x0, x1) in rails(cx, w) {
-                    let (y0, y1) = if dir == 0 { (0, cy + over) } else { (cy.saturating_sub(over), h) };
+                    let (y0, y1) = if dir == 0 {
+                        (0, cy + over)
+                    } else {
+                        (cy.saturating_sub(over), h)
+                    };
                     c.rect(x0, y0, x1, y1);
                 }
             } else {
                 for (y0, y1) in rails(cy, h) {
-                    let (x0, x1) = if dir == 2 { (0, cx + over) } else { (cx.saturating_sub(over), w) };
+                    let (x0, x1) = if dir == 2 {
+                        (0, cx + over)
+                    } else {
+                        (cx.saturating_sub(over), w)
+                    };
                     c.rect(x0, y0, x1, y1);
                 }
             }
@@ -341,11 +364,19 @@ fn draw_box(c: &mut Canvas, cp: u32) -> Option<()> {
         let t = t_of(weight);
         if vertical {
             let (x0, x1) = band(cx, t, w);
-            let (y0, y1) = if dir == 0 { (0, cy + over) } else { (cy.saturating_sub(over), h) };
+            let (y0, y1) = if dir == 0 {
+                (0, cy + over)
+            } else {
+                (cy.saturating_sub(over), h)
+            };
             c.rect(x0, y0, x1, y1);
         } else {
             let (y0, y1) = band(cy, t, h);
-            let (x0, x1) = if dir == 2 { (0, cx + over) } else { (cx.saturating_sub(over), w) };
+            let (x0, x1) = if dir == 2 {
+                (0, cx + over)
+            } else {
+                (cx.saturating_sub(over), w)
+            };
             c.rect(x0, y0, x1, y1);
         }
     };
@@ -358,21 +389,32 @@ fn draw_box(c: &mut Canvas, cp: u32) -> Option<()> {
     if arms.contains(&3) {
         let n = arms.iter().filter(|&&a| a != 0).count();
         if n >= 2 {
-            c.rect(cx.saturating_sub(2 * lt).max(if left != 0 { 0 } else { cx.saturating_sub(2 * lt) }),
-                   cy.saturating_sub(2 * lt),
-                   cx + 2 * lt, cy + 2 * lt);
+            c.rect(
+                cx.saturating_sub(2 * lt).max(if left != 0 {
+                    0
+                } else {
+                    cx.saturating_sub(2 * lt)
+                }),
+                cy.saturating_sub(2 * lt),
+                cx + 2 * lt,
+                cy + 2 * lt,
+            );
             // Re-cut the hollow between rails for straight-through doubles.
             if up == 3 && down == 3 && left == 0 && right == 0 {
                 let (x0, x1) = band(cx, lt, w);
                 c.px.iter_mut().enumerate().for_each(|(i, p)| {
                     let x = i % w;
-                    if x >= x0 && x < x1 { *p = 0; }
+                    if x >= x0 && x < x1 {
+                        *p = 0;
+                    }
                 });
             }
             if left == 3 && right == 3 && up == 0 && down == 0 {
                 let (y0, y1) = band(cy, lt, h);
                 for y in y0..y1 {
-                    for x in 0..w { c.px[y * w + x] = 0; }
+                    for x in 0..w {
+                        c.px[y * w + x] = 0;
+                    }
                 }
             }
         }
@@ -386,7 +428,7 @@ fn draw_block(c: &mut Canvas, cp: u32) {
     let eighth_h = |n: usize| (h * n).div_ceil(8);
     let eighth_w = |n: usize| (w * n).div_ceil(8);
     match cp {
-        0x2580 => c.rect(0, 0, w, h / 2),                       // upper half
+        0x2580 => c.rect(0, 0, w, h / 2), // upper half
         0x2581..=0x2588 => {
             let n = (cp - 0x2580) as usize; // lower n/8
             c.rect(0, h - eighth_h(n), w, h);
@@ -395,7 +437,7 @@ fn draw_block(c: &mut Canvas, cp: u32) {
             let n = 8 - (cp - 0x2588) as usize; // left n/8
             c.rect(0, 0, eighth_w(n), h);
         }
-        0x2590 => c.rect(w / 2, 0, w, h),                       // right half
+        0x2590 => c.rect(w / 2, 0, w, h), // right half
         0x2591..=0x2593 => {
             // Shades: 25% / 50% / 75% checker dithers.
             let keep = (cp - 0x2590) as usize; // 1..=3
@@ -408,17 +450,27 @@ fn draw_block(c: &mut Canvas, cp: u32) {
                 }
             }
         }
-        0x2594 => c.rect(0, 0, w, eighth_h(1)),                 // upper eighth
-        0x2595 => c.rect(w - eighth_w(1), 0, w, h),             // right eighth
+        0x2594 => c.rect(0, 0, w, eighth_h(1)), // upper eighth
+        0x2595 => c.rect(w - eighth_w(1), 0, w, h), // right eighth
         0x2596..=0x259F => {
             // Quadrants: bit per filled quarter, from the code chart.
             let (hw, hh) = (w / 2, h / 2);
-            let quads: [u8; 10] = [0b0010, 0b0001, 0b1000, 0b1011, 0b1101, 0b0100, 0b0111, 0b1110, 0b0110, 0b1001];
+            let quads: [u8; 10] = [
+                0b0010, 0b0001, 0b1000, 0b1011, 0b1101, 0b0100, 0b0111, 0b1110, 0b0110, 0b1001,
+            ];
             let q = quads[(cp - 0x2596) as usize];
-            if q & 0b1000 != 0 { c.rect(0, 0, hw, hh) }         // upper left
-            if q & 0b0100 != 0 { c.rect(hw, 0, w, hh) }         // upper right
-            if q & 0b0010 != 0 { c.rect(0, hh, hw, h) }         // lower left
-            if q & 0b0001 != 0 { c.rect(hw, hh, w, h) }         // lower right
+            if q & 0b1000 != 0 {
+                c.rect(0, 0, hw, hh)
+            } // upper left
+            if q & 0b0100 != 0 {
+                c.rect(hw, 0, w, hh)
+            } // upper right
+            if q & 0b0010 != 0 {
+                c.rect(0, hh, hw, h)
+            } // lower left
+            if q & 0b0001 != 0 {
+                c.rect(hw, hh, w, h)
+            } // lower right
         }
         _ => {}
     }
@@ -429,8 +481,16 @@ fn draw_braille(c: &mut Canvas, bits: u32) {
     let (w, h) = (c.w, c.h);
     // Dot n (bit n-1) -> (column, row): 1..3 left column rows 0..2, 4..6
     // right column rows 0..2, 7 left row 3, 8 right row 3.
-    const POS: [(usize, usize); 8] =
-        [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
+    const POS: [(usize, usize); 8] = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (0, 3),
+        (1, 3),
+    ];
     let r = (w.min(h) / 8).max(1);
     for (bit, &(col, row)) in POS.iter().enumerate() {
         if bits & (1 << bit) == 0 {
@@ -462,9 +522,9 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
             let fx = x as f32 + 0.5;
             let (filled, outline) = (fx <= edge, (fx - edge).abs() <= t / 2.0);
             let hit = match cp {
-                0xE0B0 => filled,                       // solid right triangle
-                0xE0B1 => outline,                      // right angle line
-                0xE0B2 => (w as f32 - fx) <= edge,      // solid left triangle
+                0xE0B0 => filled,                               // solid right triangle
+                0xE0B1 => outline,                              // right angle line
+                0xE0B2 => (w as f32 - fx) <= edge,              // solid left triangle
                 _ => ((w as f32 - fx) - edge).abs() <= t / 2.0, // left angle line
             };
             if hit {
@@ -496,18 +556,18 @@ fn draw_powerline_ext(c: &mut Canvas, cp: u32) {
             let d_fwd = ((w as f32 - fx) * h as f32 - fy * w as f32).abs() / diag; // `/`
             let (dx, dy) = (fx / w as f32, fy / h as f32);
             let hit = match cp {
-                0xE0B4 => right <= 1.0,                    // solid right semicircle
-                0xE0B5 => (right - 1.0).abs() <= ring,     // right semicircle line
-                0xE0B6 => left <= 1.0,                     // solid left semicircle
-                0xE0B7 => (left - 1.0).abs() <= ring,      // left semicircle line
-                0xE0B8 => dx <= dy,                        // solid lower-left slant
-                0xE0B9 => d_back <= t / 2.0 + 0.5,         // backslash line
-                0xE0BA => dx + dy >= 1.0,                  // solid lower-right slant
-                0xE0BB => d_fwd <= t / 2.0 + 0.5,          // forward-slash line
-                0xE0BC => dx + dy <= 1.0,                  // solid upper-left slant
-                0xE0BD => d_fwd <= t / 2.0 + 0.5,          // forward-slash line
-                0xE0BE => dx >= dy,                        // solid upper-right slant
-                _ => d_back <= t / 2.0 + 0.5,              // 0xE0BF backslash line
+                0xE0B4 => right <= 1.0,                // solid right semicircle
+                0xE0B5 => (right - 1.0).abs() <= ring, // right semicircle line
+                0xE0B6 => left <= 1.0,                 // solid left semicircle
+                0xE0B7 => (left - 1.0).abs() <= ring,  // left semicircle line
+                0xE0B8 => dx <= dy,                    // solid lower-left slant
+                0xE0B9 => d_back <= t / 2.0 + 0.5,     // backslash line
+                0xE0BA => dx + dy >= 1.0,              // solid lower-right slant
+                0xE0BB => d_fwd <= t / 2.0 + 0.5,      // forward-slash line
+                0xE0BC => dx + dy <= 1.0,              // solid upper-left slant
+                0xE0BD => d_fwd <= t / 2.0 + 0.5,      // forward-slash line
+                0xE0BE => dx >= dy,                    // solid upper-right slant
+                _ => d_back <= t / 2.0 + 0.5,          // 0xE0BF backslash line
             };
             if hit {
                 c.set(x, y);
@@ -541,7 +601,10 @@ mod tests {
             b4.iter().filter(|&&p| p != 0).count(),
             b5.iter().filter(|&&p| p != 0).count(),
         );
-        assert!(line > 0 && line < fill, "arc outline thinner than fill: {line} vs {fill}");
+        assert!(
+            line > 0 && line < fill,
+            "arc outline thinner than fill: {line} vs {fill}"
+        );
         // Mirror: solid left semicircle anchors right.
         let b6 = cov('\u{E0B6}', w, h);
         assert!(at(&b6, w, w - 1, h / 2));

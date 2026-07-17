@@ -223,7 +223,11 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let (cfg, parse_warnings) = parse(&text);
-                warnings.extend(parse_warnings.into_iter().map(|w| format!("{}: {}", path.display(), w)));
+                warnings.extend(
+                    parse_warnings
+                        .into_iter()
+                        .map(|w| format!("{}: {}", path.display(), w)),
+                );
                 (cfg, warnings)
             }
             Err(e) if explicit => {
@@ -336,7 +340,9 @@ fn resolve_path(args: &[String]) -> (Option<(PathBuf, bool)>, Vec<String>) {
     if let Some(p) = std::env::var_os("RUSTY_TERM_CONFIG") {
         return (Some((PathBuf::from(p), true)), warnings);
     }
-    let Some(base) = default_config_dir() else { return (None, warnings) };
+    let Some(base) = default_config_dir() else {
+        return (None, warnings);
+    };
     let p = base.join("rusty_term").join("config.toml");
     (p.exists().then_some((p, false)), warnings)
 }
@@ -372,7 +378,10 @@ pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
         std::fs::write(path, Config::template())?;
     }
     if let Some(editor) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) {
-        return std::process::Command::new(editor).arg(path).spawn().map(drop);
+        return std::process::Command::new(editor)
+            .arg(path)
+            .spawn()
+            .map(drop);
     }
     #[cfg(windows)]
     {
@@ -385,11 +394,17 @@ pub fn open_in_editor(path: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(path).spawn().map(drop)
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(drop)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(path).spawn().map(drop)
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(drop)
     }
 }
 
@@ -477,7 +492,9 @@ fn upsert(text: &str, edits: &[SettingEdit]) -> String {
             section = name;
             continue;
         }
-        let Some((k, _)) = trimmed.split_once('=') else { continue };
+        let Some((k, _)) = trimmed.split_once('=') else {
+            continue;
+        };
         let k = k.trim().to_ascii_lowercase().replace('-', "_");
         for (i, e) in edits.iter().enumerate() {
             if !done[i] && e.section == section && e.key == k {
@@ -511,7 +528,10 @@ fn upsert(text: &str, edits: &[SettingEdit]) -> String {
             _ => None,
         })
         .collect();
-    let at = lines.iter().position(|l| header_name(l.trim()).is_some()).unwrap_or(lines.len());
+    let at = lines
+        .iter()
+        .position(|l| header_name(l.trim()).is_some())
+        .unwrap_or(lines.len());
     for (off, &(_, key, v)) in pending.iter().filter(|(s, _, _)| s.is_empty()).enumerate() {
         lines.insert(at + off, format!("{key} = {v}"));
     }
@@ -521,7 +541,10 @@ fn upsert(text: &str, edits: &[SettingEdit]) -> String {
         by_sec.entry(sec).or_default().push((key, v));
     }
     for (sec, items) in by_sec {
-        match lines.iter().position(|l| header_name(l.trim()).as_deref() == Some(sec)) {
+        match lines
+            .iter()
+            .position(|l| header_name(l.trim()).as_deref() == Some(sec))
+        {
             Some(h) => {
                 for (off, (key, v)) in items.iter().enumerate() {
                     lines.insert(h + 1 + off, format!("{key} = {v}"));
@@ -706,8 +729,9 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             if name.eq_ignore_ascii_case("auto") {
                 cfg.theme_auto = true;
             } else {
-                cfg.theme = preset(&name)
-                    .ok_or_else(|| format!("unknown theme `{name}` (try {})", PRESETS.join(", ")))?;
+                cfg.theme = preset(&name).ok_or_else(|| {
+                    format!("unknown theme `{name}` (try {})", PRESETS.join(", "))
+                })?;
             }
         }
         ("", "theme_dark") => {
@@ -833,8 +857,7 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
         ("", "cursor_blink") => cfg.cursor_blink = Some(expect_bool(key, value)?),
         ("", "title") => cfg.title = Some(expect_str(key, value)?),
         ("keys", k) => {
-            let action =
-                parse_action(k).ok_or_else(|| format!("unknown [keys] action `{k}`"))?;
+            let action = parse_action(k).ok_or_else(|| format!("unknown [keys] action `{k}`"))?;
             cfg.keys.set(action, parse_chord(&expect_str(key, value)?)?);
         }
         // `[profile.<name>]` sections collect into named launch profiles.
@@ -843,7 +866,10 @@ fn apply(cfg: &mut Config, section: &str, key: &str, value: Value) -> Result<(),
             let idx = match cfg.profiles.iter().position(|p| p.name == name) {
                 Some(i) => i,
                 None => {
-                    cfg.profiles.push(Profile { name: name.to_string(), ..Profile::default() });
+                    cfg.profiles.push(Profile {
+                        name: name.to_string(),
+                        ..Profile::default()
+                    });
                     cfg.profiles.len() - 1
                 }
             };
@@ -894,7 +920,9 @@ fn parse_cursor_shape(s: &str) -> Result<CursorShape, String> {
         "block" => Ok(CursorShape::Block),
         "underline" | "underscore" => Ok(CursorShape::Underline),
         "bar" | "beam" | "ibeam" | "i-beam" | "line" | "vertical" => Ok(CursorShape::Bar),
-        _ => Err(format!("unknown cursor_style `{s}` (block, underline, or bar)")),
+        _ => Err(format!(
+            "unknown cursor_style `{s}` (block, underline, or bar)"
+        )),
     }
 }
 
@@ -925,9 +953,22 @@ fn expect_color(key: &str, v: Value) -> Result<u32, String> {
 /// (the first being the default). The source of truth for both [`preset`]
 /// resolution and the unknown-theme warning.
 pub const PRESETS: &[&str] = &[
-    "default", "gruvbox-dark", "dracula", "solarized-dark", "solarized-light", "nord", "one-dark",
-    "catppuccin-mocha", "catppuccin-latte", "tokyo-night", "tokyo-night-storm", "monokai",
-    "rose-pine", "github-dark", "kanagawa", "nebula",
+    "default",
+    "gruvbox-dark",
+    "dracula",
+    "solarized-dark",
+    "solarized-light",
+    "nord",
+    "one-dark",
+    "catppuccin-mocha",
+    "catppuccin-latte",
+    "tokyo-night",
+    "tokyo-night-storm",
+    "monokai",
+    "rose-pine",
+    "github-dark",
+    "kanagawa",
+    "nebula",
 ];
 
 /// A built-in theme preset by (case/sep-insensitive) name, or `None`. Colors
@@ -936,7 +977,12 @@ pub const PRESETS: &[&str] = &[
 /// they appear after it in the file.
 pub fn preset(name: &str) -> Option<Theme> {
     let key = name.to_ascii_lowercase().replace(['-', '_', ' '], "");
-    let t = |fg, bg, cursor, palette16| Theme { fg, bg, cursor, palette16 };
+    let t = |fg, bg, cursor, palette16| Theme {
+        fg,
+        bg,
+        cursor,
+        palette16,
+    };
     Some(match key.as_str() {
         "default" => Theme::default(),
         "gruvboxdark" | "gruvbox" => t(
@@ -1085,7 +1131,9 @@ pub fn preset(name: &str) -> Option<Theme> {
 impl Config {
     /// The named profile, if defined (case-insensitive).
     pub fn profile(&self, name: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+        self.profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
     }
 
     /// Layer the named `[profile.<name>]` bundle onto `self` (shell/cwd/theme,
@@ -1121,7 +1169,10 @@ impl Config {
 /// malformed lines warn and are skipped, never fatal.
 pub fn load_session(path: &std::path::Path) -> (Vec<SessionTab>, Vec<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (Vec::new(), vec![format!("session file {} is unreadable", path.display())]);
+        return (
+            Vec::new(),
+            vec![format!("session file {} is unreadable", path.display())],
+        );
     };
     let mut tabs: Vec<SessionTab> = Vec::new();
     let mut warnings = Vec::new();
@@ -1258,7 +1309,10 @@ color15 = "ffffff"
         assert_eq!(dev.shell.as_deref(), Some("/usr/bin/fish"));
         assert_eq!(dev.cwd.as_deref(), Some(std::path::Path::new("/src")));
         assert!(dev.theme.is_some());
-        assert_eq!(cfg.profile("ops").unwrap().shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(
+            cfg.profile("ops").unwrap().shell.as_deref(),
+            Some("/bin/bash")
+        );
         // Unknown profile keys warn without dropping the profile.
         let (cfg2, warns2) = parse("[profile.x]\nshell = \"sh\"\nbogus = 1\n");
         assert_eq!(warns2.len(), 1);
@@ -1289,7 +1343,10 @@ color15 = "ffffff"
         assert!(warns.is_empty());
         let before = cfg.shell.clone();
         let w = cfg.apply_profile("does-not-exist");
-        assert_eq!(w, Some("no profile named `does-not-exist` in the config".to_string()));
+        assert_eq!(
+            w,
+            Some("no profile named `does-not-exist` in the config".to_string())
+        );
         assert_eq!(cfg.shell, before);
     }
 
@@ -1499,12 +1556,28 @@ color15 = "ffffff"
         use crate::keymap::{Action, Chord, Key};
         let (cfg, warns) = parse("[keys]\ncopy = \"Ctrl+Alt+C\"\nnew_tab = \"Ctrl+Shift+N\"\n");
         assert!(warns.is_empty(), "{warns:?}");
-        assert_eq!(cfg.keys.action(Chord::new(true, false, true, Key::Char('c'))), Some(Action::Copy));
-        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('n'))), Some(Action::NewTab));
+        assert_eq!(
+            cfg.keys
+                .action(Chord::new(true, false, true, Key::Char('c'))),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            cfg.keys
+                .action(Chord::new(true, true, false, Key::Char('n'))),
+            Some(Action::NewTab)
+        );
         // The rebound action vacated its default chord.
-        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('c'))), None);
+        assert_eq!(
+            cfg.keys
+                .action(Chord::new(true, true, false, Key::Char('c'))),
+            None
+        );
         // Untouched defaults still resolve.
-        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('v'))), Some(Action::Paste));
+        assert_eq!(
+            cfg.keys
+                .action(Chord::new(true, true, false, Key::Char('v'))),
+            Some(Action::Paste)
+        );
     }
 
     #[test]
@@ -1513,7 +1586,11 @@ color15 = "ffffff"
         let (cfg, warns) = parse("[keys]\nbogus = \"Ctrl+C\"\ncopy = \"Ctrl+Nope\"\n");
         assert_eq!(warns.len(), 2); // unknown action + malformed chord
         // Both lines were rejected, so the defaults are intact.
-        assert_eq!(cfg.keys.action(Chord::new(true, true, false, Key::Char('c'))), Some(Action::Copy));
+        assert_eq!(
+            cfg.keys
+                .action(Chord::new(true, true, false, Key::Char('c'))),
+            Some(Action::Copy)
+        );
     }
 
     #[test]
@@ -1546,9 +1623,15 @@ color15 = "ffffff"
     #[test]
     fn cli_flag_resolves_explicit_path() {
         let args = vec!["--config".to_string(), "x.toml".to_string()];
-        assert_eq!(resolve_path(&args), (Some((PathBuf::from("x.toml"), true)), Vec::new()));
+        assert_eq!(
+            resolve_path(&args),
+            (Some((PathBuf::from("x.toml"), true)), Vec::new())
+        );
         let args = vec!["--config=y.toml".to_string()];
-        assert_eq!(resolve_path(&args), (Some((PathBuf::from("y.toml"), true)), Vec::new()));
+        assert_eq!(
+            resolve_path(&args),
+            (Some((PathBuf::from("y.toml"), true)), Vec::new())
+        );
     }
 
     #[test]
@@ -1673,13 +1756,21 @@ color15 = "ffffff"
 
     #[test]
     fn toml_string_escapes_path_separators() {
-        assert_eq!(toml_string(r"C:\PowerShell\pwsh.exe"), r#""C:\\PowerShell\\pwsh.exe""#);
+        assert_eq!(
+            toml_string(r"C:\PowerShell\pwsh.exe"),
+            r#""C:\\PowerShell\\pwsh.exe""#
+        );
         assert_eq!(toml_string("a\"b"), r#""a\"b""#);
     }
 
     #[test]
     fn upsert_replaces_existing_top_level_key_keeping_the_rest() {
-        let edits = [SettingEdit { section: "", key: "scrollback", value: Some("5000".into()), insert: true }];
+        let edits = [SettingEdit {
+            section: "",
+            key: "scrollback",
+            value: Some("5000".into()),
+            insert: true,
+        }];
         let out = upsert("# hi\nscrollback = 10000\nshell = \"pwsh\"\n", &edits);
         assert!(out.contains("scrollback = 5000"));
         assert!(out.contains("# hi"), "comment preserved");
@@ -1689,14 +1780,27 @@ color15 = "ffffff"
 
     #[test]
     fn upsert_inserts_top_level_before_first_section() {
-        let edits = [SettingEdit { section: "", key: "theme", value: Some(toml_string("nord")), insert: true }];
+        let edits = [SettingEdit {
+            section: "",
+            key: "theme",
+            value: Some(toml_string("nord")),
+            insert: true,
+        }];
         let out = upsert("[window]\nfont_size = 18\n", &edits);
-        assert!(out.find("theme = ").unwrap() < out.find("[window]").unwrap(), "key precedes header");
+        assert!(
+            out.find("theme = ").unwrap() < out.find("[window]").unwrap(),
+            "key precedes header"
+        );
     }
 
     #[test]
     fn upsert_inserts_into_existing_section() {
-        let edits = [SettingEdit { section: "window", key: "ligatures", value: Some("false".into()), insert: true }];
+        let edits = [SettingEdit {
+            section: "window",
+            key: "ligatures",
+            value: Some("false".into()),
+            insert: true,
+        }];
         let (cfg, warns) = parse(&upsert("[window]\nfont_size = 18\n", &edits));
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.ligatures, Some(false));
@@ -1705,7 +1809,12 @@ color15 = "ffffff"
 
     #[test]
     fn upsert_creates_missing_section() {
-        let edits = [SettingEdit { section: "window", key: "font_size", value: Some("20".into()), insert: true }];
+        let edits = [SettingEdit {
+            section: "window",
+            key: "font_size",
+            value: Some("20".into()),
+            insert: true,
+        }];
         let (cfg, warns) = parse(&upsert("shell = \"pwsh\"\n", &edits));
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.font_size, Some(20.0));
@@ -1714,14 +1823,33 @@ color15 = "ffffff"
 
     #[test]
     fn upsert_without_insert_skips_absent_but_updates_present() {
-        let edit = |insert| [SettingEdit { section: "", key: "scrollback", value: Some("10000".into()), insert }];
-        assert_eq!(upsert("shell = \"pwsh\"\n", &edit(false)), "shell = \"pwsh\"\n", "absent key left out");
-        assert!(upsert("scrollback = 50\n", &edit(false)).contains("scrollback = 10000"), "present updated");
+        let edit = |insert| {
+            [SettingEdit {
+                section: "",
+                key: "scrollback",
+                value: Some("10000".into()),
+                insert,
+            }]
+        };
+        assert_eq!(
+            upsert("shell = \"pwsh\"\n", &edit(false)),
+            "shell = \"pwsh\"\n",
+            "absent key left out"
+        );
+        assert!(
+            upsert("scrollback = 50\n", &edit(false)).contains("scrollback = 10000"),
+            "present updated"
+        );
     }
 
     #[test]
     fn upsert_removes_key_when_value_is_none() {
-        let edits = [SettingEdit { section: "", key: "shell", value: None, insert: false }];
+        let edits = [SettingEdit {
+            section: "",
+            key: "shell",
+            value: None,
+            insert: false,
+        }];
         // An existing line is dropped...
         let out = upsert("shell = \"pwsh\"\nscrollback = 50\n", &edits);
         assert!(!out.contains("shell"), "shell line removed: {out:?}");
@@ -1733,9 +1861,24 @@ color15 = "ffffff"
     #[test]
     fn upsert_round_trips_through_parse() {
         let edits = [
-            SettingEdit { section: "", key: "theme", value: Some(toml_string("gruvbox-dark")), insert: true },
-            SettingEdit { section: "", key: "cursor_blink", value: Some("true".into()), insert: true },
-            SettingEdit { section: "window", key: "font_size", value: Some("16".into()), insert: true },
+            SettingEdit {
+                section: "",
+                key: "theme",
+                value: Some(toml_string("gruvbox-dark")),
+                insert: true,
+            },
+            SettingEdit {
+                section: "",
+                key: "cursor_blink",
+                value: Some("true".into()),
+                insert: true,
+            },
+            SettingEdit {
+                section: "window",
+                key: "font_size",
+                value: Some("16".into()),
+                insert: true,
+            },
         ];
         let (cfg, warns) = parse(&upsert("", &edits));
         assert!(warns.is_empty(), "{warns:?}");

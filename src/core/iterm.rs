@@ -35,7 +35,9 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
     let mut target_rows = None;
     let mut preserve_aspect = true;
     for kv in args.split(';') {
-        let Some((k, v)) = kv.split_once('=') else { continue };
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
         match k {
             "inline" => inline = v == "1",
             "width" => target_cols = resolve_dimension(v, g.cols, g.cell_px.map(|(w, _)| w)),
@@ -57,8 +59,11 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
     // GIF first: it may be animated, which takes its own multi-frame path.
     if file.starts_with(b"GIF8") {
         if let Some(g_img) = gif::decode(&file) {
-            let frames: Vec<(Vec<Option<u32>>, u32)> =
-                g_img.frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect();
+            let frames: Vec<(Vec<Option<u32>>, u32)> = g_img
+                .frames
+                .into_iter()
+                .map(|f| (f.pixels, f.delay_ms))
+                .collect();
             #[cfg(any(test, feature = "gui"))]
             g.render_animated_image(
                 g_img.width,
@@ -117,7 +122,11 @@ pub(crate) fn feed(text: &str, g: &mut Grid) {
 /// where no real pixel size is ours to report, so a pixel hint can't be
 /// resolved and falls back to "unset"/auto). `auto` is `None` too — iTerm2's
 /// own spelling for "use the image's natural size here".
-pub(crate) fn resolve_dimension(spec: &str, axis_cells: usize, axis_cell_px: Option<u16>) -> Option<usize> {
+pub(crate) fn resolve_dimension(
+    spec: &str,
+    axis_cells: usize,
+    axis_cell_px: Option<u16>,
+) -> Option<usize> {
     if let Some(pct) = spec.strip_suffix('%') {
         let p: f64 = pct.parse().ok()?;
         return Some(((axis_cells as f64 * p / 100.0).round().max(1.0)) as usize);

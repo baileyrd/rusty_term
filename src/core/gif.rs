@@ -64,7 +64,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Gif> {
 
     loop {
         match data.get(i) {
-            None => break, // truncated after a good frame: keep what we have
+            None => break,       // truncated after a good frame: keep what we have
             Some(0x3B) => break, // trailer
             Some(0x21) => {
                 // Extension: label + sub-blocks. Only the graphic-control
@@ -131,7 +131,10 @@ pub(crate) fn decode(data: &[u8]) -> Option<Gif> {
                         canvas[y * width + x] = Some(c);
                     }
                 }
-                frames.push(Frame { pixels: canvas.clone(), delay_ms });
+                frames.push(Frame {
+                    pixels: canvas.clone(),
+                    delay_ms,
+                });
                 if frames.len() >= MAX_FRAMES {
                     break;
                 }
@@ -158,7 +161,15 @@ pub(crate) fn decode(data: &[u8]) -> Option<Gif> {
 }
 
 fn frames_or_none(width: usize, height: usize, frames: Vec<Frame>) -> Option<Gif> {
-    if frames.is_empty() { None } else { Some(Gif { width, height, frames }) }
+    if frames.is_empty() {
+        None
+    } else {
+        Some(Gif {
+            width,
+            height,
+            frames,
+        })
+    }
 }
 
 /// Read `n` RGB triples at `data[at..]` into `0xRRGGBB` colors.

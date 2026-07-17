@@ -104,9 +104,9 @@ pub(crate) fn shape_row(text: &[char]) -> Option<Vec<char>> {
         let fwd = matches!(t, Joining::L | Joining::D)
             && matches!(next, Some(Joining::D | Joining::R | Joining::C));
         let f = match (back, fwd) {
-            (true, true) => 3,  // medial
-            (true, false) => 1, // final
-            (false, true) => 2, // initial
+            (true, true) => 3,   // medial
+            (true, false) => 1,  // final
+            (false, true) => 2,  // initial
             (false, false) => 0, // isolated
         };
         // Isolated substitution is a no-op visually for most fonts, but the

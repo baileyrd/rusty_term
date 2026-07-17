@@ -31,25 +31,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use std::path::PathBuf;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, KeyLocation, ModifiersState, PhysicalKey};
-use std::path::PathBuf;
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, Window, WindowId};
 
+use super::font::{self, FontCache, GlyphSource};
+use super::layout::{Dir, Layout, Rect};
+use super::render::{CpuRenderer, PaneFrame, Renderer};
+use super::settings::{CATEGORIES, Field, Settings, Widget};
 use crate::backend::{Backend, BackendHandle};
 use crate::config::{ClipboardPolicy, Config, LaunchMode};
 use crate::core::{
     ATTR_BOLD, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, AnsiParser, Cell, Grid, Selection, Theme,
     WIDE_TRAILER, char_width,
 };
-use crate::keymap::{Action, Chord};
 use crate::gui::mouse::{MouseButtonKind, MouseEvent, MousePoint, SgrEncoder};
-use super::font::{self, FontCache, GlyphSource};
-use super::layout::{Dir, Layout, Rect};
-use super::render::{CpuRenderer, PaneFrame, Renderer};
-use super::settings::{CATEGORIES, Field, Settings, Widget};
+use crate::keymap::{Action, Chord};
 
 /// Built-in defaults, overridable via the config file (`[window]` section).
 const FONT_PX: f32 = 18.0;
@@ -123,7 +123,8 @@ pub(crate) enum UserEvent {
     ConfigChanged,
     /// A control-socket request (`--single-instance` / `rusty_term ctl`),
     /// with the channel its connection thread waits on for the reply.
-    #[cfg_attr(windows, allow(dead_code))] // constructed once the Windows named-pipe transport lands (G31)
+    #[cfg_attr(windows, allow(dead_code))]
+    // constructed once the Windows named-pipe transport lands (G31)
     Control(super::control::CtlCommand, std::sync::mpsc::Sender<String>),
 }
 
@@ -263,13 +264,17 @@ pub fn run(backend: &dyn Backend, config: &Config) -> Result<(), Box<dyn std::er
     // registered until the loop below runs on this thread, so just remember
     // it here; a bad spec warns and the app runs on without a hotkey.
     #[cfg(windows)]
-    let quake_hotkey = config.quake_hotkey.as_ref().and_then(|spec| match super::hotkey::parse(spec) {
-        Ok(hk) => Some(hk),
-        Err(e) => {
-            eprintln!("rusty_term: quake_hotkey `{spec}`: {e}");
-            None
-        }
-    });
+    let quake_hotkey =
+        config
+            .quake_hotkey
+            .as_ref()
+            .and_then(|spec| match super::hotkey::parse(spec) {
+                Ok(hk) => Some(hk),
+                Err(e) => {
+                    eprintln!("rusty_term: quake_hotkey `{spec}`: {e}");
+                    None
+                }
+            });
     #[cfg(windows)]
     let hotkey_pressed = quake_hotkey.map(|_| std::rc::Rc::new(std::cell::Cell::new(false)));
     #[cfg(windows)]
@@ -592,7 +597,14 @@ impl WindowState<'_> {
         let reader_parser = Arc::clone(&parser);
         let reader_proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            reader_loop(id, read_handle, reply_handle, reader_grid, reader_proxy, reader_parser)
+            reader_loop(
+                id,
+                read_handle,
+                reply_handle,
+                reader_grid,
+                reader_proxy,
+                reader_parser,
+            )
         });
 
         // Child-exit watcher (Windows ConPTY: the output pipe only EOFs at
@@ -605,7 +617,12 @@ impl WindowState<'_> {
                 let _ = exit_proxy.send_event(UserEvent::Exit(id));
             });
         }
-        Ok(Pane { id, grid, parser, writer: handle })
+        Ok(Pane {
+            id,
+            grid,
+            parser,
+            writer: handle,
+        })
     }
 
     /// The active tab's focused pane's cwd, as last reported via OSC 7 —
@@ -635,7 +652,9 @@ impl WindowState<'_> {
     /// Spawn a tab from a profile: its shell/cwd/theme, top-level config for
     /// anything the profile leaves unset.
     fn spawn_tab_profile(&mut self, i: usize) -> Result<(), std::io::Error> {
-        let Some(p) = self.config.profiles.get(i).cloned() else { return Ok(()) };
+        let Some(p) = self.config.profiles.get(i).cloned() else {
+            return Ok(());
+        };
         self.spawn_tab_opts(p.shell, &[], p.cwd, p.theme)
     }
 
@@ -651,8 +670,15 @@ impl WindowState<'_> {
             CtlCommand::NewWindow { .. } | CtlCommand::Quake => {
                 "err window-level command not routed\n".to_string()
             }
-            CtlCommand::NewTab { cwd, profile, shell } => {
-                let p = profile.as_deref().and_then(|n| self.config.profile(n)).cloned();
+            CtlCommand::NewTab {
+                cwd,
+                profile,
+                shell,
+            } => {
+                let p = profile
+                    .as_deref()
+                    .and_then(|n| self.config.profile(n))
+                    .cloned();
                 if profile.is_some() && p.is_none() {
                     return format!("err no profile named `{}`\n", profile.unwrap_or_default());
                 }
@@ -680,8 +706,10 @@ impl WindowState<'_> {
             CtlCommand::ListTabs => {
                 let mut out = String::new();
                 for (i, tab) in self.tabs.iter().enumerate() {
-                    let title =
-                        tab.focused().map(|p| p.grid.lock().title.clone()).unwrap_or_default();
+                    let title = tab
+                        .focused()
+                        .map(|p| p.grid.lock().title.clone())
+                        .unwrap_or_default();
                     let marker = if i == self.active { "*" } else { " " };
                     out.push_str(&format!("{i}\t{marker}\t{title}\n"));
                 }
@@ -704,11 +732,12 @@ impl WindowState<'_> {
     /// Spawn one session-file tab: profile defaults, then the tab's own
     /// cwd/command overrides, then its splits (each split pane runs the same
     /// shell and inherits the tab's cwd).
-    fn spawn_session_tab(
-        &mut self,
-        t: &crate::config::SessionTab,
-    ) -> Result<(), std::io::Error> {
-        let profile = t.profile.as_deref().and_then(|n| self.config.profile(n)).cloned();
+    fn spawn_session_tab(&mut self, t: &crate::config::SessionTab) -> Result<(), std::io::Error> {
+        let profile = t
+            .profile
+            .as_deref()
+            .and_then(|n| self.config.profile(n))
+            .cloned();
         if t.profile.is_some() && profile.is_none() {
             eprintln!(
                 "rusty_term: session: no profile named `{}`",
@@ -728,7 +757,11 @@ impl WindowState<'_> {
         let cwd = t.cwd.clone().or_else(|| profile.cwd.clone());
         self.spawn_tab_opts(shell, &args, cwd.clone(), profile.theme)?;
         for split in &t.splits {
-            let dir = if split == "right" { Dir::Vertical } else { Dir::Horizontal };
+            let dir = if split == "right" {
+                Dir::Vertical
+            } else {
+                Dir::Horizontal
+            };
             self.split_pane_with(dir, profile.shell.clone(), cwd.clone(), profile.theme);
         }
         Ok(())
@@ -757,10 +790,17 @@ impl WindowState<'_> {
         // An explicit cwd (profile/session) wins; else the focused pane's
         // cwd (so a new tab follows where the user navigated to); the launch
         // `--cwd` is the final fallback.
-        let cwd =
-            cwd.or_else(|| self.focused_pane_cwd()).or_else(|| self.config.cwd.clone());
-        let pane =
-            self.new_pane(self.cols, self.rows, shell.as_deref(), &args, cwd.as_deref(), theme)?;
+        let cwd = cwd
+            .or_else(|| self.focused_pane_cwd())
+            .or_else(|| self.config.cwd.clone());
+        let pane = self.new_pane(
+            self.cols,
+            self.rows,
+            shell.as_deref(),
+            &args,
+            cwd.as_deref(),
+            theme,
+        )?;
         let focus = pane.id;
         self.tabs.push(Tab {
             panes: vec![pane],
@@ -794,9 +834,14 @@ impl WindowState<'_> {
         theme: Option<Theme>,
     ) {
         let shell = shell.or_else(|| self.config.shell.clone());
-        let Ok(pane) =
-            self.new_pane(self.cols.max(1), self.rows.max(1), shell.as_deref(), &[], cwd.as_deref(), theme)
-        else {
+        let Ok(pane) = self.new_pane(
+            self.cols.max(1),
+            self.rows.max(1),
+            shell.as_deref(),
+            &[],
+            cwd.as_deref(),
+            theme,
+        ) else {
             return;
         };
         let new_id = pane.id;
@@ -834,7 +879,10 @@ impl WindowState<'_> {
             let mut g = p.grid.lock();
             let cur = (g.cursor.0.min(g.cols.saturating_sub(1)), g.cursor.1);
             let abs = g.abs_of_view_row(cur.1);
-            g.selection = Some(Selection { anchor: (cur.0, abs), head: (cur.0, abs) });
+            g.selection = Some(Selection {
+                anchor: (cur.0, abs),
+                head: (cur.0, abs),
+            });
             cur
         };
         self.copy_mode = Some(CopyMode { cur, anchor: None });
@@ -847,7 +895,9 @@ impl WindowState<'_> {
     /// was consumed (always, while active — copy mode owns the keyboard).
     fn copy_mode_key(&mut self, event: &KeyEvent) -> bool {
         use winit::keyboard::{Key, NamedKey};
-        let Some(mut cm) = self.copy_mode.take() else { return false };
+        let Some(mut cm) = self.copy_mode.take() else {
+            return false;
+        };
         let Some(p) = self.pane() else { return false };
         let mut exit = false;
         let mut yank = false;
@@ -855,13 +905,21 @@ impl WindowState<'_> {
             let mut g = p.grid.lock();
             let (cols, rows) = (g.cols, g.rows);
             let mv = |cm: &mut CopyMode, dc: isize, dr: isize, g: &mut Grid| {
-                cm.cur.0 = cm.cur.0.saturating_add_signed(dc).min(cols.saturating_sub(1));
+                cm.cur.0 = cm
+                    .cur
+                    .0
+                    .saturating_add_signed(dc)
+                    .min(cols.saturating_sub(1));
                 if dr < 0 && cm.cur.1 == 0 {
                     g.scroll_view_up(dr.unsigned_abs()); // keep moving into history
                 } else if dr > 0 && cm.cur.1 + 1 >= rows {
                     g.scroll_view_down(dr as usize);
                 } else {
-                    cm.cur.1 = cm.cur.1.saturating_add_signed(dr).min(rows.saturating_sub(1));
+                    cm.cur.1 = cm
+                        .cur
+                        .1
+                        .saturating_add_signed(dr)
+                        .min(rows.saturating_sub(1));
                 }
             };
             match &event.logical_key {
@@ -916,7 +974,11 @@ impl WindowState<'_> {
             // Publish the selection: anchor..cursor, or the bare cursor cell.
             let head = (cm.cur.0, g.abs_of_view_row(cm.cur.1));
             let anchor = cm.anchor.unwrap_or(head);
-            g.selection = if exit && !yank { None } else { Some(Selection { anchor, head }) };
+            g.selection = if exit && !yank {
+                None
+            } else {
+                Some(Selection { anchor, head })
+            };
         }
         if yank {
             self.copy_selection();
@@ -942,10 +1004,19 @@ impl WindowState<'_> {
     /// pane's edge, by center distance. No wrap.
     fn focus_dir(&mut self, dx: isize, dy: isize) {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let rects = tab.rects(area);
-        let Some(&(_, f)) = rects.iter().find(|(id, _)| *id == tab.focus) else { return };
-        let center = |r: &Rect| (r.col as isize * 2 + r.cols as isize, r.row as isize * 2 + r.rows as isize);
+        let Some(&(_, f)) = rects.iter().find(|(id, _)| *id == tab.focus) else {
+            return;
+        };
+        let center = |r: &Rect| {
+            (
+                r.col as isize * 2 + r.cols as isize,
+                r.row as isize * 2 + r.rows as isize,
+            )
+        };
         let (fcx, fcy) = center(&f);
         let best = rects
             .iter()
@@ -974,7 +1045,9 @@ impl WindowState<'_> {
     /// there is no visible boundary to move.
     fn resize_pane(&mut self, dir: Dir, delta: f32) {
         let ti = self.active;
-        let Some(tab) = self.tabs.get_mut(ti) else { return };
+        let Some(tab) = self.tabs.get_mut(ti) else {
+            return;
+        };
         if tab.zoomed || !tab.layout.resize(tab.focus, dir, delta) {
             return;
         }
@@ -988,7 +1061,9 @@ impl WindowState<'_> {
     /// toggled back (or the pane set changes).
     fn toggle_zoom(&mut self) {
         let ti = self.active;
-        let Some(tab) = self.tabs.get_mut(ti) else { return };
+        let Some(tab) = self.tabs.get_mut(ti) else {
+            return;
+        };
         if tab.panes.len() < 2 {
             return; // a single pane already has the whole area
         }
@@ -1002,7 +1077,11 @@ impl WindowState<'_> {
     /// Close pane `id`: collapse its split into the sibling, or close the whole
     /// tab when it was the last pane. Idempotent for stale exit events.
     fn close_pane(&mut self, id: u64) {
-        let Some(ti) = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id)) else {
+        let Some(ti) = self
+            .tabs
+            .iter()
+            .position(|t| t.panes.iter().any(|p| p.id == id))
+        else {
             return;
         };
         let tab = &mut self.tabs[ti];
@@ -1058,7 +1137,12 @@ impl WindowState<'_> {
     /// The cell area the tab's panes tile: the full grid minus the command
     /// dock (which sits at the right edge, behind a one-cell divider).
     fn pane_area(&self) -> Rect {
-        Rect::new(0, 0, (self.cols as usize).saturating_sub(self.dock_cols()), self.rows as usize)
+        Rect::new(
+            0,
+            0,
+            (self.cols as usize).saturating_sub(self.dock_cols()),
+            self.rows as usize,
+        )
     }
 
     fn layout_panes(&mut self, ti: usize) {
@@ -1107,7 +1191,8 @@ impl WindowState<'_> {
         let divider = mix(self.theme.bg, self.theme.fg, 60);
         if self.overlay.is_some() {
             let page = self.build_overlay_grid();
-            let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref()) else {
+            let (Some(renderer), Some(window)) = (self.renderer.as_mut(), self.window.as_ref())
+            else {
                 return;
             };
             let size = window.inner_size();
@@ -1145,9 +1230,8 @@ impl WindowState<'_> {
                 let g = p.grid.lock();
                 build_dock_grid(&g, &self.theme, DOCK_CELLS, self.rows as usize)
             });
-            let (grid, items) = built.unwrap_or_else(|| {
-                (Grid::new(DOCK_CELLS, self.rows as usize), Vec::new())
-            });
+            let (grid, items) =
+                built.unwrap_or_else(|| (Grid::new(DOCK_CELLS, self.rows as usize), Vec::new()));
             self.dock_items = items;
             Some(grid)
         } else {
@@ -1176,7 +1260,11 @@ impl WindowState<'_> {
         if let Some(p) = tab.focused() {
             let g = p.grid.lock();
             let fallback = self.config.title.as_deref().unwrap_or("rusty_term");
-            window.set_title(if g.title.is_empty() { fallback } else { &g.title });
+            window.set_title(if g.title.is_empty() {
+                fallback
+            } else {
+                &g.title
+            });
             #[cfg(windows)]
             if let Some(hwnd) = hwnd {
                 super::taskbar::sync(hwnd, g.progress);
@@ -1203,7 +1291,11 @@ impl WindowState<'_> {
                 let cur = (g.cursor_visible && g.view_offset == 0).then_some(g.cursor);
                 match (self.cursor_prev, cur) {
                     (Some((pid, prev)), Some(cur)) if pid == focus && prev != cur => {
-                        self.trail = Some(Trail { from: prev, to: cur, since: now });
+                        self.trail = Some(Trail {
+                            from: prev,
+                            to: cur,
+                            since: now,
+                        });
                     }
                     _ => {}
                 }
@@ -1235,7 +1327,11 @@ impl WindowState<'_> {
                 row0: r.row + 1,
                 focused: *foc,
                 cursor_on: blink,
-                trail: if *foc { std::mem::take(&mut ghosts) } else { Vec::new() },
+                trail: if *foc {
+                    std::mem::take(&mut ghosts)
+                } else {
+                    Vec::new()
+                },
                 hover_link: if *foc { self.hover_link } else { None },
                 marks: if marks_on {
                     g.viewport_block_marks()
@@ -1286,7 +1382,9 @@ impl WindowState<'_> {
         self.tabs.iter().find_map(|t| t.pane(id))
     }
     fn pane_by_id_mut(&mut self, id: u64) -> Option<&mut Pane> {
-        self.tabs.iter_mut().find_map(|t| t.panes.iter_mut().find(|p| p.id == id))
+        self.tabs
+            .iter_mut()
+            .find_map(|t| t.panes.iter_mut().find(|p| p.id == id))
     }
 
     /// Lay out the chrome bar for the current tabs/size: tab labels and the
@@ -1298,7 +1396,11 @@ impl WindowState<'_> {
     /// the edge), while controls lay out within `layout` whole cells so the
     /// caption buttons reach the right edge without being cut.
     fn bar_cells(&self) -> (usize, usize) {
-        let px = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0) as usize;
+        let px = self
+            .window
+            .as_ref()
+            .map(|w| w.inner_size().width)
+            .unwrap_or(0) as usize;
         if px == 0 || self.cell_w == 0 {
             let c = self.cols as usize;
             return (c, c);
@@ -1333,7 +1435,13 @@ impl WindowState<'_> {
         let Some(pane) = self.pane() else { return row };
         let (cwd, last_exit, view_offset, gcols, grows) = {
             let g = pane.grid.lock();
-            (g.cwd.clone(), g.last_command_exit(), g.view_offset, g.cols, g.rows)
+            (
+                g.cwd.clone(),
+                g.last_command_exit(),
+                g.view_offset,
+                g.cols,
+                g.rows,
+            )
         };
         let cwd = path_from_file_uri(&cwd);
         let branch = cwd.as_deref().and_then(|d| self.git_branch_for(d));
@@ -1369,15 +1477,42 @@ impl WindowState<'_> {
                 let tail: String = text.chars().skip(count - (avail - 1)).collect();
                 text = format!("\u{2026}{tail}");
             }
-            put_text(&mut row, &mut hits, &mut col, limit, &format!(" {text}"), self.theme.fg, bar_bg, Hit::Drag);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut col,
+                limit,
+                &format!(" {text}"),
+                self.theme.fg,
+                bar_bg,
+                Hit::Drag,
+            );
             if let Some(b) = &branch {
                 let accent = self.theme.cursor;
-                put_text(&mut row, &mut hits, &mut col, limit, &format!("  \u{2387} {b}"), accent, bar_bg, Hit::Drag);
+                put_text(
+                    &mut row,
+                    &mut hits,
+                    &mut col,
+                    limit,
+                    &format!("  \u{2387} {b}"),
+                    accent,
+                    bar_bg,
+                    Hit::Drag,
+                );
             }
         }
         let mut rcol = cols.saturating_sub(right_len);
         for (text, color) in &right {
-            put_text(&mut row, &mut hits, &mut rcol, cols, text, *color, bar_bg, Hit::Drag);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut rcol,
+                cols,
+                text,
+                *color,
+                bar_bg,
+                Hit::Drag,
+            );
         }
         row
     }
@@ -1415,10 +1550,32 @@ impl WindowState<'_> {
             let limit = cols.saturating_sub(count.chars().count());
             let mut hits = vec![Hit::Drag; paint_cols];
             let mut col = 0;
-            let mode = if self.search_regex { " Find(re): " } else { " Find: " };
-            put_text(&mut row, &mut hits, &mut col, limit, &format!("{mode}{query}"), self.theme.fg, bar_bg, Hit::Drag);
+            let mode = if self.search_regex {
+                " Find(re): "
+            } else {
+                " Find: "
+            };
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut col,
+                limit,
+                &format!("{mode}{query}"),
+                self.theme.fg,
+                bar_bg,
+                Hit::Drag,
+            );
             let mut ccol = limit;
-            put_text(&mut row, &mut hits, &mut ccol, cols, &count, self.theme.fg, bar_bg, Hit::Drag);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut ccol,
+                cols,
+                &count,
+                self.theme.fg,
+                bar_bg,
+                Hit::Drag,
+            );
             self.hits = hits;
             return row;
         }
@@ -1472,9 +1629,11 @@ impl WindowState<'_> {
         // inactive behind it. The chip's room comes off the tab budget.
         let settings_open = matches!(self.overlay, Some(Overlay::Settings(_)));
         const SETTINGS_TAB_W: usize = 12; // " Settings" + " × "
-        let tab_limit = btn0
-            .saturating_sub(8)
-            .saturating_sub(if settings_open { SETTINGS_TAB_W + 1 } else { 0 });
+        let tab_limit = btn0.saturating_sub(8).saturating_sub(if settings_open {
+            SETTINGS_TAB_W + 1
+        } else {
+            0
+        });
 
         // The active tab of a focused window is being watched; its badge is
         // stale by definition. (Cleared before labels are gathered below.)
@@ -1499,14 +1658,22 @@ impl WindowState<'_> {
                     (g.title.clone(), g.progress)
                 });
                 let (label, progress) = state.unwrap_or_default();
-                let title = if label.is_empty() { format!("shell {}", i + 1) } else { label };
+                let title = if label.is_empty() {
+                    format!("shell {}", i + 1)
+                } else {
+                    label
+                };
                 let suffix = match progress {
                     Some((2 | 4, pct)) => format!(" !{pct}%"),
                     Some((3, _)) => " …".to_string(),
                     Some((_, pct)) => format!(" {pct}%"),
                     None => String::new(),
                 };
-                let cast = if i == self.active && self.broadcast { "⇉ " } else { "" };
+                let cast = if i == self.active && self.broadcast {
+                    "⇉ "
+                } else {
+                    ""
+                };
                 (format!(" {cast}{title}{suffix}"), tab.attention)
             })
             .collect();
@@ -1527,11 +1694,18 @@ impl WindowState<'_> {
             None => {
                 let strip = tab_limit.saturating_sub(OVERFLOW_INDICATOR_W);
                 let (start, end) = visible_tab_range(self.active, self.tabs.len(), strip);
-                (start, vec![TAB_CELLS; end - start], self.tabs.len() - (end - start))
+                (
+                    start,
+                    vec![TAB_CELLS; end - start],
+                    self.tabs.len() - (end - start),
+                )
             }
         };
-        let strip_limit =
-            if hidden > 0 { tab_limit.saturating_sub(OVERFLOW_INDICATOR_W) } else { tab_limit };
+        let strip_limit = if hidden > 0 {
+            tab_limit.saturating_sub(OVERFLOW_INDICATOR_W)
+        } else {
+            tab_limit
+        };
 
         let mut col = 0usize;
         for (vi, &w) in widths.iter().enumerate() {
@@ -1567,7 +1741,11 @@ impl WindowState<'_> {
             // clicked to switch. Width still reserves its cells, so the label
             // doesn't reflow when the × appears.
             let has_close = (is_active || tab_hovered) && tab_end - col > close_w + 1;
-            let label_end = if has_close { tab_end - close_w } else { tab_end - close_w.min(tab_end - col) };
+            let label_end = if has_close {
+                tab_end - close_w
+            } else {
+                tab_end - close_w.min(tab_end - col)
+            };
             // A title that doesn't fit ends in an ellipsis, not a hard cut.
             let badge_w = if attention { 2 } else { 0 };
             let space = label_end.saturating_sub(col + badge_w);
@@ -1589,9 +1767,27 @@ impl WindowState<'_> {
             let mut tcol = col + lead;
             if attention {
                 let alert = self.theme.palette16[1]; // ANSI red
-                put_text(&mut row, &mut hits, &mut tcol, label_end, " •", alert, bg, Hit::Tab(i));
+                put_text(
+                    &mut row,
+                    &mut hits,
+                    &mut tcol,
+                    label_end,
+                    " •",
+                    alert,
+                    bg,
+                    Hit::Tab(i),
+                );
             }
-            put_text(&mut row, &mut hits, &mut tcol, label_end, &shown, fg, bg, Hit::Tab(i));
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut tcol,
+                label_end,
+                &shown,
+                fg,
+                bg,
+                Hit::Tab(i),
+            );
             if has_close {
                 let mut ccol = tab_end - close_w;
                 let (cfg, cbg) = if hover == Some(Hit::CloseTab(i)) {
@@ -1599,7 +1795,16 @@ impl WindowState<'_> {
                 } else {
                     (fg, bg)
                 };
-                put_text(&mut row, &mut hits, &mut ccol, tab_end, " × ", cfg, cbg, Hit::CloseTab(i));
+                put_text(
+                    &mut row,
+                    &mut hits,
+                    &mut ccol,
+                    tab_end,
+                    " × ",
+                    cfg,
+                    cbg,
+                    Hit::CloseTab(i),
+                );
             }
             // Active tab: bold label plus an accent underline under the label
             // area — stopping before the ×, so it reads as the tab's title
@@ -1628,7 +1833,16 @@ impl WindowState<'_> {
                 row[c].bg = ibg;
                 hits[c] = Hit::MoreTabs;
             }
-            put_text(&mut row, &mut hits, &mut col, indicator_end, &format!(" »{hidden}"), ifg, ibg, Hit::MoreTabs);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut col,
+                indicator_end,
+                &format!(" »{hidden}"),
+                ifg,
+                ibg,
+                Hit::MoreTabs,
+            );
             col = indicator_end;
         }
         // The settings page's own chip: rendered exactly like an active tab
@@ -1645,14 +1859,32 @@ impl WindowState<'_> {
             }
             let label_end = end.saturating_sub(close_w);
             let mut tcol = start;
-            put_text(&mut row, &mut hits, &mut tcol, label_end, " Settings", self.theme.fg, bg, Hit::SettingsTab);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut tcol,
+                label_end,
+                " Settings",
+                self.theme.fg,
+                bg,
+                Hit::SettingsTab,
+            );
             let (cfg, cbg) = if hover == Some(Hit::CloseSettings) {
                 (self.theme.fg, mix(bg, self.theme.fg, 55))
             } else {
                 (self.theme.fg, bg)
             };
             let mut ccol = label_end;
-            put_text(&mut row, &mut hits, &mut ccol, end, " × ", cfg, cbg, Hit::CloseSettings);
+            put_text(
+                &mut row,
+                &mut hits,
+                &mut ccol,
+                end,
+                " × ",
+                cfg,
+                cbg,
+                Hit::CloseSettings,
+            );
             for c in &mut row[start..label_end.max(start)] {
                 c.flags |= ATTR_BOLD | ATTR_UNDERLINE | ATTR_UNDERLINE_COLOR;
                 c.underline_color = accent;
@@ -1662,17 +1894,71 @@ impl WindowState<'_> {
                 col += 1;
             }
         }
-        let btn_bg = |hit: Hit| if hover == Some(hit) { btn_hover_bg } else { bar_bg };
-        put_text(&mut row, &mut hits, &mut col, btn0, " + ", self.theme.fg, btn_bg(Hit::NewTab), Hit::NewTab);
-        put_text(&mut row, &mut hits, &mut col, btn0, " ▾ ", self.theme.fg, btn_bg(Hit::ShellMenu), Hit::ShellMenu);
+        let btn_bg = |hit: Hit| {
+            if hover == Some(hit) {
+                btn_hover_bg
+            } else {
+                bar_bg
+            }
+        };
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut col,
+            btn0,
+            " + ",
+            self.theme.fg,
+            btn_bg(Hit::NewTab),
+            Hit::NewTab,
+        );
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut col,
+            btn0,
+            " ▾ ",
+            self.theme.fg,
+            btn_bg(Hit::ShellMenu),
+            Hit::ShellMenu,
+        );
 
         let mut bcol = btn0;
-        put_text(&mut row, &mut hits, &mut bcol, btn0 + 4, "  ─ ", self.theme.fg, btn_bg(Hit::Minimize), Hit::Minimize);
-        put_text(&mut row, &mut hits, &mut bcol, btn0 + 8, "  □ ", self.theme.fg, btn_bg(Hit::Maximize), Hit::Maximize);
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut bcol,
+            btn0 + 4,
+            "  ─ ",
+            self.theme.fg,
+            btn_bg(Hit::Minimize),
+            Hit::Minimize,
+        );
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut bcol,
+            btn0 + 8,
+            "  □ ",
+            self.theme.fg,
+            btn_bg(Hit::Maximize),
+            Hit::Maximize,
+        );
         // The caption close button hovers native-red, matching Windows 11.
-        let (close_fg, close_bg) =
-            if hover == Some(Hit::Close) { (0xFFFFFF, 0xC42B1C) } else { (self.theme.fg, bar_bg) };
-        put_text(&mut row, &mut hits, &mut bcol, cols, "  × ", close_fg, close_bg, Hit::Close);
+        let (close_fg, close_bg) = if hover == Some(Hit::Close) {
+            (0xFFFFFF, 0xC42B1C)
+        } else {
+            (self.theme.fg, bar_bg)
+        };
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut bcol,
+            cols,
+            "  × ",
+            close_fg,
+            close_bg,
+            Hit::Close,
+        );
         // Any partial cell past the last whole one still belongs to the ×:
         // the window's top-right corner should always close (Fitts's law),
         // never fall through to the drag strip.
@@ -1715,7 +2001,8 @@ impl WindowState<'_> {
     /// (the chrome bar occupies the screen row above grid row 0).
     fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
         let pad = self.pad as f64;
-        let col = ((px - pad).max(0.0) as usize / self.cell_w).min((self.cols as usize).saturating_sub(1));
+        let col = ((px - pad).max(0.0) as usize / self.cell_w)
+            .min((self.cols as usize).saturating_sub(1));
         let row = ((py - self.grid_oy() as f64).max(0.0) as usize / self.cell_h)
             .saturating_sub(1)
             .min((self.rows as usize).saturating_sub(1));
@@ -1820,7 +2107,8 @@ impl WindowState<'_> {
                 if g.mouse_modes.active() && !self.mods.shift_key() {
                     None
                 } else {
-                    g.prompt_cursor_moves(cell.0, cell.1).map(|m| (m, g.app_cursor_keys))
+                    g.prompt_cursor_moves(cell.0, cell.1)
+                        .map(|m| (m, g.app_cursor_keys))
                 }
             };
             if let Some(((dx, dy), app_cursor)) = moves {
@@ -1841,8 +2129,9 @@ impl WindowState<'_> {
             _ => 1,
         };
         self.last_grid_click = Some((now, cell));
-        self.sel_anchor =
-            self.pane().map(|p| (cell.0, p.grid.lock().abs_of_view_row(cell.1)));
+        self.sel_anchor = self
+            .pane()
+            .map(|p| (cell.0, p.grid.lock().abs_of_view_row(cell.1)));
         // Every streak arms a drag now, not just a plain click: dragging
         // after a double/triple click extends the selection by whole
         // word/line (`CursorMoved` below reads `click_streak` to pick the
@@ -1870,7 +2159,10 @@ impl WindowState<'_> {
         let (col, row) = self.cell_at(px, py);
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         self.tabs.get(self.active).and_then(|t| {
-            t.rects(area).into_iter().find(|(_, r)| r.contains(col, row)).map(|(id, _)| id)
+            t.rects(area)
+                .into_iter()
+                .find(|(_, r)| r.contains(col, row))
+                .map(|(id, _)| id)
         })
     }
 
@@ -1908,7 +2200,10 @@ impl WindowState<'_> {
     fn pane_rect(&self, id: u64) -> Option<Rect> {
         let area = Rect::new(0, 0, self.cols as usize, self.rows as usize);
         let tab = self.tabs.get(self.active)?;
-        tab.rects(area).into_iter().find(|(pid, _)| *pid == id).map(|(_, r)| r)
+        tab.rects(area)
+            .into_iter()
+            .find(|(pid, _)| *pid == id)
+            .map(|(_, r)| r)
     }
 
     /// The focused pane's id, `None` before any tab exists.
@@ -1949,7 +2244,9 @@ impl WindowState<'_> {
         if !self.selecting {
             return false;
         }
-        let Some(r) = self.focused_pane_rect() else { return false };
+        let Some(r) = self.focused_pane_rect() else {
+            return false;
+        };
         let top_px = (self.grid_oy() + (r.row + 1) * self.cell_h) as f64;
         let bottom_px = (self.grid_oy() + (r.row + r.rows + 1) * self.cell_h) as f64;
         let Some(scroll_up) =
@@ -1960,7 +2257,11 @@ impl WindowState<'_> {
         let Some(p) = self.pane() else { return false };
         let moved = {
             let mut g = p.grid.lock();
-            if scroll_up { g.scroll_view_up(1) } else { g.scroll_view_down(1) }
+            if scroll_up {
+                g.scroll_view_up(1)
+            } else {
+                g.scroll_view_down(1)
+            }
         };
         if !moved {
             return false;
@@ -1989,7 +2290,11 @@ impl WindowState<'_> {
                 }
                 // Arm drag-to-reorder; it only engages past the slop, so a
                 // plain click stays a plain click.
-                self.tab_drag = Some(TabDrag { idx: i, press_x: x, moving: false });
+                self.tab_drag = Some(TabDrag {
+                    idx: i,
+                    press_x: x,
+                    moving: false,
+                });
                 window.request_redraw();
             }
             Hit::CloseTab(i) => {
@@ -2061,7 +2366,11 @@ impl WindowState<'_> {
         let Some(p) = self.pane() else { return };
         let (text, html) = {
             let g = p.grid.lock();
-            let html = if self.config.copy_html.unwrap_or(true) { g.selected_html() } else { None };
+            let html = if self.config.copy_html.unwrap_or(true) {
+                g.selected_html()
+            } else {
+                None
+            };
             (g.selected_text(), html)
         };
         if let (Some(text), Some(cb)) = (text, self.clipboard.as_mut()) {
@@ -2123,7 +2432,10 @@ impl WindowState<'_> {
             #[cfg(all(unix, not(target_os = "macos")))]
             {
                 use arboard::SetExtLinux as _;
-                let _ = cb.set().clipboard(arboard::LinuxClipboardKind::Primary).text(text);
+                let _ = cb
+                    .set()
+                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                    .text(text);
             }
             #[cfg(not(all(unix, not(target_os = "macos"))))]
             let _ = cb.set_text(text); // no primary selection: best effort
@@ -2160,7 +2472,11 @@ impl WindowState<'_> {
             std::mem::take(&mut g.notifications)
         };
         for (title, body) in notes {
-            let title = if title.is_empty() { "rusty_term" } else { title.as_str() };
+            let title = if title.is_empty() {
+                "rusty_term"
+            } else {
+                title.as_str()
+            };
             notify(title, &body);
         }
     }
@@ -2176,12 +2492,18 @@ impl WindowState<'_> {
         let (bell, finished) = {
             let Some(p) = self.pane_by_id(id) else { return };
             let mut g = p.grid.lock();
-            (std::mem::take(&mut g.bell), std::mem::take(&mut g.finished_commands))
+            (
+                std::mem::take(&mut g.bell),
+                std::mem::take(&mut g.finished_commands),
+            )
         };
         if !bell && finished.is_empty() {
             return;
         }
-        let tab_idx = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id));
+        let tab_idx = self
+            .tabs
+            .iter()
+            .position(|t| t.panes.iter().any(|p| p.id == id));
         let background = tab_idx != Some(self.active);
         let unseen = background || !self.focused;
         let mut badge = false;
@@ -2307,9 +2629,7 @@ impl WindowState<'_> {
         }
         let Some(window) = &self.window else { return };
         let now_fullscreen = window.fullscreen().is_some();
-        window.set_fullscreen(
-            (!now_fullscreen).then_some(Fullscreen::Borderless(None)),
-        );
+        window.set_fullscreen((!now_fullscreen).then_some(Fullscreen::Borderless(None)));
     }
 
     /// Grow/shrink the font by `delta` px (Ctrl+=/Ctrl+-, the Chrome/VS Code/
@@ -2359,7 +2679,9 @@ impl WindowState<'_> {
                 self.search_regex = !self.search_regex;
                 self.run_search();
             }
-            Key::Character(s) if self.mods.alt_key() && !self.mods.control_key() && s.as_str() == "c" => {
+            Key::Character(s)
+                if self.mods.alt_key() && !self.mods.control_key() && s.as_str() == "c" =>
+            {
                 self.search_case_sensitive = !self.search_case_sensitive;
                 self.run_search();
             }
@@ -2396,7 +2718,9 @@ impl WindowState<'_> {
     /// contributes: a query is one line, and a pasted multi-line clipboard
     /// would otherwise produce a query no match could ever satisfy.
     fn paste_into_search(&mut self, text: Option<String>) {
-        let Some(text) = text.filter(|t| !t.is_empty()) else { return };
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            return;
+        };
         if let Some(q) = self.searching.as_mut() {
             q.push_str(text.lines().next().unwrap_or(""));
         }
@@ -2465,8 +2789,7 @@ impl WindowState<'_> {
         // position within an unsplit *first* pane regardless of which split
         // pane is actually focused (e.g. a right/bottom split composing IME
         // would show the candidate window over the wrong pane entirely).
-        let (base_col, base_row) =
-            self.focused_pane_rect().map_or((0, 0), |r| (r.col, r.row));
+        let (base_col, base_row) = self.focused_pane_rect().map_or((0, 0), |r| (r.col, r.row));
         let (x, y) = ime_cursor_area_origin(
             self.pad,
             self.grid_oy(),
@@ -2505,9 +2828,14 @@ impl WindowState<'_> {
         {
             let Some(p) = self.pane() else { return };
             let text = p.grid.lock().selected_text();
-            if let (Some(text), Some(cb)) = (text.filter(|t| !t.is_empty()), self.clipboard.as_mut()) {
+            if let (Some(text), Some(cb)) =
+                (text.filter(|t| !t.is_empty()), self.clipboard.as_mut())
+            {
                 use arboard::SetExtLinux as _;
-                let _ = cb.set().clipboard(arboard::LinuxClipboardKind::Primary).text(text);
+                let _ = cb
+                    .set()
+                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                    .text(text);
             }
         }
     }
@@ -2519,7 +2847,10 @@ impl WindowState<'_> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             use arboard::GetExtLinux as _;
-            cb.get().clipboard(arboard::LinuxClipboardKind::Primary).text().ok()
+            cb.get()
+                .clipboard(arboard::LinuxClipboardKind::Primary)
+                .text()
+                .ok()
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
@@ -2530,7 +2861,9 @@ impl WindowState<'_> {
     /// Middle-click pastes the PRIMARY selection (X11 muscle memory), unless
     /// the child is tracking the mouse — then the click is the child's.
     fn paste_primary(&mut self) {
-        let Some(text) = self.primary_text().filter(|t| !t.is_empty()) else { return };
+        let Some(text) = self.primary_text().filter(|t| !t.is_empty()) else {
+            return;
+        };
         if let Some(p) = self.pane_mut() {
             let bracketed = p.grid.lock().bracketed_paste;
             let _ = p.writer.write(&encode_paste(&text, bracketed));
@@ -2540,7 +2873,9 @@ impl WindowState<'_> {
 
     /// Paste the system clipboard into the active tab's child (Ctrl+Shift+V).
     fn paste(&mut self) {
-        let Some(cb) = self.clipboard.as_mut() else { return };
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
         let Ok(text) = cb.get_text() else { return };
         if text.is_empty() {
             return;
@@ -2573,12 +2908,18 @@ impl WindowState<'_> {
     /// pointer" agree by the time this runs), or whichever pane is under
     /// the pointer for wheel events, which don't go through `on_left_press`
     /// and so would otherwise always report to the wrong pane in a split.
-    fn report_mouse(&mut self, id: Option<u64>, build: impl FnOnce(usize, usize) -> MouseEvent) -> bool {
+    fn report_mouse(
+        &mut self,
+        id: Option<u64>,
+        build: impl FnOnce(usize, usize) -> MouseEvent,
+    ) -> bool {
         if self.mods.shift_key() {
             return false;
         }
         let Some(id) = id else { return false };
-        let Some(p) = self.pane_by_id(id) else { return false };
+        let Some(p) = self.pane_by_id(id) else {
+            return false;
+        };
         let modes = p.grid.lock().mouse_modes;
         if !modes.active() {
             return false;
@@ -2598,7 +2939,10 @@ impl WindowState<'_> {
         {
             e.point = pane_pixel_point(
                 self.mouse_pos,
-                (self.pad + r.col * self.cell_w, self.pad + (r.row + 1) * self.cell_h),
+                (
+                    self.pad + r.col * self.cell_w,
+                    self.pad + (r.row + 1) * self.cell_h,
+                ),
                 (r.cols * self.cell_w, r.rows * self.cell_h),
             );
         }
@@ -2607,7 +2951,9 @@ impl WindowState<'_> {
         if out.is_empty() {
             return false;
         }
-        let Some(p) = self.pane_by_id_mut(id) else { return false };
+        let Some(p) = self.pane_by_id_mut(id) else {
+            return false;
+        };
         let _ = p.writer.write(&out);
         true
     }
@@ -2623,7 +2969,9 @@ impl WindowState<'_> {
             let col = g.logical_col(col, row);
             // An explicit OSC 8 link wins; otherwise scan the cell's logical
             // line for a plain-text URL (G16) — most programs never emit OSC 8.
-            g.link_at(col, row).map(str::to_owned).or_else(|| g.url_at(col, row))
+            g.link_at(col, row)
+                .map(str::to_owned)
+                .or_else(|| g.url_at(col, row))
         };
         url.is_some_and(|u| open_url(&u))
     }
@@ -2642,7 +2990,8 @@ impl WindowState<'_> {
                 let (col, row) = self.cell_in_focused(x, y);
                 let g = p.grid.lock();
                 let col = g.logical_col(col, row);
-                g.hover_link_at(col, row).map(|(start, end, _)| (row, start, end))
+                g.hover_link_at(col, row)
+                    .map(|(start, end, _)| (row, start, end))
             })
         } else {
             None
@@ -2672,12 +3021,22 @@ impl WindowState<'_> {
                 // Menu rows are narrow; elide the middle of long URLs.
                 let label = if u.chars().count() > 46 {
                     let head: String = u.chars().take(30).collect();
-                    let tail: String = u.chars().rev().take(13).collect::<Vec<_>>().into_iter().rev().collect();
+                    let tail: String = u
+                        .chars()
+                        .rev()
+                        .take(13)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     format!("{head}…{tail}")
                 } else {
                     u.clone()
                 };
-                MenuItem { label, kind: MenuKind::OpenUrl(u) }
+                MenuItem {
+                    label,
+                    kind: MenuKind::OpenUrl(u),
+                }
             })
             .collect();
         self.overlay = Some(Overlay::Menu { items, sel: 0 });
@@ -2702,7 +3061,9 @@ impl WindowState<'_> {
     /// drives a pager (`less`, `man`, …) that never registered native mouse
     /// support.
     fn send_alt_scroll_keys(&mut self, id: u64, lines: isize) {
-        let app_cursor = self.pane_by_id(id).is_some_and(|p| p.grid.lock().app_cursor_keys);
+        let app_cursor = self
+            .pane_by_id(id)
+            .is_some_and(|p| p.grid.lock().app_cursor_keys);
         let seq: &[u8] = match (lines >= 0, app_cursor) {
             (true, true) => b"\x1bOA",
             (true, false) => b"\x1b[A",
@@ -2772,7 +3133,9 @@ impl WindowState<'_> {
     /// from the commented template first if needed. The live-reload watcher
     /// then applies any save the user makes.
     fn open_config(&self) {
-        let Some(path) = &self.config_path else { return };
+        let Some(path) = &self.config_path else {
+            return;
+        };
         if let Err(e) = crate::config::open_in_editor(path) {
             eprintln!("rusty_term: open config: {e}");
         }
@@ -2790,7 +3153,9 @@ impl WindowState<'_> {
     /// revert to the file's top-level default on every save (mirrors
     /// `runtime::tokio_rt::watch_config`'s fix for the TUI front-end).
     fn reload_config(&mut self) {
-        let Some(path) = self.config_path.clone() else { return };
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
         let args = vec!["--config".to_string(), path.to_string_lossy().into_owned()];
         let (mut new, mut warnings) = crate::config::Config::load(&args);
         if let Some(name) = &self.profile_override
@@ -2842,8 +3207,7 @@ impl WindowState<'_> {
             self.close_overlay();
             return;
         }
-        let opacity_supported =
-            self.renderer.as_ref().is_some_and(|r| r.supports_opacity());
+        let opacity_supported = self.renderer.as_ref().is_some_and(|r| r.supports_opacity());
         let s = Settings::new(
             &self.config,
             &self.theme,
@@ -2885,7 +3249,9 @@ impl WindowState<'_> {
     /// Write the settings page's values to the config file. The live-reload
     /// watcher re-reads the save; live application already happened per change.
     fn persist_settings(&self, s: &Settings) {
-        let Some(path) = &self.config_path else { return };
+        let Some(path) = &self.config_path else {
+            return;
+        };
         if let Err(e) = crate::config::save_settings(path, &s.edits()) {
             eprintln!("rusty_term: save settings: {e}");
         }
@@ -2924,7 +3290,9 @@ impl WindowState<'_> {
     /// (or, digits on a number row, starts an edit); the rest navigates.
     fn settings_key(&mut self, event: &KeyEvent) {
         use winit::keyboard::{Key, NamedKey};
-        let Some(Overlay::Settings(s)) = &mut self.overlay else { return };
+        let Some(Overlay::Settings(s)) = &mut self.overlay else {
+            return;
+        };
         let editing = s.editing.is_some();
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
@@ -3014,7 +3382,11 @@ impl WindowState<'_> {
             Some(Overlay::Menu { items, sel }) => {
                 let n = items.len();
                 if n > 0 {
-                    *sel = if forward { (*sel + 1) % n } else { (*sel + n - 1) % n };
+                    *sel = if forward {
+                        (*sel + 1) % n
+                    } else {
+                        (*sel + n - 1) % n
+                    };
                 }
             }
             Some(Overlay::Settings(s)) => {
@@ -3084,7 +3456,10 @@ impl WindowState<'_> {
     fn menu_pick(&mut self, kind: MenuKind) {
         match kind {
             MenuKind::LaunchShell(i) => {
-                let shell = self.shells.get(i).map(|s| s.path.to_string_lossy().into_owned());
+                let shell = self
+                    .shells
+                    .get(i)
+                    .map(|s| s.path.to_string_lossy().into_owned());
                 self.overlay = None;
                 if let Err(e) = self.spawn_tab_with(shell) {
                     eprintln!("rusty_term: new tab: {e}");
@@ -3119,7 +3494,9 @@ impl WindowState<'_> {
     /// row under the pointer (activating it for a menu); on the settings page
     /// also switch sidebar categories and cycle a clicked value widget.
     fn overlay_click(&mut self, x: f64, y: f64) {
-        let Some((col, grid_row)) = self.overlay_cell(x, y) else { return };
+        let Some((col, grid_row)) = self.overlay_cell(x, y) else {
+            return;
+        };
         let mut apply: Vec<Field> = Vec::new();
         let mut activate = false;
         match &mut self.overlay {
@@ -3174,7 +3551,9 @@ impl WindowState<'_> {
     /// their rows say "applies at next launch" — but still count as applied
     /// so persistence picks them up on close.
     fn apply_setting(&mut self, field: Field) {
-        let Some(Overlay::Settings(s)) = self.overlay.as_ref() else { return };
+        let Some(Overlay::Settings(s)) = self.overlay.as_ref() else {
+            return;
+        };
         let theme = crate::config::preset(s.theme_name());
         let font_size = s.font_size();
         let cursor = s.cursor();
@@ -3378,7 +3757,9 @@ impl WindowState<'_> {
         ) else {
             return false;
         };
-        let Some(font) = FontCache::new(font_set, px, ligatures) else { return false };
+        let Some(font) = FontCache::new(font_set, px, ligatures) else {
+            return false;
+        };
         let (cw, ch) = font.cell_size();
         self.font = font;
         self.cell_w = cw.max(1);
@@ -3464,9 +3845,23 @@ impl WindowState<'_> {
                     if on {
                         fill_row(&mut g, r, 0, bar, rfg, rbg);
                     }
-                    write_row(&mut g, r, 2, &format!("{}. {}", i + 1, item.label), rfg, rbg);
+                    write_row(
+                        &mut g,
+                        r,
+                        2,
+                        &format!("{}. {}", i + 1, item.label),
+                        rfg,
+                        rbg,
+                    );
                 }
-                write_row(&mut g, footer, 2, "Up/Down select   Enter/1-9 open   Esc close", dim, bg);
+                write_row(
+                    &mut g,
+                    footer,
+                    2,
+                    "Up/Down select   Enter/1-9 open   Esc close",
+                    dim,
+                    bg,
+                );
             }
             Some(Overlay::Settings(s)) => {
                 // No header row: the strip's own "Settings" tab names the
@@ -3513,8 +3908,11 @@ impl WindowState<'_> {
                 // The sidebar's idle bottom answers "what file does Esc save
                 // into, and which build is this" without opening the docs.
                 if footer_top >= 2 {
-                    if let Some(name) =
-                        self.config_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+                    if let Some(name) = self
+                        .config_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
                     {
                         let shown: String = name.chars().take(SETTINGS_SIDEBAR_W - 2).collect();
                         write_row(&mut g, footer_top - 2, 2, &shown, dim, bg);
@@ -3548,15 +3946,36 @@ impl WindowState<'_> {
                     Some(q) => {
                         let qcol = value_end.saturating_sub(q.chars().count() + 2);
                         write_row(&mut g, SETTINGS_TOP, qcol, &format!("/{q}"), fg, bg);
-                        write_row(&mut g, SETTINGS_TOP, value_end.saturating_sub(1), "_", dim, bg);
+                        write_row(
+                            &mut g,
+                            SETTINGS_TOP,
+                            value_end.saturating_sub(1),
+                            "_",
+                            dim,
+                            bg,
+                        );
                     }
                     None => {
                         let t = "/ search";
-                        write_row(&mut g, SETTINGS_TOP, value_end.saturating_sub(t.len()), t, dim, bg);
+                        write_row(
+                            &mut g,
+                            SETTINGS_TOP,
+                            value_end.saturating_sub(t.len()),
+                            t,
+                            dim,
+                            bg,
+                        );
                     }
                 }
                 let rule_w = value_end.saturating_sub(SETTINGS_CARD_X);
-                write_row(&mut g, SETTINGS_TOP + 1, SETTINGS_CARD_X, &"\u{2500}".repeat(rule_w), dim, bg);
+                write_row(
+                    &mut g,
+                    SETTINGS_TOP + 1,
+                    SETTINGS_CARD_X,
+                    &"\u{2500}".repeat(rule_w),
+                    dim,
+                    bg,
+                );
 
                 // Setting cards: title + right-aligned value widget, then a
                 // dim one-line description. Highlight bands stop at the card
@@ -3578,7 +3997,14 @@ impl WindowState<'_> {
                     };
                     if rbg != bg {
                         fill_row(&mut g, top, SETTINGS_SIDEBAR_W + 2, value_end + 1, fg, rbg);
-                        fill_row(&mut g, top + 1, SETTINGS_SIDEBAR_W + 2, value_end + 1, fg, rbg);
+                        fill_row(
+                            &mut g,
+                            top + 1,
+                            SETTINGS_SIDEBAR_W + 2,
+                            value_end + 1,
+                            fg,
+                            rbg,
+                        );
                     }
                     if selected {
                         write_row(&mut g, top, SETTINGS_SIDEBAR_W + 2, "\u{258C}", fg, rbg);
@@ -3599,7 +4025,14 @@ impl WindowState<'_> {
                         write_row(&mut g, top, after + 2, &format!("\u{B7} {cat}"), dim, rbg);
                     }
                     let desc_fg = if selected { mid } else { dim };
-                    write_row(&mut g, top + 1, SETTINGS_CARD_X, row.description, desc_fg, rbg);
+                    write_row(
+                        &mut g,
+                        top + 1,
+                        SETTINGS_CARD_X,
+                        row.description,
+                        desc_fg,
+                        rbg,
+                    );
                     // The theme row previews its palette: the 16 ANSI colors
                     // as swatches on the description row, so cycling themes
                     // is a visual choice rather than a name lottery. Skipped
@@ -3680,7 +4113,11 @@ impl WindowState<'_> {
                 let hints: &[(&str, &str)] = if s.editing.is_some() {
                     &[("Enter", "apply"), ("Esc", "keep old value")]
                 } else if filtering {
-                    &[("type", "to refine"), ("Up/Down", "result"), ("Esc", "back")]
+                    &[
+                        ("type", "to refine"),
+                        ("Up/Down", "result"),
+                        ("Esc", "back"),
+                    ]
                 } else {
                     &[
                         ("Tab", "category"),
@@ -3691,7 +4128,11 @@ impl WindowState<'_> {
                         ("Esc", "close & save"),
                     ]
                 };
-                let status = if s.dirty { "modified - saves on close" } else { "saved" };
+                let status = if s.dirty {
+                    "modified - saves on close"
+                } else {
+                    "saved"
+                };
                 let hrow = rows.saturating_sub(1);
                 let limit = cols.saturating_sub(status.chars().count() + 4);
                 let mut hcol = 2;
@@ -3705,7 +4146,14 @@ impl WindowState<'_> {
                     hcol += verb.chars().count() + 3;
                 }
                 let scol = cols.saturating_sub(status.chars().count() + 2);
-                write_row(&mut g, hrow, scol, status, if s.dirty { fg } else { dim }, bg);
+                write_row(
+                    &mut g,
+                    hrow,
+                    scol,
+                    status,
+                    if s.dirty { fg } else { dim },
+                    bg,
+                );
             }
             None => {}
         }
@@ -3723,16 +4171,23 @@ fn shell_menu_items(
     let mut items: Vec<MenuItem> = profiles
         .iter()
         .enumerate()
-        .map(|(i, p)| MenuItem { label: format!("Profile: {}", p.name), kind: MenuKind::LaunchProfile(i) })
+        .map(|(i, p)| MenuItem {
+            label: format!("Profile: {}", p.name),
+            kind: MenuKind::LaunchProfile(i),
+        })
         .collect();
-    items.extend(
-        shells
-            .iter()
-            .enumerate()
-            .map(|(i, s)| MenuItem { label: s.name.to_string(), kind: MenuKind::LaunchShell(i) }),
-    );
-    items.push(MenuItem { label: "Settings".to_string(), kind: MenuKind::Settings });
-    items.push(MenuItem { label: "Open config file".to_string(), kind: MenuKind::EditConfig });
+    items.extend(shells.iter().enumerate().map(|(i, s)| MenuItem {
+        label: s.name.to_string(),
+        kind: MenuKind::LaunchShell(i),
+    }));
+    items.push(MenuItem {
+        label: "Settings".to_string(),
+        kind: MenuKind::Settings,
+    });
+    items.push(MenuItem {
+        label: "Open config file".to_string(),
+        kind: MenuKind::EditConfig,
+    });
     items
 }
 
@@ -3791,7 +4246,9 @@ fn settings_hit(
     }
     // Card area (below the page title + rule): a card's title and
     // description rows both count; the spacing row between cards is dead.
-    let Some(r) = row.checked_sub(SETTINGS_CARDS_TOP) else { return SettingsHit::None };
+    let Some(r) = row.checked_sub(SETTINGS_CARDS_TOP) else {
+        return SettingsHit::None;
+    };
     let card = r / SETTINGS_ROW_H;
     if r % SETTINGS_ROW_H < 2 && card < settings_visible(grid_rows) {
         let i = scroll + card;
@@ -4021,8 +4478,11 @@ fn read_git_branch(dir: &std::path::Path) -> Option<String> {
         let text = std::fs::read_to_string(&git).ok()?;
         let target = text.strip_prefix("gitdir:")?.trim();
         let target = std::path::Path::new(target);
-        let base =
-            if target.is_absolute() { target.to_path_buf() } else { git.parent()?.join(target) };
+        let base = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            git.parent()?.join(target)
+        };
         base.join("HEAD")
     } else {
         git.join("HEAD")
@@ -4134,7 +4594,11 @@ impl WindowState<'_> {
                 window.request_redraw();
             }
         }
-        Some(if animating { now + ANIM } else { self.last_blink + BLINK })
+        Some(if animating {
+            now + ANIM
+        } else {
+            self.last_blink + BLINK
+        })
     }
 
     /// Create this state's OS window + renderer if it doesn't have one yet.
@@ -4198,12 +4662,18 @@ impl WindowState<'_> {
         // configured fraction of its height, and kept above other windows so
         // it drops over whatever has focus.
         let quake_geom = self.quake.then(|| {
-            let mon = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
+            let mon = event_loop
+                .primary_monitor()
+                .or_else(|| event_loop.available_monitors().next());
             let (mw, mh, pos) = mon
                 .map(|m| (m.size().width, m.size().height, m.position()))
                 .unwrap_or((1920, 1080, winit::dpi::PhysicalPosition::new(0, 0)));
             let frac = self.config.quake_height.unwrap_or(0.4).clamp(0.1, 1.0);
-            (mw.max(1), ((mh as f32 * frac) as u32).max(self.cell_h as u32 * 2), pos)
+            (
+                mw.max(1),
+                ((mh as f32 * frac) as u32).max(self.cell_h as u32 * 2),
+                pos,
+            )
         });
         let attrs = if let Some((w, h, pos)) = quake_geom {
             attrs
@@ -4324,7 +4794,9 @@ impl WindowState<'_> {
                             (g.app_cursor_keys, g.kitty_keyboard_flags(), g.win32_input)
                         })
                         .unwrap_or_default();
-                    if self.overlay.is_some() || self.searching.is_some() || self.copy_mode.is_some()
+                    if self.overlay.is_some()
+                        || self.searching.is_some()
+                        || self.copy_mode.is_some()
                     {
                         return;
                     }
@@ -4390,7 +4862,9 @@ impl WindowState<'_> {
                 // the keymap lookup so a user chord still wins, and on the
                 // Ctrl+Alt layer so plain Ctrl+digit stays encodable to
                 // kitty-protocol apps.
-                if self.mods.control_key() && self.mods.alt_key() && !self.mods.shift_key()
+                if self.mods.control_key()
+                    && self.mods.alt_key()
+                    && !self.mods.shift_key()
                     && let PhysicalKey::Code(code) = event.physical_key
                 {
                     let digit = match code {
@@ -4406,21 +4880,33 @@ impl WindowState<'_> {
                         _ => None,
                     };
                     if let Some(d) = digit {
-                        let i = if d == usize::MAX { self.tabs.len().saturating_sub(1) } else { d };
+                        let i = if d == usize::MAX {
+                            self.tabs.len().saturating_sub(1)
+                        } else {
+                            d
+                        };
                         self.select_tab(i);
                         return;
                     }
                 }
                 // While the IME is composing, it owns key input; don't also
                 // encode it (the committed text arrives via `WindowEvent::Ime`).
-                if self.pane().is_some_and(|p| !p.grid.lock().ime_preedit.is_empty()) {
+                if self
+                    .pane()
+                    .is_some_and(|p| !p.grid.lock().ime_preedit.is_empty())
+                {
                     return;
                 }
                 let (app_cursor, app_keypad, kitty_flags, win32_input) = self
                     .pane()
                     .map(|p| {
                         let g = p.grid.lock();
-                        (g.app_cursor_keys, g.app_keypad, g.kitty_keyboard_flags(), g.win32_input)
+                        (
+                            g.app_cursor_keys,
+                            g.app_keypad,
+                            g.kitty_keyboard_flags(),
+                            g.win32_input,
+                        )
                     })
                     .unwrap_or_default();
                 // win32-input-mode (?9001) supersedes every VT encoding: the
@@ -4566,7 +5052,8 @@ impl WindowState<'_> {
                 // Chrome-bar hover feedback: track the element under the
                 // pointer and repaint when it changes (drag-strip cells and
                 // anything below the bar count as no hover).
-                let hover = if (position.y.max(0.0) as usize) < self.cell_h && !self.hits.is_empty() {
+                let hover = if (position.y.max(0.0) as usize) < self.cell_h && !self.hits.is_empty()
+                {
                     let col = (position.x.max(0.0) as usize / self.cell_w).min(self.hits.len() - 1);
                     match self.hits[col] {
                         Hit::Drag => None,
@@ -4586,11 +5073,17 @@ impl WindowState<'_> {
                     let grid_rows = self.rows as usize;
                     let grid_cols = self.cols as usize;
                     if let Some(Overlay::Settings(s)) = &mut self.overlay {
-                        let hovered =
-                            match settings_hit(col, grid_row, grid_cols, grid_rows, s.scroll, s.len()) {
-                                SettingsHit::Row(i) => Some(i),
-                                _ => None,
-                            };
+                        let hovered = match settings_hit(
+                            col,
+                            grid_row,
+                            grid_cols,
+                            grid_rows,
+                            s.scroll,
+                            s.len(),
+                        ) {
+                            SettingsHit::Row(i) => Some(i),
+                            _ => None,
+                        };
                         if hovered != s.hover {
                             s.hover = hovered;
                             if let Some(window) = &self.window {
@@ -4627,7 +5120,11 @@ impl WindowState<'_> {
                         } else {
                             self.pane()
                                 .and_then(|p| {
-                                    p.grid.lock().cursor_icon.as_deref().and_then(parse_cursor_icon)
+                                    p.grid
+                                        .lock()
+                                        .cursor_icon
+                                        .as_deref()
+                                        .and_then(parse_cursor_icon)
                                 })
                                 .unwrap_or(CursorIcon::Text)
                         }
@@ -4648,8 +5145,11 @@ impl WindowState<'_> {
                 // above — both can be active at once. `report_mouse` bypasses
                 // itself when Shift is held, so a Shift-drag is pure local
                 // selection with nothing forwarded to the app.
-                let (sh, al, ct) =
-                    (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                let (sh, al, ct) = (
+                    self.mods.shift_key(),
+                    self.mods.alt_key(),
+                    self.mods.control_key(),
+                );
                 let dragging = self.mouse_button_down.is_some();
                 let button = self.mouse_button_down.unwrap_or_default();
                 self.report_mouse(self.focused_pane_id(), |c, r| {
@@ -4696,15 +5196,20 @@ impl WindowState<'_> {
                                 return;
                             }
                             if self.mods.shift_key()
-                                || !self.pane().is_some_and(|p| p.grid.lock().mouse_modes.active())
+                                || !self
+                                    .pane()
+                                    .is_some_and(|p| p.grid.lock().mouse_modes.active())
                             {
                                 self.paste_primary();
                                 return;
                             }
                         }
                         self.mouse_button_down = Some(kind);
-                        let (sh, al, ct) =
-                            (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                        let (sh, al, ct) = (
+                            self.mods.shift_key(),
+                            self.mods.alt_key(),
+                            self.mods.control_key(),
+                        );
                         self.report_mouse(self.focused_pane_id(), |c, r| {
                             MouseEvent::new_point(c, r)
                                 .with_button(true)
@@ -4723,8 +5228,11 @@ impl WindowState<'_> {
                         if self.mouse_button_down == Some(kind) {
                             self.mouse_button_down = None;
                         }
-                        let (sh, al, ct) =
-                            (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                        let (sh, al, ct) = (
+                            self.mods.shift_key(),
+                            self.mods.alt_key(),
+                            self.mods.control_key(),
+                        );
                         self.report_mouse(self.focused_pane_id(), |c, r| {
                             MouseEvent::new_point(c, r)
                                 .with_button(false)
@@ -4772,10 +5280,15 @@ impl WindowState<'_> {
                 let Some(id) = self.pane_under(self.mouse_pos.0, self.mouse_pos.1) else {
                     return;
                 };
-                let (sh, al, ct) =
-                    (self.mods.shift_key(), self.mods.alt_key(), self.mods.control_key());
+                let (sh, al, ct) = (
+                    self.mods.shift_key(),
+                    self.mods.alt_key(),
+                    self.mods.control_key(),
+                );
                 if self.report_mouse(Some(id), |c, r| {
-                    MouseEvent::new_point(c, r).with_scroll(lines).with_modifiers(sh, al, ct)
+                    MouseEvent::new_point(c, r)
+                        .with_scroll(lines)
+                        .with_modifiers(sh, al, ct)
                 }) {
                     return;
                 }
@@ -4804,7 +5317,10 @@ impl WindowState<'_> {
         // Output on a background tab doesn't repaint; its bar label
         // refreshes with the next frame the active tab causes.
         if !syncing
-            && self.tabs.get(self.active).is_some_and(|t| t.panes.iter().any(|p| p.id == id))
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.panes.iter().any(|p| p.id == id))
             && let Some(window) = &self.window
         {
             window.request_redraw();
@@ -4924,7 +5440,8 @@ impl<'a> App<'a> {
         theme: Option<Theme>,
     ) -> Result<(), String> {
         let mut ws = self.new_window_state(quake)?;
-        ws.spawn_tab_opts(shell, &[], cwd, theme).map_err(|e| format!("spawn shell: {e}"))?;
+        ws.spawn_tab_opts(shell, &[], cwd, theme)
+            .map_err(|e| format!("spawn shell: {e}"))?;
         if !ws.ensure_window(event_loop) {
             return Err("could not create a window".into());
         }
@@ -4936,7 +5453,11 @@ impl<'a> App<'a> {
     /// focused one, else the first non-quake one, else any.
     fn control_target(&mut self) -> Option<&mut WindowState<'a>> {
         let focused = self.focused_window;
-        if let Some(i) = self.windows.iter().position(|w| w.window_id() == focused && focused.is_some()) {
+        if let Some(i) = self
+            .windows
+            .iter()
+            .position(|w| w.window_id() == focused && focused.is_some())
+        {
             return self.windows.get_mut(i);
         }
         if let Some(i) = self.windows.iter().position(|w| !w.quake) {
@@ -5047,7 +5568,11 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 // Window-level commands are the router's; everything else
                 // acts on the focused window.
                 let text = match cmd {
-                    CtlCommand::NewWindow { cwd, profile, shell } => {
+                    CtlCommand::NewWindow {
+                        cwd,
+                        profile,
+                        shell,
+                    } => {
                         let p = profile
                             .as_deref()
                             .and_then(|n| self.config.profile(n))
@@ -5109,7 +5634,9 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
         out.extend_from_slice(b"\x1b[201~");
         out
     } else {
-        text.bytes().filter(|&b| b == b'\t' || b == b'\r' || !b.is_ascii_control()).collect()
+        text.bytes()
+            .filter(|&b| b == b'\t' || b == b'\r' || !b.is_ascii_control())
+            .collect()
     }
 }
 
@@ -5262,14 +5789,22 @@ fn tab_widths(desired: &[usize], strip: usize) -> Option<Vec<usize>> {
     }
     let gaps = desired.len() - 1;
     let fits = |cap: usize| {
-        desired.iter().map(|&d| d.clamp(TAB_MIN, cap)).sum::<usize>() + gaps <= strip
+        desired
+            .iter()
+            .map(|&d| d.clamp(TAB_MIN, cap))
+            .sum::<usize>()
+            + gaps
+            <= strip
     };
     if !fits(TAB_MIN) {
         return None;
     }
     // Largest cap that still fits; the range is small, so a scan reads
     // clearer than a binary search.
-    let cap = (TAB_MIN..=TAB_CELLS).rev().find(|&c| fits(c)).unwrap_or(TAB_MIN);
+    let cap = (TAB_MIN..=TAB_CELLS)
+        .rev()
+        .find(|&c| fits(c))
+        .unwrap_or(TAB_MIN);
     Some(desired.iter().map(|&d| d.clamp(TAB_MIN, cap)).collect())
 }
 
@@ -5283,7 +5818,10 @@ fn visible_tab_range(active: usize, total: usize, available_cells: usize) -> (us
         return (0, total);
     }
     let max_start = total - capacity;
-    let start = active.saturating_sub(capacity - 1).min(active).min(max_start);
+    let start = active
+        .saturating_sub(capacity - 1)
+        .min(active)
+        .min(max_start);
     (start, start + capacity)
 }
 
@@ -5306,7 +5844,10 @@ fn pane_pixel_point(pos: (f64, f64), origin: (usize, usize), size: (usize, usize
     let clamp = |v: f64, o: usize, s: usize| {
         ((v.max(0.0) as usize).saturating_sub(o)).min(s.saturating_sub(1))
     };
-    MousePoint { col: clamp(pos.0, origin.0, size.0), row: clamp(pos.1, origin.1, size.1) }
+    MousePoint {
+        col: clamp(pos.0, origin.0, size.0),
+        row: clamp(pos.1, origin.1, size.1),
+    }
 }
 
 /// Quote `path` for pasting into a shell command line (a drag-and-dropped
@@ -5335,7 +5876,9 @@ fn open_url(url: &str) -> bool {
         return false;
     }
     #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -5384,11 +5927,15 @@ fn path_from_file_uri(uri: &str) -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&decoded)))
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            &decoded,
+        )))
     }
     #[cfg(not(unix))]
     {
-        Some(std::path::PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()))
+        Some(std::path::PathBuf::from(
+            String::from_utf8_lossy(&decoded).into_owned(),
+        ))
     }
 }
 
@@ -5434,7 +5981,14 @@ fn notify(title: &str, body: &str) {
     let mut cmd = {
         const PS: &str = "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.BalloonTipTitle = $env:RT_TITLE; $n.BalloonTipText = $env:RT_BODY; $n.Visible = $true; $n.ShowBalloonTip(6000); Start-Sleep -Seconds 7; $n.Dispose()";
         let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS]);
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            PS,
+        ]);
         c
     };
     #[cfg(target_os = "macos")]
@@ -5541,18 +6095,17 @@ fn osc52_reply(sel: char, text: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Hit, ImeCommitTarget, MenuKind, SETTINGS_CARDS_TOP, SETTINGS_FOOTER_H,
-        SETTINGS_ROW_H, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
-        SETTINGS_SEARCH_W, arrow_presses, drag_scroll_direction, encode_paste,
-        ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,
-        display_path, fmt_runtime, pane_pixel_point, path_from_file_uri, put_text,
-        read_git_branch, settings_hit, settings_value_end,
-        settings_visible, shell_menu_items, tab_drag_target, tab_spans, tab_widths,
-        visible_tab_range, widget_text,
-    };
     #[cfg(not(windows))]
     use super::shell_quote;
+    use super::{
+        Hit, ImeCommitTarget, MenuKind, SETTINGS_CARDS_TOP, SETTINGS_FOOTER_H, SETTINGS_ROW_H,
+        SETTINGS_SEARCH_W, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
+        arrow_presses, display_path, drag_scroll_direction, encode_paste, fmt_runtime,
+        ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,
+        pane_pixel_point, path_from_file_uri, put_text, read_git_branch, settings_hit,
+        settings_value_end, settings_visible, shell_menu_items, tab_drag_target, tab_spans,
+        tab_widths, visible_tab_range, widget_text,
+    };
     use crate::core::Cell;
 
     #[test]
@@ -5584,40 +6137,73 @@ mod tests {
         // Sidebar: categories every other row, with the gap row belonging to
         // the entry above it — the whole strip is clickable.
         let t = super::SETTINGS_TOP;
-        assert_eq!(settings_hit(2, t, cols, rows, 0, 7), SettingsHit::Category(0));
-        assert_eq!(settings_hit(2, t + 1, cols, rows, 0, 7), SettingsHit::Category(0));
-        assert_eq!(settings_hit(0, t + 2, cols, rows, 0, 7), SettingsHit::Category(1));
-        assert_eq!(settings_hit(2, t + 4, cols, rows, 0, 7), SettingsHit::Category(2));
+        assert_eq!(
+            settings_hit(2, t, cols, rows, 0, 7),
+            SettingsHit::Category(0)
+        );
+        assert_eq!(
+            settings_hit(2, t + 1, cols, rows, 0, 7),
+            SettingsHit::Category(0)
+        );
+        assert_eq!(
+            settings_hit(0, t + 2, cols, rows, 0, 7),
+            SettingsHit::Category(1)
+        );
+        assert_eq!(
+            settings_hit(2, t + 4, cols, rows, 0, 7),
+            SettingsHit::Category(2)
+        );
         // Below the last category the strip is dead.
         assert_eq!(settings_hit(2, t + 6, cols, rows, 0, 7), SettingsHit::None);
         // The title row's right end is the search affordance; its left is dead.
         let value_end = settings_value_end(cols);
-        assert_eq!(settings_hit(value_end - 1, t, cols, rows, 0, 7), SettingsHit::Search);
+        assert_eq!(
+            settings_hit(value_end - 1, t, cols, rows, 0, 7),
+            SettingsHit::Search
+        );
         assert_eq!(
             settings_hit(value_end - SETTINGS_SEARCH_W, t, cols, rows, 0, 7),
             SettingsHit::Search,
         );
-        assert_eq!(settings_hit(SETTINGS_SIDEBAR_W + 4, t, cols, rows, 0, 7), SettingsHit::None);
+        assert_eq!(
+            settings_hit(SETTINGS_SIDEBAR_W + 4, t, cols, rows, 0, 7),
+            SettingsHit::None
+        );
         // Card area starts below the title + rule; the rule row and the
         // spacer between cards are dead.
         let x = SETTINGS_SIDEBAR_W + 4;
         assert_eq!(settings_hit(x, t + 1, cols, rows, 0, 7), SettingsHit::None);
-        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 0, 7), SettingsHit::Row(0));
-        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP + 1, cols, rows, 0, 7), SettingsHit::Row(0));
-        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP + 2, cols, rows, 0, 7), SettingsHit::None);
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 0, 7),
+            SettingsHit::Row(0)
+        );
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP + 1, cols, rows, 0, 7),
+            SettingsHit::Row(0)
+        );
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP + 2, cols, rows, 0, 7),
+            SettingsHit::None
+        );
         assert_eq!(
             settings_hit(x, SETTINGS_CARDS_TOP + SETTINGS_ROW_H, cols, rows, 0, 7),
             SettingsHit::Row(1),
         );
         // Scroll offsets the list index the same card resolves to.
-        assert_eq!(settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 3, 7), SettingsHit::Row(3));
+        assert_eq!(
+            settings_hit(x, SETTINGS_CARDS_TOP, cols, rows, 3, 7),
+            SettingsHit::Row(3)
+        );
         // Past the end of a short list: dead.
         assert_eq!(
             settings_hit(x, SETTINGS_CARDS_TOP + SETTINGS_ROW_H, cols, rows, 0, 1),
             SettingsHit::None,
         );
         // Footer rows never hit.
-        assert_eq!(settings_hit(x, rows - 1, cols, rows, 0, 7), SettingsHit::None);
+        assert_eq!(
+            settings_hit(x, rows - 1, cols, rows, 0, 7),
+            SettingsHit::None
+        );
     }
 
     #[test]
@@ -5645,8 +6231,14 @@ mod tests {
             accum = next;
             total_lines += lines;
         }
-        assert_eq!(total_lines, 1, "5 * 0.3 == 1.5, so exactly one whole line has fired so far");
-        assert!((accum - 0.5).abs() < 1e-9, "the remaining 0.5 must still be carried: {accum}");
+        assert_eq!(
+            total_lines, 1,
+            "5 * 0.3 == 1.5, so exactly one whole line has fired so far"
+        );
+        assert!(
+            (accum - 0.5).abs() < 1e-9,
+            "the remaining 0.5 must still be carried: {accum}"
+        );
     }
 
     #[test]
@@ -5773,7 +6365,16 @@ mod tests {
         let mut row = vec![Cell::blank(); 8];
         let mut hits = vec![Hit::Drag; 8];
         let mut col = 1;
-        put_text(&mut row, &mut hits, &mut col, 4, "abcdef", 0x111111, 0x222222, Hit::NewTab);
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut col,
+            4,
+            "abcdef",
+            0x111111,
+            0x222222,
+            Hit::NewTab,
+        );
         assert_eq!(col, 4, "stops at the limit");
         assert_eq!(row[1].ch, 'a');
         assert_eq!(row[3].ch, 'c');
@@ -5789,7 +6390,16 @@ mod tests {
         let mut row = vec![Cell::blank(); 8];
         let mut hits = vec![Hit::Drag; 8];
         let mut col = 0;
-        put_text(&mut row, &mut hits, &mut col, 8, "你x", 0xAAAAAA, 0x0, Hit::Close);
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut col,
+            8,
+            "你x",
+            0xAAAAAA,
+            0x0,
+            Hit::Close,
+        );
         assert_eq!(col, 3, "wide glyph advances two cells");
         assert_eq!(row[0].ch, '你');
         assert_ne!(row[1].flags & WIDE_TRAILER, 0, "trailer flagged");
@@ -5801,7 +6411,16 @@ mod tests {
         let mut row = vec![Cell::blank(); 4];
         let mut hits = vec![Hit::Drag; 4];
         let mut col = 0;
-        put_text(&mut row, &mut hits, &mut col, 2, "a你", 0x0, 0x0, Hit::Close);
+        put_text(
+            &mut row,
+            &mut hits,
+            &mut col,
+            2,
+            "a你",
+            0x0,
+            0x0,
+            Hit::Close,
+        );
         assert_eq!(col, 1, "wide head would straddle the limit; stops");
         assert_eq!(row[1].ch, ' ');
     }
@@ -5811,7 +6430,10 @@ mod tests {
         assert_eq!(mix(0x000000, 0xFFFFFF, 0), 0x000000);
         assert_eq!(mix(0x000000, 0xFFFFFF, 255), 0xFFFFFF);
         let mid = mix(0x000000, 0xFFFFFF, 128);
-        assert!((0x7F..=0x81).contains(&(mid & 0xff)), "roughly half: {mid:#x}");
+        assert!(
+            (0x7F..=0x81).contains(&(mid & 0xff)),
+            "roughly half: {mid:#x}"
+        );
     }
 
     #[test]
@@ -5819,8 +6441,14 @@ mod tests {
         use crate::shells::DetectedShell;
         use std::path::PathBuf;
         let shells = vec![
-            DetectedShell { name: "pwsh", path: PathBuf::from("/x/pwsh") },
-            DetectedShell { name: "bash", path: PathBuf::from("/bin/bash") },
+            DetectedShell {
+                name: "pwsh",
+                path: PathBuf::from("/x/pwsh"),
+            },
+            DetectedShell {
+                name: "bash",
+                path: PathBuf::from("/bin/bash"),
+            },
         ];
         let profiles = vec![crate::config::Profile {
             name: "dev".into(),
@@ -5883,19 +6511,34 @@ mod tests {
     fn ime_commit_routes_to_the_find_bar_when_searching() {
         // Regardless of overlay/copy-mode state, an open find bar wins — it's
         // the innermost, most specific input owner.
-        assert_eq!(ime_commit_target(true, false, false), ImeCommitTarget::SearchBar);
-        assert_eq!(ime_commit_target(true, true, true), ImeCommitTarget::SearchBar);
+        assert_eq!(
+            ime_commit_target(true, false, false),
+            ImeCommitTarget::SearchBar
+        );
+        assert_eq!(
+            ime_commit_target(true, true, true),
+            ImeCommitTarget::SearchBar
+        );
     }
 
     #[test]
     fn ime_commit_is_dropped_under_an_overlay_or_copy_mode() {
-        assert_eq!(ime_commit_target(false, true, false), ImeCommitTarget::Dropped);
-        assert_eq!(ime_commit_target(false, false, true), ImeCommitTarget::Dropped);
+        assert_eq!(
+            ime_commit_target(false, true, false),
+            ImeCommitTarget::Dropped
+        );
+        assert_eq!(
+            ime_commit_target(false, false, true),
+            ImeCommitTarget::Dropped
+        );
     }
 
     #[test]
     fn ime_commit_reaches_the_pane_only_when_nothing_else_owns_the_keyboard() {
-        assert_eq!(ime_commit_target(false, false, false), ImeCommitTarget::Pane);
+        assert_eq!(
+            ime_commit_target(false, false, false),
+            ImeCommitTarget::Pane
+        );
     }
 
     #[test]
@@ -5995,7 +6638,10 @@ mod tests {
         assert_eq!(drag_scroll_direction(16.0, top, bottom, margin), None); // inside the margin
         assert_eq!(drag_scroll_direction(14.0, top, bottom, margin), Some(true)); // past it: scroll up
         assert_eq!(drag_scroll_direction(104.0, top, bottom, margin), None); // inside the margin
-        assert_eq!(drag_scroll_direction(106.0, top, bottom, margin), Some(false)); // past it: scroll down
+        assert_eq!(
+            drag_scroll_direction(106.0, top, bottom, margin),
+            Some(false)
+        ); // past it: scroll down
     }
 
     #[cfg(not(windows))]
@@ -6020,17 +6666,39 @@ mod tests {
         use crate::core::AnsiParser;
         let mut g = crate::core::Grid::new(40, 8);
         let mut p = AnsiParser::new();
-        p.advance(&mut g, b"$ make ok\r\n\x1b]133;C\x07fine\r\n\x1b]133;D;0\x07");
-        p.advance(&mut g, b"$ make bad\r\n\x1b]133;C\x07boom\r\n\x1b]133;D;3\x07");
+        p.advance(
+            &mut g,
+            b"$ make ok\r\n\x1b]133;C\x07fine\r\n\x1b]133;D;0\x07",
+        );
+        p.advance(
+            &mut g,
+            b"$ make bad\r\n\x1b]133;C\x07boom\r\n\x1b]133;D;3\x07",
+        );
         let theme = crate::core::Theme::default();
         let (d, items) = super::build_dock_grid(&g, &theme, 30, 8);
         // Header on row 0; entries start on row 2, newest first.
-        assert_eq!(d.viewport_cell(1, 2).ch, '\u{2717}', "newest (failed) block first");
-        assert_eq!(d.viewport_cell(1, 2).fg, theme.palette16[1], "failure glyph is red");
+        assert_eq!(
+            d.viewport_cell(1, 2).ch,
+            '\u{2717}',
+            "newest (failed) block first"
+        );
+        assert_eq!(
+            d.viewport_cell(1, 2).fg,
+            theme.palette16[1],
+            "failure glyph is red"
+        );
         let label: String = (3..14).map(|c| d.viewport_cell(c, 2).ch).collect();
-        assert_eq!(label.trim_end(), "$ make bad", "label is the prompt line above the block");
+        assert_eq!(
+            label.trim_end(),
+            "$ make bad",
+            "label is the prompt line above the block"
+        );
         assert_eq!(d.viewport_cell(1, 3).ch, '\u{2713}', "older success below");
-        assert_eq!(d.viewport_cell(1, 3).fg, theme.palette16[2], "success glyph is green");
+        assert_eq!(
+            d.viewport_cell(1, 3).fg,
+            theme.palette16[2],
+            "success glyph is green"
+        );
         // Click map: row 2 jumps to the failed block's start, row 3 to the
         // successful one's; header/blank rows are inert.
         assert_eq!(items[2], Some(3));
@@ -6056,17 +6724,27 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         // A symbolic ref resolves to the branch name, from a subdirectory.
-        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature/status-bar\n").unwrap();
+        std::fs::write(
+            root.join(".git/HEAD"),
+            "ref: refs/heads/feature/status-bar\n",
+        )
+        .unwrap();
         assert_eq!(read_git_branch(&sub).as_deref(), Some("feature/status-bar"));
         // A detached head shows the short hash.
-        std::fs::write(root.join(".git/HEAD"), "0123456789abcdef0123456789abcdef01234567\n")
-            .unwrap();
+        std::fs::write(
+            root.join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
         assert_eq!(read_git_branch(&sub).as_deref(), Some("01234567"));
         // A worktree-style `.git` *file* follows its gitdir pointer.
         let wt = std::env::temp_dir().join(format!("rt_git_wt_{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", root.join(".git").display()))
-            .unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", root.join(".git").display()),
+        )
+        .unwrap();
         assert_eq!(read_git_branch(&wt).as_deref(), Some("01234567"));
         // Outside any repository: None.
         let bare = std::env::temp_dir().join(format!("rt_git_none_{}", std::process::id()));
@@ -6081,7 +6759,9 @@ mod tests {
     fn display_path_shortens_home_to_tilde() {
         // Only meaningful where a home directory is defined (CI always has one).
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-        let Some(home) = home.map(std::path::PathBuf::from) else { return };
+        let Some(home) = home.map(std::path::PathBuf::from) else {
+            return;
+        };
         assert_eq!(display_path(&home), "~");
         assert_eq!(
             display_path(&home.join("projects")),

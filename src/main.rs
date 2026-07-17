@@ -1,6 +1,6 @@
-use rusty_term::{backend, config, core, runtime, shells, term};
 #[cfg(feature = "gui")]
 use rusty_term::gui;
+use rusty_term::{backend, config, core, runtime, shells, term};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +22,10 @@ use core::Grid;
 /// child argument that happens to read like one of our flags (even literally
 /// `--config`) is never misread as ours.
 fn split_command(args: &[String]) -> (&[String], Option<(String, Vec<String>)>) {
-    match args.iter().position(|a| a == "--" || a == "-e" || a == "--command") {
+    match args
+        .iter()
+        .position(|a| a == "--" || a == "-e" || a == "--command")
+    {
         Some(pos) => {
             let rest = &args[pos + 1..];
             let command = rest.split_first().map(|(p, a)| (p.clone(), a.to_vec()));
@@ -137,7 +140,8 @@ fn apply_cli_overrides(
     command: Option<(String, Vec<String>)>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    if let Some(dir) = flag_value(args, "--cwd").or_else(|| flag_value(args, "--starting-directory"))
+    if let Some(dir) =
+        flag_value(args, "--cwd").or_else(|| flag_value(args, "--starting-directory"))
     {
         config.cwd = Some(PathBuf::from(dir));
     }
@@ -261,8 +265,7 @@ fn main() -> Result<(), std::io::Error> {
         // Single-instance: if a control socket/pipe answers, hand this
         // launch to the running instance as a new tab and exit instead of
         // opening a second window.
-        if config.single_instance.unwrap_or(false)
-            || args.iter().any(|a| a == "--single-instance")
+        if config.single_instance.unwrap_or(false) || args.iter().any(|a| a == "--single-instance")
         {
             let mut req = String::from("new-tab");
             if let Some(cwd) = &config.cwd {
@@ -346,9 +349,8 @@ fn run_ctl(args: &[String]) -> std::io::Result<()> {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let reply = gui::control::request(&line).map_err(|e| {
-            std::io::Error::other(format!("no running rusty_term instance ({e})"))
-        })?;
+        let reply = gui::control::request(&line)
+            .map_err(|e| std::io::Error::other(format!("no running rusty_term instance ({e})")))?;
         print!("{reply}");
         if reply.lines().last().is_some_and(|l| l.starts_with("err")) {
             return Err(std::io::Error::other("control command failed"));
@@ -363,7 +365,6 @@ fn run_ctl(args: &[String]) -> std::io::Result<()> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,9 +376,23 @@ mod tests {
     #[test]
     fn all_known_flags_pass_through_unrecognized_flags_cleanly() {
         let args = s(&[
-            "--cwd", "/tmp", "--title", "hi", "--fullscreen", "--opacity", "0.5", "--profile",
-            "dev", "--session", "/x", "--gui", "--single-instance", "--list-shells", "--help",
-            "-h", "--version",
+            "--cwd",
+            "/tmp",
+            "--title",
+            "hi",
+            "--fullscreen",
+            "--opacity",
+            "0.5",
+            "--profile",
+            "dev",
+            "--session",
+            "/x",
+            "--gui",
+            "--single-instance",
+            "--list-shells",
+            "--help",
+            "-h",
+            "--version",
         ]);
         assert!(unrecognized_flags(&args).is_empty());
     }
@@ -501,8 +516,10 @@ mod tests {
 
     #[test]
     fn cli_overrides_trailing_command_replaces_shell_and_args() {
-        let mut config =
-            Config { shell: Some("/bin/bash".to_string()), ..Default::default() };
+        let mut config = Config {
+            shell: Some("/bin/bash".to_string()),
+            ..Default::default()
+        };
         let command = Some(("htop".to_string(), s(&["-d", "10"])));
         apply_cli_overrides(&mut config, &[], command);
         assert_eq!(config.shell.as_deref(), Some("htop"));

@@ -132,9 +132,19 @@ pub(crate) fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, FrameEr
     if buf.len() < at + len {
         return Ok(None);
     }
-    let payload: Vec<u8> =
-        buf[at..at + len].iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
-    Ok(Some((Frame { fin, opcode, payload }, at + len)))
+    let payload: Vec<u8> = buf[at..at + len]
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ mask[i % 4])
+        .collect();
+    Ok(Some((
+        Frame {
+            fin,
+            opcode,
+            payload,
+        },
+        at + len,
+    )))
 }
 
 /// Encode a server-to-client frame (FIN set, unmasked — servers must not
@@ -236,7 +246,9 @@ pub(crate) fn parse_upgrade(head: &str) -> Option<(String, Option<String>)> {
     }
     let (mut key, mut origin, mut upgrade_ok, mut version_ok) = (None, None, false, false);
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         let value = value.trim();
         match name.to_ascii_lowercase().as_str() {
             "upgrade" => upgrade_ok = value.eq_ignore_ascii_case("websocket"),
@@ -260,7 +272,9 @@ pub(crate) fn parse_upgrade(head: &str) -> Option<(String, Option<String>)> {
 /// cross-origin confused-deputy problem this guards against).
 pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else { return true };
-    let rest = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"));
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
     let Some(rest) = rest else { return false };
     // A bracketed IPv6 literal ("[::1]" or "[::1]:5173") has colons inside
     // the brackets, so a naive split(':') never reaches the host — take
@@ -286,20 +300,31 @@ mod tests {
 
     #[test]
     fn sha1_matches_fips_vectors() {
-        assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(
-            hex(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
         // Two blocks with length in the second: 64 bytes of 'a'.
-        assert_eq!(hex(&sha1(&[b'a'; 64])), "0098ba824b5c16427bd7a1122a5a442a25ec644d");
+        assert_eq!(
+            hex(&sha1(&[b'a'; 64])),
+            "0098ba824b5c16427bd7a1122a5a442a25ec644d"
+        );
     }
 
     #[test]
     fn accept_key_matches_the_rfc_example() {
         // RFC 6455 §1.3's worked example.
-        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 
     /// Mask and frame `payload` the way a client would.
@@ -404,7 +429,10 @@ mod tests {
         // brackets and never reaches the host — these must still match.
         assert!(origin_allowed(Some("http://[::1]:5173")));
         assert!(origin_allowed(Some("https://[::1]")));
-        assert!(!origin_allowed(Some("http://[::2]:5173")), "not the loopback address");
+        assert!(
+            !origin_allowed(Some("http://[::2]:5173")),
+            "not the loopback address"
+        );
         // A malformed/unterminated bracket must not panic and must be
         // refused rather than accidentally matching.
         assert!(!origin_allowed(Some("http://[::1")));

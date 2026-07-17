@@ -967,7 +967,10 @@ fn xtgettcap_answers_known_caps_and_truecolor() {
     // `Co` (436f) and `Tc` (5463) in one query.
     p.advance(&mut g, b"\x1bP+q436f;5463\x1b\\");
     // Co=256 -> value "256" hex-encoded (323536); Tc is a boolean (no value).
-    assert_eq!(p.take_responses(), b"\x1bP1+r436f=323536\x1b\\\x1bP1+r5463\x1b\\");
+    assert_eq!(
+        p.take_responses(),
+        b"\x1bP1+r436f=323536\x1b\\\x1bP1+r5463\x1b\\"
+    );
     assert_eq!(g.cells[0].ch, ' '); // nothing leaked to the screen
 }
 
@@ -977,7 +980,10 @@ fn xtgettcap_reports_terminal_name() {
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"\x1bP+q544e\x1b\\"); // TN -> terminfo name
     // "rusty_term" hex-encoded.
-    assert_eq!(p.take_responses(), b"\x1bP1+r544e=72757374795f7465726d\x1b\\");
+    assert_eq!(
+        p.take_responses(),
+        b"\x1bP1+r544e=72757374795f7465726d\x1b\\"
+    );
 }
 
 #[test]
@@ -1124,7 +1130,10 @@ fn xtwinops_pixel_queries_need_cell_px_and_answer_when_set() {
     p.advance(&mut g, b"\x1b[16t");
     assert_eq!(p.take_responses(), b"\x1b[6;18;9t");
     p.advance(&mut g, b"\x1b[14t");
-    assert_eq!(p.take_responses(), format!("\x1b[4;{};{}t", 18 * 24, 9 * 80).as_bytes());
+    assert_eq!(
+        p.take_responses(),
+        format!("\x1b[4;{};{}t", 18 * 24, 9 * 80).as_bytes()
+    );
 }
 
 #[test]
@@ -1221,13 +1230,32 @@ fn ris_and_decstr_clear_sync_output_and_cursor_icon() {
 
 #[test]
 fn sgr4_colon_style_sets_undercurl_and_other_styles() {
-    let g = parse(b"\x1b[4:3ma\x1b[4:4mb\x1b[4:5mc\x1b[4:2md\x1b[4:1me\x1b[4:0mf", 80, 24);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Curly);
+    let g = parse(
+        b"\x1b[4:3ma\x1b[4:4mb\x1b[4:5mc\x1b[4:2md\x1b[4:1me\x1b[4:0mf",
+        80,
+        24,
+    );
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[0].flags),
+        UnderlineStyle::Curly
+    );
     assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[1].flags), UnderlineStyle::Dotted);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[2].flags), UnderlineStyle::Dashed);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[3].flags), UnderlineStyle::Double);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[4].flags), UnderlineStyle::Straight);
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[1].flags),
+        UnderlineStyle::Dotted
+    );
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[2].flags),
+        UnderlineStyle::Dashed
+    );
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[3].flags),
+        UnderlineStyle::Double
+    );
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[4].flags),
+        UnderlineStyle::Straight
+    );
     // `4:0` turns the underline off outright rather than just resetting style.
     assert_eq!(g.cells[5].flags & ATTR_UNDERLINE, 0);
 }
@@ -1239,19 +1267,29 @@ fn sgr4_semicolon_form_is_unambiguous_from_colon_sub_param() {
     let g = parse(b"\x1b[4;3mx", 80, 24);
     assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
     assert_ne!(g.cells[0].flags & ATTR_ITALIC, 0);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Straight);
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[0].flags),
+        UnderlineStyle::Straight
+    );
 }
 
 #[test]
 fn sgr4_bare_forces_straight_even_over_a_leftover_colon_style() {
     let g = parse(b"\x1b[4:3m\x1b[4mx", 80, 24);
-    assert_eq!(UnderlineStyle::from_attrs(g.cells[0].flags), UnderlineStyle::Straight);
+    assert_eq!(
+        UnderlineStyle::from_attrs(g.cells[0].flags),
+        UnderlineStyle::Straight
+    );
     assert_ne!(g.cells[0].flags & ATTR_UNDERLINE, 0);
 }
 
 #[test]
 fn sgr58_sets_underline_color_independent_of_fg_and_59_resets() {
-    let g = parse(b"\x1b[4m\x1b[38;2;10;20;30m\x1b[58;2;255;0;0mA\x1b[59mB", 80, 24);
+    let g = parse(
+        b"\x1b[4m\x1b[38;2;10;20;30m\x1b[58;2;255;0;0mA\x1b[59mB",
+        80,
+        24,
+    );
     assert_ne!(g.cells[0].flags & ATTR_UNDERLINE_COLOR, 0);
     assert_eq!(g.cells[0].underline_color, 0xFF0000);
     assert_eq!(g.cells[0].fg, 0x0A141E); // fg untouched by SGR 58
@@ -1518,7 +1556,10 @@ fn osc_9_records_notification_and_relays() {
     let mut g = Grid::new(80, 24);
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"\x1b]9;Build complete\x07");
-    assert_eq!(g.notifications, vec![(String::new(), "Build complete".to_string())]);
+    assert_eq!(
+        g.notifications,
+        vec![(String::new(), "Build complete".to_string())]
+    );
     assert_eq!(g.take_host_out(), b"\x1b]9;Build complete\x07"); // relayed for TUI
     assert_eq!(g.cells[0].ch, ' '); // not printed
 }
@@ -1544,7 +1585,10 @@ fn osc_777_parses_title_and_body() {
     let mut p = AnsiParser::new();
     // The body keeps any further `;` (only the first two are structural).
     p.advance(&mut g, b"\x1b]777;notify;Deploy;done; ok\x07");
-    assert_eq!(g.notifications, vec![("Deploy".to_string(), "done; ok".to_string())]);
+    assert_eq!(
+        g.notifications,
+        vec![("Deploy".to_string(), "done; ok".to_string())]
+    );
 }
 
 #[test]
@@ -1598,7 +1642,11 @@ fn links_arc_and_clusters_arc_stay_in_sync_with_the_backing_vecs() {
     // "e\u{0301}" is 'e' + combining acute accent: the accent is a grapheme
     // continuation, interned into `clusters`.
     p.advance(&mut g, "e\u{0301}".as_bytes());
-    assert_eq!(g.clusters.len(), 1, "the combining accent should be interned");
+    assert_eq!(
+        g.clusters.len(),
+        1,
+        "the combining accent should be interned"
+    );
     assert_eq!(g.clusters_arc.len(), g.clusters.len());
     assert_eq!(&*g.clusters_arc, &g.clusters[..]);
 }
@@ -1607,7 +1655,10 @@ fn links_arc_and_clusters_arc_stay_in_sync_with_the_backing_vecs() {
 fn force_full_repaint_marks_every_row_dirty_even_after_a_clear() {
     let mut g = Grid::new(10, 4);
     g.clear_dirty();
-    assert!(g.dirty.iter().all(|&d| !d), "clear_dirty should have cleared everything");
+    assert!(
+        g.dirty.iter().all(|&d| !d),
+        "clear_dirty should have cleared everything"
+    );
     g.force_full_repaint();
     assert_eq!(g.dirty.len(), 4);
     assert!(g.dirty.iter().all(|&d| d));
@@ -1885,7 +1936,10 @@ fn fold_block_toggle_finds_the_block_containing_a_line_only() {
     assert!(g.fold_blocks()[0].folded);
     assert!(g.toggle_fold_at(start)); // toggling again flips it back
     assert!(!g.fold_blocks()[0].folded);
-    assert!(!g.toggle_fold_at(end), "end is exclusive: one past the block");
+    assert!(
+        !g.toggle_fold_at(end),
+        "end is exclusive: one past the block"
+    );
 }
 
 #[test]
@@ -1913,9 +1967,16 @@ fn viewport_block_marks_color_rows_by_exit_and_running_state() {
     let marks = g.viewport_block_marks();
     assert_eq!(marks[0], Some(BlockMark::Success));
     assert_eq!(marks[1], Some(BlockMark::Error));
-    assert_eq!(marks[2], None, "a block without an exit code carries no mark");
+    assert_eq!(
+        marks[2], None,
+        "a block without an exit code carries no mark"
+    );
     assert_eq!(marks[3], Some(BlockMark::Running));
-    assert_eq!(marks[4], Some(BlockMark::Running), "the cursor line is still the command's");
+    assert_eq!(
+        marks[4],
+        Some(BlockMark::Running),
+        "the cursor line is still the command's"
+    );
     assert_eq!(marks[5], None, "past the running command: unmarked");
 }
 
@@ -1960,7 +2021,10 @@ fn fold_blocks_shift_with_scrollback_eviction_and_stale_block_is_dropped() {
     for _ in 0..(SCROLLBACK_MAX + 10) {
         p.advance(&mut g, b"y\r\n");
     }
-    assert!(g.fold_blocks().is_empty(), "the old block's line scrolled off the cap");
+    assert!(
+        g.fold_blocks().is_empty(),
+        "the old block's line scrolled off the cap"
+    );
 
     // A block opened after the overflow survives further eviction, shifted
     // down by exactly the one line that scrolls off per iteration.
@@ -1986,7 +2050,10 @@ fn fold_blocks_cleared_on_ris() {
 fn fold_blocks_survive_a_resize_reflow() {
     let mut g = Grid::new(80, 10);
     let mut p = AnsiParser::new();
-    p.advance(&mut g, b"\x1b]133;C\x07a line of output\r\nanother line\r\n");
+    p.advance(
+        &mut g,
+        b"\x1b]133;C\x07a line of output\r\nanother line\r\n",
+    );
     p.advance(&mut g, b"\x1b]133;D\x07");
     assert_eq!(g.fold_blocks().len(), 1);
     g.resize(40, 10); // narrower: forces a rewrap
@@ -3193,7 +3260,10 @@ fn base64_encodes_with_padding_and_round_trips() {
     assert_eq!(base64::encode(b""), "");
     // Round-trips with decode across every byte value.
     let data: Vec<u8> = (0u8..=255).collect();
-    assert_eq!(base64::decode(base64::encode(&data).as_bytes()).unwrap(), data);
+    assert_eq!(
+        base64::decode(base64::encode(&data).as_bytes()).unwrap(),
+        data
+    );
 }
 
 #[test]
@@ -3297,7 +3367,11 @@ const NOISE34_444_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEA
 /// A decoded JPEG pixel `(r, g, b)` as signed ints (for tolerance comparisons).
 fn jpx(img: &jpeg::Image, x: usize, y: usize) -> (i32, i32, i32) {
     let o = (y * img.width + x) * 4;
-    (img.rgba[o] as i32, img.rgba[o + 1] as i32, img.rgba[o + 2] as i32)
+    (
+        img.rgba[o] as i32,
+        img.rgba[o + 1] as i32,
+        img.rgba[o + 2] as i32,
+    )
 }
 
 #[test]
@@ -3331,9 +3405,17 @@ fn jpeg_decodes_two_colors_444() {
     let img = jpeg::decode(&data).unwrap();
     assert_eq!((img.width, img.height), (16, 16));
     let (lr, lg, lb) = jpx(&img, 2, 8);
-    assert!(lr > 180 && lg < 80 && lb < 80, "left red, got {:?}", (lr, lg, lb));
+    assert!(
+        lr > 180 && lg < 80 && lb < 80,
+        "left red, got {:?}",
+        (lr, lg, lb)
+    );
     let (rr, rg, rb) = jpx(&img, 13, 8);
-    assert!(rb > 180 && rr < 80 && rg < 90, "right blue, got {:?}", (rr, rg, rb));
+    assert!(
+        rb > 180 && rr < 80 && rg < 90,
+        "right blue, got {:?}",
+        (rr, rg, rb)
+    );
 }
 
 #[test]
@@ -3442,7 +3524,12 @@ fn iterm2_width_hint_shrinks_the_image_footprint() {
     // Natural size is 8x8 (one cell column per pixel column): unhinted, all
     // 8 columns of row 0 get painted.
     let g = parse(
-        &[b"\x1b]1337;File=inline=1:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        &[
+            b"\x1b]1337;File=inline=1:".as_slice(),
+            GRAY8_B64.as_bytes(),
+            b"\x07",
+        ]
+        .concat(),
         20,
         10,
     );
@@ -3450,7 +3537,12 @@ fn iterm2_width_hint_shrinks_the_image_footprint() {
 
     // width=4 shrinks the footprint to 4 columns; nothing past it is touched.
     let g = parse(
-        &[b"\x1b]1337;File=inline=1;width=4:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        &[
+            b"\x1b]1337;File=inline=1;width=4:".as_slice(),
+            GRAY8_B64.as_bytes(),
+            b"\x07",
+        ]
+        .concat(),
         20,
         10,
     );
@@ -3462,7 +3554,12 @@ fn iterm2_width_hint_shrinks_the_image_footprint() {
 fn iterm2_height_hint_shrinks_the_row_footprint() {
     // Natural 8px tall -> 4 cell rows unhinted.
     let g = parse(
-        &[b"\x1b]1337;File=inline=1:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        &[
+            b"\x1b]1337;File=inline=1:".as_slice(),
+            GRAY8_B64.as_bytes(),
+            b"\x07",
+        ]
+        .concat(),
         20,
         10,
     );
@@ -3470,7 +3567,12 @@ fn iterm2_height_hint_shrinks_the_row_footprint() {
 
     // height=2 shrinks it to 2 cell rows; row 2 onward is never touched.
     let g = parse(
-        &[b"\x1b]1337;File=inline=1;height=2:".as_slice(), GRAY8_B64.as_bytes(), b"\x07"].concat(),
+        &[
+            b"\x1b]1337;File=inline=1;height=2:".as_slice(),
+            GRAY8_B64.as_bytes(),
+            b"\x07",
+        ]
+        .concat(),
         20,
         10,
     );
@@ -3581,7 +3683,10 @@ fn kitty_oversized_chunk_reports_failure_not_truncated_render() {
         p.advance(&mut g, &more);
     }
     p.advance(&mut g, b"\x1b_Gm=0;\x1b\\"); // final chunk
-    assert_eq!(g.cells[0].ch, ' ', "no image rendered from truncated payload");
+    assert_eq!(
+        g.cells[0].ch, ' ',
+        "no image rendered from truncated payload"
+    );
     assert_eq!(p.take_responses(), b"\x1b_Gi=7;EBADF\x1b\\");
 }
 
@@ -3629,7 +3734,13 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         );
-        for tool in ["get_screen", "get_scrollback", "get_cwd", "get_title", "get_dimensions"] {
+        for tool in [
+            "get_screen",
+            "get_scrollback",
+            "get_cwd",
+            "get_title",
+            "get_dimensions",
+        ] {
             assert!(resp.contains(tool), "tools/list missing {tool}");
         }
     }
@@ -3645,7 +3756,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_screen"}}"#,
         );
-        assert!(resp.contains("hello channel"), "screen text not returned: {resp}");
+        assert!(
+            resp.contains("hello channel"),
+            "screen text not returned: {resp}"
+        );
         assert!(resp.contains("\"content\""));
     }
 
@@ -3756,7 +3870,10 @@ mod l13 {
             "channel",
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"version":0}}"#,
         );
-        assert!(resp.contains("\"error\""), "version 0 must be rejected: {resp}");
+        assert!(
+            resp.contains("\"error\""),
+            "version 0 must be rejected: {resp}"
+        );
         assert!(resp.contains("\"supported\""));
     }
 
@@ -3780,8 +3897,14 @@ mod l13 {
             "channel",
             r#"{"jsonrpc":"2.0","id":2,"method":"describe"}"#,
         );
-        assert!(resp.contains("\"min\":1") && resp.contains("\"max\":1"), "{resp}");
-        assert!(resp.contains("resources/read"), "schema lists MCP resource methods: {resp}");
+        assert!(
+            resp.contains("\"min\":1") && resp.contains("\"max\":1"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("resources/read"),
+            "schema lists MCP resource methods: {resp}"
+        );
         assert!(resp.contains("\"acp\""));
     }
 
@@ -3796,15 +3919,25 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
         );
-        for uri in ["terminal://screen", "terminal://cursor", "terminal://dimensions"] {
-            assert!(list.contains(uri), "resource {uri} missing from list: {list}");
+        for uri in [
+            "terminal://screen",
+            "terminal://cursor",
+            "terminal://dimensions",
+        ] {
+            assert!(
+                list.contains(uri),
+                "resource {uri} missing from list: {list}"
+            );
         }
         let read = channel_roundtrip(
             &mut g,
             "mcp",
             r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"terminal://screen"}}"#,
         );
-        assert!(read.contains("resource body"), "screen resource text missing: {read}");
+        assert!(
+            read.contains("resource body"),
+            "screen resource text missing: {read}"
+        );
         assert!(read.contains("\"contents\""));
     }
 
@@ -3816,7 +3949,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"terminal://nope"}}"#,
         );
-        assert!(resp.contains("\"error\""), "unknown resource must error: {resp}");
+        assert!(
+            resp.contains("\"error\""),
+            "unknown resource must error: {resp}"
+        );
     }
 
     #[test]
@@ -3830,7 +3966,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_cursor"}}"#,
         );
-        assert!(resp.contains("5,3"), "cursor position not reported as COL,ROW: {resp}");
+        assert!(
+            resp.contains("5,3"),
+            "cursor position not reported as COL,ROW: {resp}"
+        );
     }
 
     #[test]
@@ -3841,14 +3980,23 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://cwd"}}"#,
         );
-        assert!(sub.contains("\"result\""), "subscribe should succeed: {sub}");
+        assert!(
+            sub.contains("\"result\""),
+            "subscribe should succeed: {sub}"
+        );
         // A cwd change (OSC 7) now pushes a notification on the child channel.
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]7;file:///tmp/x\x07");
         let push = String::from_utf8(p.take_responses()).unwrap();
-        assert!(push.contains("notifications/resources/updated"), "no push: {push}");
+        assert!(
+            push.contains("notifications/resources/updated"),
+            "no push: {push}"
+        );
         assert!(push.contains("terminal://cwd"), "{push}");
-        assert!(!push.contains("\"id\""), "a notification carries no id: {push}");
+        assert!(
+            !push.contains("\"id\""),
+            "a notification carries no id: {push}"
+        );
     }
 
     #[test]
@@ -3856,7 +4004,10 @@ mod l13 {
         let mut g = Grid::new(80, 24);
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]7;file:///tmp/x\x07");
-        assert!(p.take_responses().is_empty(), "no notification without subscribe");
+        assert!(
+            p.take_responses().is_empty(),
+            "no notification without subscribe"
+        );
     }
 
     #[test]
@@ -3874,7 +4025,10 @@ mod l13 {
         );
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]2;new title\x07");
-        assert!(p.take_responses().is_empty(), "unsubscribed: must not notify");
+        assert!(
+            p.take_responses().is_empty(),
+            "unsubscribed: must not notify"
+        );
     }
 
     #[test]
@@ -3886,7 +4040,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"terminal://screen"}}"#,
         );
-        assert!(resp.contains("\"error\""), "screen is not subscribable: {resp}");
+        assert!(
+            resp.contains("\"error\""),
+            "screen is not subscribable: {resp}"
+        );
     }
 
     #[test]
@@ -3900,12 +4057,17 @@ mod l13 {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]2;same\x07"); // "" -> "same": a real change
         assert!(
-            String::from_utf8(p.take_responses()).unwrap().contains("terminal://title"),
+            String::from_utf8(p.take_responses())
+                .unwrap()
+                .contains("terminal://title"),
             "first title set must notify"
         );
         let mut p2 = AnsiParser::new();
         p2.advance(&mut g, b"\x1b]2;same\x07"); // "same" -> "same": no change
-        assert!(p2.take_responses().is_empty(), "a no-op title set must not notify");
+        assert!(
+            p2.take_responses().is_empty(),
+            "a no-op title set must not notify"
+        );
     }
 
     #[test]
@@ -3919,7 +4081,11 @@ mod l13 {
         assert!(ok.contains("\"result\""), "set_status should succeed: {ok}");
         // The bottom row of a snapshot now shows the overlay text, not grid content.
         let frame = g.snapshot_dirty();
-        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 2).expect("bottom row dirty");
+        let (_, bottom) = frame
+            .rows
+            .iter()
+            .find(|(y, _)| *y == 2)
+            .expect("bottom row dirty");
         let text: String = bottom.iter().map(|c| c.ch).collect();
         assert!(text.starts_with("READY"), "overlay text missing: {text:?}");
         // Clearing restores the underlying (blank) row.
@@ -3929,7 +4095,11 @@ mod l13 {
             r#"{"jsonrpc":"2.0","id":2,"method":"clear_status"}"#,
         );
         let frame = g.snapshot_dirty();
-        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 2).expect("bottom row dirty");
+        let (_, bottom) = frame
+            .rows
+            .iter()
+            .find(|(y, _)| *y == 2)
+            .expect("bottom row dirty");
         let text: String = bottom.iter().map(|c| c.ch).collect();
         assert!(!text.contains("READY"), "overlay not cleared: {text:?}");
     }
@@ -3944,10 +4114,17 @@ mod l13 {
         );
         g.resize(4, 4); // overlay re-lays out to the new width
         let frame = g.snapshot_dirty();
-        let (_, bottom) = frame.rows.iter().find(|(y, _)| *y == 3).expect("new bottom row");
+        let (_, bottom) = frame
+            .rows
+            .iter()
+            .find(|(y, _)| *y == 3)
+            .expect("new bottom row");
         assert_eq!(bottom.len(), 4, "overlay re-laid to new width");
         let text: String = bottom.iter().map(|c| c.ch).collect();
-        assert!(text.starts_with("hi"), "overlay lost across resize: {text:?}");
+        assert!(
+            text.starts_with("hi"),
+            "overlay lost across resize: {text:?}"
+        );
     }
 
     #[test]
@@ -3958,7 +4135,10 @@ mod l13 {
             "render",
             r#"{"jsonrpc":"2.0","id":1,"method":"set_status","params":{}}"#,
         );
-        assert!(resp.contains("\"error\""), "missing text must error: {resp}");
+        assert!(
+            resp.contains("\"error\""),
+            "missing text must error: {resp}"
+        );
     }
 
     #[test]
@@ -3973,15 +4153,24 @@ mod l13 {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]133;D;0\x07");
         let push = String::from_utf8(p.take_responses()).unwrap();
-        assert!(push.contains("notifications/command_finished"), "no typed push: {push}");
-        assert!(push.contains("\"exit\":0"), "exit code not carried in the push: {push}");
+        assert!(
+            push.contains("notifications/command_finished"),
+            "no typed push: {push}"
+        );
+        assert!(
+            push.contains("\"exit\":0"),
+            "exit code not carried in the push: {push}"
+        );
         // The resource now reads the exit code.
         let read = channel_roundtrip(
             &mut g,
             "mcp",
             r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
         );
-        assert!(read.contains("\"text\":\"0\""), "exit code not reported: {read}");
+        assert!(
+            read.contains("\"text\":\"0\""),
+            "exit code not reported: {read}"
+        );
     }
 
     #[test]
@@ -3994,7 +4183,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
         );
-        assert!(read.contains("\"text\":\"130\""), "nonzero exit not parsed: {read}");
+        assert!(
+            read.contains("\"text\":\"130\""),
+            "nonzero exit not parsed: {read}"
+        );
     }
 
     #[test]
@@ -4009,14 +4201,23 @@ mod l13 {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b]133;D\x07");
         let push = String::from_utf8(p.take_responses()).unwrap();
-        assert!(push.contains("notifications/command_finished"), "must push on finish: {push}");
-        assert!(push.contains("\"exit\":null"), "a missing code should push null: {push}");
+        assert!(
+            push.contains("notifications/command_finished"),
+            "must push on finish: {push}"
+        );
+        assert!(
+            push.contains("\"exit\":null"),
+            "a missing code should push null: {push}"
+        );
         let read = channel_roundtrip(
             &mut g,
             "mcp",
             r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://exit"}}"#,
         );
-        assert!(read.contains("\"text\":\"\""), "missing code should read empty: {read}");
+        assert!(
+            read.contains("\"text\":\"\""),
+            "missing code should read empty: {read}"
+        );
     }
 
     #[test]
@@ -4029,15 +4230,24 @@ mod l13 {
         );
         // Prompt, command line, output-start, output, command-end.
         let mut p = AnsiParser::new();
-        p.advance(&mut g, b"\x1b]133;A\x07$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        p.advance(
+            &mut g,
+            b"\x1b]133;A\x07$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07",
+        );
         let push = String::from_utf8(p.take_responses()).unwrap();
-        assert!(push.contains("terminal://command"), "command finish must push: {push}");
+        assert!(
+            push.contains("terminal://command"),
+            "command finish must push: {push}"
+        );
         let read = channel_roundtrip(
             &mut g,
             "mcp",
             r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
         );
-        assert!(read.contains("\"text\":\"hi\""), "captured output wrong: {read}");
+        assert!(
+            read.contains("\"text\":\"hi\""),
+            "captured output wrong: {read}"
+        );
     }
 
     #[test]
@@ -4054,7 +4264,10 @@ mod l13 {
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
         );
         // Output rows joined by a newline (escaped in JSON).
-        assert!(read.contains("a.txt\\nb.txt"), "multi-line capture wrong: {read}");
+        assert!(
+            read.contains("a.txt\\nb.txt"),
+            "multi-line capture wrong: {read}"
+        );
     }
 
     #[test]
@@ -4068,7 +4281,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
         );
-        assert!(read.contains("\"text\":\"\""), "no C means no captured output: {read}");
+        assert!(
+            read.contains("\"text\":\"\""),
+            "no C means no captured output: {read}"
+        );
     }
 
     #[test]
@@ -4083,7 +4299,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
         );
-        assert!(read.contains("\"text\":\"partial\""), "resize must keep the capture: {read}");
+        assert!(
+            read.contains("\"text\":\"partial\""),
+            "resize must keep the capture: {read}"
+        );
     }
 
     #[test]
@@ -4100,7 +4319,10 @@ mod l13 {
             "mcp",
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"terminal://command"}}"#,
         );
-        assert!(read.contains("ABCD\\nEFGH"), "capture must reflect the rewrap: {read}");
+        assert!(
+            read.contains("ABCD\\nEFGH"),
+            "capture must reflect the rewrap: {read}"
+        );
     }
 
     #[test]
@@ -4126,38 +4348,56 @@ mod l13 {
 #[test]
 fn selection_extracts_single_line() {
     let mut g = parse(b"hello world", 20, 2);
-    g.selection = Some(Selection { anchor: (0, 0), head: (4, 0) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (4, 0),
+    });
     assert_eq!(g.selected_text().as_deref(), Some("hello"));
 }
 
 #[test]
 fn selection_spans_rows_and_joins_with_newline() {
     let mut g = parse(b"abc\r\ndef", 10, 3);
-    g.selection = Some(Selection { anchor: (0, 0), head: (2, 1) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (2, 1),
+    });
     assert_eq!(g.selected_text().as_deref(), Some("abc\ndef"));
 }
 
 #[test]
 fn selection_backward_drag_normalizes() {
     let mut g = parse(b"hello world", 20, 2);
-    g.selection = Some(Selection { anchor: (4, 0), head: (0, 0) });
+    g.selection = Some(Selection {
+        anchor: (4, 0),
+        head: (0, 0),
+    });
     assert_eq!(g.selected_text().as_deref(), Some("hello"));
 }
 
 #[test]
 fn selection_trims_trailing_blanks_per_line() {
     let mut g = parse(b"hi", 10, 1);
-    g.selection = Some(Selection { anchor: (0, 0), head: (9, 0) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (9, 0),
+    });
     assert_eq!(g.selected_text().as_deref(), Some("hi"));
 }
 
 #[test]
 fn is_selected_includes_full_intermediate_rows() {
     let mut g = parse(b"", 10, 3);
-    g.selection = Some(Selection { anchor: (5, 0), head: (1, 2) });
+    g.selection = Some(Selection {
+        anchor: (5, 0),
+        head: (1, 2),
+    });
     assert!(g.is_selected(0, 1), "whole intermediate row is selected");
     assert!(g.is_selected(9, 1));
-    assert!(!g.is_selected(4, 0), "before the start col on the start row");
+    assert!(
+        !g.is_selected(4, 0),
+        "before the start col on the start row"
+    );
     assert!(!g.is_selected(2, 2), "after the end col on the end row");
     assert!(g.is_selected(1, 2), "the end cell is inclusive");
 }
@@ -4169,7 +4409,10 @@ fn selection_in_scrolled_history_copies_viewport_text() {
     // not whatever the live grid holds at the same coordinates ("two").
     let mut g = parse(b"one\r\ntwo\r\nthree", 10, 2);
     assert!(g.scroll_view_up(1));
-    g.selection = Some(Selection { anchor: (0, 0), head: (4, 0) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (4, 0),
+    });
     assert_eq!(g.selected_text().as_deref(), Some("one"));
 }
 
@@ -4196,7 +4439,10 @@ fn ris_clears_bracketed_paste_and_selection() {
     let mut g = Grid::new(10, 2);
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"\x1b[?2004h");
-    g.selection = Some(Selection { anchor: (0, 0), head: (3, 0) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (3, 0),
+    });
     p.advance(&mut g, b"\x1bc"); // RIS
     assert!(!g.bracketed_paste);
     assert_eq!(g.selection, None);
@@ -4212,7 +4458,11 @@ fn sixel_huge_repeat_count_is_bounded() {
     // inner paint loop ~usize::MAX times. A ~25-byte payload must decode promptly.
     let img = decode(b"#0;2;100;0;0!999999999999999999~");
     assert!(img.width > 0, "the band still paints");
-    assert!(img.width <= 2000, "repeat clamped to the column cap, got {}", img.width);
+    assert!(
+        img.width <= 2000,
+        "repeat clamped to the column cap, got {}",
+        img.width
+    );
 }
 
 #[test]
@@ -4221,7 +4471,11 @@ fn rep_huge_count_is_bounded_to_capacity() {
     // scrollback); without the clamp this would loop ~1e8+ times under the lock.
     // The fill still completes; the top row is a fully repeated, scrolled-up line.
     let g = parse(b"A\x1b[99999999b", 4, 2);
-    assert_eq!(row_text(&g, 0), "AAAA", "the clamped REP still fills the screen");
+    assert_eq!(
+        row_text(&g, 0),
+        "AAAA",
+        "the clamped REP still fills the screen"
+    );
 }
 
 #[test]
@@ -4234,7 +4488,11 @@ fn su_huge_count_clears_region_without_flooding_scrollback() {
     // exactly the two displaced lines — not 9_999_999_999 blank entries.
     assert_eq!(row_text(&g, 0).trim_end(), "");
     assert_eq!(row_text(&g, 1).trim_end(), "");
-    assert_eq!(g.scrollback.len(), 2, "only the region's rows reach scrollback");
+    assert_eq!(
+        g.scrollback.len(),
+        2,
+        "only the region's rows reach scrollback"
+    );
 }
 
 // --- Configured theme (startup config) ---
@@ -4242,7 +4500,12 @@ fn su_huge_count_clears_region_without_flooding_scrollback() {
 /// A distinctive test theme: dark-grey bg, off-white fg, red cursor, and a
 /// remapped ANSI red (index 1).
 fn test_theme() -> Theme {
-    let mut t = Theme { fg: 0xd8d8d8, bg: 0x1d1f21, cursor: 0xff0000, ..Default::default() };
+    let mut t = Theme {
+        fg: 0xd8d8d8,
+        bg: 0x1d1f21,
+        cursor: 0xff0000,
+        ..Default::default()
+    };
     t.palette16[1] = 0xcc6666;
     t
 }
@@ -4280,8 +4543,14 @@ fn ris_restores_theme_not_builtin() {
     // The child sets its own colors (OSC 10/11), then fully resets.
     p.advance(&mut g, b"\x1b]10;#ffffff\x07\x1b]11;#000000\x07\x1b\x63x");
     let c = g.cells[0];
-    assert_eq!(c.fg, 0xd8d8d8, "RIS returns to the configured fg, not white");
-    assert_eq!(c.bg, 0x1d1f21, "RIS returns to the configured bg, not black");
+    assert_eq!(
+        c.fg, 0xd8d8d8,
+        "RIS returns to the configured fg, not white"
+    );
+    assert_eq!(
+        c.bg, 0x1d1f21,
+        "RIS returns to the configured bg, not black"
+    );
 }
 
 #[test]
@@ -4302,7 +4571,10 @@ fn osc_104_resets_palette_to_theme() {
     // Remap index 1 via OSC 4, then reset it via OSC 104;1 — it must return to
     // the *themed* red, not the stock xterm 0x800000.
     p.advance(&mut g, b"\x1b]4;1;#0000ff\x07\x1b]104;1\x07\x1b[31mx");
-    assert_eq!(g.cells[0].fg, 0xcc6666, "OSC 104 restores the themed index 1");
+    assert_eq!(
+        g.cells[0].fg, 0xcc6666,
+        "OSC 104 restores the themed index 1"
+    );
 }
 
 #[test]
@@ -4332,7 +4604,11 @@ fn retheme_recolors_existing_content() {
     let mut p = AnsiParser::with_theme(test_theme());
     p.advance(&mut g, b"hi\x1b[31mr");
     // Switch to a different theme: defaults and ANSI red follow.
-    let mut new = Theme { fg: 0x111111, bg: 0x222222, ..Default::default() };
+    let mut new = Theme {
+        fg: 0x111111,
+        bg: 0x222222,
+        ..Default::default()
+    };
     new.palette16[1] = 0x333333;
     let old = p.retheme(new);
     assert_eq!(old, test_theme(), "retheme returns the previous seed");
@@ -4374,7 +4650,10 @@ fn retheme_recolors_scrollback() {
         p.advance(&mut g, format!("l{i}\r\n").as_bytes());
     }
     assert!(!g.scrollback.is_empty());
-    let new = Theme { fg: 0x999999, ..Default::default() };
+    let new = Theme {
+        fg: 0x999999,
+        ..Default::default()
+    };
     let old = p.retheme(new);
     g.retheme(&old, &new);
     for line in &g.scrollback {
@@ -4597,13 +4876,19 @@ fn extend_line_selection_spans_whole_wrapped_lines_either_drag_direction() {
     g.select_line_at(0);
     let anchor_row = g.selection.unwrap().anchor.1;
     g.extend_line_selection(anchor_row, 2);
-    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno\nsecond"));
+    assert_eq!(
+        g.selected_text().as_deref(),
+        Some("abcdefghij\nklmno\nsecond")
+    );
 
     // Same span, dragging from the last line back up to the first.
     g.select_line_at(2);
     let anchor_row = g.selection.unwrap().anchor.1;
     g.extend_line_selection(anchor_row, 0);
-    assert_eq!(g.selected_text().as_deref(), Some("abcdefghij\nklmno\nsecond"));
+    assert_eq!(
+        g.selected_text().as_deref(),
+        Some("abcdefghij\nklmno\nsecond")
+    );
 }
 
 // ---- Wave-3 additions: regex search (rusty_regx) ----
@@ -4658,8 +4943,14 @@ fn url_at_detects_plain_text_urls_across_wraps() {
     let mut p = AnsiParser::new();
     // URL soft-wraps across two rows; detection joins the logical line.
     p.advance(&mut g, b"see https://example.com/a/long/path now");
-    assert_eq!(g.url_at(6, 0).as_deref(), Some("https://example.com/a/long/path"));
-    assert_eq!(g.url_at(2, 1).as_deref(), Some("https://example.com/a/long/path"));
+    assert_eq!(
+        g.url_at(6, 0).as_deref(),
+        Some("https://example.com/a/long/path")
+    );
+    assert_eq!(
+        g.url_at(2, 1).as_deref(),
+        Some("https://example.com/a/long/path")
+    );
     assert_eq!(g.url_at(0, 0), None); // "see" is not a URL
 }
 
@@ -4681,7 +4972,10 @@ fn hover_link_at_clamps_a_wrapped_plain_text_url_to_the_hovered_row() {
 fn url_detection_trims_punctuation_and_handles_www() {
     let mut g = Grid::new(60, 5);
     let mut p = AnsiParser::new();
-    p.advance(&mut g, b"(see https://ex.com/x). Or www.rust-lang.org, ok? mailto:a@b.c!");
+    p.advance(
+        &mut g,
+        b"(see https://ex.com/x). Or www.rust-lang.org, ok? mailto:a@b.c!",
+    );
     assert_eq!(g.url_at(6, 0).as_deref(), Some("https://ex.com/x"));
     assert_eq!(g.url_at(28, 0).as_deref(), Some("http://www.rust-lang.org"));
     assert_eq!(g.url_at(51, 0).as_deref(), Some("mailto:a@b.c"));
@@ -4784,7 +5078,10 @@ fn osc_99_single_part_notification() {
     // Bare payload (implicit p=title, d=1): surfaces as the body.
     p.advance(&mut g, b"\x1b]99;;Build finished\x07");
     assert_eq!(g.notifications.len(), 1);
-    assert_eq!(g.notifications[0], (String::new(), "Build finished".to_string()));
+    assert_eq!(
+        g.notifications[0],
+        (String::new(), "Build finished".to_string())
+    );
     let _ = g.take_host_out();
 }
 
@@ -4797,7 +5094,10 @@ fn osc_99_multipart_title_and_body_with_base64() {
     assert!(g.notifications.is_empty());
     p.advance(&mut g, b"\x1b]99;i=x:d=1:p=body:e=1;am9iIDQyMQ==\x07");
     assert_eq!(g.notifications.len(), 1);
-    assert_eq!(g.notifications[0], ("CI failed".to_string(), "job 421".to_string()));
+    assert_eq!(
+        g.notifications[0],
+        ("CI failed".to_string(), "job 421".to_string())
+    );
     let _ = g.take_host_out();
 }
 
@@ -4852,9 +5152,11 @@ fn select_line_follows_wraps_into_scrollback() {
     g.scroll_view_up(10); // far enough that the wrapped run is in view
     // Find the viewport row showing the run's middle chunk ("klmnopqrst").
     let vr = (0..3)
-        .find(|&r| !g.is_selected(0, r) && {
-            g.select_word_at(0, r);
-            g.selected_text().is_some_and(|t| t.contains("klmnopqrst"))
+        .find(|&r| {
+            !g.is_selected(0, r) && {
+                g.select_word_at(0, r);
+                g.selected_text().is_some_and(|t| t.contains("klmnopqrst"))
+            }
         })
         .unwrap_or(1);
     g.select_line_at(vr);
@@ -4911,7 +5213,9 @@ fn parser_survives_deterministic_byte_soup() {
             let r = rng.next();
             let b = match r % 10 {
                 0 => 0x1b,
-                1 => *b"[]P_^X#()78cnqSHJKm~u".get((r >> 8) as usize % 21).unwrap(),
+                1 => *b"[]P_^X#()78cnqSHJKm~u"
+                    .get((r >> 8) as usize % 21)
+                    .unwrap(),
                 2 => b';',
                 3..=4 => (r >> 16) as u8 % 10 + b'0',
                 _ => (r >> 24) as u8,
@@ -5088,7 +5392,10 @@ fn side_margins_confine_wrap_cr_and_scrolling() {
 fn side_margins_limit_il_dl_to_the_band() {
     let mut g = Grid::new(10, 4);
     let mut p = AnsiParser::new();
-    p.advance(&mut g, b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+    p.advance(
+        &mut g,
+        b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd",
+    );
     p.advance(&mut g, b"\x1b[?69h\x1b[3;8s\x1b[2;3H"); // margins 2..=7, cursor row 1 in band
     p.advance(&mut g, b"\x1b[1L"); // IL: shift band rows 1.. down
     // Outside the margins row 1 keeps its 'b's; inside it blanked.
@@ -5113,7 +5420,10 @@ fn delete_lines_with_side_margins_and_cursor_at_top_does_not_panic() {
     // cursor parked at the top must not crash the terminal.
     let mut g = Grid::new(10, 4);
     let mut p = AnsiParser::new();
-    p.advance(&mut g, b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+    p.advance(
+        &mut g,
+        b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd",
+    );
     p.advance(&mut g, b"\x1b[?69h\x1b[3;8s\x1b[1;3H"); // margins cols 2..=7 (0-based), cursor row 0 in band
     p.advance(&mut g, b"\x1b[9999M"); // DL count far exceeding the region height
     // The whole band is blanked; outside the margins is untouched.
@@ -5160,13 +5470,19 @@ fn kitty_virtual_placement_and_placeholder_decode() {
     let mut g = Grid::new(20, 6);
     let mut p = AnsiParser::new();
     // 1×1 red stored + virtually placed on a 2×2 cell grid.
-    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=T,U=1,i=42,c=2,r=2;/wAA/w==\x1b\\");
+    p.advance(
+        &mut g,
+        b"\x1b_Gf=32,s=1,v=1,a=T,U=1,i=42,c=2,r=2;/wAA/w==\x1b\\",
+    );
     assert_eq!(g.cells[0].ch, ' ', "a virtual placement draws no cells");
     assert_eq!(g.kitty_virtual_geometry(42), Some((2, 2)));
     // The app prints placeholders: fg encodes the id, diacritics row/col.
     // DIACRITICS[0]=U+0305 (0), DIACRITICS[1]=U+030D (1).
     p.advance(&mut g, b"\x1b[38;2;0;0;42m");
-    p.advance(&mut g, "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes());
+    p.advance(
+        &mut g,
+        "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes(),
+    );
     assert_eq!(g.placeholder_at(0, 0), Some((42, Some(0), Some(0))));
     assert_eq!(g.placeholder_at(1, 0), Some((42, Some(0), Some(1))));
     // A plain cell is not a placeholder.
@@ -5184,7 +5500,10 @@ fn kitty_frames_composite_and_advance() {
     // Root: 2x1 red|red (raw RGBA: ff0000ff ff0000ff).
     p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=t,i=9;/wAA//8AAP8=\x1b\\");
     // Frame 2: 1x1 green composited at x=1 -> red|green. `AP8A/w==`.
-    p.advance(&mut g, b"\x1b_Gf=32,s=1,v=1,a=f,i=9,x=1,z=100;AP8A/w==\x1b\\");
+    p.advance(
+        &mut g,
+        b"\x1b_Gf=32,s=1,v=1,a=f,i=9,x=1,z=100;AP8A/w==\x1b\\",
+    );
     let (w, _, px) = g.kitty_frame(9).unwrap();
     assert_eq!(w, 2);
     assert_eq!(px[0], Some(0xFF0000), "frame 0 shown before playback");
@@ -5221,7 +5540,8 @@ const PROG_GRAY_JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAg
 /// 16x16 lossless (VP8L) WebP with a patterned RGBA payload.
 const WEBP_LOSSLESS_B64: &str = "UklGRkQAAABXRUJQVlA4TDgAAAAvD8ADELkyRPQ/dhHR/wCZMMQq6N+Xzz0RE0AwSdPnw8eHwqQNmO6+ApqS/sIY8f2FllmwTPcPAQ==";
 /// 8x8 lossy (VP8) WebP — must be rejected, not misdecoded.
-const WEBP_LOSSY_B64: &str = "UklGRjoAAABXRUJQVlA4IC4AAADwAQCdASoIAAgAAUAmJaACdLoB+AAEyAAA/hMf+Uq8FjdHn/3nz9z5+58/5xgA";
+const WEBP_LOSSY_B64: &str =
+    "UklGRjoAAABXRUJQVlA4IC4AAADwAQCdASoIAAgAAUAmJaACdLoB+AAEyAAA/hMf+Uq8FjdHn/3nz9z5+58/5xgA";
 
 #[test]
 fn gif_decodes_animation_frames_and_delays() {
@@ -5279,7 +5599,10 @@ fn gif_rejects_garbage() {
 #[test]
 fn jpeg_decodes_progressive_color() {
     let data = base64::decode(PROG_JPEG_B64.as_bytes()).unwrap();
-    assert!(data.windows(2).any(|w| w == [0xFF, 0xC2]), "fixture is SOF2");
+    assert!(
+        data.windows(2).any(|w| w == [0xFF, 0xC2]),
+        "fixture is SOF2"
+    );
     let img = jpeg::decode(&data).unwrap();
     assert_eq!((img.width, img.height), (32, 24));
     // Reference values from libjpeg's decode of the same file (tolerance
@@ -5303,7 +5626,10 @@ fn jpeg_decodes_progressive_color() {
 #[test]
 fn jpeg_decodes_progressive_grayscale() {
     let data = base64::decode(PROG_GRAY_JPEG_B64.as_bytes()).unwrap();
-    assert!(data.windows(2).any(|w| w == [0xFF, 0xC2]), "fixture is SOF2");
+    assert!(
+        data.windows(2).any(|w| w == [0xFF, 0xC2]),
+        "fixture is SOF2"
+    );
     let img = jpeg::decode(&data).unwrap();
     assert_eq!((img.width, img.height), (16, 16));
     for (x, want) in [(0usize, 0i32), (5, 80), (10, 160), (15, 240)] {
@@ -5382,7 +5708,8 @@ fn iterm2_inline_webp_renders_cells() {
 const WEBP_PHOTO_B64: &str = "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";
 /// 33x5 three-color lossless WebP: the color-indexing transform with 2-bit
 /// packed pixels and an odd width (packing edge case).
-const WEBP_PAL_B64: &str = "UklGRi4AAABXRUJQVlA4TCEAAAAvIAABAFDTtgET/qRzdwCY//nvv5AgScoVEkwVH0leegAA";
+const WEBP_PAL_B64: &str =
+    "UklGRi4AAABXRUJQVlA4TCEAAAAvIAABAFDTtgET/qRzdwCY//nvv5AgScoVEkwVH0leegAA";
 
 #[test]
 fn webp_lossless_photo_roundtrips_exactly() {
@@ -5412,7 +5739,11 @@ fn webp_lossless_palette_roundtrips_exactly() {
     for y in 0..5usize {
         for x in 0..33usize {
             let o = (y * 33 + x) * 4;
-            assert_eq!(&img.rgba[o..o + 4], &cols[(x + 2 * y) % 3], "pixel ({x},{y})");
+            assert_eq!(
+                &img.rgba[o..o + 4],
+                &cols[(x + 2 * y) % 3],
+                "pixel ({x},{y})"
+            );
         }
     }
 }
@@ -5420,7 +5751,11 @@ fn webp_lossless_palette_roundtrips_exactly() {
 /// Text of viewport row `r`, trailing blanks trimmed.
 #[cfg(test)]
 fn vrow_text(g: &Grid, r: usize) -> String {
-    (0..g.cols).map(|c| g.viewport_cell(c, r).ch).collect::<String>().trim_end().to_string()
+    (0..g.cols)
+        .map(|c| g.viewport_cell(c, r).ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 #[test]
@@ -5446,11 +5781,17 @@ fn folded_block_renders_one_summary_line_over_hidden_history() {
         .iter()
         .position(|t| t.contains("lines hidden"))
         .expect("a fold summary line is visible");
-    assert!(rows[summary].starts_with('\u{25B7}'), "summary marked with a triangle: {rows:?}");
+    assert!(
+        rows[summary].starts_with('\u{25B7}'),
+        "summary marked with a triangle: {rows:?}"
+    );
     assert!(rows[summary].contains("4 lines hidden"), "{rows:?}");
     // The block's interior never paints; the line after the summary is the
     // first line past the block.
-    assert!(rows.iter().all(|t| !t.contains("out2")), "hidden rows stay hidden: {rows:?}");
+    assert!(
+        rows.iter().all(|t| !t.contains("out2")),
+        "hidden rows stay hidden: {rows:?}"
+    );
     assert_eq!(rows[summary + 1], "after1", "{rows:?}");
     // The summary cell is styled dim+italic on default colors.
     let c = g.viewport_cell(0, summary);
@@ -5494,7 +5835,10 @@ fn search_unfolds_a_block_hiding_its_match() {
     assert!(g.toggle_last_fold());
     assert!(g.fold_blocks()[0].folded);
     assert_eq!(g.search_with("needle", false), 1);
-    assert!(!g.fold_blocks()[0].folded, "jumping to a hidden match unfolds its block");
+    assert!(
+        !g.fold_blocks()[0].folded,
+        "jumping to a hidden match unfolds its block"
+    );
 }
 
 #[test]
@@ -5518,7 +5862,10 @@ fn selected_html_carries_colors_attrs_and_escapes() {
     let mut p = AnsiParser::new();
     // red bold "hi", default " ", green "<&>"
     p.advance(&mut g, b"\x1b[31;1mhi\x1b[0m \x1b[32m<&>\x1b[0m");
-    g.selection = Some(Selection { anchor: (0, 0), head: (5, 0) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (5, 0),
+    });
     let html = g.selected_html().unwrap();
     assert!(html.starts_with("<pre style=\""), "{html}");
     assert!(html.ends_with("</pre>"), "{html}");
@@ -5541,7 +5888,10 @@ fn selected_html_multiline_trims_and_none_without_selection() {
     let mut p = AnsiParser::new();
     p.advance(&mut g, b"abc\r\ndef");
     assert!(g.selected_html().is_none());
-    g.selection = Some(Selection { anchor: (0, 0), head: (9, 1) });
+    g.selection = Some(Selection {
+        anchor: (0, 0),
+        head: (9, 1),
+    });
     let html = g.selected_html().unwrap();
     // Trailing blanks trimmed, newline between rows preserved (spans close
     // at end of line, so the rows are separate runs).
@@ -5586,7 +5936,12 @@ fn bidi_row_keeps_wide_glyph_cells_adjacent() {
     let b = g.bidi_row(0).expect("reorders");
     let lead_v = b.log2vis[3] as usize;
     let trail_v = b.log2vis[4] as usize;
-    assert_eq!(trail_v, lead_v + 1, "wide pair adjacent, lead first: {:?}", b.vis2log);
+    assert_eq!(
+        trail_v,
+        lead_v + 1,
+        "wide pair adjacent, lead first: {:?}",
+        b.vis2log
+    );
 }
 
 #[test]
@@ -5595,7 +5950,10 @@ fn bdsm_mode_8_gates_bidi_and_alt_screen_defaults_explicit() {
     g.bidi = true;
     let mut p = AnsiParser::new();
     p.advance(&mut g, "ab \u{5D0}\u{5D1}".as_bytes());
-    assert!(g.bidi_row(0).is_some(), "implicit is the main-screen default");
+    assert!(
+        g.bidi_row(0).is_some(),
+        "implicit is the main-screen default"
+    );
     // The app opts out (explicit mode): no reordering.
     p.advance(&mut g, b"\x1b[8l");
     assert!(g.bidi_row(0).is_none());
@@ -5614,7 +5972,10 @@ fn bdsm_mode_8_gates_bidi_and_alt_screen_defaults_explicit() {
     p2.advance(&mut g2, b"\x1b[8$p");
     assert_eq!(p2.take_responses(), b"\x1b[8;2$y");
     p2.advance(&mut g2, b"\x1b[8h");
-    assert!(g2.bidi_row(0).is_some(), "app-requested implicit wins on alt");
+    assert!(
+        g2.bidi_row(0).is_some(),
+        "app-requested implicit wins on alt"
+    );
 }
 
 #[test]
@@ -5630,7 +5991,12 @@ fn scp_fixed_direction_applies_when_autodetect_is_off() {
     let b = g.bidi_row(0).expect("RTL base reorders the line");
     // An RTL paragraph right-aligns: trailing blanks reset to the paragraph
     // level (rule L1) and fill the left; the text sits at the right edge.
-    assert_eq!(&b.vis2log[3..6], &[2, 1, 0], "line laid out right-to-left: {:?}", b.vis2log);
+    assert_eq!(
+        &b.vis2log[3..6],
+        &[2, 1, 0],
+        "line laid out right-to-left: {:?}",
+        b.vis2log
+    );
     // DECRQM reports 2501 reset.
     p.advance(&mut g, b"\x1b[?2501$p");
     assert_eq!(p.take_responses(), b"\x1b[?2501;2$y");
@@ -5645,9 +6011,17 @@ fn search_folds_canonical_accents_together() {
     let mut p = AnsiParser::new();
     // Precomposed e-acute; the search query is a bare (even uppercase) E.
     p.advance(&mut g, "caf\u{E9} time".as_bytes());
-    assert_eq!(g.search_with("cafE", false), 1, "E matches precomposed \u{E9}");
+    assert_eq!(
+        g.search_with("cafE", false),
+        1,
+        "E matches precomposed \u{E9}"
+    );
     // And the reverse: an accented query finds plain text.
-    assert_eq!(g.search_with("t\u{EC}me", false), 1, "accented query folds too");
+    assert_eq!(
+        g.search_with("t\u{EC}me", false),
+        1,
+        "accented query folds too"
+    );
     assert_eq!(g.search_with("xyz", false), 0);
 }
 

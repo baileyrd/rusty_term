@@ -315,7 +315,9 @@ async fn run_async(
         let pid = reader.child_pid();
         tokio::spawn(async move {
             let Some(pid) = pid else { return };
-            let Ok(mut sigchld) = signal(SignalKind::child()) else { return };
+            let Ok(mut sigchld) = signal(SignalKind::child()) else {
+                return;
+            };
             loop {
                 if sigchld.recv().await.is_none() {
                     break;
@@ -527,7 +529,11 @@ async fn run_async(
     input_task.abort();
     sigchld_task.abort();
     restore_host_modes();
-    let code = exit_status.lock().take().or_else(|| reader.reap_exit_status()).unwrap_or(0);
+    let code = exit_status
+        .lock()
+        .take()
+        .or_else(|| reader.reap_exit_status())
+        .unwrap_or(0);
     Ok(code)
 }
 

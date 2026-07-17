@@ -167,7 +167,10 @@ impl Backend for WindowsBackend {
             cmdline.push(0);
 
             let cwd_wide: Option<Vec<u16>> = cwd.map(|p| {
-                p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+                p.as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
             });
             let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
 
@@ -277,7 +280,11 @@ fn push_quoted_arg(arg: &str, out: &mut Vec<u16>) {
                 backslashes += 1;
             }
             let doubled = matches!(chars.peek(), Some('"') | None);
-            for _ in 0..(if doubled { backslashes * 2 } else { backslashes }) {
+            for _ in 0..(if doubled {
+                backslashes * 2
+            } else {
+                backslashes
+            }) {
                 out.push(b'\\' as u16);
             }
         } else if c == '"' {
@@ -421,7 +428,15 @@ impl BackendHandle for WindowsHandle {
         let dup = unsafe {
             let proc = GetCurrentProcess();
             let mut dup: HANDLE = std::ptr::null_mut();
-            if DuplicateHandle(proc, self.process, proc, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS) == 0
+            if DuplicateHandle(
+                proc,
+                self.process,
+                proc,
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) == 0
             {
                 return None;
             }

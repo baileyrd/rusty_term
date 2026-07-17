@@ -165,7 +165,12 @@ mod tests {
         assert!(shells.iter().any(|s| s.name == "sh"), "/bin/sh not found");
         // Every reported path actually exists.
         for s in &shells {
-            assert!(s.path.is_file(), "{} reported at non-file {:?}", s.name, s.path);
+            assert!(
+                s.path.is_file(),
+                "{} reported at non-file {:?}",
+                s.name,
+                s.path
+            );
         }
     }
 

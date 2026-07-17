@@ -8,8 +8,8 @@
 //! DCS/APC/PM/SOS strings are consumed opaquely so they never leak as text.
 
 use super::cell::{
-    ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_REVERSE, ATTR_STRIKE,
-    ATTR_PROTECTED, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Pen, UnderlineStyle,
+    ATTR_BLINK, ATTR_BOLD, ATTR_DIM, ATTR_HIDDEN, ATTR_ITALIC, ATTR_PROTECTED, ATTR_REVERSE,
+    ATTR_STRIKE, ATTR_UNDERLINE, ATTR_UNDERLINE_COLOR, Pen, UnderlineStyle,
 };
 use super::charset::Charset;
 use super::color::Palette;
@@ -828,14 +828,16 @@ impl AnsiParser {
             g.host_out.push(cmd);
             if kitty_keyboard {
                 let params = self.parse_params();
-                let p = |i: usize, default: usize| params.get(i).copied().flatten().unwrap_or(default);
+                let p =
+                    |i: usize, default: usize| params.get(i).copied().flatten().unwrap_or(default);
                 match self.csi_marker {
                     b'>' => g.push_kitty_flags(p(0, 0) as u8),
                     b'<' => g.pop_kitty_flags(p(0, 1)),
                     b'=' => g.set_kitty_flags(p(0, 0) as u8, p(1, 1) as u8),
                     b'?' => {
                         let flags = g.kitty_keyboard_flags();
-                        self.responses.extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
+                        self.responses
+                            .extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
                     }
                     _ => {}
                 }
@@ -865,9 +867,8 @@ impl AnsiParser {
                 996 => self.responses.extend_from_slice(&g.color_scheme_report()),
                 6 => {
                     let (cx, cy) = g.cursor;
-                    self.responses.extend_from_slice(
-                        format!("\x1b[?{};{};1R", cy + 1, cx + 1).as_bytes(),
-                    );
+                    self.responses
+                        .extend_from_slice(format!("\x1b[?{};{};1R", cy + 1, cx + 1).as_bytes());
                 }
                 _ => {}
             }
@@ -1033,12 +1034,14 @@ impl AnsiParser {
             2004 => g.bracketed_paste,
             2026 => g.sync_output_active(),
             _ => {
-                self.responses.extend_from_slice(format!("\x1b[?{mode};0$y").as_bytes());
+                self.responses
+                    .extend_from_slice(format!("\x1b[?{mode};0$y").as_bytes());
                 return;
             }
         };
         let status = if set { 1 } else { 2 };
-        self.responses.extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
+        self.responses
+            .extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
     }
 
     /// Answer an ANSI (non-private) DECRQM query (`CSI Ps $ p`) with a DECRPM
@@ -1074,7 +1077,8 @@ impl AnsiParser {
             }
             _ => 0,
         };
-        self.responses.extend_from_slice(format!("\x1b[{mode};{status}$y").as_bytes());
+        self.responses
+            .extend_from_slice(format!("\x1b[{mode};{status}$y").as_bytes());
     }
 
     /// Parse `param_buffer` into positional parameters. An empty slot (e.g. the
@@ -1165,7 +1169,10 @@ impl AnsiParser {
                 // an unclamped value (parsed up to `usize`) would spin under the
                 // held grid lock and hang the terminal on hostile input.
                 if let Some(ch) = self.last_char {
-                    let cap = g.rows.saturating_add(g.scrollback_max).saturating_mul(g.cols);
+                    let cap = g
+                        .rows
+                        .saturating_add(g.scrollback_max)
+                        .saturating_mul(g.cols);
                     for _ in 0..count.min(cap) {
                         g.put_char(ch, self.write_pen());
                     }
@@ -1401,7 +1408,8 @@ impl AnsiParser {
                     if let Some((cw, ch)) = g.cell_px {
                         let w = cw as usize * g.cols;
                         let h = ch as usize * g.rows;
-                        self.responses.extend_from_slice(format!("\x1b[4;{h};{w}t").as_bytes());
+                        self.responses
+                            .extend_from_slice(format!("\x1b[4;{h};{w}t").as_bytes());
                     }
                 }
                 22 => g.push_title(), // XTPUSHTITLE (sub-param ignored — one title, not icon+title)
@@ -1446,7 +1454,10 @@ impl AnsiParser {
                 // Bare SGR 4 always means a plain single underline, even if a
                 // colon style was left over from an earlier `4:N` without an
                 // intervening `24` reset (matches xterm/kitty behavior).
-                4 => self.pen.attrs = UnderlineStyle::Straight.pack_into(self.pen.attrs | ATTR_UNDERLINE),
+                4 => {
+                    self.pen.attrs =
+                        UnderlineStyle::Straight.pack_into(self.pen.attrs | ATTR_UNDERLINE)
+                }
                 // Colon sub-parameter form of SGR 4 (see `parse_sgr_params`):
                 // `4:0` turns underline off, `4:1..=4:5` sets the style.
                 4000..=4005 => {
@@ -1472,7 +1483,10 @@ impl AnsiParser {
                 // Reset text attributes. 22 clears both bold and dim.
                 22 => self.pen.attrs &= !(ATTR_BOLD | ATTR_DIM),
                 23 => self.pen.attrs &= !ATTR_ITALIC,
-                24 => self.pen.attrs = UnderlineStyle::Straight.pack_into(self.pen.attrs & !ATTR_UNDERLINE),
+                24 => {
+                    self.pen.attrs =
+                        UnderlineStyle::Straight.pack_into(self.pen.attrs & !ATTR_UNDERLINE)
+                }
                 25 => self.pen.attrs &= !ATTR_BLINK,
                 27 => self.pen.attrs &= !ATTR_REVERSE,
                 28 => self.pen.attrs &= !ATTR_HIDDEN,

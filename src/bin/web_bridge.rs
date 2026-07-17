@@ -33,7 +33,9 @@ fn main() {
         }
     }
     let cfg = BridgeConfig {
-        listen: flag_value(&args, "--listen").unwrap_or(DEFAULT_LISTEN).to_string(),
+        listen: flag_value(&args, "--listen")
+            .unwrap_or(DEFAULT_LISTEN)
+            .to_string(),
         shell: flag_value(&args, "--shell").map(str::to_string),
     };
     if let Err(e) = run(cfg) {

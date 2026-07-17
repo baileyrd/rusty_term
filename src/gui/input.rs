@@ -48,8 +48,21 @@ impl KeyPhase {
 /// point with repeat/release, alternate keys, and associated text is
 /// [`encode_full`].
 #[cfg(test)]
-pub(crate) fn encode(key: &Key, mods: ModifiersState, app_cursor: bool, kitty_flags: u8) -> Option<Vec<u8>> {
-    encode_full(key, mods, app_cursor, kitty_flags, KeyPhase::Press, None, None)
+pub(crate) fn encode(
+    key: &Key,
+    mods: ModifiersState,
+    app_cursor: bool,
+    kitty_flags: u8,
+) -> Option<Vec<u8>> {
+    encode_full(
+        key,
+        mods,
+        app_cursor,
+        kitty_flags,
+        KeyPhase::Press,
+        None,
+        None,
+    )
 }
 
 /// The full encoder: `phase` distinguishes press/repeat/release (repeat and
@@ -75,7 +88,12 @@ pub(crate) fn encode_full(
     } else {
         phase
     };
-    let ctx = KittyCtx { flags: kitty_flags, phase, alternate, text };
+    let ctx = KittyCtx {
+        flags: kitty_flags,
+        phase,
+        alternate,
+        text,
+    };
     match key {
         Key::Named(named) => encode_named(*named, mods, app_cursor, &ctx),
         Key::Character(s) => encode_text(s, mods, &ctx),
@@ -110,7 +128,9 @@ impl KittyCtx<'_> {
         if self.flags & KITTY_ASSOC_TEXT == 0 || self.phase == KeyPhase::Release {
             return String::new();
         }
-        let Some(text) = self.text.filter(|t| !t.is_empty()) else { return String::new() };
+        let Some(text) = self.text.filter(|t| !t.is_empty()) else {
+            return String::new();
+        };
         // Control characters are never "associated text".
         if text.chars().any(char::is_control) {
             return String::new();
@@ -158,14 +178,22 @@ fn encode_text(text: &str, mods: ModifiersState, ctx: &KittyCtx) -> Option<Vec<u
             // The base (lowercase) letter's own codepoint, not the C0 control
             // byte — disambiguates e.g. Ctrl+I from a literal Tab keypress,
             // which both produce 0x09 in legacy encoding.
-            return Some(kitty_u(c.to_ascii_lowercase() as u32, modifier_param(mods), ctx));
+            return Some(kitty_u(
+                c.to_ascii_lowercase() as u32,
+                modifier_param(mods),
+                ctx,
+            ));
         }
         if ctx.phase == KeyPhase::Release {
             return None; // no legacy encoding for a release
         }
         // C0 control byte: 'a'/'A' → 0x01 … '_' → 0x1f, Space/@ → 0x00.
         let b = c.to_ascii_uppercase() as u8 & 0x1f;
-        return Some(if mods.alt_key() { vec![0x1b, b] } else { vec![b] });
+        return Some(if mods.alt_key() {
+            vec![0x1b, b]
+        } else {
+            vec![b]
+        });
     }
     if ctx.phase == KeyPhase::Release {
         return None; // plain text keys have no release encoding (needs flag 8)
@@ -178,7 +206,12 @@ fn encode_text(text: &str, mods: ModifiersState, ctx: &KittyCtx) -> Option<Vec<u
     Some(text.as_bytes().to_vec())
 }
 
-fn encode_named(named: NamedKey, mods: ModifiersState, app_cursor: bool, ctx: &KittyCtx) -> Option<Vec<u8>> {
+fn encode_named(
+    named: NamedKey,
+    mods: ModifiersState,
+    app_cursor: bool,
+    ctx: &KittyCtx,
+) -> Option<Vec<u8>> {
     let m = modifier_param(mods);
     if ctx.flags & KITTY_DISAMBIGUATE != 0 {
         // These four collide with C0 control bytes / plain text in legacy
@@ -394,8 +427,20 @@ pub(crate) fn encode_win32(
     // `ModifiersChanged` may not have fired yet when the key itself arrives).
     match vk {
         0x10 => cs = if down { cs | CS_SHIFT } else { cs & !CS_SHIFT },
-        0x11 => cs = if down { cs | CS_LEFT_CTRL } else { cs & !CS_LEFT_CTRL },
-        0x12 => cs = if down { cs | CS_LEFT_ALT } else { cs & !CS_LEFT_ALT },
+        0x11 => {
+            cs = if down {
+                cs | CS_LEFT_CTRL
+            } else {
+                cs & !CS_LEFT_CTRL
+            }
+        }
+        0x12 => {
+            cs = if down {
+                cs | CS_LEFT_ALT
+            } else {
+                cs & !CS_LEFT_ALT
+            }
+        }
         _ => {}
     }
     let kd = u8::from(down);
@@ -573,12 +618,27 @@ mod tests {
         let b = encode_win32(pk(KeyCode::Enter), &k_named(NamedKey::Enter), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[13;28;13;1;0;1_");
         // Arrows are enhanced keys: ENHANCED_KEY (0x100), Uc=0.
-        let b = encode_win32(pk(KeyCode::ArrowLeft), &k_named(NamedKey::ArrowLeft), NONE, true);
+        let b = encode_win32(
+            pk(KeyCode::ArrowLeft),
+            &k_named(NamedKey::ArrowLeft),
+            NONE,
+            true,
+        );
         assert_eq!(b.unwrap(), b"\x1b[37;75;0;1;256;1_");
-        let b = encode_win32(pk(KeyCode::ArrowUp), &k_named(NamedKey::ArrowUp), NONE, false);
+        let b = encode_win32(
+            pk(KeyCode::ArrowUp),
+            &k_named(NamedKey::ArrowUp),
+            NONE,
+            false,
+        );
         assert_eq!(b.unwrap(), b"\x1b[38;72;0;0;256;1_");
         // Numpad Enter is VK_RETURN with the enhanced flag.
-        let b = encode_win32(pk(KeyCode::NumpadEnter), &k_named(NamedKey::Enter), NONE, true);
+        let b = encode_win32(
+            pk(KeyCode::NumpadEnter),
+            &k_named(NamedKey::Enter),
+            NONE,
+            true,
+        );
         assert_eq!(b.unwrap(), b"\x1b[13;28;13;1;256;1_");
         // F5, Tab, Escape, Backspace, Delete.
         let b = encode_win32(pk(KeyCode::F5), &k_named(NamedKey::F5), NONE, true);
@@ -587,7 +647,12 @@ mod tests {
         assert_eq!(b.unwrap(), b"\x1b[9;15;9;1;0;1_");
         let b = encode_win32(pk(KeyCode::Escape), &k_named(NamedKey::Escape), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[27;1;27;1;0;1_");
-        let b = encode_win32(pk(KeyCode::Backspace), &k_named(NamedKey::Backspace), NONE, true);
+        let b = encode_win32(
+            pk(KeyCode::Backspace),
+            &k_named(NamedKey::Backspace),
+            NONE,
+            true,
+        );
         assert_eq!(b.unwrap(), b"\x1b[8;14;8;1;0;1_");
         let b = encode_win32(pk(KeyCode::Delete), &k_named(NamedKey::Delete), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[46;83;0;1;256;1_");
@@ -597,12 +662,27 @@ mod tests {
     fn win32_modifier_keys_report_their_own_state() {
         // A lone Shift press includes SHIFT_PRESSED even if ModifiersChanged
         // hasn't fired yet; the release clears it.
-        let b = encode_win32(pk(KeyCode::ShiftLeft), &k_named(NamedKey::Shift), NONE, true);
+        let b = encode_win32(
+            pk(KeyCode::ShiftLeft),
+            &k_named(NamedKey::Shift),
+            NONE,
+            true,
+        );
         assert_eq!(b.unwrap(), b"\x1b[16;42;0;1;16;1_");
-        let b = encode_win32(pk(KeyCode::ShiftLeft), &k_named(NamedKey::Shift), ModifiersState::SHIFT, false);
+        let b = encode_win32(
+            pk(KeyCode::ShiftLeft),
+            &k_named(NamedKey::Shift),
+            ModifiersState::SHIFT,
+            false,
+        );
         assert_eq!(b.unwrap(), b"\x1b[16;42;0;0;0;1_");
         // Right Ctrl is an enhanced key.
-        let b = encode_win32(pk(KeyCode::ControlRight), &k_named(NamedKey::Control), NONE, true);
+        let b = encode_win32(
+            pk(KeyCode::ControlRight),
+            &k_named(NamedKey::Control),
+            NONE,
+            true,
+        );
         assert_eq!(b.unwrap(), b"\x1b[17;29;0;1;264;1_");
         let b = encode_win32(pk(KeyCode::AltLeft), &k_named(NamedKey::Alt), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[18;56;0;1;2;1_");
@@ -616,7 +696,10 @@ mod tests {
         let b = encode_win32(unident, &k_char("é"), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[0;0;233;1;0;1_");
         // No VK and no text: nothing to send.
-        assert_eq!(encode_win32(unident, &k_named(NamedKey::F35), NONE, true), None);
+        assert_eq!(
+            encode_win32(unident, &k_named(NamedKey::F35), NONE, true),
+            None
+        );
         // Unmapped KeyCode with text still falls back.
         let b = encode_win32(pk(KeyCode::LaunchMail), &k_char("m"), NONE, true);
         assert_eq!(b.unwrap(), b"\x1b[0;0;109;1;0;1_");
@@ -625,33 +708,78 @@ mod tests {
     #[test]
     fn plain_text_and_named_basics() {
         assert_eq!(encode(&k_char("a"), NONE, false, 0).unwrap(), b"a");
-        assert_eq!(encode(&k_char("A"), ModifiersState::SHIFT, false, 0).unwrap(), b"A");
-        assert_eq!(encode(&k_named(NamedKey::Enter), NONE, false, 0).unwrap(), b"\r");
-        assert_eq!(encode(&k_named(NamedKey::Backspace), NONE, false, 0).unwrap(), b"\x7f");
-        assert_eq!(encode(&k_named(NamedKey::Escape), NONE, false, 0).unwrap(), b"\x1b");
-        assert_eq!(encode(&k_named(NamedKey::Tab), NONE, false, 0).unwrap(), b"\t");
-        assert_eq!(encode(&k_named(NamedKey::Tab), ModifiersState::SHIFT, false, 0).unwrap(), b"\x1b[Z");
+        assert_eq!(
+            encode(&k_char("A"), ModifiersState::SHIFT, false, 0).unwrap(),
+            b"A"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Enter), NONE, false, 0).unwrap(),
+            b"\r"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Backspace), NONE, false, 0).unwrap(),
+            b"\x7f"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Escape), NONE, false, 0).unwrap(),
+            b"\x1b"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Tab), NONE, false, 0).unwrap(),
+            b"\t"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Tab), ModifiersState::SHIFT, false, 0).unwrap(),
+            b"\x1b[Z"
+        );
     }
 
     #[test]
     fn ctrl_and_alt_modifiers_on_text() {
-        assert_eq!(encode(&k_char("c"), ModifiersState::CONTROL, false, 0).unwrap(), b"\x03"); // Ctrl-C
-        assert_eq!(encode(&k_char("C"), ModifiersState::CONTROL, false, 0).unwrap(), b"\x03"); // case-insensitive
-        assert_eq!(encode(&k_char("a"), ModifiersState::ALT, false, 0).unwrap(), b"\x1ba"); // Alt-a = ESC a
+        assert_eq!(
+            encode(&k_char("c"), ModifiersState::CONTROL, false, 0).unwrap(),
+            b"\x03"
+        ); // Ctrl-C
+        assert_eq!(
+            encode(&k_char("C"), ModifiersState::CONTROL, false, 0).unwrap(),
+            b"\x03"
+        ); // case-insensitive
+        assert_eq!(
+            encode(&k_char("a"), ModifiersState::ALT, false, 0).unwrap(),
+            b"\x1ba"
+        ); // Alt-a = ESC a
         // Ctrl+Alt-c → ESC + control byte
         assert_eq!(
-            encode(&k_char("c"), ModifiersState::CONTROL | ModifiersState::ALT, false, 0).unwrap(),
+            encode(
+                &k_char("c"),
+                ModifiersState::CONTROL | ModifiersState::ALT,
+                false,
+                0
+            )
+            .unwrap(),
             b"\x1b\x03"
         );
     }
 
     #[test]
     fn arrows_respect_app_cursor_and_modifiers() {
-        assert_eq!(encode(&k_named(NamedKey::ArrowUp), NONE, false, 0).unwrap(), b"\x1b[A");
-        assert_eq!(encode(&k_named(NamedKey::ArrowUp), NONE, true, 0).unwrap(), b"\x1bOA"); // DECCKM
+        assert_eq!(
+            encode(&k_named(NamedKey::ArrowUp), NONE, false, 0).unwrap(),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::ArrowUp), NONE, true, 0).unwrap(),
+            b"\x1bOA"
+        ); // DECCKM
         // Ctrl+Left → CSI 1;5 D
         assert_eq!(
-            encode(&k_named(NamedKey::ArrowLeft), ModifiersState::CONTROL, false, 0).unwrap(),
+            encode(
+                &k_named(NamedKey::ArrowLeft),
+                ModifiersState::CONTROL,
+                false,
+                0
+            )
+            .unwrap(),
             b"\x1b[1;5D"
         );
         // Shift+Up → CSI 1;2 A (modifier wins over app-cursor mode)
@@ -663,30 +791,69 @@ mod tests {
 
     #[test]
     fn function_and_tilde_keys() {
-        assert_eq!(encode(&k_named(NamedKey::F1), NONE, false, 0).unwrap(), b"\x1bOP");
-        assert_eq!(encode(&k_named(NamedKey::F5), NONE, false, 0).unwrap(), b"\x1b[15~");
-        assert_eq!(encode(&k_named(NamedKey::F12), NONE, false, 0).unwrap(), b"\x1b[24~");
-        assert_eq!(encode(&k_named(NamedKey::PageUp), NONE, false, 0).unwrap(), b"\x1b[5~");
-        assert_eq!(encode(&k_named(NamedKey::Delete), NONE, false, 0).unwrap(), b"\x1b[3~");
+        assert_eq!(
+            encode(&k_named(NamedKey::F1), NONE, false, 0).unwrap(),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::F5), NONE, false, 0).unwrap(),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::F12), NONE, false, 0).unwrap(),
+            b"\x1b[24~"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::PageUp), NONE, false, 0).unwrap(),
+            b"\x1b[5~"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Delete), NONE, false, 0).unwrap(),
+            b"\x1b[3~"
+        );
         // Shift+F5 → CSI 15;2 ~
-        assert_eq!(encode(&k_named(NamedKey::F5), ModifiersState::SHIFT, false, 0).unwrap(), b"\x1b[15;2~");
+        assert_eq!(
+            encode(&k_named(NamedKey::F5), ModifiersState::SHIFT, false, 0).unwrap(),
+            b"\x1b[15;2~"
+        );
     }
 
     #[test]
     fn kitty_disambiguate_encodes_escape_enter_tab_backspace_as_csi_u() {
-        assert_eq!(encode(&k_named(NamedKey::Escape), NONE, false, 1).unwrap(), b"\x1b[27u");
-        assert_eq!(encode(&k_named(NamedKey::Enter), NONE, false, 1).unwrap(), b"\x1b[13u");
-        assert_eq!(encode(&k_named(NamedKey::Tab), NONE, false, 1).unwrap(), b"\x1b[9u");
-        assert_eq!(encode(&k_named(NamedKey::Backspace), NONE, false, 1).unwrap(), b"\x1b[127u");
+        assert_eq!(
+            encode(&k_named(NamedKey::Escape), NONE, false, 1).unwrap(),
+            b"\x1b[27u"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Enter), NONE, false, 1).unwrap(),
+            b"\x1b[13u"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Tab), NONE, false, 1).unwrap(),
+            b"\x1b[9u"
+        );
+        assert_eq!(
+            encode(&k_named(NamedKey::Backspace), NONE, false, 1).unwrap(),
+            b"\x1b[127u"
+        );
         // Shift+Tab still takes the legacy back-tab shorthand, not CSI 9u —
         // there's no ambiguity to resolve for it.
-        assert_eq!(encode(&k_named(NamedKey::Tab), ModifiersState::SHIFT, false, 1).unwrap(), b"\x1b[Z");
+        assert_eq!(
+            encode(&k_named(NamedKey::Tab), ModifiersState::SHIFT, false, 1).unwrap(),
+            b"\x1b[Z"
+        );
     }
 
     #[test]
     fn kitty_disambiguate_adds_modifier_param_to_csi_u() {
         assert_eq!(
-            encode(&k_named(NamedKey::Escape), ModifiersState::CONTROL, false, 1).unwrap(),
+            encode(
+                &k_named(NamedKey::Escape),
+                ModifiersState::CONTROL,
+                false,
+                1
+            )
+            .unwrap(),
             b"\x1b[27;5u"
         );
     }
@@ -695,12 +862,24 @@ mod tests {
     fn kitty_disambiguate_encodes_ctrl_letters_by_base_codepoint_not_control_byte() {
         // Ctrl+I would collide with a literal Tab (both 0x09) in legacy
         // encoding; disambiguated, it's CSI 105 (lowercase 'i') ; 5 (ctrl) u.
-        assert_eq!(encode(&k_char("i"), ModifiersState::CONTROL, false, 1).unwrap(), b"\x1b[105;5u");
+        assert_eq!(
+            encode(&k_char("i"), ModifiersState::CONTROL, false, 1).unwrap(),
+            b"\x1b[105;5u"
+        );
         // Case-insensitive, same as the legacy control-byte path.
-        assert_eq!(encode(&k_char("I"), ModifiersState::CONTROL, false, 1).unwrap(), b"\x1b[105;5u");
+        assert_eq!(
+            encode(&k_char("I"), ModifiersState::CONTROL, false, 1).unwrap(),
+            b"\x1b[105;5u"
+        );
         // Ctrl+Shift+C: shift folds into the modifier param, not the codepoint.
         assert_eq!(
-            encode(&k_char("c"), ModifiersState::CONTROL | ModifiersState::SHIFT, false, 1).unwrap(),
+            encode(
+                &k_char("c"),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                false,
+                1
+            )
+            .unwrap(),
             b"\x1b[99;6u"
         );
     }
@@ -709,7 +888,10 @@ mod tests {
     fn kitty_flags_zero_is_legacy_encoding_even_when_arg_present() {
         // Arrow keys and plain text are untouched by the disambiguate flag —
         // only the specifically ambiguous keys route through CSI u.
-        assert_eq!(encode(&k_named(NamedKey::ArrowUp), NONE, false, 1).unwrap(), b"\x1b[A");
+        assert_eq!(
+            encode(&k_named(NamedKey::ArrowUp), NONE, false, 1).unwrap(),
+            b"\x1b[A"
+        );
         assert_eq!(encode(&k_char("a"), NONE, false, 1).unwrap(), b"a");
     }
 
@@ -720,7 +902,10 @@ mod tests {
         assert_eq!(encode_numpad(&k_char("9"), NONE, true).unwrap(), b"\x1bOy");
         assert_eq!(encode_numpad(&k_char("+"), NONE, true).unwrap(), b"\x1bOk");
         assert_eq!(encode_numpad(&k_char("."), NONE, true).unwrap(), b"\x1bOn");
-        assert_eq!(encode_numpad(&k_named(NamedKey::Enter), NONE, true).unwrap(), b"\x1bOM");
+        assert_eq!(
+            encode_numpad(&k_named(NamedKey::Enter), NONE, true).unwrap(),
+            b"\x1bOM"
+        );
     }
 
     #[test]
@@ -745,14 +930,28 @@ mod tests {
         let rel = encode_full(&k_char("a"), ctrl, false, 3, KeyPhase::Release, None, None);
         assert_eq!(rel.unwrap(), b"\x1b[97;5:3u");
         // Functional keys ride the mods field of their legacy form.
-        let arrow = encode_full(&k_named(NamedKey::ArrowUp), NONE, false, 3, KeyPhase::Release, None, None);
+        let arrow = encode_full(
+            &k_named(NamedKey::ArrowUp),
+            NONE,
+            false,
+            3,
+            KeyPhase::Release,
+            None,
+            None,
+        );
         assert_eq!(arrow.unwrap(), b"\x1b[1;1:3A");
         // Without flag 2 a release is silent; a repeat is a plain press.
-        assert_eq!(encode_full(&k_char("a"), ctrl, false, 1, KeyPhase::Release, None, None), None);
+        assert_eq!(
+            encode_full(&k_char("a"), ctrl, false, 1, KeyPhase::Release, None, None),
+            None
+        );
         let rep1 = encode_full(&k_char("a"), ctrl, false, 1, KeyPhase::Repeat, None, None);
         assert_eq!(rep1.unwrap(), b"\x1b[97;5u");
         // Plain text keys have no release encoding (that needs flag 8).
-        assert_eq!(encode_full(&k_char("a"), NONE, false, 3, KeyPhase::Release, None, None), None);
+        assert_eq!(
+            encode_full(&k_char("a"), NONE, false, 3, KeyPhase::Release, None, None),
+            None
+        );
     }
 
     #[test]
@@ -763,12 +962,36 @@ mod tests {
         assert_eq!(alt.unwrap(), b"\x1b[97:65;6u");
         // Flag 1|16: Alt+a carries its associated text codepoints...
         let am = ModifiersState::ALT | ModifiersState::CONTROL;
-        let txt = encode_full(&k_char("a"), am, false, 17, KeyPhase::Press, None, Some("a"));
+        let txt = encode_full(
+            &k_char("a"),
+            am,
+            false,
+            17,
+            KeyPhase::Press,
+            None,
+            Some("a"),
+        );
         assert_eq!(txt.unwrap(), b"\x1b[97;7;97u");
         // ...but never on release, and control characters are filtered.
-        let rel = encode_full(&k_char("a"), am, false, 19, KeyPhase::Release, None, Some("a"));
+        let rel = encode_full(
+            &k_char("a"),
+            am,
+            false,
+            19,
+            KeyPhase::Release,
+            None,
+            Some("a"),
+        );
         assert_eq!(rel.unwrap(), b"\x1b[97;7:3u");
-        let ctl = encode_full(&k_char("a"), am, false, 17, KeyPhase::Press, None, Some("\u{1}"));
+        let ctl = encode_full(
+            &k_char("a"),
+            am,
+            false,
+            17,
+            KeyPhase::Press,
+            None,
+            Some("\u{1}"),
+        );
         assert_eq!(ctl.unwrap(), b"\x1b[97;7u");
     }
 }
