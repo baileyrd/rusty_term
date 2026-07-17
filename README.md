@@ -75,6 +75,9 @@ cargo run --features gui-gpu -- --gui --gpu
 
 # Structured side-channel (see below).
 cargo run --features l13
+
+# WebSocket PTY bridge for the web frontend prototype (see web/README.md).
+cargo run --features web-bridge --bin rusty_term_web_bridge
 ```
 
 ### Command-line flags & environment
