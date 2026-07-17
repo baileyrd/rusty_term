@@ -164,6 +164,15 @@ Real (with the bridge running, `?ws`):
   `localStorage` (`nebula.session` + `nebula.panes`, debounced writes).
   Live PTY sessions can't be resurrected — each pane reconnects to the
   bridge as a fresh shell under the restored layout and history.
+- **Settings sheet** (`Ctrl+,` / `Cmd+,`, or the palette's *Open settings*):
+  a single place for the cross-cutting preferences the palette otherwise
+  scatters across one-shot actions — the theme picker (same three
+  presets, applied live), the assist connection (the same key state the
+  orb's panel reads: connect/disconnect here shows up there too, no
+  separate copy to fall out of sync), pinned-snippet housekeeping (count +
+  clear all), and a static keyboard-shortcut reference. Same overlay
+  conventions as the palette and search: capture-phase Escape, backdrop
+  dismiss.
 - **Tab activity badges**: a command finishing in a background tab puts
   an amber unseen-count badge on that tab, cleared the moment it's
   activated. Restored history starts fully seen, so old tabs don't light
