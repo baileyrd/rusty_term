@@ -117,13 +117,40 @@ Real:
 Real (with the bridge running, `?ws`):
 - The xterm panel is a live shell: PTY output, resize (SIGWINCH), and the
   exit code all round-trip through `rusty_term_web_bridge`.
+- **The command cards**, when the shell emits OSC 133 shell-integration
+  marks: each command becomes a card the moment it starts running and
+  resolves to success/error with its real output (first 30 lines), exit
+  code, and duration. The tracker
+  ([`commandTracker.ts`](src/components/terminal/commandTracker.ts)) reads
+  the same A/B/C/D marks rusty_term's native gutter marks and command dock
+  consume, via xterm's OSC handler + buffer markers — it observes the
+  rendered stream and never rewrites it, so terminal fidelity is untouched
+  (the native renderer's "semantic features are additive" rule).
+- The side dock's *recent commands*, which mirror the live card stream.
+- The input line: submits write into the same PTY, and the resulting card
+  arrives through the same OSC 133 path as a hand-typed command.
+
+To emit the marks from bash, drop this in the profile of the shell the
+bridge spawns (zsh/fish equivalents exist; VS Code and WezTerm ship the
+same integration):
+
+```sh
+PS0='\033]133;C\007'
+PROMPT_COMMAND='printf "\033]133;D;%s\007\033]133;A\007" "$?"'
+PS1='\$ \[\033]133;B\007\]'
+```
+
+Without the marks the cards simply stay empty in live mode — semantic
+features degrade to a plain terminal, never break it.
 
 Demo/stub:
 - `LoopbackTransport` (the default without `?ws`) echoes input locally (try
   `help`, `size`, `clear`, `exit`) — no real shell behind it.
-- The command cards in `App.tsx`, the ribbon's load/latency/git numbers, the
-  dock's CPU/RAM bars, recent commands, and snippets are hardcoded demo data.
-- Submitting on the input line appends a fake "executed locally" card.
+- Without `?ws`, the command cards in `App.tsx` are hardcoded demo data and
+  the input line appends a fake "executed locally" card.
+- The ribbon's load/latency/git numbers, the dock's CPU/RAM bars, and the
+  pinned snippets are hardcoded in both modes (candidates for a structured
+  side-channel later).
 - The AI orb is presentational; clicking it only clears the badge.
 - `theme="cyberpunk" | "minimal"` are accepted per the spec but currently
   render the Nebula skin.

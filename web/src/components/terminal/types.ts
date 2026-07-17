@@ -51,4 +51,12 @@ export interface TerminalShellProps {
   theme?: 'nebula' | 'cyberpunk' | 'minimal';
   commands?: CommandCardProps[];
   onCommandSubmit?: (command: string) => void;
+  /**
+   * Live-session extensions (additive to the original spec): structured
+   * OSC 133 command events from the raw terminal, and the connected
+   * transport — both threaded down to `TerminalView` / up to the app so
+   * the command cards can be fed by a real shell session.
+   */
+  onCommandEvent?: (event: import('./commandTracker').CommandEvent) => void;
+  onTransportReady?: (transport: import('../../transport/bridge').TerminalTransport) => void;
 }

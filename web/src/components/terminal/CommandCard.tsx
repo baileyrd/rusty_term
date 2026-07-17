@@ -45,6 +45,8 @@ export default function CommandCard({
 
   return (
     <article
+      data-testid="command-card"
+      data-status={status}
       className={`animate-nebula-fade-in rounded-nebula-md border ${STATUS_BORDER[status]} bg-nebula-surface shadow-nebula-soft transition-colors duration-nebula-base ease-nebula`}
     >
       <header className="flex items-baseline gap-2 px-4 pt-3 pb-2">

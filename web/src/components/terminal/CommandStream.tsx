@@ -3,17 +3,21 @@ import type { FormEvent } from 'react';
 import CommandCard from './CommandCard';
 import TerminalView from './TerminalView';
 import type { CommandCardProps } from './types';
+import type { CommandEvent } from './commandTracker';
+import type { TerminalTransport } from '../../transport/bridge';
 
 export interface CommandStreamProps {
   commands: CommandCardProps[];
   onCommandSubmit?: (command: string) => void;
+  onCommandEvent?: (event: CommandEvent) => void;
+  onTransportReady?: (transport: TerminalTransport) => void;
 }
 
 /**
  * The center column: a scrolling stream of CommandCards, the raw xterm.js
  * panel, and the command input line at the bottom.
  */
-export default function CommandStream({ commands, onCommandSubmit }: CommandStreamProps) {
+export default function CommandStream({ commands, onCommandSubmit, onCommandEvent, onTransportReady }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -37,7 +41,7 @@ export default function CommandStream({ commands, onCommandSubmit }: CommandStre
           <CommandCard key={c.id ?? `cmd-${i}`} {...c} />
         ))}
 
-        <TerminalView />
+        <TerminalView onCommandEvent={onCommandEvent} onTransportReady={onTransportReady} />
       </div>
 
       <form

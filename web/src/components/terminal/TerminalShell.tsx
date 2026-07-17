@@ -16,6 +16,8 @@ export default function TerminalShell({
   theme = 'nebula',
   commands = [],
   onCommandSubmit,
+  onCommandEvent,
+  onTransportReady,
 }: TerminalShellProps) {
   const [orbHints, setOrbHints] = useState(2);
 
@@ -36,7 +38,12 @@ export default function TerminalShell({
       />
 
       <div className="flex min-h-0 flex-1">
-        <CommandStream commands={commands} onCommandSubmit={onCommandSubmit} />
+        <CommandStream
+          commands={commands}
+          onCommandSubmit={onCommandSubmit}
+          onCommandEvent={onCommandEvent}
+          onTransportReady={onTransportReady}
+        />
         <SideDock
           cpu={0.34}
           ram={0.61}
