@@ -90,6 +90,9 @@ Wire protocol (text = control, binary = PTY bytes):
 | client → server  | binary | keystrokes/pastes, written to the PTY verbatim |
 | server → client  | binary | PTY output, verbatim                           |
 | server → client  | text   | `exit <code>` when the shell exits, then Close |
+| server → client  | text   | `stats <json>` every 2s: system load, memory, and the cwd's git branch/counts (`null` where the host can't say) |
+| client → server  | text   | `cwd <path>` — the shell's OSC 7 directory, relayed by the page |
+| client → server  | text   | `ping <token>` → `pong <token>` — app-level RTT probe |
 
 Security posture: the bridge hands a shell to whoever completes a handshake,
 so it binds `127.0.0.1` only and refuses browser `Origin`s other than
@@ -127,6 +130,13 @@ Real (with the bridge running, `?ws`):
   rendered stream and never rewrites it, so terminal fidelity is untouched
   (the native renderer's "semantic features are additive" rule).
 - The side dock's *recent commands*, which mirror the live card stream.
+- **The ribbon and dock stats**: the bridge pushes `stats` frames with the
+  host's load average and memory pressure (Linux `/proc`; `null` elsewhere)
+  and git facts — branch from `.git/HEAD`, added/modified/deleted counts
+  from `git status --porcelain` — for the directory the shell reports via
+  OSC 7 (the page decodes the URI and relays it as a `cwd` message). The
+  environment pill flips to `live`, the sparkline is a rolling window of
+  real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
 
@@ -148,9 +158,9 @@ Demo/stub:
   `help`, `size`, `clear`, `exit`) — no real shell behind it.
 - Without `?ws`, the command cards in `App.tsx` are hardcoded demo data and
   the input line appends a fake "executed locally" card.
-- The ribbon's load/latency/git numbers, the dock's CPU/RAM bars, and the
-  pinned snippets are hardcoded in both modes (candidates for a structured
-  side-channel later).
+- Without `?ws`, the ribbon's load/latency/git numbers and the dock's
+  CPU/RAM bars are hardcoded (they're live with the bridge — see above).
+- The pinned snippets are hardcoded in both modes.
 - The AI orb is presentational; clicking it only clears the badge.
 - `theme="cyberpunk" | "minimal"` are accepted per the spec but currently
   render the Nebula skin.

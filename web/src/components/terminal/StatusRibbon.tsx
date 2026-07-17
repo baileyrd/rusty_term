@@ -49,16 +49,19 @@ export default function StatusRibbon({
 
       <div className="flex items-center gap-1.5" title={`Latency ${latencyMs}ms`}>
         <span className={`h-2 w-2 rounded-full ${latencyColor(latencyMs)}`} />
-        <span className="text-nebula-text/60">{latencyMs}ms</span>
+        <span data-testid="ribbon-latency" className="text-nebula-text/60">{latencyMs}ms</span>
       </div>
 
-      <span className="rounded-full border border-nebula-accent/30 px-2.5 py-0.5 text-nebula-accent">
+      <span
+        data-testid="ribbon-env"
+        className="rounded-full border border-nebula-accent/30 px-2.5 py-0.5 text-nebula-accent"
+      >
         {environment}
       </span>
 
       <div className="ml-auto flex items-center gap-2 rounded-nebula-sm border border-white/5 px-2.5 py-1">
         <span className="text-nebula-accent2"></span>
-        <span className="font-nebula-command text-nebula-text/90">{gitBranch}</span>
+        <span data-testid="ribbon-branch" className="font-nebula-command text-nebula-text/90">{gitBranch}</span>
         <span className="text-nebula-success">+{gitStats.added}</span>
         <span className="text-nebula-warning">~{gitStats.modified}</span>
         <span className="text-nebula-error">-{gitStats.deleted}</span>

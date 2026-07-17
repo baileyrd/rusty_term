@@ -14,8 +14,16 @@
 //!
 //! * client → server, first frame: `start <cols> <rows>` — spawns the shell.
 //! * client → server: `resize <cols> <rows>` — [`BackendHandle::set_winsize`].
+//! * client → server: `cwd <path>` — the shell's OSC 7 working directory,
+//!   relayed by the page so the stats push can carry git facts for it.
+//! * client → server: `ping <token>` → server: `pong <token>` — an
+//!   application-level RTT probe (browsers can't send WS Ping frames).
 //! * client → server, binary: keystrokes/pastes, written to the PTY verbatim.
 //! * server → client, binary: PTY output, verbatim.
+//! * server → client, text: `stats <json>` every [`STATS_INTERVAL`] — system
+//!   load, memory pressure, and the cwd's git branch/counts (see
+//!   [`stats::stats_json`] for the shape; fields the host can't provide are
+//!   `null`).
 //! * server → client, text: `exit <code>` when the shell exits (code per
 //!   [`BackendHandle::reap_exit_status`]: the exit code, or 128+signal),
 //!   followed by a Close frame.
@@ -29,9 +37,11 @@
 //! beyond localhost is deliberately not a flag; put a real reverse proxy
 //! with authentication in front instead.
 
+mod stats;
 mod ws;
 
 use std::io::{Error, ErrorKind};
+use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
@@ -48,6 +58,9 @@ use crate::backend::WindowsBackend as PlatformBackend;
 /// Where the bridge listens when `--listen` isn't given. Loopback only —
 /// see the module docs' security posture.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7703";
+
+/// How often each session pushes a `stats <json>` frame.
+const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bridge configuration, filled from the binary's CLI flags.
 #[derive(Clone, Debug)]
@@ -129,6 +142,12 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
     let mut buf: Vec<u8> = Vec::new();
     let mut handle: Option<Box<dyn BackendHandle>> = None;
     let (tx, mut rx) = mpsc::unbounded_channel::<PtyEvent>();
+    // Stats side-channel state: the cwd the client relays from OSC 7, and
+    // the per-session git cache behind it.
+    let mut cwd: Option<PathBuf> = None;
+    let mut git_cache = stats::GitCache::new();
+    let mut stats_tick = tokio::time::interval(STATS_INTERVAL);
+    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Drain complete frames before reading more from the socket.
@@ -147,6 +166,12 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
                             if let Some(h) = handle.as_mut() {
                                 let _ = h.set_winsize(cols, rows);
                             }
+                        }
+                        Some(Command::Cwd(path)) => cwd = Some(path),
+                        Some(Command::Ping(token)) => {
+                            let pong = format!("pong {token}");
+                            wr.write_all(&ws::encode_frame(ws::Opcode::Text, pong.as_bytes()))
+                                .await?;
                         }
                         // A second `start`, or anything unrecognized: a
                         // client bug. Close rather than guess.
@@ -199,6 +224,20 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
                     return finish(&mut wr, handle.as_mut()).await;
                 }
             },
+            _ = stats_tick.tick() => {
+                let git = match &cwd {
+                    Some(dir) => git_cache.info(dir),
+                    None => stats::GitInfo::default(),
+                };
+                let json = stats::stats_json(
+                    stats::system_load(),
+                    stats::memory_used(),
+                    cwd.as_deref(),
+                    &git,
+                );
+                let msg = format!("stats {json}");
+                wr.write_all(&ws::encode_frame(ws::Opcode::Text, msg.as_bytes())).await?;
+            }
         }
     }
 }
@@ -258,23 +297,44 @@ fn spawn_reader(mut clone: Box<dyn BackendHandle>, tx: mpsc::UnboundedSender<Pty
 enum Command {
     Start(u16, u16),
     Resize(u16, u16),
+    /// The shell's OSC 7 working directory, relayed by the page (already
+    /// URI-decoded to a plain path client-side).
+    Cwd(PathBuf),
+    /// RTT probe; the token echoes back verbatim in a `pong`.
+    Ping(String),
 }
 
-/// Parse `start <cols> <rows>` / `resize <cols> <rows>`, dimensions clamped
-/// to something a terminal can be (so a hostile client can't request a
-/// pathological grid).
+/// Parse a control frame. `start`/`resize` carry two dimensions, clamped to
+/// something a terminal can be (so a hostile client can't request a
+/// pathological grid); `cwd` takes the rest of the line as a path; `ping` a
+/// single opaque token.
 fn parse_command(text: &str) -> Option<Command> {
-    let mut parts = text.split_ascii_whitespace();
-    let verb = parts.next()?;
-    let cols: u16 = parts.next()?.parse().ok()?;
-    let rows: u16 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
+    let (verb, rest) = match text.split_once(' ') {
+        Some((v, r)) => (v, r.trim()),
+        None => (text, ""),
+    };
     match verb {
-        "start" => Some(Command::Start(cols, rows)),
-        "resize" => Some(Command::Resize(cols, rows)),
+        "start" | "resize" => {
+            let mut parts = rest.split_ascii_whitespace();
+            let cols: u16 = parts.next()?.parse().ok()?;
+            let rows: u16 = parts.next()?.parse().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
+            match verb {
+                "start" => Some(Command::Start(cols, rows)),
+                _ => Some(Command::Resize(cols, rows)),
+            }
+        }
+        // Bound the path (it lands in filesystem walks) and require it to be
+        // absolute — OSC 7 always reports one.
+        "cwd" if !rest.is_empty() && rest.len() < 4096 && rest.starts_with('/') => {
+            Some(Command::Cwd(PathBuf::from(rest)))
+        }
+        "ping" if !rest.is_empty() && rest.len() < 64 && !rest.contains(char::is_whitespace) => {
+            Some(Command::Ping(rest.to_string()))
+        }
         _ => None,
     }
 }
@@ -294,5 +354,20 @@ mod tests {
         assert_eq!(parse_command("start 80 24 zsh"), None, "no trailing args");
         assert_eq!(parse_command("kill 1 2"), None);
         assert_eq!(parse_command(""), None);
+    }
+
+    #[test]
+    fn cwd_and_ping_commands_parse_with_bounds() {
+        assert_eq!(
+            parse_command("cwd /home/user/my project"),
+            Some(Command::Cwd(PathBuf::from("/home/user/my project"))),
+            "paths keep their spaces"
+        );
+        assert_eq!(parse_command("cwd relative/path"), None, "must be absolute");
+        assert_eq!(parse_command("cwd"), None);
+        assert_eq!(parse_command(&format!("cwd /{}", "a".repeat(5000))), None, "bounded");
+        assert_eq!(parse_command("ping 1752712345"), Some(Command::Ping("1752712345".into())));
+        assert_eq!(parse_command("ping a b"), None, "one token only");
+        assert_eq!(parse_command("ping"), None);
     }
 }

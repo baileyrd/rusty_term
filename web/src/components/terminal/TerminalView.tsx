@@ -71,6 +71,18 @@ export default function TerminalView({
     });
     const onInput = term.onData((data) => t.write(data));
     const tracker = onCommandEvent ? attachCommandTracker(term, onCommandEvent) : null;
+    // OSC 7 (working directory): decode the file:// URI and relay it so the
+    // bridge's stats push can carry git facts for the shell's actual cwd.
+    const osc7 = term.parser.registerOscHandler(7, (data) => {
+      try {
+        const uri = new URL(data);
+        if (uri.protocol === 'file:') t.noteCwd?.(decodeURIComponent(uri.pathname));
+      } catch {
+        // Not a URI — some shells send a bare path.
+        if (data.startsWith('/')) t.noteCwd?.(data);
+      }
+      return true;
+    });
 
     t.connect(connectUrl)
       .then(() => {
@@ -92,6 +104,7 @@ export default function TerminalView({
 
     return () => {
       resizeObserver.disconnect();
+      osc7.dispose();
       tracker?.dispose();
       onInput.dispose();
       offData();

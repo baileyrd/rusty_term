@@ -47,6 +47,21 @@ export interface AiOrbProps {
   onClick?: () => void;
 }
 
+/**
+ * Live session stats assembled by the app from the bridge's `stats` pushes
+ * (see `transport/bridge.ts`): a rolling load history for the sparkline,
+ * measured latency, and git facts for the shell's cwd. `null` fields mean
+ * "the host couldn't provide this" and fall back to the demo values.
+ */
+export interface LiveShellStats {
+  systemLoad: number[];
+  latencyMs: number | null;
+  gitBranch: string | null;
+  gitStats: GitStats;
+  cpu: number | null;
+  ram: number | null;
+}
+
 export interface TerminalShellProps {
   theme?: 'nebula' | 'cyberpunk' | 'minimal';
   commands?: CommandCardProps[];
@@ -59,4 +74,6 @@ export interface TerminalShellProps {
    */
   onCommandEvent?: (event: import('./commandTracker').CommandEvent) => void;
   onTransportReady?: (transport: import('../../transport/bridge').TerminalTransport) => void;
+  /** Live ribbon/dock stats; absent (demo mode) keeps the hardcoded values. */
+  liveStats?: LiveShellStats;
 }

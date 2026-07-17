@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import TerminalShell from './components/terminal/TerminalShell';
-import type { CommandCardProps } from './components/terminal/types';
+import type { CommandCardProps, LiveShellStats } from './components/terminal/types';
 import type { CommandEvent } from './components/terminal/commandTracker';
 import type { TerminalTransport } from './transport/bridge';
 
@@ -57,8 +57,12 @@ const DEMO_COMMANDS: CommandCardProps[] = [
 /** Cap on retained cards; the terminal's scrollback keeps the rest. */
 const CARDS_MAX = 100;
 
+/** Load samples retained for the ribbon's sparkline. */
+const LOAD_HISTORY = 12;
+
 export default function App() {
   const [commands, setCommands] = useState<CommandCardProps[]>(LIVE ? [] : DEMO_COMMANDS);
+  const [liveStats, setLiveStats] = useState<LiveShellStats | undefined>(undefined);
   const transportRef = useRef<TerminalTransport | null>(null);
 
   /** OSC 133 events from the live session → command cards. */
@@ -99,6 +103,21 @@ export default function App() {
 
   const handleTransportReady = useCallback((t: TerminalTransport) => {
     transportRef.current = t;
+    // Bridge stats pushes → ribbon/dock state, with a rolling load history
+    // for the sparkline. The subscription dies with the transport.
+    t.onStats?.((s) => {
+      setLiveStats((prev) => ({
+        systemLoad:
+          s.load === null
+            ? (prev?.systemLoad ?? [])
+            : [...(prev?.systemLoad ?? []), Math.min(s.load, 1)].slice(-LOAD_HISTORY),
+        latencyMs: s.latencyMs,
+        gitBranch: s.branch,
+        gitStats: s.git,
+        cpu: s.load === null ? null : Math.min(s.load, 1),
+        ram: s.mem,
+      }));
+    });
   }, []);
 
   /**
@@ -133,6 +152,7 @@ export default function App() {
       onCommandSubmit={handleSubmit}
       onCommandEvent={LIVE ? handleCommandEvent : undefined}
       onTransportReady={LIVE ? handleTransportReady : undefined}
+      liveStats={liveStats}
     />
   );
 }

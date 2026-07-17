@@ -18,11 +18,13 @@ export default function TerminalShell({
   onCommandSubmit,
   onCommandEvent,
   onTransportReady,
+  liveStats,
 }: TerminalShellProps) {
   const [orbHints, setOrbHints] = useState(2);
 
-  // Demo ribbon/dock data — a live build feeds these from the bridge.
+  // Demo ribbon/dock data, used when no live stats channel is feeding us.
   const demoLoad = [0.22, 0.31, 0.28, 0.45, 0.38, 0.52, 0.47, 0.6, 0.42, 0.35, 0.4, 0.33];
+  const live = liveStats;
 
   return (
     <div
@@ -30,11 +32,11 @@ export default function TerminalShell({
       className="flex h-full flex-col bg-nebula-bg text-nebula-text"
     >
       <StatusRibbon
-        systemLoad={demoLoad}
-        latencyMs={12}
-        environment="dev"
-        gitBranch="claude/rusty-term-web-frontend"
-        gitStats={{ added: 3, modified: 7, deleted: 1 }}
+        systemLoad={live && live.systemLoad.length > 1 ? live.systemLoad : demoLoad}
+        latencyMs={live ? (live.latencyMs ?? 0) : 12}
+        environment={live ? 'live' : 'demo'}
+        gitBranch={live ? (live.gitBranch ?? '(no repo)') : 'claude/rusty-term-web-frontend'}
+        gitStats={live ? live.gitStats : { added: 3, modified: 7, deleted: 1 }}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -45,8 +47,8 @@ export default function TerminalShell({
           onTransportReady={onTransportReady}
         />
         <SideDock
-          cpu={0.34}
-          ram={0.61}
+          cpu={live ? (live.cpu ?? 0) : 0.34}
+          ram={live ? (live.ram ?? 0) : 0.61}
           recentCommands={commands.map((c) => c.command).slice(-6).reverse()}
           pinnedSnippets={[
             { title: 'Rebuild + test', command: 'cargo test --workspace' },
