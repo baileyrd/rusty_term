@@ -6,6 +6,7 @@ import AiOrb from './AiOrb';
 import AssistPanel, { type AiAssistState, type ChatState } from './AssistPanel';
 import CommandPalette from './CommandPalette';
 import SearchOverlay from './SearchOverlay';
+import SettingsSheet from './SettingsSheet';
 import { exportTranscript } from './transcript';
 import { localHeuristics } from '../../assist/heuristics';
 import {
@@ -320,6 +321,8 @@ export default function TerminalShell({
     setSnippets((prev) => prev.filter((s) => s.command !== snippet.command));
   }, []);
 
+  const clearSnippets = useCallback(() => setSnippets([]), []);
+
   const toggleAssist = useCallback(() => {
     setAssistOpen((open) => {
       if (!open) setSeenFailures(failures);
@@ -332,6 +335,7 @@ export default function TerminalShell({
   // xterm never writes them into the pty.
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [assistTab, setAssistTab] = useState<'insights' | 'chat'>('insights');
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -343,6 +347,10 @@ export default function TerminalShell({
         e.preventDefault();
         e.stopPropagation();
         setSearchOpen((open) => !open);
+      } else if (e.key === ',' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        setSettingsOpen((open) => !open);
       }
     };
     window.addEventListener('keydown', onKeyDown, true);
@@ -433,6 +441,18 @@ export default function TerminalShell({
         onJump={jumpToCard}
       />
 
+      <SettingsSheet
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        activeTheme={activeTheme}
+        onSetTheme={setActiveTheme}
+        apiKeyConnected={apiKey !== null}
+        onConnectAssist={connectAssist}
+        onDisconnectAssist={disconnectAssist}
+        snippets={snippets}
+        onClearSnippets={clearSnippets}
+      />
+
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -451,6 +471,7 @@ export default function TerminalShell({
         onTabAdd={onTabAdd}
         onTabClose={tabs.length > 1 ? () => handleTabClose(currentTab) : undefined}
         onSearchHistory={() => setSearchOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
         failuresOnly={failuresOnly}
         onToggleFailuresOnly={() => setFailuresOnly((v) => !v)}
         onExportTranscript={(format) =>

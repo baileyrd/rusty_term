@@ -41,6 +41,8 @@ export interface CommandPaletteProps {
   /** Toggle the failures-only stream filter. */
   failuresOnly?: boolean;
   onToggleFailuresOnly?: () => void;
+  /** Open the Ctrl+, settings sheet. */
+  onOpenSettings?: () => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -97,6 +99,7 @@ export default function CommandPalette({
   onExportTranscript,
   failuresOnly = false,
   onToggleFailuresOnly,
+  onOpenSettings,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -187,6 +190,15 @@ export default function CommandPalette({
         title: 'Search session history',
         detail: 'Ctrl+Shift+F',
         action: onSearchHistory,
+      });
+    }
+    if (onOpenSettings) {
+      candidates.push({
+        id: 'open-settings',
+        group: 'actions',
+        title: 'Open settings',
+        detail: 'Ctrl+,',
+        action: onOpenSettings,
       });
     }
     if (onToggleFailuresOnly) {
@@ -284,7 +296,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory, onExportTranscript, failuresOnly, onToggleFailuresOnly]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory, onExportTranscript, failuresOnly, onToggleFailuresOnly, onOpenSettings]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));
