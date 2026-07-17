@@ -24,8 +24,9 @@ const DEMO_COMMANDS: CommandCardProps[] = [
       ' 9 files changed, 412 insertions(+), 38 deletions(-)',
     ],
     meta: 'exit 0',
-    startedAt: now - 320_000,
-    finishedAt: now - 319_780,
+    // A separate burst ~25 min back, so the demo shows two card groups.
+    startedAt: now - 1_500_000,
+    finishedAt: now - 1_499_780,
   },
   {
     id: 'demo-2',
