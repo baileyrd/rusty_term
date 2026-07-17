@@ -22,6 +22,71 @@ export const colors = {
   info: '#4CE1F7',
 } as const;
 
+export type ThemeColors = { [K in keyof typeof colors]: string };
+export type ThemeName = 'nebula' | 'cyberpunk' | 'minimal';
+
+/**
+ * The three presets the spec's `theme` prop promises. Nebula is the design
+ * system's home look; cyberpunk trades the cyan/amber pair for hot pink on
+ * a violet-black canvas; minimal desaturates everything to a quiet
+ * monochrome (still dark — the hairline `white/…` borders used throughout
+ * assume a dark canvas).
+ */
+export const themes: Record<ThemeName, ThemeColors> = {
+  nebula: { ...colors },
+  cyberpunk: {
+    bg: '#0B0014',
+    surface: 'rgba(255, 42, 109, 0.05)',
+    text: '#F0E6FF',
+    accent: '#FF2A6D',
+    accent2: '#05FFA1',
+    success: '#05FFA1',
+    warning: '#FFD300',
+    error: '#FF3B3B',
+    info: '#00C2FF',
+  },
+  minimal: {
+    bg: '#0E0E11',
+    surface: 'rgba(255, 255, 255, 0.04)',
+    text: '#DEDEE4',
+    accent: '#8FA8C7',
+    accent2: '#A8A8B4',
+    success: '#8FC7A5',
+    warning: '#C7B98F',
+    error: '#C78F8F',
+    info: '#8FA8C7',
+  },
+};
+
+export const THEME_NAMES = Object.keys(themes) as ThemeName[];
+
+/** '#4CE1F7' → '76 225 247', the channel form Tailwind's alpha slot needs. */
+function hexTriplet(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 0xff} ${(n >> 8) & 0xff} ${n & 0xff}`;
+}
+
+/**
+ * The CSS custom properties a theme resolves to. Everything except
+ * `surface` (which carries its own alpha) is an RGB triplet so Tailwind
+ * opacity modifiers (`text-nebula-accent/40`) keep working.
+ */
+export function themeCssVars(name: ThemeName): Record<string, string> {
+  const t = themes[name];
+  return {
+    '--nebula-bg': hexTriplet(t.bg),
+    '--nebula-surface': t.surface,
+    '--nebula-text': hexTriplet(t.text),
+    '--nebula-accent': hexTriplet(t.accent),
+    '--nebula-accent2': hexTriplet(t.accent2),
+    '--nebula-success': hexTriplet(t.success),
+    '--nebula-warning': hexTriplet(t.warning),
+    '--nebula-error': hexTriplet(t.error),
+    '--nebula-info': hexTriplet(t.info),
+  };
+}
+
+
 export const radii = {
   sm: '6px',
   md: '10px',
@@ -75,6 +140,12 @@ export const fonts = {
   ],
 } as const;
 
+/** '#4CE1F7' + 0.25 → 'rgba(76, 225, 247, 0.25)'. */
+function withAlpha(hex: string, alpha: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 0xff}, ${(n >> 8) & 0xff}, ${n & 0xff}, ${alpha})`;
+}
+
 /**
  * ANSI 16-color palette for the raw xterm.js panel, tuned to sit inside the
  * Nebula canvas without vibrating against it.
@@ -102,6 +173,23 @@ export const ansiPalette = {
   brightCyan: '#8AEEFF',
   brightWhite: '#F4F4FA',
 } as const;
+
+/**
+ * The xterm.js theme for a preset: canvas, text, cursor, and selection
+ * follow the theme; the 16 ANSI slots are program-chosen colors and stay
+ * put so `ls --color` output looks the same everywhere.
+ */
+export function ansiPaletteFor(name: ThemeName): { [K in keyof typeof ansiPalette]: string } {
+  const t = themes[name];
+  return {
+    ...ansiPalette,
+    background: t.bg,
+    foreground: t.text,
+    cursor: t.accent,
+    cursorAccent: t.bg,
+    selectionBackground: withAlpha(t.accent, 0.25),
+  };
+}
 
 export const tokens = { colors, radii, shadows, motion, fonts, ansiPalette } as const;
 export default tokens;

@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { transportFromLocation, type TerminalTransport } from '../../transport/bridge';
 import { attachCommandTracker, type CommandEvent } from './commandTracker';
-import { ansiPalette, fonts } from '../../theme/tokens';
+import { ansiPalette, ansiPaletteFor, fonts, type ThemeName } from '../../theme/tokens';
 
 export interface TerminalViewProps {
   /**
@@ -30,6 +30,8 @@ export interface TerminalViewProps {
    * page's input line can write into the same PTY the panel shows.
    */
   onTransportReady?: (transport: TerminalTransport) => void;
+  /** Active preset; canvas/cursor/selection colors follow it at runtime. */
+  theme?: ThemeName;
 }
 
 /**
@@ -41,8 +43,18 @@ export default function TerminalView({
   url,
   onCommandEvent,
   onTransportReady,
+  theme,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+
+  // Re-skin the live instance when the preset changes — xterm applies
+  // theme updates via options without a re-open.
+  useEffect(() => {
+    if (termRef.current && theme) {
+      termRef.current.options.theme = ansiPaletteFor(theme);
+    }
+  }, [theme]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -52,12 +64,13 @@ export default function TerminalView({
       cursorBlink: true,
       fontSize: 13,
       fontFamily: fonts.output.join(', '),
-      theme: { ...ansiPalette },
+      theme: theme ? ansiPaletteFor(theme) : { ...ansiPalette },
       scrollback: 2000,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    termRef.current = term;
     fit.fit();
 
     const fallback = transport === undefined ? transportFromLocation(window.location.search) : null;
@@ -110,6 +123,7 @@ export default function TerminalView({
       offData();
       offExit();
       if (ownsTransport) t.dispose();
+      termRef.current = null;
       term.dispose();
     };
   }, [transport, url, onCommandEvent, onTransportReady]);

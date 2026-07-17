@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
 import type { SnippetItem } from './types';
 
 /** One row of the palette: what it shows and what happens on Enter. */
@@ -19,6 +20,9 @@ export interface CommandPaletteProps {
   onRunCommand?: (command: string) => void;
   /** Open the assist sheet on the given tab. */
   onOpenAssist?: (tab: 'insights' | 'chat') => void;
+  /** Switch the visual preset ("Theme: cyberpunk" rows). */
+  onSetTheme?: (theme: ThemeName) => void;
+  activeTheme?: ThemeName;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -61,6 +65,8 @@ export default function CommandPalette({
   recentCommands,
   onRunCommand,
   onOpenAssist,
+  onSetTheme,
+  activeTheme,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -125,6 +131,17 @@ export default function CommandPalette({
         },
       );
     }
+    if (onSetTheme) {
+      for (const name of THEME_NAMES) {
+        candidates.push({
+          id: `theme-${name}`,
+          group: 'actions',
+          title: `Theme: ${name}`,
+          detail: name === activeTheme ? 'active' : undefined,
+          action: () => onSetTheme(name),
+        });
+      }
+    }
     // The raw-run row always survives filtering (it *is* the query); the
     // rest rank by fuzzy match over title + detail.
     return candidates
@@ -138,7 +155,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

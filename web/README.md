@@ -139,6 +139,15 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Theme switcher**: the spec's three presets are real — *nebula* (cyan
+  and amber on near-black), *cyberpunk* (hot pink and mint on violet-black),
+  *minimal* (quiet monochrome). Switch from the palette's "Theme: …"
+  actions; the choice persists in `localStorage` (`nebula.theme`) and wins
+  over the `theme` prop on reload. Colors are CSS custom properties (RGB
+  triplets, so Tailwind opacity modifiers keep working) stamped on `<html>`
+  by `theme/apply.ts`; the xterm panel re-skins its canvas/cursor/selection
+  live while the 16 ANSI slots stay put so program output looks the same
+  everywhere.
 - **Command palette** (`Ctrl+K` / `Cmd+K`): a top-center overlay that
   fuzzy-filters pinned snippets, recent commands (subsequence matching —
   `ctw` hits `cargo test --workspace`), and shell actions ("Open assist
@@ -212,5 +221,3 @@ Demo/stub:
   and cards/submits are the loopback fakes.
 - Without a connected API key the assist panel is pattern rules, not a
   model — and says so in its header.
-- `theme="cyberpunk" | "minimal"` are accepted per the spec but currently
-  render the Nebula skin.
