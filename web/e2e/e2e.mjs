@@ -135,7 +135,15 @@ const webRoot = new URL('..', import.meta.url);
 let previewOutput = '';
 const preview = spawn(
   process.execPath,
-  [new URL('node_modules/vite/bin/vite.js', webRoot).pathname, 'preview', '--port', String(PREVIEW_PORT), '--strictPort'],
+  [
+    new URL('node_modules/vite/bin/vite.js', webRoot).pathname,
+    'preview',
+    '--port',
+    String(PREVIEW_PORT),
+    '--strictPort',
+    '--host',
+    '127.0.0.1',
+  ],
   {
     cwd: webRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
