@@ -39,6 +39,27 @@ cargo run --features web-bridge --bin rusty_term_web_bridge   # ws://127.0.0.1:7
 # or with an explicit endpoint: http://localhost:5173/?ws=ws://127.0.0.1:7703
 ```
 
+## Testing
+
+```sh
+npm test               # builds, then runs the full demo-mode Playwright
+                        # suite (palette, search, settings, theme, panes,
+                        # tabs, restore, assist — insights/streaming/chat/
+                        # code blocks — against a mocked Anthropic Messages
+                        # API): web/e2e/e2e.mjs
+```
+
+Needs a Chromium build Playwright can find — `npx playwright install
+chromium` if one isn't already on `PLAYWRIGHT_BROWSERS_PATH` or the default
+cache.
+
+A second suite, `web/e2e/live-bridge.mjs` (`npm run test:live-bridge`),
+covers what the demo can't: background-tab activity badges need a real
+shell finishing a command via genuine OSC 133 marks, which only the actual
+bridge can produce. Build the bridge first (`cargo build --features
+web-bridge` from the repo root) — the script spawns it with a bash whose
+rcfile emits the marks, so it's otherwise self-contained.
+
 ## Layout
 
 ```
