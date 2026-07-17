@@ -136,7 +136,22 @@ const preview = spawn('npx', ['vite', 'preview', '--port', String(PREVIEW_PORT),
   stdio: 'ignore',
   detached: true, // own process group, so cleanup kills the vite child too
 });
-await new Promise((r) => setTimeout(r, 2500));
+
+// Poll instead of a fixed sleep: a slower CI runner can take longer than a
+// couple seconds to get vite preview accepting connections.
+async function waitForServer(url, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  throw new Error(`Server at ${url} never came up within ${timeoutMs}ms`);
+}
+await waitForServer(`http://127.0.0.1:${PREVIEW_PORT}/`);
 
 const browser = await chromium.launch();
 try {
