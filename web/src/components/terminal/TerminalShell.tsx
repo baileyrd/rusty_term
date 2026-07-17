@@ -128,6 +128,7 @@ export default function TerminalShell({
   onTabClose,
   liveStats,
   searchSessions,
+  tabBadges,
 }: TerminalShellProps) {
   const currentTab = activeTabId ?? tabs[0].id;
   // The active preset: stored choice wins over the prop, which stays the
@@ -405,6 +406,7 @@ export default function TerminalShell({
           onTabAdd={onTabAdd}
           onTabClose={tabs.length > 1 ? handleTabClose : undefined}
           onClosePane={closePane}
+          tabBadges={tabBadges}
           highlightCardId={highlightCardId}
           failuresOnly={failuresOnly}
           onClearFilter={() => setFailuresOnly(false)}

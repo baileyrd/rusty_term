@@ -155,6 +155,11 @@ function loadSession(): SavedSession | null {
   }
 }
 
+/** Finished (success or error) cards in a list. */
+function finishedCount(cards: CommandCardProps[]): number {
+  return cards.filter((c) => c.status === 'success' || c.status === 'error').length;
+}
+
 /** The next free `tab-N` counter given the restored tabs. */
 function nextTabCounter(tabs: SessionTab[]): number {
   const max = Math.max(0, ...tabs.map((t) => Number(/^tab-(\d+)$/.exec(t.id)?.[1] ?? 0)));
@@ -177,6 +182,16 @@ export default function App() {
     saved?.commandsByTab ?? { 'tab-1': LIVE ? [] : DEMO_COMMANDS },
   );
   const [liveStats, setLiveStats] = useState<LiveShellStats | undefined>(undefined);
+  // Per-tab "seen" watermark for the activity badges: how many finished
+  // cards the user has already looked at. Restored history starts fully
+  // seen, so old tabs don't light up on load.
+  const [seenByTab, setSeenByTab] = useState<Record<string, number>>(() =>
+    Object.fromEntries(
+      Object.entries(
+        saved?.commandsByTab ?? { 'tab-1': LIVE ? [] : DEMO_COMMANDS },
+      ).map(([id, cards]) => [id, finishedCount(cards)]),
+    ),
+  );
   const transportsRef = useRef(new Map<string, TerminalTransport>());
   const tabCounter = useRef(saved ? nextTabCounter(saved.tabs) : 2);
 
@@ -207,6 +222,13 @@ export default function App() {
     }, 400);
     return () => clearTimeout(timer);
   }, [tabs, activeTabId, commandsByTab]);
+
+  // Watching a tab means seeing it: keep the active tab's watermark at its
+  // current finished count, so only *background* completions accumulate.
+  useEffect(() => {
+    const n = finishedCount(commandsByTab[activeTabId] ?? []);
+    setSeenByTab((prev) => (prev[activeTabId] === n ? prev : { ...prev, [activeTabId]: n }));
+  }, [activeTabId, commandsByTab]);
 
   /** OSC 133 events from a tab's live session → that tab's command cards. */
   const handleCommandEvent = useCallback((tabId: string, event: CommandEvent) => {
@@ -339,6 +361,14 @@ export default function App() {
         title: t.title,
         commands: commandsByTab[t.id] ?? [],
       }))}
+      tabBadges={Object.fromEntries(
+        tabs.map((t) => [
+          t.id,
+          t.id === activeTabId
+            ? 0
+            : Math.max(0, finishedCount(commandsByTab[t.id] ?? []) - (seenByTab[t.id] ?? 0)),
+        ]),
+      )}
     />
   );
 }

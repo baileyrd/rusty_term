@@ -30,6 +30,8 @@ export interface CommandStreamProps {
   onTabClose?: (id: string) => void;
   /** Close a secondary pane (the primary has no close affordance). */
   onClosePane?: (tabId: string, paneId: string) => void;
+  /** Unseen finished commands per tab; >0 renders an activity badge. */
+  tabBadges?: Record<string, number>;
   /** Card to scroll into view and flash (a history-search jump target). */
   highlightCardId?: string | null;
   /** Show only error cards, with a dismissible chip above the stream. */
@@ -53,6 +55,7 @@ export default function CommandStream({
   onTabAdd,
   onTabClose,
   onClosePane,
+  tabBadges,
   highlightCardId,
   failuresOnly = false,
   onClearFilter,
@@ -130,6 +133,15 @@ export default function CommandStream({
             <button type="button" onClick={() => onTabSelect?.(tab.id)} className="truncate">
               {tab.title}
             </button>
+            {(tabBadges?.[tab.id] ?? 0) > 0 && (
+              <span
+                data-testid="tab-badge"
+                title={`${tabBadges?.[tab.id]} command(s) finished in the background`}
+                className="flex h-4 min-w-4 items-center justify-center rounded-full bg-nebula-accent2 px-1 font-nebula-meta text-[10px] font-semibold text-black"
+              >
+                {tabBadges?.[tab.id]}
+              </span>
+            )}
             {onTabClose && (
               <button
                 type="button"
