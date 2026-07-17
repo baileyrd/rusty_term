@@ -139,6 +139,14 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Command palette** (`Ctrl+K` / `Cmd+K`): a top-center overlay that
+  fuzzy-filters pinned snippets, recent commands (subsequence matching —
+  `ctw` hits `cargo test --workspace`), and shell actions ("Open assist
+  insights/chat"), with whatever you typed always available as a raw
+  *run-in-terminal* row at the top. Fully keyboard-driven (↑↓/↵/esc); the
+  shortcut is captured before xterm sees it, so the chord never reaches
+  the PTY. Running from the palette goes through the same submit path as
+  cards and snippets.
 - **Pinned snippets**: hover a command card and hit its pin (⌖) to keep the
   command in the dock; clicking a snippet (or a *recent commands* row) runs
   it through the same submit path. Pins persist in `localStorage` and can

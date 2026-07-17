@@ -4,6 +4,7 @@ import CommandStream from './CommandStream';
 import SideDock from './SideDock';
 import AiOrb from './AiOrb';
 import AssistPanel, { type AiAssistState, type ChatState } from './AssistPanel';
+import CommandPalette from './CommandPalette';
 import { localHeuristics } from '../../assist/heuristics';
 import {
   createLlmProvider,
@@ -192,6 +193,31 @@ export default function TerminalShell({
     });
   }, [failures]);
 
+  // The Ctrl/Cmd+K command palette. The listener runs in the capture phase
+  // and swallows the chord so a focused xterm never writes \v to the pty.
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [assistTab, setAssistTab] = useState<'insights' | 'chat'>('insights');
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        setPaletteOpen((open) => !open);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, []);
+
+  const openAssistFromPalette = useCallback(
+    (tab: 'insights' | 'chat') => {
+      setAssistTab(tab);
+      setSeenFailures(failures);
+      setAssistOpen(true);
+    },
+    [failures],
+  );
+
   // Demo ribbon/dock data, used when no live stats channel is feeding us.
   const demoLoad = [0.22, 0.31, 0.28, 0.45, 0.38, 0.52, 0.47, 0.6, 0.42, 0.35, 0.4, 0.33];
   const live = liveStats;
@@ -228,10 +254,20 @@ export default function TerminalShell({
         />
       </div>
 
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        snippets={snippets}
+        recentCommands={commands.map((c) => c.command)}
+        onRunCommand={onCommandSubmit}
+        onOpenAssist={openAssistFromPalette}
+      />
+
       {assistOpen && (
         <AssistPanel
           insights={insights}
           ai={aiState}
+          initialTab={assistTab}
           chat={chat}
           onChatSend={sendChat}
           onChatRun={onCommandSubmit}

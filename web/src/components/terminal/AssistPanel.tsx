@@ -43,6 +43,8 @@ export interface AssistPanelProps {
   onDisconnect: () => void;
   onRun?: (command: string) => void;
   onClose: () => void;
+  /** Tab to show when the sheet mounts (the palette opens straight to chat). */
+  initialTab?: 'insights' | 'chat';
 }
 
 function InsightCard({
@@ -315,8 +317,11 @@ export default function AssistPanel({
   onDisconnect,
   onRun,
   onClose,
+  initialTab = 'insights',
 }: AssistPanelProps) {
-  const [tab, setTab] = useState<'insights' | 'chat'>('insights');
+  const [tab, setTab] = useState<'insights' | 'chat'>(initialTab);
+  // The palette can retarget an already-open sheet ("Open assist chat").
+  useEffect(() => setTab(initialTab), [initialTab]);
   const subtitle =
     ai.phase === 'disconnected'
       ? 'local heuristics · no AI provider connected'
