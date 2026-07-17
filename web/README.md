@@ -139,6 +139,13 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Split panes**: the raw-terminal area splits into up to four
+  side-by-side panes via the palette's *Split terminal pane* action; each
+  pane is its own transport session (a separate PTY against the same
+  bridge in live mode, its own loopback in demo). Close a split with its
+  header ✕ or the palette's *Close terminal pane*; the primary pane has no
+  close button and stays bound to the command cards and the input line —
+  splits are independent scratch terminals.
 - **Theme switcher**: the spec's three presets are real — *nebula* (cyan
   and amber on near-black), *cyberpunk* (hot pink and mint on violet-black),
   *minimal* (quiet monochrome). Switch from the palette's "Theme: …"

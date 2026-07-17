@@ -22,6 +22,9 @@ const SNIPPETS_KEY = 'nebula.pinnedSnippets';
 /** localStorage key for the chosen theme preset. */
 const THEME_KEY = 'nebula.theme';
 
+/** Ceiling for side-by-side terminal panes — beyond this they get too thin. */
+const MAX_PANES = 4;
+
 function loadTheme(): ThemeName | null {
   try {
     const stored = localStorage.getItem(THEME_KEY);
@@ -99,6 +102,23 @@ export default function TerminalShell({
       // Blocked storage: the choice just doesn't survive a reload.
     }
   }, [activeTheme]);
+
+  // Split panes: primary first, up to MAX_PANES side-by-side terminals.
+  // Each split is its own transport session; ids only ever grow so React
+  // never remounts (and thus never reconnects) a surviving pane.
+  const [panes, setPanes] = useState<string[]>(['primary']);
+  const paneCounter = useRef(1);
+  const splitPane = useCallback(() => {
+    setPanes((prev) =>
+      prev.length >= MAX_PANES ? prev : [...prev, `pane-${paneCounter.current++}`],
+    );
+  }, []);
+  const closePane = useCallback((id: string) => {
+    setPanes((prev) => (prev.length > 1 && id !== 'primary' ? prev.filter((p) => p !== id) : prev));
+  }, []);
+  const closeLastPane = useCallback(() => {
+    setPanes((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev));
+  }, []);
 
   const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
   const [assistOpen, setAssistOpen] = useState(false);
@@ -271,6 +291,8 @@ export default function TerminalShell({
           onCommandEvent={onCommandEvent}
           onTransportReady={onTransportReady}
           theme={activeTheme}
+          panes={panes}
+          onClosePane={closePane}
         />
         <SideDock
           cpu={live ? (live.cpu ?? 0) : 0.34}
@@ -292,6 +314,9 @@ export default function TerminalShell({
         onOpenAssist={openAssistFromPalette}
         activeTheme={activeTheme}
         onSetTheme={setActiveTheme}
+        paneCount={panes.length}
+        onSplitPane={splitPane}
+        onCloseLastPane={closeLastPane}
       />
 
       {assistOpen && (
