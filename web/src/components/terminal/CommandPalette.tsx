@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
-import type { SnippetItem } from './types';
+import type { SessionTabInfo, SnippetItem } from './types';
 
 /** One row of the palette: what it shows and what happens on Enter. */
 interface PaletteItem {
@@ -27,6 +27,13 @@ export interface CommandPaletteProps {
   paneCount?: number;
   onSplitPane?: () => void;
   onCloseLastPane?: () => void;
+  /** Session-tab actions: new / close-active / switch rows. */
+  tabs?: SessionTabInfo[];
+  activeTabId?: string;
+  onTabSelect?: (id: string) => void;
+  onTabAdd?: () => void;
+  /** Close the active tab; absent when only one tab remains. */
+  onTabClose?: () => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -74,6 +81,11 @@ export default function CommandPalette({
   paneCount = 1,
   onSplitPane,
   onCloseLastPane,
+  tabs = [],
+  activeTabId,
+  onTabSelect,
+  onTabAdd,
+  onTabClose,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -82,10 +94,13 @@ export default function CommandPalette({
 
   useEffect(() => {
     if (open) {
+      // The overlay mounts on this render; focus once it exists. The query
+      // is reset on *close*, not here — this effect runs after paint, so a
+      // reset here could wipe input typed in the first frames after opening.
+      requestAnimationFrame(() => inputRef.current?.focus());
+    } else {
       setQuery('');
       setCursor(0);
-      // The overlay mounts on this render; focus once it exists.
-      requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
 
@@ -154,6 +169,35 @@ export default function CommandPalette({
         },
       );
     }
+    if (onTabAdd) {
+      candidates.push({
+        id: 'tab-new',
+        group: 'actions',
+        title: 'New session tab',
+        detail: `${tabs.length} open`,
+        action: onTabAdd,
+      });
+    }
+    if (onTabClose) {
+      candidates.push({
+        id: 'tab-close',
+        group: 'actions',
+        title: 'Close session tab',
+        detail: tabs.find((t) => t.id === activeTabId)?.title,
+        action: onTabClose,
+      });
+    }
+    if (onTabSelect) {
+      for (const tab of tabs) {
+        if (tab.id === activeTabId) continue;
+        candidates.push({
+          id: `tab-${tab.id}`,
+          group: 'actions',
+          title: `Tab: ${tab.title}`,
+          action: () => onTabSelect(tab.id),
+        });
+      }
+    }
     if (onSplitPane && paneCount < 4) {
       candidates.push({
         id: 'pane-split',
@@ -196,7 +240,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

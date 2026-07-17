@@ -139,6 +139,14 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Session tabs**: the center column has a tab strip — each tab is an
+  independent workspace with its own command cards, its own transport (a
+  separate PTY session in live mode), and its own pane layout. Inactive
+  tabs stay mounted but hidden, so switching never drops a session. Open
+  with the strip's `+` or the palette's *New session tab*; switch by
+  clicking or via the palette's *Tab: session N* rows; close from a tab's
+  ✕ or *Close session tab* (the last tab can't be closed). The input line,
+  dock recents, and assist insights/chat all follow the active tab.
 - **Split panes**: the raw-terminal area splits into up to four
   side-by-side panes via the palette's *Split terminal pane* action; each
   pane is its own transport session (a separate PTY against the same

@@ -16,6 +16,8 @@ import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
 import { applyTheme } from '../../theme/apply';
 import type { SnippetItem, TerminalShellProps } from './types';
 
+const DEFAULT_TABS = [{ id: 'main', title: 'session 1' }];
+
 /** localStorage key for the pinned snippets. */
 const SNIPPETS_KEY = 'nebula.pinnedSnippets';
 
@@ -86,10 +88,15 @@ export default function TerminalShell({
   theme = 'nebula',
   commands = [],
   onCommandSubmit,
-  onCommandEvent,
-  onTransportReady,
+  sessionHandlers,
+  tabs = DEFAULT_TABS,
+  activeTabId,
+  onTabSelect,
+  onTabAdd,
+  onTabClose,
   liveStats,
 }: TerminalShellProps) {
+  const currentTab = activeTabId ?? tabs[0].id;
   // The active preset: stored choice wins over the prop, which stays the
   // initial default. applyTheme stamps the custom properties on <html> so
   // Tailwind's var()-based colors (and the body background) all follow.
@@ -103,22 +110,47 @@ export default function TerminalShell({
     }
   }, [activeTheme]);
 
-  // Split panes: primary first, up to MAX_PANES side-by-side terminals.
-  // Each split is its own transport session; ids only ever grow so React
-  // never remounts (and thus never reconnects) a surviving pane.
-  const [panes, setPanes] = useState<string[]>(['primary']);
+  // Split panes, per tab: primary first, up to MAX_PANES side-by-side
+  // terminals. Each split is its own transport session; ids only ever grow
+  // so React never remounts (and thus never reconnects) a surviving pane.
+  const [panesByTab, setPanesByTab] = useState<Record<string, string[]>>({});
   const paneCounter = useRef(1);
+  const panesFor = useCallback(
+    (tabId: string) => panesByTab[tabId] ?? ['primary'],
+    [panesByTab],
+  );
   const splitPane = useCallback(() => {
-    setPanes((prev) =>
-      prev.length >= MAX_PANES ? prev : [...prev, `pane-${paneCounter.current++}`],
-    );
-  }, []);
-  const closePane = useCallback((id: string) => {
-    setPanes((prev) => (prev.length > 1 && id !== 'primary' ? prev.filter((p) => p !== id) : prev));
+    setPanesByTab((prev) => {
+      const cur = prev[currentTab] ?? ['primary'];
+      return cur.length >= MAX_PANES
+        ? prev
+        : { ...prev, [currentTab]: [...cur, `pane-${paneCounter.current++}`] };
+    });
+  }, [currentTab]);
+  const closePane = useCallback((tabId: string, id: string) => {
+    setPanesByTab((prev) => {
+      const cur = prev[tabId] ?? ['primary'];
+      if (cur.length <= 1 || id === 'primary') return prev;
+      return { ...prev, [tabId]: cur.filter((p) => p !== id) };
+    });
   }, []);
   const closeLastPane = useCallback(() => {
-    setPanes((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev));
-  }, []);
+    setPanesByTab((prev) => {
+      const cur = prev[currentTab] ?? ['primary'];
+      return cur.length > 1 ? { ...prev, [currentTab]: cur.slice(0, -1) } : prev;
+    });
+  }, [currentTab]);
+  const handleTabClose = useCallback(
+    (id: string) => {
+      // Drop the closed tab's pane layout with it.
+      setPanesByTab((prev) => {
+        const { [id]: _dropped, ...rest } = prev;
+        return rest;
+      });
+      onTabClose?.(id);
+    },
+    [onTabClose],
+  );
 
   const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
   const [assistOpen, setAssistOpen] = useState(false);
@@ -288,10 +320,13 @@ export default function TerminalShell({
           commands={commands}
           onCommandSubmit={onCommandSubmit}
           onPinCommand={pinCommand}
-          onCommandEvent={onCommandEvent}
-          onTransportReady={onTransportReady}
+          sessionHandlers={sessionHandlers}
           theme={activeTheme}
-          panes={panes}
+          tabs={tabs.map((t) => ({ ...t, panes: panesFor(t.id) }))}
+          activeTabId={currentTab}
+          onTabSelect={onTabSelect}
+          onTabAdd={onTabAdd}
+          onTabClose={tabs.length > 1 ? handleTabClose : undefined}
           onClosePane={closePane}
         />
         <SideDock
@@ -314,9 +349,14 @@ export default function TerminalShell({
         onOpenAssist={openAssistFromPalette}
         activeTheme={activeTheme}
         onSetTheme={setActiveTheme}
-        paneCount={panes.length}
+        paneCount={panesFor(currentTab).length}
         onSplitPane={splitPane}
         onCloseLastPane={closeLastPane}
+        tabs={tabs}
+        activeTabId={currentTab}
+        onTabSelect={onTabSelect}
+        onTabAdd={onTabAdd}
+        onTabClose={tabs.length > 1 ? () => handleTabClose(currentTab) : undefined}
       />
 
       {assistOpen && (

@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
+import type { CommandEvent } from './components/terminal/commandTracker';
 import TerminalShell from './components/terminal/TerminalShell';
 import type { CommandCardProps, LiveShellStats } from './components/terminal/types';
-import type { CommandEvent } from './components/terminal/commandTracker';
 import type { TerminalTransport } from './transport/bridge';
 
 /**
@@ -60,51 +60,72 @@ const CARDS_MAX = 100;
 /** Load samples retained for the ribbon's sparkline. */
 const LOAD_HISTORY = 12;
 
-export default function App() {
-  const [commands, setCommands] = useState<CommandCardProps[]>(LIVE ? [] : DEMO_COMMANDS);
-  const [liveStats, setLiveStats] = useState<LiveShellStats | undefined>(undefined);
-  const transportRef = useRef<TerminalTransport | null>(null);
+/** One OSC 133 event folded into a tab's card list (pure). */
+function reduceCommandEvent(prev: CommandCardProps[], event: CommandEvent): CommandCardProps[] {
+  if (event.type === 'start') {
+    const card: CommandCardProps = {
+      id: `live-${event.startedAt}-${prev.length}`,
+      command: event.command,
+      status: 'running',
+      output: [],
+      startedAt: event.startedAt,
+    };
+    return [...prev, card].slice(-CARDS_MAX);
+  }
+  // finish: close the most recent running card.
+  const i = prev.map((c) => c.status).lastIndexOf('running');
+  if (i < 0) return prev;
+  const open = prev[i];
+  const secs = open.startedAt ? (event.finishedAt - open.startedAt) / 1000 : null;
+  const done: CommandCardProps = {
+    ...open,
+    // No reported code reads as "finished" rather than failed, the same
+    // call the native gutter marks make.
+    status: event.exit === null || event.exit === 0 ? 'success' : 'error',
+    output: event.output,
+    finishedAt: event.finishedAt,
+    meta: [
+      event.exit === null ? 'exit ?' : `exit ${event.exit}`,
+      secs !== null ? `${secs.toFixed(secs < 10 ? 1 : 0)}s` : null,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  };
+  return [...prev.slice(0, i), done, ...prev.slice(i + 1)];
+}
 
-  /** OSC 133 events from the live session → command cards. */
-  const handleCommandEvent = useCallback((event: CommandEvent) => {
-    setCommands((prev) => {
-      if (event.type === 'start') {
-        const card: CommandCardProps = {
-          id: `live-${event.startedAt}-${prev.length}`,
-          command: event.command,
-          status: 'running',
-          output: [],
-          startedAt: event.startedAt,
-        };
-        return [...prev, card].slice(-CARDS_MAX);
-      }
-      // finish: close the most recent running card.
-      const i = prev.map((c) => c.status).lastIndexOf('running');
-      if (i < 0) return prev;
-      const open = prev[i];
-      const secs = open.startedAt ? (event.finishedAt - open.startedAt) / 1000 : null;
-      const done: CommandCardProps = {
-        ...open,
-        // No reported code reads as "finished" rather than failed, the same
-        // call the native gutter marks make.
-        status: event.exit === null || event.exit === 0 ? 'success' : 'error',
-        output: event.output,
-        finishedAt: event.finishedAt,
-        meta: [
-          event.exit === null ? 'exit ?' : `exit ${event.exit}`,
-          secs !== null ? `${secs.toFixed(secs < 10 ? 1 : 0)}s` : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
-      };
-      return [...prev.slice(0, i), done, ...prev.slice(i + 1)];
-    });
+interface SessionTab {
+  id: string;
+  title: string;
+}
+
+export default function App() {
+  // Session tabs: each is an independent workspace — its own command cards,
+  // its own transport (and thus its own PTY session in live mode), its own
+  // pane set (owned by the shell). Tab 1 gets the demo cards; new tabs
+  // start clean.
+  const [tabs, setTabs] = useState<SessionTab[]>([{ id: 'tab-1', title: 'session 1' }]);
+  const [activeTabId, setActiveTabId] = useState('tab-1');
+  const [commandsByTab, setCommandsByTab] = useState<Record<string, CommandCardProps[]>>({
+    'tab-1': LIVE ? [] : DEMO_COMMANDS,
+  });
+  const [liveStats, setLiveStats] = useState<LiveShellStats | undefined>(undefined);
+  const transportsRef = useRef(new Map<string, TerminalTransport>());
+  const tabCounter = useRef(2);
+
+  /** OSC 133 events from a tab's live session → that tab's command cards. */
+  const handleCommandEvent = useCallback((tabId: string, event: CommandEvent) => {
+    setCommandsByTab((prev) => ({
+      ...prev,
+      [tabId]: reduceCommandEvent(prev[tabId] ?? [], event),
+    }));
   }, []);
 
-  const handleTransportReady = useCallback((t: TerminalTransport) => {
-    transportRef.current = t;
+  const handleTransportReady = useCallback((tabId: string, t: TerminalTransport) => {
+    transportsRef.current.set(tabId, t);
     // Bridge stats pushes → ribbon/dock state, with a rolling load history
-    // for the sparkline. The subscription dies with the transport.
+    // for the sparkline. All tabs talk to the same host, so last write
+    // wins harmlessly. The subscription dies with the transport.
     t.onStats?.((s) => {
       setLiveStats((prev) => ({
         systemLoad:
@@ -120,38 +141,103 @@ export default function App() {
     });
   }, []);
 
-  /**
-   * The input line. Live: write the command into the PTY (the OSC 133 marks
-   * then produce its card, exactly as if it were typed in the raw panel).
-   * Demo: append a fake card, as before.
-   */
-  const handleSubmit = useCallback((command: string) => {
-    if (LIVE) {
-      transportRef.current?.write(`${command}\r`);
-      return;
-    }
-    const startedAt = Date.now();
-    setCommands((prev) => [
-      ...prev,
+  // Stable per-tab handler objects: TerminalView's mount effect depends on
+  // these callbacks, so fresh identities would tear down and reconnect the
+  // pane's session on every render.
+  const handlersRef = useRef(
+    new Map<
+      string,
       {
-        id: `local-${startedAt}`,
-        command,
-        status: 'success',
-        output: [`(demo) executed locally: ${command}`],
-        meta: 'exit 0 · loopback',
-        startedAt,
-        finishedAt: startedAt + 12,
-      },
-    ]);
+        onCommandEvent: (event: CommandEvent) => void;
+        onTransportReady: (t: TerminalTransport) => void;
+      }
+    >(),
+  );
+  const sessionHandlers = useCallback(
+    (tabId: string) => {
+      let h = handlersRef.current.get(tabId);
+      if (!h) {
+        h = {
+          onCommandEvent: (event: CommandEvent) => handleCommandEvent(tabId, event),
+          onTransportReady: (t: TerminalTransport) => handleTransportReady(tabId, t),
+        };
+        handlersRef.current.set(tabId, h);
+      }
+      return h;
+    },
+    [handleCommandEvent, handleTransportReady],
+  );
+
+  const addTab = useCallback(() => {
+    const n = tabCounter.current++;
+    const id = `tab-${n}`;
+    setTabs((prev) => [...prev, { id, title: `session ${n}` }]);
+    setCommandsByTab((prev) => ({ ...prev, [id]: [] }));
+    setActiveTabId(id);
   }, []);
+
+  const closeTab = useCallback(
+    (id: string) => {
+      if (tabs.length <= 1) return;
+      const idx = tabs.findIndex((t) => t.id === id);
+      if (idx < 0) return;
+      const next = tabs.filter((t) => t.id !== id);
+      setTabs(next);
+      if (activeTabId === id) setActiveTabId(next[Math.max(0, idx - 1)].id);
+      setCommandsByTab((prev) => {
+        const { [id]: _dropped, ...rest } = prev;
+        return rest;
+      });
+      // The tab's TerminalViews unmount and dispose their own transports;
+      // just forget our references.
+      transportsRef.current.delete(id);
+      handlersRef.current.delete(id);
+    },
+    [tabs, activeTabId],
+  );
+
+  /**
+   * The input line, targeting the active tab. Live: write the command into
+   * that tab's PTY (the OSC 133 marks then produce its card, exactly as if
+   * it were typed in the raw panel). Demo: append a fake card, as before.
+   */
+  const handleSubmit = useCallback(
+    (command: string) => {
+      if (LIVE) {
+        transportsRef.current.get(activeTabId)?.write(`${command}\r`);
+        return;
+      }
+      const startedAt = Date.now();
+      setCommandsByTab((prev) => ({
+        ...prev,
+        [activeTabId]: [
+          ...(prev[activeTabId] ?? []),
+          {
+            id: `local-${startedAt}`,
+            command,
+            status: 'success',
+            output: [`(demo) executed locally: ${command}`],
+            meta: 'exit 0 · loopback',
+            startedAt,
+            finishedAt: startedAt + 12,
+          },
+        ],
+      }));
+    },
+    [activeTabId],
+  );
 
   return (
     <TerminalShell
       theme="nebula"
-      commands={commands}
+      commands={commandsByTab[activeTabId] ?? []}
       onCommandSubmit={handleSubmit}
-      onCommandEvent={LIVE ? handleCommandEvent : undefined}
-      onTransportReady={LIVE ? handleTransportReady : undefined}
+      sessionHandlers={LIVE ? sessionHandlers : undefined}
+      tabs={tabs}
+      activeTabId={activeTabId}
+      onTabSelect={setActiveTabId}
+      onTabAdd={addTab}
+      onTabClose={closeTab}
       liveStats={liveStats}
     />
   );

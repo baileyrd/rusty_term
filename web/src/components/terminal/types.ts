@@ -68,18 +68,36 @@ export interface LiveShellStats {
   ram: number | null;
 }
 
+export interface SessionTabInfo {
+  id: string;
+  title: string;
+}
+
+/**
+ * Per-session wiring for a tab's primary terminal pane: structured OSC 133
+ * command events and the connected transport, threaded down to
+ * `TerminalView` / up to the app so each tab's command cards are fed by
+ * its own shell session. Returned objects must be identity-stable per tab
+ * — `TerminalView`'s mount effect depends on them.
+ */
+export type SessionHandlers = (tabId: string) => {
+  onCommandEvent: (event: import('./commandTracker').CommandEvent) => void;
+  onTransportReady: (transport: import('../../transport/bridge').TerminalTransport) => void;
+};
+
 export interface TerminalShellProps {
   theme?: 'nebula' | 'cyberpunk' | 'minimal';
+  /** The active tab's command cards. */
   commands?: CommandCardProps[];
   onCommandSubmit?: (command: string) => void;
-  /**
-   * Live-session extensions (additive to the original spec): structured
-   * OSC 133 command events from the raw terminal, and the connected
-   * transport — both threaded down to `TerminalView` / up to the app so
-   * the command cards can be fed by a real shell session.
-   */
-  onCommandEvent?: (event: import('./commandTracker').CommandEvent) => void;
-  onTransportReady?: (transport: import('../../transport/bridge').TerminalTransport) => void;
+  /** Live-session wiring; absent in demo mode. */
+  sessionHandlers?: SessionHandlers;
+  /** Session tabs, primary first. Defaults to a single anonymous session. */
+  tabs?: SessionTabInfo[];
+  activeTabId?: string;
+  onTabSelect?: (id: string) => void;
+  onTabAdd?: () => void;
+  onTabClose?: (id: string) => void;
   /** Live ribbon/dock stats; absent (demo mode) keeps the hardcoded values. */
   liveStats?: LiveShellStats;
 }
