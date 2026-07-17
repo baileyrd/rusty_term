@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { ASSIST_MODEL } from '../../assist/llmProvider';
 import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
+import { useOverlayEscape, useOverlayLifecycle } from './useOverlay';
 import type { SnippetItem } from './types';
 
 export interface SettingsSheetProps {
@@ -59,22 +60,8 @@ export default function SettingsSheet({
 }: SettingsSheetProps) {
   const [draftKey, setDraftKey] = useState('');
 
-  useEffect(() => {
-    if (!open) setDraftKey('');
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [open, onClose]);
+  useOverlayLifecycle(open, { onClose: () => setDraftKey('') });
+  useOverlayEscape(open, onClose);
 
   if (!open) return null;
 
