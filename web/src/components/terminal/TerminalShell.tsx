@@ -6,6 +6,7 @@ import AiOrb from './AiOrb';
 import AssistPanel, { type AiAssistState, type ChatState } from './AssistPanel';
 import CommandPalette from './CommandPalette';
 import SearchOverlay from './SearchOverlay';
+import { exportTranscript } from './transcript';
 import { localHeuristics } from '../../assist/heuristics';
 import {
   createLlmProvider,
@@ -441,6 +442,13 @@ export default function TerminalShell({
         onTabAdd={onTabAdd}
         onTabClose={tabs.length > 1 ? () => handleTabClose(currentTab) : undefined}
         onSearchHistory={() => setSearchOpen(true)}
+        onExportTranscript={(format) =>
+          exportTranscript(
+            tabs.find((t) => t.id === currentTab)?.title ?? 'session',
+            commands,
+            format,
+          )
+        }
       />
 
       {assistOpen && (

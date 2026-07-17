@@ -36,6 +36,8 @@ export interface CommandPaletteProps {
   onTabClose?: () => void;
   /** Open the Ctrl+Shift+F history search. */
   onSearchHistory?: () => void;
+  /** Download the active session's transcript in the given format. */
+  onExportTranscript?: (format: 'md' | 'json') => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -89,6 +91,7 @@ export default function CommandPalette({
   onTabAdd,
   onTabClose,
   onSearchHistory,
+  onExportTranscript,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -181,6 +184,22 @@ export default function CommandPalette({
         action: onSearchHistory,
       });
     }
+    if (onExportTranscript) {
+      candidates.push(
+        {
+          id: 'export-md',
+          group: 'actions',
+          title: 'Export transcript (markdown)',
+          action: () => onExportTranscript('md'),
+        },
+        {
+          id: 'export-json',
+          group: 'actions',
+          title: 'Export transcript (json)',
+          action: () => onExportTranscript('json'),
+        },
+      );
+    }
     if (onTabAdd) {
       candidates.push({
         id: 'tab-new',
@@ -252,7 +271,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory, onExportTranscript]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

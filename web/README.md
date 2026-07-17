@@ -139,6 +139,11 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Transcript export** (palette: *Export transcript (markdown/json)*):
+  downloads the active session's card history. Markdown reads like a lab
+  notebook — grouped into the same bursts the stream shows, status glyphs,
+  fenced output; JSON is the raw cards for tooling. Filenames carry the
+  session slug and date (`rusty-term-session-1-2026-07-17.md`).
 - **Card groups**: the stream partitions into bursts of activity — more
   than 5 idle minutes between commands starts a new group. Each group gets
   a hairline header (time range · count · failures) that collapses the
