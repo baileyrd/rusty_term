@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import CommandCard from './CommandCard';
+import { groupCards, groupLabel } from './cardGroups';
 import TerminalView from './TerminalView';
 import type { CommandCardProps, SessionHandlers, SessionTabInfo } from './types';
 import type { ThemeName } from '../../theme/tokens';
@@ -54,18 +55,46 @@ export default function CommandStream({
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Card groups: bursts of activity separated by idle gaps. Collapsed
+  // group ids live here (memory only — a reload reopens everything);
+  // headers only render once there's more than one group to fold.
+  const groups = useMemo(() => groupCards(commands), [commands]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const toggleGroup = (id: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // A search jump must be able to land inside a collapsed group.
+  useEffect(() => {
+    if (!highlightCardId) return;
+    const target = groups.find((g) => g.cards.some((c) => c.id === highlightCardId));
+    if (target && collapsed.has(target.id)) {
+      setCollapsed((prev) => {
+        const next = new Set(prev);
+        next.delete(target.id);
+        return next;
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- expand once per jump
+  }, [highlightCardId, groups]);
+
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [commands.length]);
 
-  // Bring a search-jump target into view once it's rendered.
+  // Bring a search-jump target into view once it's rendered (collapsed is
+  // a dependency so the scroll re-runs after a group auto-expands).
   useEffect(() => {
     if (!highlightCardId) return;
     scrollRef.current
       ?.querySelector(`[data-card-id="${CSS.escape(highlightCardId)}"]`)
       ?.scrollIntoView({ block: 'center' });
-  }, [highlightCardId]);
+  }, [highlightCardId, collapsed]);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -118,13 +147,34 @@ export default function CommandStream({
         )}
       </div>
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
-        {commands.map((c, i) => (
-          <CommandCard
-            key={c.id ?? `cmd-${i}`}
-            {...c}
-            onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
-            highlighted={highlightCardId !== null && highlightCardId === c.id}
-          />
+        {groups.map((group) => (
+          <section key={group.id} className="space-y-3">
+            {groups.length > 1 && (
+              <button
+                type="button"
+                data-testid="card-group-header"
+                data-collapsed={collapsed.has(group.id)}
+                aria-expanded={!collapsed.has(group.id)}
+                onClick={() => toggleGroup(group.id)}
+                className="flex w-full items-center gap-2 rounded-nebula-sm px-1 py-0.5 text-left font-nebula-meta text-[11px] text-nebula-text/40 transition-colors duration-nebula-fast ease-nebula hover:text-nebula-text/70"
+              >
+                <span className="font-nebula-command text-nebula-accent/60">
+                  {collapsed.has(group.id) ? '▸' : '▾'}
+                </span>
+                <span>{groupLabel(group)}</span>
+                <span className="h-px flex-1 bg-white/5" />
+              </button>
+            )}
+            {!collapsed.has(group.id) &&
+              group.cards.map((c, i) => (
+                <CommandCard
+                  key={c.id ?? `cmd-${i}`}
+                  {...c}
+                  onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
+                  highlighted={highlightCardId !== null && highlightCardId === c.id}
+                />
+              ))}
+          </section>
         ))}
 
         {tabs.map((tab) => (

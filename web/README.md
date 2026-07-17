@@ -139,6 +139,12 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Card groups**: the stream partitions into bursts of activity — more
+  than 5 idle minutes between commands starts a new group. Each group gets
+  a hairline header (time range · count · failures) that collapses the
+  burst to one line; headers only appear once there are at least two
+  groups. Collapse state is per-sitting (a reload reopens everything), and
+  a history-search jump into a collapsed group auto-expands it.
 - **History search** (`Ctrl+Shift+F`, or the palette's *Search session
   history*): searches every tab's command cards — commands, output, and
   meta — case-insensitively, newest hits first, with the matching fragment
