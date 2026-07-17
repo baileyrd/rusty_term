@@ -38,7 +38,35 @@ export interface TerminalTransport {
 
   /** Tear down the transport and release resources. */
   dispose(): void;
+
+  /**
+   * Structured session stats, when the transport has a side-channel for
+   * them (the websocket bridge pushes `stats <json>` every 2s; the
+   * loopback has none). Latency comes from the transport's own ping loop.
+   */
+  onStats?(listener: StatsListener): Unsubscribe;
+
+  /**
+   * Relay the shell's OSC 7 working directory (already decoded to a plain
+   * path) so the stats side-channel can report git facts for it.
+   */
+  noteCwd?(path: string): void;
 }
+
+/** One `stats` push from the bridge, plus the measured round-trip latency. */
+export interface LiveStats {
+  /** 1-min load / cores, `0..` (may exceed 1); `null` off-Linux. */
+  load: number | null;
+  /** Memory in use, `0..1`; `null` off-Linux. */
+  mem: number | null;
+  cwd: string | null;
+  branch: string | null;
+  git: { added: number; modified: number; deleted: number };
+  /** Application-level ping RTT in ms; `null` until the first pong. */
+  latencyMs: number | null;
+}
+
+export type StatsListener = (stats: LiveStats) => void;
 
 /**
  * Offline demo transport: echoes keystrokes locally with just enough line
@@ -160,24 +188,34 @@ export class LoopbackTransport implements TerminalTransport {
 export class WebSocketTransport implements TerminalTransport {
   private dataListeners = new Set<DataListener>();
   private exitListeners = new Set<ExitListener>();
+  private statsListeners = new Set<StatsListener>();
   private socket: WebSocket | null = null;
   private started = false;
   private decoder = new TextDecoder();
   private encoder = new TextEncoder();
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private pingSentAt = 0;
+  private latencyMs: number | null = null;
 
   connect(url: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
       socket.binaryType = 'arraybuffer';
-      socket.onopen = () => resolve();
+      socket.onopen = () => {
+        // App-level RTT probe (browsers can't send WS Ping frames): one
+        // in-flight ping at a time, every 5s.
+        this.pingTimer = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN && this.pingSentAt === 0) {
+            this.pingSentAt = performance.now();
+            socket.send(`ping ${Date.now()}`);
+          }
+        }, 5000);
+        resolve();
+      };
       socket.onerror = () => reject(new Error(`bridge connection failed: ${url}`));
       socket.onmessage = (ev: MessageEvent) => {
         if (typeof ev.data === 'string') {
-          // Control channel: `exit <code>`.
-          const [verb, code] = ev.data.split(' ');
-          if (verb === 'exit') {
-            for (const l of this.exitListeners) l(Number(code ?? 0));
-          }
+          this.handleControl(ev.data);
           return;
         }
         // Streaming-decode so a UTF-8 sequence split across frames survives.
@@ -185,6 +223,8 @@ export class WebSocketTransport implements TerminalTransport {
         for (const l of this.dataListeners) l(text);
       };
       socket.onclose = () => {
+        if (this.pingTimer !== null) clearInterval(this.pingTimer);
+        this.pingTimer = null;
         this.socket = null;
       };
       this.socket = socket;
@@ -214,11 +254,55 @@ export class WebSocketTransport implements TerminalTransport {
     return () => this.exitListeners.delete(listener);
   }
 
+  onStats(listener: StatsListener): Unsubscribe {
+    this.statsListeners.add(listener);
+    return () => this.statsListeners.delete(listener);
+  }
+
+  noteCwd(path: string): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(`cwd ${path}`);
+    }
+  }
+
+  /** Route a control (text) frame: `exit`, `pong`, or `stats <json>`. */
+  private handleControl(data: string): void {
+    const space = data.indexOf(' ');
+    const verb = space < 0 ? data : data.slice(0, space);
+    const rest = space < 0 ? '' : data.slice(space + 1);
+    switch (verb) {
+      case 'exit':
+        for (const l of this.exitListeners) l(Number(rest || 0));
+        break;
+      case 'pong':
+        if (this.pingSentAt !== 0) {
+          this.latencyMs = Math.max(0, Math.round(performance.now() - this.pingSentAt));
+          this.pingSentAt = 0;
+        }
+        break;
+      case 'stats': {
+        try {
+          const parsed = JSON.parse(rest) as Omit<LiveStats, 'latencyMs'>;
+          const stats: LiveStats = { ...parsed, latencyMs: this.latencyMs };
+          for (const l of this.statsListeners) l(stats);
+        } catch {
+          // A malformed push is dropped; the next tick brings another.
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
   dispose(): void {
+    if (this.pingTimer !== null) clearInterval(this.pingTimer);
+    this.pingTimer = null;
     this.socket?.close(1000);
     this.socket = null;
     this.dataListeners.clear();
     this.exitListeners.clear();
+    this.statsListeners.clear();
   }
 }
 
