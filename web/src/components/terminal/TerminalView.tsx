@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { LoopbackTransport, type TerminalTransport } from '../../transport/bridge';
+import { transportFromLocation, type TerminalTransport } from '../../transport/bridge';
 import { ansiPalette, fonts } from '../../theme/tokens';
 
 export interface TerminalViewProps {
@@ -11,7 +11,12 @@ export interface TerminalViewProps {
    * rusty_term PTY bridge.
    */
   transport?: TerminalTransport;
-  /** Bridge endpoint handed to `transport.connect`. Ignored by the loopback. */
+  /**
+   * Bridge endpoint handed to `transport.connect`. When neither prop is
+   * given, both come from the page URL: `?ws[=ws://host:port]` selects the
+   * live `WebSocketTransport` against a running `rusty_term_web_bridge`,
+   * and no parameter selects the offline loopback demo.
+   */
   url?: string;
 }
 
@@ -19,7 +24,7 @@ export interface TerminalViewProps {
  * Raw terminal panel: a real xterm.js instance themed with the Nebula ANSI
  * palette, kept fitted to its container and wired to a `TerminalTransport`.
  */
-export default function TerminalView({ transport, url = 'ws://localhost:9090/pty' }: TerminalViewProps) {
+export default function TerminalView({ transport, url }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -38,7 +43,9 @@ export default function TerminalView({ transport, url = 'ws://localhost:9090/pty
     term.open(el);
     fit.fit();
 
-    const t = transport ?? new LoopbackTransport();
+    const fallback = transport === undefined ? transportFromLocation(window.location.search) : null;
+    const t = transport ?? fallback!.transport;
+    const connectUrl = url ?? fallback?.url ?? '';
     const ownsTransport = transport === undefined;
 
     const offData = t.onData((data) => term.write(data));
@@ -47,9 +54,16 @@ export default function TerminalView({ transport, url = 'ws://localhost:9090/pty
     });
     const onInput = term.onData((data) => t.write(data));
 
-    void t.connect(url).then(() => {
-      t.resize(term.cols, term.rows);
-    });
+    t.connect(connectUrl)
+      .then(() => {
+        t.resize(term.cols, term.rows);
+      })
+      .catch((e: unknown) => {
+        term.write(
+          `\x1b[38;2;255;95;95m${e instanceof Error ? e.message : String(e)}\x1b[0m\r\n` +
+            'Start the bridge with: cargo run --features web-bridge --bin rusty_term_web_bridge\r\n',
+        );
+      });
 
     const resizeObserver = new ResizeObserver(() => {
       fit.fit();

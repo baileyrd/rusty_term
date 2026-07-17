@@ -29,8 +29,8 @@ pub(crate) fn decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Encode `data` as standard base64 (RFC 4648, `=`-padded). Used for the OSC 52
-/// clipboard query reply.
-#[cfg(any(test, feature = "gui"))]
+/// clipboard query reply and the web bridge's websocket accept key.
+#[cfg(any(test, feature = "gui", feature = "web-bridge"))]
 pub(crate) fn encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

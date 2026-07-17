@@ -141,3 +141,97 @@ export class LoopbackTransport implements TerminalTransport {
     }
   }
 }
+
+/**
+ * Live transport: a browser `WebSocket` speaking the rusty_term web bridge's
+ * protocol (`src/web_bridge` in the repo root, binary
+ * `rusty_term_web_bridge`, built with `cargo build --features web-bridge`):
+ *
+ * - text frames carry control — we send `start <cols> <rows>` once and
+ *   `resize <cols> <rows>` afterwards; the bridge sends `exit <code>` when
+ *   the shell exits;
+ * - binary frames carry raw PTY bytes in both directions.
+ *
+ * The bridge spawns the shell on the first `start`, so the socket is opened
+ * by `connect()` but the session begins on the first `resize()` call — which
+ * `TerminalView` issues as soon as `connect()` resolves, with the fitted
+ * grid size.
+ */
+export class WebSocketTransport implements TerminalTransport {
+  private dataListeners = new Set<DataListener>();
+  private exitListeners = new Set<ExitListener>();
+  private socket: WebSocket | null = null;
+  private started = false;
+  private decoder = new TextDecoder();
+  private encoder = new TextEncoder();
+
+  connect(url: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+      socket.onopen = () => resolve();
+      socket.onerror = () => reject(new Error(`bridge connection failed: ${url}`));
+      socket.onmessage = (ev: MessageEvent) => {
+        if (typeof ev.data === 'string') {
+          // Control channel: `exit <code>`.
+          const [verb, code] = ev.data.split(' ');
+          if (verb === 'exit') {
+            for (const l of this.exitListeners) l(Number(code ?? 0));
+          }
+          return;
+        }
+        // Streaming-decode so a UTF-8 sequence split across frames survives.
+        const text = this.decoder.decode(ev.data as ArrayBuffer, { stream: true });
+        for (const l of this.dataListeners) l(text);
+      };
+      socket.onclose = () => {
+        this.socket = null;
+      };
+      this.socket = socket;
+    });
+  }
+
+  write(data: string): void {
+    if (this.socket?.readyState === WebSocket.OPEN && this.started) {
+      this.socket.send(this.encoder.encode(data));
+    }
+  }
+
+  resize(cols: number, rows: number): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    // The first size we learn doubles as the session start.
+    this.socket.send(`${this.started ? 'resize' : 'start'} ${cols} ${rows}`);
+    this.started = true;
+  }
+
+  onData(listener: DataListener): Unsubscribe {
+    this.dataListeners.add(listener);
+    return () => this.dataListeners.delete(listener);
+  }
+
+  onExit(listener: ExitListener): Unsubscribe {
+    this.exitListeners.add(listener);
+    return () => this.exitListeners.delete(listener);
+  }
+
+  dispose(): void {
+    this.socket?.close(1000);
+    this.socket = null;
+    this.dataListeners.clear();
+    this.exitListeners.clear();
+  }
+}
+
+/**
+ * Pick the transport for the page: `?ws=ws://127.0.0.1:7703` (or `?ws` alone
+ * for that default) attaches to a running `rusty_term_web_bridge`; without
+ * the parameter the offline loopback demo runs. Returns the transport and
+ * the URL to hand its `connect()`.
+ */
+export function transportFromLocation(search: string): { transport: TerminalTransport; url: string } {
+  const ws = new URLSearchParams(search).get('ws');
+  if (ws === null) {
+    return { transport: new LoopbackTransport(), url: '' };
+  }
+  return { transport: new WebSocketTransport(), url: ws || 'ws://127.0.0.1:7703' };
+}

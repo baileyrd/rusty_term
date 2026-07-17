@@ -59,7 +59,7 @@ pub(crate) use bidi::mirrored as bidi_mirrored;
 pub use cell::{Cell, char_width};
 #[cfg(feature = "gui")]
 pub use grid::{MouseModes, Selection};
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "web-bridge"))]
 pub(crate) use base64::encode as base64_encode;
 #[cfg(feature = "gui")]
 pub(crate) use png::decode as png_decode;

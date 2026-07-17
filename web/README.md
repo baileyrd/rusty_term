@@ -29,14 +29,25 @@ npm run dev      # dev server at http://localhost:5173
 npm run build    # type-check + production bundle in dist/
 ```
 
+Without URL parameters the page runs the offline loopback demo. To attach it
+to a **real shell**, build and start the websocket PTY bridge from the repo
+root, then open the page with `?ws`:
+
+```sh
+cargo run --features web-bridge --bin rusty_term_web_bridge   # ws://127.0.0.1:7703
+# then browse to http://localhost:5173/?ws
+# or with an explicit endpoint: http://localhost:5173/?ws=ws://127.0.0.1:7703
+```
+
 ## Layout
 
 ```
 src/
   theme/tokens.ts                  Nebula design tokens (colors, radii,
                                    shadows, motion, fonts, ANSI palette)
-  transport/bridge.ts              TerminalTransport interface + offline
-                                   LoopbackTransport demo implementation
+  transport/bridge.ts              TerminalTransport interface, offline
+                                   LoopbackTransport demo, and the live
+                                   WebSocketTransport (rusty_term bridge)
   components/terminal/
     types.ts                       Shared prop types per the design spec
     TerminalShell.tsx              Layout root: ribbon / stream / dock / orb
@@ -62,25 +73,36 @@ connect(url) · write(data) · resize(cols, rows) · onData(cb) · onExit(cb) ·
 
 This deliberately mirrors the shape of the repo's PTY abstraction in
 `src/backend/mod.rs` — `BackendHandle::write`, `set_winsize`, read-as-events,
-and `reap_exit_status` — so the future bridge is a thin adapter, not a
-redesign.
+and `reap_exit_status` — so the bridge is a thin adapter, not a redesign.
 
-**Later phase:** a small Rust websocket PTY bridge binary (e.g.
-`rusty_term_bridge`) that:
+**The bridge exists**: `rusty_term_web_bridge` (repo root, `src/web_bridge/`,
+built with `cargo build --features web-bridge`). True to the repo's ethos it
+adds **zero dependencies** — the RFC 6455 handshake (SHA-1 included) and
+frame codec are hand-rolled and unit-tested, and the runtime is the tokio
+the terminal already links. Per websocket connection it spawns a shell
+through the platform `Backend::spawn_shell` and shuttles bytes.
 
-1. accepts a websocket connection per session,
-2. spawns a shell via the existing `Backend::spawn_shell(cols, rows, shell,
-   args, cwd)`,
-3. forwards PTY output frames to the socket and socket input to
-   `BackendHandle::write`,
-4. maps a `resize` control message to `set_winsize`, and
-5. reports the child's exit status (`reap_exit_status`) as an exit frame.
+Wire protocol (text = control, binary = PTY bytes):
 
-The web side then gains a `WebSocketTransport implements TerminalTransport`
-next to `LoopbackTransport`, and nothing in the component tree changes.
-Structured features (command cards populated from real command boundaries,
-git stats, system load) can ride the same socket later, plausibly reusing the
-repo's L13 side-channel concepts for framing.
+| direction        | frame  | meaning                                        |
+|------------------|--------|------------------------------------------------|
+| client → server  | text   | `start <cols> <rows>` (first message), then `resize <cols> <rows>` |
+| client → server  | binary | keystrokes/pastes, written to the PTY verbatim |
+| server → client  | binary | PTY output, verbatim                           |
+| server → client  | text   | `exit <code>` when the shell exits, then Close |
+
+Security posture: the bridge hands a shell to whoever completes a handshake,
+so it binds `127.0.0.1` only and refuses browser `Origin`s other than
+localhost. Exposing it further is deliberately not a flag — put an
+authenticating reverse proxy in front instead.
+
+On this side, `WebSocketTransport` in
+[`transport/bridge.ts`](src/transport/bridge.ts) implements
+`TerminalTransport` over that protocol, and `transportFromLocation` picks it
+(vs. the loopback demo) from the page's `?ws` parameter — nothing in the
+component tree changed. Structured features (command cards populated from
+real command boundaries, git stats, system load) can ride the same socket
+later, plausibly reusing the repo's L13 side-channel concepts for framing.
 
 ## What is demo/stub vs real
 
@@ -92,9 +114,13 @@ Real:
   interface it will use in production.
 - The `TerminalTransport` interface.
 
+Real (with the bridge running, `?ws`):
+- The xterm panel is a live shell: PTY output, resize (SIGWINCH), and the
+  exit code all round-trip through `rusty_term_web_bridge`.
+
 Demo/stub:
-- `LoopbackTransport` echoes input locally (try `help`, `size`, `clear`,
-  `exit`) — no real shell behind it.
+- `LoopbackTransport` (the default without `?ws`) echoes input locally (try
+  `help`, `size`, `clear`, `exit`) — no real shell behind it.
 - The command cards in `App.tsx`, the ribbon's load/latency/git numbers, the
   dock's CPU/RAM bars, recent commands, and snippets are hardcoded demo data.
 - Submitting on the input line appends a fake "executed locally" card.
