@@ -62,6 +62,13 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7703";
 /// How often each session pushes a `stats <json>` frame.
 const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Ceiling on how long the HTTP-upgrade handshake may take. The header-block
+/// read loop below is bounded in *size* (8192 bytes) but not otherwise in
+/// time, so a peer trickling one byte occasionally could otherwise hold a
+/// spawned task (and its socket) open indefinitely — a loopback-only
+/// slowloris variant. Ten seconds is generous for a same-machine handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Bridge configuration, filled from the binary's CLI flags.
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -112,18 +119,17 @@ enum PtyEvent {
 /// hangs up the child's terminal, so an abandoned session doesn't leak a
 /// shell.
 async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> {
-    // --- HTTP upgrade. Read the header block (bounded), validate, 101. ---
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() > 8192 {
-            return refuse(&mut stream, "431 Request Header Fields Too Large").await;
-        }
-        if stream.read(&mut byte).await? == 0 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "closed during handshake"));
-        }
-        head.push(byte[0]);
-    }
+    // --- HTTP upgrade. Read the header block (bounded in size and time),
+    // validate, 101. ---
+    let head = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_handshake_head(&mut stream)).await
+    {
+        Ok(Ok(Some(head))) => head,
+        Ok(Ok(None)) => return refuse(&mut stream, "431 Request Header Fields Too Large").await,
+        Ok(Err(e)) => return Err(e),
+        // The peer never finished sending a handshake within the budget —
+        // drop the connection rather than holding the task open forever.
+        Err(_) => return Err(Error::new(ErrorKind::TimedOut, "handshake timed out")),
+    };
     let head = String::from_utf8_lossy(&head);
     let Some((key, origin)) = ws::parse_upgrade(&head) else {
         return refuse(&mut stream, "400 Bad Request").await;
@@ -260,6 +266,27 @@ async fn refuse(stream: &mut TcpStream, status: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Read the HTTP upgrade request's header block a byte at a time, up to and
+/// including the blank line that ends it. `Ok(None)` means the block grew
+/// past 8192 bytes without ending (caller sends 431); real read errors
+/// (including a clean EOF mid-handshake) propagate as `Err`. Bounded only in
+/// *size* here — [`session`] wraps the call in [`HANDSHAKE_TIMEOUT`] to bound
+/// it in time too.
+async fn read_handshake_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, Error> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Ok(None);
+        }
+        if stream.read(&mut byte).await? == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "closed during handshake"));
+        }
+        head.push(byte[0]);
+    }
+    Ok(Some(head))
+}
+
 fn protocol_err(e: ws::FrameError) -> Error {
     Error::new(ErrorKind::InvalidData, format!("websocket protocol error: {e:?}"))
 }
@@ -342,6 +369,36 @@ fn parse_command(text: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that never finishes the header block must eventually be cut
+    /// off rather than holding the read open forever — the mechanism
+    /// `session()` relies on ([`HANDSHAKE_TIMEOUT`] wrapping this same call)
+    /// to bound a loopback-only slowloris variant. Uses a short test-local
+    /// timeout rather than the production constant so the test itself stays
+    /// fast.
+    #[tokio::test]
+    async fn handshake_read_times_out_on_a_stalled_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            // Send part of a request line, then stall — never the blank
+            // line that would end the header block.
+            sock.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            read_handshake_head(&mut server_stream),
+        )
+        .await;
+        assert!(result.is_err(), "a stalled peer must time out rather than hang forever");
+
+        client.abort();
+    }
 
     #[test]
     fn commands_parse_and_clamp() {
