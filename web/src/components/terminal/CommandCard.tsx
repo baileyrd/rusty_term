@@ -40,20 +40,32 @@ export default function CommandCard({
   meta,
   startedAt,
   finishedAt,
-}: CommandCardProps) {
+  onPin,
+}: CommandCardProps & { onPin?: () => void }) {
   const duration = formatDuration(startedAt, finishedAt);
 
   return (
     <article
       data-testid="command-card"
       data-status={status}
-      className={`animate-nebula-fade-in rounded-nebula-md border ${STATUS_BORDER[status]} bg-nebula-surface shadow-nebula-soft transition-colors duration-nebula-base ease-nebula`}
+      className={`group animate-nebula-fade-in rounded-nebula-md border ${STATUS_BORDER[status]} bg-nebula-surface shadow-nebula-soft transition-colors duration-nebula-base ease-nebula`}
     >
       <header className="flex items-baseline gap-2 px-4 pt-3 pb-2">
         <span className="select-none font-nebula-command text-sm text-nebula-accent2">❯</span>
         <span className="flex-1 truncate font-nebula-command text-sm text-nebula-text">
           {command}
         </span>
+        {onPin && (
+          <button
+            type="button"
+            onClick={onPin}
+            aria-label={`Pin ${command} to the side dock`}
+            title="Pin to side dock"
+            className="hidden rounded-nebula-sm px-1.5 font-nebula-meta text-xs text-nebula-text/40 hover:bg-white/10 hover:text-nebula-accent2 group-hover:block"
+          >
+            ⌖
+          </button>
+        )}
         <span
           className={`font-nebula-meta text-xs ${STATUS_COLOR[status]} ${
             status === 'running' ? 'animate-pulse' : ''

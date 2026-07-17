@@ -1,13 +1,58 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import StatusRibbon from './StatusRibbon';
 import CommandStream from './CommandStream';
 import SideDock from './SideDock';
 import AiOrb from './AiOrb';
-import type { TerminalShellProps } from './types';
+import AssistPanel from './AssistPanel';
+import { localHeuristics } from '../../assist/heuristics';
+import type { SnippetItem, TerminalShellProps } from './types';
+
+/** localStorage key for the pinned snippets. */
+const SNIPPETS_KEY = 'nebula.pinnedSnippets';
+
+const DEFAULT_SNIPPETS: SnippetItem[] = [
+  { title: 'Rebuild + test', command: 'cargo test --workspace' },
+  { title: 'Tail logs', command: 'journalctl -fu rusty-term-bridge' },
+];
+
+function loadSnippets(): SnippetItem[] {
+  try {
+    const raw = localStorage.getItem(SNIPPETS_KEY);
+    if (raw === null) return DEFAULT_SNIPPETS;
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.every(
+        (s) =>
+          typeof s === 'object' &&
+          s !== null &&
+          typeof (s as SnippetItem).title === 'string' &&
+          typeof (s as SnippetItem).command === 'string',
+      )
+    ) {
+      return parsed as SnippetItem[];
+    }
+  } catch {
+    // Corrupt or unavailable storage: fall through to defaults.
+  }
+  return DEFAULT_SNIPPETS;
+}
+
+/** A dock title for a pinned command: its first couple of words. */
+function snippetTitle(command: string): string {
+  const words = command.trim().split(/\s+/);
+  return words.slice(0, 2).join(' ');
+}
 
 /**
  * Layout root for the Nebula terminal: status ribbon on top, command stream
  * in the center, side dock on the right, AI orb floating bottom-right.
+ *
+ * Owns the two pieces of cross-cutting UI state: the pinned snippets
+ * (persisted to localStorage; pin from a card's hover button, run/unpin in
+ * the dock) and the assist panel (the orb's sheet, fed by the local
+ * heuristics provider over the same command cards the stream shows — its
+ * badge counts failures that arrived since the panel was last opened).
  *
  * The `theme` prop is Nebula-only for now; 'cyberpunk' and 'minimal' are
  * accepted per the spec but map to the Nebula skin until those presets land.
@@ -20,7 +65,43 @@ export default function TerminalShell({
   onTransportReady,
   liveStats,
 }: TerminalShellProps) {
-  const [orbHints, setOrbHints] = useState(2);
+  const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
+  const [assistOpen, setAssistOpen] = useState(false);
+  const [seenFailures, setSeenFailures] = useState(0);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SNIPPETS_KEY, JSON.stringify(snippets));
+    } catch {
+      // Storage full/blocked: pins simply don't persist this session.
+    }
+  }, [snippets]);
+
+  const insights = useMemo(() => localHeuristics.analyze(commands), [commands]);
+  const failures = useMemo(
+    () => commands.filter((c) => c.status === 'error').length,
+    [commands],
+  );
+  const unreadHints = assistOpen ? 0 : Math.max(0, failures - seenFailures);
+
+  const pinCommand = useCallback((command: string) => {
+    setSnippets((prev) =>
+      prev.some((s) => s.command === command)
+        ? prev
+        : [...prev, { title: snippetTitle(command), command }],
+    );
+  }, []);
+
+  const removeSnippet = useCallback((snippet: SnippetItem) => {
+    setSnippets((prev) => prev.filter((s) => s.command !== snippet.command));
+  }, []);
+
+  const toggleAssist = useCallback(() => {
+    setAssistOpen((open) => {
+      if (!open) setSeenFailures(failures);
+      return !open;
+    });
+  }, [failures]);
 
   // Demo ribbon/dock data, used when no live stats channel is feeding us.
   const demoLoad = [0.22, 0.31, 0.28, 0.45, 0.38, 0.52, 0.47, 0.6, 0.42, 0.35, 0.4, 0.33];
@@ -43,6 +124,7 @@ export default function TerminalShell({
         <CommandStream
           commands={commands}
           onCommandSubmit={onCommandSubmit}
+          onPinCommand={pinCommand}
           onCommandEvent={onCommandEvent}
           onTransportReady={onTransportReady}
         />
@@ -50,14 +132,28 @@ export default function TerminalShell({
           cpu={live ? (live.cpu ?? 0) : 0.34}
           ram={live ? (live.ram ?? 0) : 0.61}
           recentCommands={commands.map((c) => c.command).slice(-6).reverse()}
-          pinnedSnippets={[
-            { title: 'Rebuild + test', command: 'cargo test --workspace' },
-            { title: 'Tail logs', command: 'journalctl -fu rusty-term-bridge' },
-          ]}
+          pinnedSnippets={snippets}
+          onSnippetClick={(s) => onCommandSubmit?.(s.command)}
+          onSnippetRemove={removeSnippet}
+          onRecentCommandClick={(cmd) => onCommandSubmit?.(cmd)}
         />
       </div>
 
-      <AiOrb unreadHints={orbHints} enabled onClick={() => setOrbHints(0)} />
+      {assistOpen && (
+        <AssistPanel
+          insights={insights}
+          onRun={
+            onCommandSubmit
+              ? (cmd) => {
+                  onCommandSubmit(cmd);
+                  setAssistOpen(false);
+                }
+              : undefined
+          }
+          onClose={toggleAssist}
+        />
+      )}
+      <AiOrb unreadHints={unreadHints} enabled onClick={toggleAssist} />
     </div>
   );
 }

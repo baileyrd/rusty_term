@@ -39,6 +39,9 @@ export default function SideDock({
   ram,
   recentCommands = [],
   pinnedSnippets = [],
+  onSnippetClick,
+  onSnippetRemove,
+  onRecentCommandClick,
 }: SideDockProps) {
   return (
     <aside className="hidden w-64 shrink-0 flex-col gap-3 overflow-y-auto border-l border-white/5 p-3 lg:flex">
@@ -55,12 +58,15 @@ export default function SideDock({
         ) : (
           <ul className="flex flex-col gap-1">
             {recentCommands.map((cmd, i) => (
-              <li
-                key={`${i}-${cmd}`}
-                className="truncate rounded-nebula-sm px-1.5 py-1 font-nebula-command text-xs text-nebula-text/70 transition-colors duration-nebula-fast ease-nebula hover:bg-white/5 hover:text-nebula-text"
-                title={cmd}
-              >
-                {cmd}
+              <li key={`${i}-${cmd}`}>
+                <button
+                  type="button"
+                  onClick={() => onRecentCommandClick?.(cmd)}
+                  className="w-full truncate rounded-nebula-sm px-1.5 py-1 text-left font-nebula-command text-xs text-nebula-text/70 transition-colors duration-nebula-fast ease-nebula hover:bg-white/5 hover:text-nebula-text"
+                  title={`Run again: ${cmd}`}
+                >
+                  {cmd}
+                </button>
               </li>
             ))}
           </ul>
@@ -74,13 +80,31 @@ export default function SideDock({
           <ul className="flex flex-col gap-2">
             {pinnedSnippets.map((s, i) => (
               <li
-                key={`${i}-${s.title}`}
-                className="rounded-nebula-sm border border-white/5 p-2 transition-colors duration-nebula-fast ease-nebula hover:border-nebula-accent/30"
+                key={`${i}-${s.command}`}
+                data-testid="pinned-snippet"
+                className="group relative rounded-nebula-sm border border-white/5 p-2 transition-colors duration-nebula-fast ease-nebula hover:border-nebula-accent/30"
               >
-                <p className="mb-1 font-nebula-meta text-[11px] text-nebula-accent2">{s.title}</p>
-                <code className="block truncate font-nebula-command text-xs text-nebula-text/70">
-                  {s.command}
-                </code>
+                <button
+                  type="button"
+                  onClick={() => onSnippetClick?.(s)}
+                  className="block w-full cursor-pointer text-left"
+                  title={`Run: ${s.command}`}
+                >
+                  <p className="mb-1 font-nebula-meta text-[11px] text-nebula-accent2">{s.title}</p>
+                  <code className="block truncate font-nebula-command text-xs text-nebula-text/70">
+                    {s.command}
+                  </code>
+                </button>
+                {onSnippetRemove && (
+                  <button
+                    type="button"
+                    onClick={() => onSnippetRemove(s)}
+                    aria-label={`Unpin ${s.title}`}
+                    className="absolute right-1 top-1 hidden rounded-nebula-sm px-1 font-nebula-meta text-[11px] text-nebula-text/40 hover:bg-white/10 hover:text-nebula-error group-hover:block"
+                  >
+                    ✕
+                  </button>
+                )}
               </li>
             ))}
           </ul>

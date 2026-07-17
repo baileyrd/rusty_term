@@ -9,6 +9,8 @@ import type { TerminalTransport } from '../../transport/bridge';
 export interface CommandStreamProps {
   commands: CommandCardProps[];
   onCommandSubmit?: (command: string) => void;
+  /** Pin a card's command to the side dock's snippets. */
+  onPinCommand?: (command: string) => void;
   onCommandEvent?: (event: CommandEvent) => void;
   onTransportReady?: (transport: TerminalTransport) => void;
 }
@@ -17,7 +19,7 @@ export interface CommandStreamProps {
  * The center column: a scrolling stream of CommandCards, the raw xterm.js
  * panel, and the command input line at the bottom.
  */
-export default function CommandStream({ commands, onCommandSubmit, onCommandEvent, onTransportReady }: CommandStreamProps) {
+export default function CommandStream({ commands, onCommandSubmit, onPinCommand, onCommandEvent, onTransportReady }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -38,7 +40,11 @@ export default function CommandStream({ commands, onCommandSubmit, onCommandEven
     <main className="flex min-w-0 flex-1 flex-col">
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
         {commands.map((c, i) => (
-          <CommandCard key={c.id ?? `cmd-${i}`} {...c} />
+          <CommandCard
+            key={c.id ?? `cmd-${i}`}
+            {...c}
+            onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
+          />
         ))}
 
         <TerminalView onCommandEvent={onCommandEvent} onTransportReady={onTransportReady} />
