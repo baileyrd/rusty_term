@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import StatusRibbon from './StatusRibbon';
 import CommandStream from './CommandStream';
 import SideDock from './SideDock';
 import AiOrb from './AiOrb';
-import AssistPanel from './AssistPanel';
+import AssistPanel, { type AiAssistState } from './AssistPanel';
 import { localHeuristics } from '../../assist/heuristics';
+import { createLlmProvider, loadApiKey, storeApiKey } from '../../assist/llmProvider';
 import type { SnippetItem, TerminalShellProps } from './types';
 
 /** localStorage key for the pinned snippets. */
@@ -50,9 +51,9 @@ function snippetTitle(command: string): string {
  *
  * Owns the two pieces of cross-cutting UI state: the pinned snippets
  * (persisted to localStorage; pin from a card's hover button, run/unpin in
- * the dock) and the assist panel (the orb's sheet, fed by the local
- * heuristics provider over the same command cards the stream shows — its
- * badge counts failures that arrived since the panel was last opened).
+ * the dock) and the assist panel (the orb's sheet — local heuristics always,
+ * plus a Claude-backed section when an API key is connected; its badge
+ * counts failures that arrived since the panel was last opened).
  *
  * The `theme` prop is Nebula-only for now; 'cyberpunk' and 'minimal' are
  * accepted per the spec but map to the Nebula skin until those presets land.
@@ -68,6 +69,10 @@ export default function TerminalShell({
   const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
   const [assistOpen, setAssistOpen] = useState(false);
   const [seenFailures, setSeenFailures] = useState(0);
+  const [apiKey, setApiKey] = useState<string | null>(loadApiKey);
+  const [aiState, setAiState] = useState<AiAssistState>({ phase: 'disconnected' });
+  // Monotonic id so a slow response from a stale request can't clobber state.
+  const aiRequest = useRef(0);
 
   useEffect(() => {
     try {
@@ -78,6 +83,45 @@ export default function TerminalShell({
   }, [snippets]);
 
   const insights = useMemo(() => localHeuristics.analyze(commands), [commands]);
+
+  // The Claude half: with a key connected and the panel open, ship the
+  // current cards off for analysis. Re-runs when a command finishes (the
+  // dependency is the finished count, not the array identity, so streaming
+  // output doesn't hammer the API), guarded against stale responses.
+  const finishedCount = useMemo(
+    () => commands.filter((c) => c.status === 'success' || c.status === 'error').length,
+    [commands],
+  );
+  useEffect(() => {
+    if (apiKey === null) {
+      setAiState({ phase: 'disconnected' });
+      return;
+    }
+    if (!assistOpen) return;
+    const requestId = ++aiRequest.current;
+    setAiState({ phase: 'loading' });
+    createLlmProvider(apiKey)
+      .analyze(commands)
+      .then((aiInsights) => {
+        if (aiRequest.current === requestId) setAiState({ phase: 'ready', insights: aiInsights });
+      })
+      .catch((err: unknown) => {
+        if (aiRequest.current === requestId) {
+          setAiState({ phase: 'error', message: err instanceof Error ? err.message : String(err) });
+        }
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see note above on finishedCount
+  }, [apiKey, assistOpen, finishedCount]);
+
+  const connectAssist = useCallback((key: string) => {
+    storeApiKey(key);
+    setApiKey(key);
+  }, []);
+
+  const disconnectAssist = useCallback(() => {
+    storeApiKey(null);
+    setApiKey(null);
+  }, []);
   const failures = useMemo(
     () => commands.filter((c) => c.status === 'error').length,
     [commands],
@@ -142,6 +186,9 @@ export default function TerminalShell({
       {assistOpen && (
         <AssistPanel
           insights={insights}
+          ai={aiState}
+          onConnect={connectAssist}
+          onDisconnect={disconnectAssist}
           onRun={
             onCommandSubmit
               ? (cmd) => {
