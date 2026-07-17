@@ -38,7 +38,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Image> {
         match tag {
             b"VP8L" => return vp8l(body),
             b"VP8 " | b"ANMF" | b"ALPH" => return None, // lossy / animated
-            _ => {} // VP8X header, ICCP, EXIF, XMP — skip
+            _ => {}                                     // VP8X header, ICCP, EXIF, XMP — skip
         }
         i += 8 + len + (len & 1); // chunks are 2-byte aligned
     }
@@ -124,7 +124,13 @@ impl Prefix {
                 next[l as usize] += 1;
             }
         }
-        Some(Prefix { counts, firsts, offsets, symbols, single: None })
+        Some(Prefix {
+            counts,
+            firsts,
+            offsets,
+            symbols,
+            single: None,
+        })
     }
 
     fn read(&self, br: &mut Br) -> Option<u32> {
@@ -136,7 +142,10 @@ impl Prefix {
             code = (code << 1) | br.bits(1);
             let count = self.counts[l];
             if count > 0 && code >= self.firsts[l] && code < self.firsts[l] + count {
-                return self.symbols.get((self.offsets[l] + code - self.firsts[l]) as usize).copied();
+                return self
+                    .symbols
+                    .get((self.offsets[l] + code - self.firsts[l]) as usize)
+                    .copied();
             }
         }
         None
@@ -144,7 +153,9 @@ impl Prefix {
 }
 
 /// The order code-length code lengths are transmitted in.
-const CL_ORDER: [usize; 19] = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const CL_ORDER: [usize; 19] = [
+    17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+];
 
 /// Read one prefix code (spec 6.2.2): either "simple" (1-2 symbols inline) or
 /// the code-length-coded form with 16/17/18 repeat symbols.
@@ -240,16 +251,14 @@ fn plane_distance(value: usize, xsize: usize) -> usize {
         return value - 120;
     }
     const CODE_TO_PLANE: [u8; 120] = [
-        0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1a, 0x26, 0x2a,
-        0x38, 0x05, 0x37, 0x39, 0x15, 0x1b, 0x36, 0x3a, 0x25, 0x2b, 0x48, 0x04,
-        0x47, 0x49, 0x14, 0x1c, 0x35, 0x3b, 0x46, 0x4a, 0x24, 0x2c, 0x58, 0x45,
-        0x4b, 0x34, 0x3c, 0x03, 0x57, 0x59, 0x13, 0x1d, 0x56, 0x5a, 0x23, 0x2d,
-        0x44, 0x4c, 0x55, 0x5b, 0x33, 0x3d, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1e,
-        0x66, 0x6a, 0x22, 0x2e, 0x54, 0x5c, 0x43, 0x4d, 0x65, 0x6b, 0x32, 0x3e,
-        0x78, 0x01, 0x77, 0x79, 0x53, 0x5d, 0x11, 0x1f, 0x64, 0x6c, 0x42, 0x4e,
-        0x76, 0x7a, 0x21, 0x2f, 0x75, 0x7b, 0x31, 0x3f, 0x63, 0x6d, 0x52, 0x5e,
-        0x00, 0x74, 0x7c, 0x41, 0x4f, 0x10, 0x20, 0x62, 0x6e, 0x30, 0x73, 0x7d,
-        0x51, 0x5f, 0x40, 0x72, 0x7e, 0x61, 0x6f, 0x50, 0x71, 0x7f, 0x60, 0x70,
+        0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1a, 0x26, 0x2a, 0x38, 0x05, 0x37,
+        0x39, 0x15, 0x1b, 0x36, 0x3a, 0x25, 0x2b, 0x48, 0x04, 0x47, 0x49, 0x14, 0x1c, 0x35, 0x3b,
+        0x46, 0x4a, 0x24, 0x2c, 0x58, 0x45, 0x4b, 0x34, 0x3c, 0x03, 0x57, 0x59, 0x13, 0x1d, 0x56,
+        0x5a, 0x23, 0x2d, 0x44, 0x4c, 0x55, 0x5b, 0x33, 0x3d, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1e,
+        0x66, 0x6a, 0x22, 0x2e, 0x54, 0x5c, 0x43, 0x4d, 0x65, 0x6b, 0x32, 0x3e, 0x78, 0x01, 0x77,
+        0x79, 0x53, 0x5d, 0x11, 0x1f, 0x64, 0x6c, 0x42, 0x4e, 0x76, 0x7a, 0x21, 0x2f, 0x75, 0x7b,
+        0x31, 0x3f, 0x63, 0x6d, 0x52, 0x5e, 0x00, 0x74, 0x7c, 0x41, 0x4f, 0x10, 0x20, 0x62, 0x6e,
+        0x30, 0x73, 0x7d, 0x51, 0x5f, 0x40, 0x72, 0x7e, 0x61, 0x6f, 0x50, 0x71, 0x7f, 0x60, 0x70,
     ];
     let code = CODE_TO_PLANE[value - 1];
     let yoff = (code >> 4) as isize;
@@ -271,7 +280,10 @@ fn vp8l(body: &[u8]) -> Option<Image> {
     if body.first() != Some(&0x2F) {
         return None; // signature
     }
-    let mut br = Br { data: &body[1..], pos: 0 };
+    let mut br = Br {
+        data: &body[1..],
+        pos: 0,
+    };
     let width = br.bits(14) as usize + 1;
     let height = br.bits(14) as usize + 1;
     let _alpha_hint = br.bits(1);
@@ -317,7 +329,10 @@ fn vp8l(body: &[u8]) -> Option<Image> {
                     5..=16 => 1,
                     _ => 0,
                 };
-                transforms.push(Transform::ColorIndex { palette, packed_bits });
+                transforms.push(Transform::ColorIndex {
+                    palette,
+                    packed_bits,
+                });
                 xsize = sub_size(xsize, packed_bits);
             }
             _ => return None,
@@ -333,7 +348,10 @@ fn vp8l(body: &[u8]) -> Option<Image> {
     // Apply transforms in reverse order.
     for t in transforms.iter().rev() {
         match t {
-            Transform::ColorIndex { palette, packed_bits } => {
+            Transform::ColorIndex {
+                palette,
+                packed_bits,
+            } => {
                 argb = unpack_palette(&argb, cur_w, height, width, palette, *packed_bits)?;
                 cur_w = width;
             }
@@ -364,7 +382,11 @@ fn vp8l(body: &[u8]) -> Option<Image> {
         rgba.push((p & 0xFF) as u8);
         rgba.push((p >> 24) as u8);
     }
-    Some(Image { width, height, rgba })
+    Some(Image {
+        width,
+        height,
+        rgba,
+    })
 }
 
 fn sub_size(size: usize, bits: u32) -> usize {
@@ -412,7 +434,12 @@ fn decode_argb_image(br: &mut Br, xsize: usize, ysize: usize, top_level: bool) -
     // Prefix-code groups.
     let num_groups = meta
         .as_ref()
-        .map(|m| m.iter().map(|&p| ((p >> 8) & 0xFFFF) + 1).max().unwrap_or(1) as usize)
+        .map(|m| {
+            m.iter()
+                .map(|&p| ((p >> 8) & 0xFFFF) + 1)
+                .max()
+                .unwrap_or(1) as usize
+        })
         .unwrap_or(1);
     if num_groups > 256 {
         return None;
@@ -521,7 +548,9 @@ fn apply_color_transform(argb: &mut [u32], width: usize, height: usize, bits: u3
     let delta = |t: u8, c: u8| -> i32 { ((t as i8 as i32) * (c as i8 as i32)) >> 5 };
     for y in 0..height {
         for x in 0..width {
-            let Some(&cte) = data.get((y >> bits) * bw + (x >> bits)) else { continue };
+            let Some(&cte) = data.get((y >> bits) * bw + (x >> bits)) else {
+                continue;
+            };
             let g2r = (cte & 0xFF) as u8;
             let g2b = ((cte >> 8) & 0xFF) as u8;
             let r2b = ((cte >> 16) & 0xFF) as u8;
@@ -601,7 +630,11 @@ fn apply_predictor(argb: &mut [u32], width: usize, height: usize, bits: u32, dat
             };
             let l = if x > 0 { argb[i - 1] } else { 0 };
             let t = if y > 0 { argb[i - width] } else { 0 };
-            let tl = if x > 0 && y > 0 { argb[i - width - 1] } else { 0 };
+            let tl = if x > 0 && y > 0 {
+                argb[i - width - 1]
+            } else {
+                0
+            };
             // At the right edge `i+1-width` wraps to the current row's first
             // (already reconstructed) pixel -- the reference decoder's exact
             // memory-layout behavior, kept bit-for-bit.

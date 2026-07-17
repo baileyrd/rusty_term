@@ -130,8 +130,12 @@ pub(crate) fn dispatch(
                 if head == "4" {
                     // ConEmu progress: `9 ; 4 ; st ; pr`. Missing/garbled
                     // fields read as 0, which clears — the safe direction.
-                    let mut num =
-                        || fields.next().and_then(|f| f.parse::<u8>().ok()).unwrap_or(0);
+                    let mut num = || {
+                        fields
+                            .next()
+                            .and_then(|f| f.parse::<u8>().ok())
+                            .unwrap_or(0)
+                    };
                     let (state, percent) = (num(), num());
                     g.set_progress(state, percent);
                     forward_to_host(osc_buffer, g);

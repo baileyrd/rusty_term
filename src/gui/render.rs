@@ -102,7 +102,10 @@ impl CpuRenderer {
     pub(crate) fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window)?;
-        Ok(CpuRenderer { _context: context, surface })
+        Ok(CpuRenderer {
+            _context: context,
+            surface,
+        })
     }
 }
 
@@ -136,7 +139,11 @@ impl Renderer for CpuRenderer {
         // strip band shows above it); the grid shifts down by the same
         // amount so the pad-sized gap between bar and content survives —
         // the bottom pad absorbs the difference.
-        let inset = if chrome.is_empty() { 0 } else { bar_inset(pad, ch) };
+        let inset = if chrome.is_empty() {
+            0
+        } else {
+            bar_inset(pad, ch)
+        };
         let oy = pad + inset;
         // Gaps between panes show the divider: fill the panes' bounding box
         // with it, then let the grids overpaint everything but the gaps.
@@ -162,10 +169,31 @@ impl Renderer for CpuRenderer {
         }
         for p in panes {
             cpu::draw_grid(
-                &mut buffer, w, h, p.grid, p.col0, p.row0, pad, oy, p.focused, p.cursor_on,
-                p.hover_link, font,
+                &mut buffer,
+                w,
+                h,
+                p.grid,
+                p.col0,
+                p.row0,
+                pad,
+                oy,
+                p.focused,
+                p.cursor_on,
+                p.hover_link,
+                font,
             );
-            cpu::draw_trail(&mut buffer, w, h, p.grid, p.col0, p.row0, pad, oy, &p.trail, font);
+            cpu::draw_trail(
+                &mut buffer,
+                w,
+                h,
+                p.grid,
+                p.col0,
+                p.row0,
+                pad,
+                oy,
+                &p.trail,
+                font,
+            );
             cpu::draw_marks(&mut buffer, w, h, p.col0, p.row0, pad, oy, &p.marks, font);
         }
         let _ = buffer.present();

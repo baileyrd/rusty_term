@@ -33,7 +33,14 @@ pub(crate) struct Glyph {
 impl Glyph {
     /// An empty (whitespace / unoutlined) glyph.
     fn blank() -> Glyph {
-        Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new(), color: None }
+        Glyph {
+            width: 0,
+            height: 0,
+            left: 0,
+            top: 0,
+            coverage: Vec::new(),
+            color: None,
+        }
     }
 }
 
@@ -128,7 +135,9 @@ impl FontCache {
         let scale = PxScale::from(px);
         let scaled = regular.as_scaled(scale);
         let cell_w = scaled.h_advance(regular.glyph_id('M')).ceil().max(1.0) as usize;
-        let cell_h = (scaled.ascent() - scaled.descent() + scaled.line_gap()).ceil().max(1.0) as usize;
+        let cell_h = (scaled.ascent() - scaled.descent() + scaled.line_gap())
+            .ceil()
+            .max(1.0) as usize;
         let baseline = scaled.ascent().ceil() as i32;
         // Parse a styled variant, building its GSUB shaper from the same bytes.
         let styled = |slot: usize, bytes: Option<Vec<u8>>, sh: &mut [Option<Shaper>; 4]| {
@@ -144,7 +153,11 @@ impl FontCache {
             styled(2, set.italic, &mut shapers),
             styled(3, set.bold_italic, &mut shapers),
         ];
-        let fallback = set.fallback.into_iter().filter_map(|b| FontVec::try_from_vec(b).ok()).collect();
+        let fallback = set
+            .fallback
+            .into_iter()
+            .filter_map(|b| FontVec::try_from_vec(b).ok())
+            .collect();
         Some(FontCache {
             faces,
             shapers,
@@ -177,7 +190,8 @@ impl FontCache {
     /// loaded / it lacks the char / the strike isn't PNG. Only consulted for
     /// emoji-block scalars so ordinary text never pays the lookup (G24).
     fn color_emoji(&self, ch: char) -> Option<Glyph> {
-        if !matches!(ch as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x2049 | 0x203C) {
+        if !matches!(ch as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x2049 | 0x203C)
+        {
             return None;
         }
         let data = self.emoji.as_deref()?;
@@ -205,8 +219,12 @@ impl FontCache {
             for x in 0..w {
                 let sx = x * decoded.width / w;
                 let i = (sy * decoded.width + sx) * 4;
-                let (r, g, b, a) =
-                    (decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2], decoded.rgba[i + 3]);
+                let (r, g, b, a) = (
+                    decoded.rgba[i],
+                    decoded.rgba[i + 1],
+                    decoded.rgba[i + 2],
+                    decoded.rgba[i + 3],
+                );
                 color.push(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32);
                 coverage.push(a);
             }
@@ -222,19 +240,27 @@ impl FontCache {
     }
 
     fn face_for(&self, ch: char, style: Style) -> &FontVec {
-        let styled =
-            self.faces[style as usize].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
+        let styled = self.faces[style as usize]
+            .as_ref()
+            .unwrap_or_else(|| self.faces[0].as_ref().unwrap());
         if styled.glyph_id(ch).0 != 0 {
             return styled;
         }
-        self.fallback.iter().find(|f| f.glyph_id(ch).0 != 0).unwrap_or(styled)
+        self.fallback
+            .iter()
+            .find(|f| f.glyph_id(ch).0 != 0)
+            .unwrap_or(styled)
     }
 
     /// The face index used to shape and render `style`: the styled face if
     /// present, else regular (index 0). Shaping (cmap + GSUB) and outlining must
     /// use the same face so glyph ids line up.
     fn eff_face(&self, style: Style) -> usize {
-        if self.faces[style as usize].is_some() { style as usize } else { 0 }
+        if self.faces[style as usize].is_some() {
+            style as usize
+        } else {
+            0
+        }
     }
 
     /// Rasterize and cache a glyph by glyph id (ligatures / contextual
@@ -244,7 +270,9 @@ impl FontCache {
         if let Some(g) = self.gid_cache.get(&(gid, style)) {
             return Rc::clone(g);
         }
-        let face = self.faces[eff].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
+        let face = self.faces[eff]
+            .as_ref()
+            .unwrap_or_else(|| self.faces[0].as_ref().unwrap());
         let g = Rc::new(rasterize_id(face, self.scale, GlyphId(gid)));
         self.gid_cache.insert((gid, style), Rc::clone(&g));
         g
@@ -279,7 +307,12 @@ impl GlyphSource for FontCache {
                     // clip or bleed into the neighbor cell (Ghostty-style
                     // glyph constraining).
                     if is_private_use(ch) {
-                        constrain_to_cell(g, crate::core::char_width(ch).max(1) * cw, chh, self.baseline())
+                        constrain_to_cell(
+                            g,
+                            crate::core::char_width(ch).max(1) * cw,
+                            chh,
+                            self.baseline(),
+                        )
                     } else {
                         g
                     }
@@ -289,11 +322,12 @@ impl GlyphSource for FontCache {
         g
     }
 
-
     fn shape(&mut self, text: &[char], style: Style) -> Vec<(Rc<Glyph>, usize)> {
         let eff = self.eff_face(style);
         // Glyph ids via the effective face's cmap (the same face GSUB indexes).
-        let face = self.faces[eff].as_ref().unwrap_or_else(|| self.faces[0].as_ref().unwrap());
+        let face = self.faces[eff]
+            .as_ref()
+            .unwrap_or_else(|| self.faces[0].as_ref().unwrap());
         let gids: Vec<u16> = text.iter().map(|&c| face.glyph_id(c).0).collect();
         let shaped: Vec<(u16, u8)> = match self.shapers[eff].as_ref() {
             Some(sh) => sh.shape(&gids),
@@ -450,7 +484,12 @@ pub(crate) fn load_set(
     if let Some(b) = find_nerd_symbols() {
         fb.push(b);
     }
-    fb.extend(SYSTEM_FALLBACKS.iter().filter_map(|p| std::fs::read(p).ok()).take(2));
+    fb.extend(
+        SYSTEM_FALLBACKS
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok())
+            .take(2),
+    );
     let emoji = EMOJI_FONTS.iter().find_map(|p| std::fs::read(p).ok());
     Some(FontSet {
         regular,
@@ -476,7 +515,10 @@ fn load_variant(
     let name = reg.file_name()?.to_str()?;
     let (stem, ext) = name.rsplit_once('.')?;
     for token in tokens {
-        for cand in [stem.replace("Regular", token).replace("regular", token), format!("{stem}-{token}")] {
+        for cand in [
+            stem.replace("Regular", token).replace("regular", token),
+            format!("{stem}-{token}"),
+        ] {
             if cand == stem {
                 continue; // no substitution happened -> not a real variant name
             }
@@ -516,7 +558,9 @@ fn find_nerd_symbols() -> Option<Vec<u8>> {
             }
         }
         // One level of subdirectories (e.g. ~/.local/share/fonts/NerdFonts/).
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -570,8 +614,14 @@ mod tests {
         let g = constrain_to_cell(big, 10, 20, 16);
         assert!(g.width <= 10 && g.height <= 20, "{}x{}", g.width, g.height);
         assert_eq!(g.height, 20, "limited by height (aspect 1:2 in a 1:2 box)");
-        assert!(g.left >= 0 && g.left as usize + g.width <= 10, "centered inside");
-        assert!(g.top >= -16 && g.top + g.height as i32 <= 4, "inside the cell vertically");
+        assert!(
+            g.left >= 0 && g.left as usize + g.width <= 10,
+            "centered inside"
+        );
+        assert!(
+            g.top >= -16 && g.top + g.height as i32 <= 4,
+            "inside the cell vertically"
+        );
         assert!(g.coverage.iter().any(|&c| c != 0));
         // A fitting glyph passes through untouched.
         let ok = Glyph {
@@ -604,14 +654,31 @@ mod tests {
             eprintln!("no system monospace font found; skipping font integration test");
             return;
         };
-        let mut fc =
-            FontCache::new(FontSet { regular: bytes, ..Default::default() }, 18.0, false).expect("font parses");
+        let mut fc = FontCache::new(
+            FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            18.0,
+            false,
+        )
+        .expect("font parses");
         let (w, h) = fc.cell_size();
         assert!(w > 0 && h > 0, "cell size must be positive: {w}x{h}");
         assert!(fc.baseline() > 0);
-        assert!(fc.glyph('M', Style::Regular).width > 0, "'M' should rasterize");
-        assert_eq!(fc.glyph(' ', Style::Regular).width, 0, "space has no outline");
-        assert!(Rc::ptr_eq(&fc.glyph('M', Style::Regular), &fc.glyph('M', Style::Regular)));
+        assert!(
+            fc.glyph('M', Style::Regular).width > 0,
+            "'M' should rasterize"
+        );
+        assert_eq!(
+            fc.glyph(' ', Style::Regular).width,
+            0,
+            "space has no outline"
+        );
+        assert!(Rc::ptr_eq(
+            &fc.glyph('M', Style::Regular),
+            &fc.glyph('M', Style::Regular)
+        ));
         // A missing variant face falls back to regular but caches per style.
         assert!(fc.glyph('M', Style::Bold).width > 0);
     }
@@ -621,8 +688,15 @@ mod tests {
         let Some(bytes) = load_default_font(None) else {
             return; // no system font on this host; covered by boxdraw's own tests
         };
-        let mut fc =
-            FontCache::new(FontSet { regular: bytes, ..Default::default() }, 18.0, false).expect("font parses");
+        let mut fc = FontCache::new(
+            FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            18.0,
+            false,
+        )
+        .expect("font parses");
         let (w, h) = fc.cell_size();
         // Box drawing comes from the synthesizer: exactly cell-sized, at the
         // cell origin — regardless of what the font provides.

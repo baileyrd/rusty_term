@@ -101,7 +101,12 @@ pub struct Chord {
 
 impl Chord {
     pub fn new(ctrl: bool, shift: bool, alt: bool, key: Key) -> Self {
-        Self { ctrl, shift, alt, key }
+        Self {
+            ctrl,
+            shift,
+            alt,
+            key,
+        }
     }
 }
 
@@ -176,7 +181,10 @@ impl Keymap {
     /// The action bound to `chord`, if any.
     #[cfg(any(test, feature = "gui"))]
     pub fn action(&self, chord: Chord) -> Option<Action> {
-        self.binds.iter().find(|(ch, _)| *ch == chord).map(|(_, a)| *a)
+        self.binds
+            .iter()
+            .find(|(ch, _)| *ch == chord)
+            .map(|(_, a)| *a)
     }
 }
 
@@ -295,16 +303,43 @@ mod tests {
     #[test]
     fn defaults_bind_the_builtin_shortcuts() {
         let km = Keymap::default();
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('c'))), Some(Action::Copy));
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Tab)), Some(Action::NextTab));
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Tab)), Some(Action::PrevTab));
-        assert_eq!(km.action(Chord::new(false, true, false, Key::PageUp)), Some(Action::ScrollPageUp));
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Char(','))), Some(Action::OpenSettings));
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('n'))), Some(Action::NewWindow));
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('u'))), Some(Action::FoldOutput));
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('c'))),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Tab)),
+            Some(Action::NextTab)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Tab)),
+            Some(Action::PrevTab)
+        );
+        assert_eq!(
+            km.action(Chord::new(false, true, false, Key::PageUp)),
+            Some(Action::ScrollPageUp)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Char(','))),
+            Some(Action::OpenSettings)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('n'))),
+            Some(Action::NewWindow)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('u'))),
+            Some(Action::FoldOutput)
+        );
         // Unbound chords (plain typing, Ctrl+C) fall through to the child.
-        assert_eq!(km.action(Chord::new(false, false, false, Key::Char('a'))), None);
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('c'))), None);
+        assert_eq!(
+            km.action(Chord::new(false, false, false, Key::Char('a'))),
+            None
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Char('c'))),
+            None
+        );
     }
 
     #[test]
@@ -313,11 +348,26 @@ mod tests {
         // was launch_mode-only, and font size only adjustable via the
         // settings overlay.
         let km = Keymap::default();
-        assert_eq!(km.action(Chord::new(false, false, false, Key::F11)), Some(Action::ToggleFullscreen));
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('='))), Some(Action::FontSizeUp));
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('-'))), Some(Action::FontSizeDown));
-        assert_eq!(km.action(Chord::new(true, false, false, Key::Char('0'))), Some(Action::FontSizeReset));
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('k'))), Some(Action::ToggleDock));
+        assert_eq!(
+            km.action(Chord::new(false, false, false, Key::F11)),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Char('='))),
+            Some(Action::FontSizeUp)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Char('-'))),
+            Some(Action::FontSizeDown)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, false, false, Key::Char('0'))),
+            Some(Action::FontSizeReset)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('k'))),
+            Some(Action::ToggleDock)
+        );
     }
 
     #[test]
@@ -327,7 +377,10 @@ mod tests {
         km.set(Action::Copy, new);
         assert_eq!(km.action(new), Some(Action::Copy));
         // The old Ctrl+Shift+C no longer copies.
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('c'))), None);
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('c'))),
+            None
+        );
         // Rebinding Paste onto Copy's new chord moves it off Copy.
         km.set(Action::Paste, new);
         assert_eq!(km.action(new), Some(Action::Paste));
@@ -337,12 +390,30 @@ mod tests {
 
     #[test]
     fn parse_chord_handles_modifiers_and_keys() {
-        assert_eq!(parse_chord("Ctrl+Shift+C"), Ok(Chord::new(true, true, false, Key::Char('c'))));
-        assert_eq!(parse_chord("shift+pageup"), Ok(Chord::new(false, true, false, Key::PageUp)));
-        assert_eq!(parse_chord("Ctrl+Tab"), Ok(Chord::new(true, false, false, Key::Tab)));
-        assert_eq!(parse_chord("Ctrl+Shift+Comma"), Ok(Chord::new(true, true, false, Key::Char(','))));
-        assert_eq!(parse_chord("Ctrl+Shift+,"), Ok(Chord::new(true, true, false, Key::Char(','))));
-        assert_eq!(parse_chord("Alt+x"), Ok(Chord::new(false, false, true, Key::Char('x'))));
+        assert_eq!(
+            parse_chord("Ctrl+Shift+C"),
+            Ok(Chord::new(true, true, false, Key::Char('c')))
+        );
+        assert_eq!(
+            parse_chord("shift+pageup"),
+            Ok(Chord::new(false, true, false, Key::PageUp))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Tab"),
+            Ok(Chord::new(true, false, false, Key::Tab))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Shift+Comma"),
+            Ok(Chord::new(true, true, false, Key::Char(',')))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Shift+,"),
+            Ok(Chord::new(true, true, false, Key::Char(',')))
+        );
+        assert_eq!(
+            parse_chord("Alt+x"),
+            Ok(Chord::new(false, false, true, Key::Char('x')))
+        );
     }
 
     #[test]
@@ -358,16 +429,46 @@ mod tests {
         // unbindable at all (only letters/digits/comma/tab/pageup/pagedown/
         // arrows/space worked) — `[keys] copy = "Ctrl+F5"` failed with
         // "unknown key" and there was no escape hatch to spare function keys.
-        assert_eq!(parse_chord("Ctrl+F5"), Ok(Chord::new(true, false, false, Key::F5)));
-        assert_eq!(parse_chord("F11"), Ok(Chord::new(false, false, false, Key::F11)));
-        assert_eq!(parse_chord("Ctrl+Home"), Ok(Chord::new(true, false, false, Key::Home)));
-        assert_eq!(parse_chord("Shift+End"), Ok(Chord::new(false, true, false, Key::End)));
-        assert_eq!(parse_chord("Ctrl+Enter"), Ok(Chord::new(true, false, false, Key::Enter)));
-        assert_eq!(parse_chord("Alt+Return"), Ok(Chord::new(false, false, true, Key::Enter)));
-        assert_eq!(parse_chord("Ctrl+Delete"), Ok(Chord::new(true, false, false, Key::Delete)));
-        assert_eq!(parse_chord("Ctrl+Insert"), Ok(Chord::new(true, false, false, Key::Insert)));
-        assert_eq!(parse_chord("Ctrl+Escape"), Ok(Chord::new(true, false, false, Key::Escape)));
-        assert_eq!(parse_chord("Ctrl+Backspace"), Ok(Chord::new(true, false, false, Key::Backspace)));
+        assert_eq!(
+            parse_chord("Ctrl+F5"),
+            Ok(Chord::new(true, false, false, Key::F5))
+        );
+        assert_eq!(
+            parse_chord("F11"),
+            Ok(Chord::new(false, false, false, Key::F11))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Home"),
+            Ok(Chord::new(true, false, false, Key::Home))
+        );
+        assert_eq!(
+            parse_chord("Shift+End"),
+            Ok(Chord::new(false, true, false, Key::End))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Enter"),
+            Ok(Chord::new(true, false, false, Key::Enter))
+        );
+        assert_eq!(
+            parse_chord("Alt+Return"),
+            Ok(Chord::new(false, false, true, Key::Enter))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Delete"),
+            Ok(Chord::new(true, false, false, Key::Delete))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Insert"),
+            Ok(Chord::new(true, false, false, Key::Insert))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Escape"),
+            Ok(Chord::new(true, false, false, Key::Escape))
+        );
+        assert_eq!(
+            parse_chord("Ctrl+Backspace"),
+            Ok(Chord::new(true, false, false, Key::Backspace))
+        );
     }
 
     #[test]
@@ -375,9 +476,15 @@ mod tests {
         assert_eq!(parse_action("new_tab"), Some(Action::NewTab));
         assert_eq!(parse_action("new_window"), Some(Action::NewWindow));
         assert_eq!(parse_action("fold_output"), Some(Action::FoldOutput));
-        assert_eq!(parse_action("scroll_prompt_down"), Some(Action::ScrollPromptDown));
+        assert_eq!(
+            parse_action("scroll_prompt_down"),
+            Some(Action::ScrollPromptDown)
+        );
         assert_eq!(parse_action("open_settings"), Some(Action::OpenSettings));
-        assert_eq!(parse_action("toggle_fullscreen"), Some(Action::ToggleFullscreen));
+        assert_eq!(
+            parse_action("toggle_fullscreen"),
+            Some(Action::ToggleFullscreen)
+        );
         assert_eq!(parse_action("font_size_up"), Some(Action::FontSizeUp));
         assert_eq!(parse_action("font_size_down"), Some(Action::FontSizeDown));
         assert_eq!(parse_action("font_size_reset"), Some(Action::FontSizeReset));
@@ -396,8 +503,14 @@ mod tests {
             km.action(Chord::new(true, true, false, Key::Right)),
             Some(Action::ResizeRight)
         );
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Char('z'))), Some(Action::ZoomPane));
-        assert_eq!(km.action(Chord::new(true, true, false, Key::Space)), Some(Action::CopyMode));
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Char('z'))),
+            Some(Action::ZoomPane)
+        );
+        assert_eq!(
+            km.action(Chord::new(true, true, false, Key::Space)),
+            Some(Action::CopyMode)
+        );
         // Config strings for the new keys/actions round-trip.
         assert_eq!(parse_action("zoom_pane"), Some(Action::ZoomPane));
         assert_eq!(parse_action("copy_mode"), Some(Action::CopyMode));

@@ -26,8 +26,12 @@ pub enum MouseEventKind {
     /// Pointer motion. `dragging` is whether a button is currently held —
     /// distinguishes a `?1002` (button-event) drag from a `?1003` (any-event)
     /// idle hover, and picks which button number a drag reports.
-    Move { dragging: bool },
-    Scroll { lines: isize },
+    Move {
+        dragging: bool,
+    },
+    Scroll {
+        lines: isize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,7 +57,11 @@ impl MouseEvent {
     }
 
     pub fn with_button(mut self, pressed: bool) -> Self {
-        self.kind = if pressed { MouseEventKind::Press } else { MouseEventKind::Release };
+        self.kind = if pressed {
+            MouseEventKind::Press
+        } else {
+            MouseEventKind::Release
+        };
         self
     }
 
@@ -97,7 +105,14 @@ impl SgrEncoder {
         if self.base == 0 {
             return;
         }
-        let MouseEvent { point, kind, button, shift, alt, ctrl } = e;
+        let MouseEvent {
+            point,
+            kind,
+            button,
+            shift,
+            alt,
+            ctrl,
+        } = e;
         let col = point.col.saturating_add(1);
         let row = point.row.saturating_add(1);
         let btn = match button {
@@ -128,9 +143,15 @@ impl SgrEncoder {
         };
 
         let mut flags = 0u8;
-        if shift { flags |= 4; }
-        if alt { flags |= 8; }
-        if ctrl { flags |= 16; }
+        if shift {
+            flags |= 4;
+        }
+        if alt {
+            flags |= 8;
+        }
+        if ctrl {
+            flags |= 16;
+        }
 
         out.extend_from_slice(b"\x1b[<");
         out.extend_from_slice((cb | flags as usize).to_string().as_bytes());
@@ -168,7 +189,9 @@ mod tests {
     #[test]
     fn modifiers_or_into_button_field() {
         let mut out = Vec::new();
-        let e = MouseEvent::new_point(0, 0).with_button(true).with_modifiers(true, false, true);
+        let e = MouseEvent::new_point(0, 0)
+            .with_button(true)
+            .with_modifiers(true, false, true);
         enc(1002).write(e, &mut out);
         // button 0 | shift(4) | ctrl(16) = 20
         assert_eq!(out, b"\x1b[<20;1;1M");
@@ -194,12 +217,20 @@ mod tests {
     #[test]
     fn right_and_middle_buttons_encode_their_own_number() {
         let mut right = Vec::new();
-        enc(1000)
-            .write(MouseEvent::new_point(0, 0).with_button(true).with_button_kind(MouseButtonKind::Right), &mut right);
+        enc(1000).write(
+            MouseEvent::new_point(0, 0)
+                .with_button(true)
+                .with_button_kind(MouseButtonKind::Right),
+            &mut right,
+        );
         assert_eq!(right, b"\x1b[<2;1;1M");
         let mut middle = Vec::new();
-        enc(1000)
-            .write(MouseEvent::new_point(0, 0).with_button(true).with_button_kind(MouseButtonKind::Middle), &mut middle);
+        enc(1000).write(
+            MouseEvent::new_point(0, 0)
+                .with_button(true)
+                .with_button_kind(MouseButtonKind::Middle),
+            &mut middle,
+        );
         assert_eq!(middle, b"\x1b[<1;1;1M");
     }
 
@@ -221,7 +252,9 @@ mod tests {
 
         let mut dragging = Vec::new();
         enc(1002).write(
-            MouseEvent::new_point(4, 2).with_move(true).with_button_kind(MouseButtonKind::Left),
+            MouseEvent::new_point(4, 2)
+                .with_move(true)
+                .with_button_kind(MouseButtonKind::Left),
             &mut dragging,
         );
         // 32 (motion) + 0 (left) = 32.
@@ -237,7 +270,9 @@ mod tests {
 
         let mut dragging = Vec::new();
         enc(1003).write(
-            MouseEvent::new_point(0, 0).with_move(true).with_button_kind(MouseButtonKind::Right),
+            MouseEvent::new_point(0, 0)
+                .with_move(true)
+                .with_button_kind(MouseButtonKind::Right),
             &mut dragging,
         );
         // 32 (motion) + 2 (right) = 34.

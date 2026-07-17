@@ -42,7 +42,9 @@ pub(crate) fn render(
         draw_chrome(buf, width, height, chrome, font, cw, ch, 0, 0);
     }
     let row0 = if chrome.is_empty() { 0 } else { 1 };
-    draw_grid(buf, width, height, grid, 0, row0, 0, 0, true, cursor_on, None, font);
+    draw_grid(
+        buf, width, height, grid, 0, row0, 0, 0, true, cursor_on, None, font,
+    );
 }
 
 /// Paint the window's chrome bar (tabs + caption buttons): a thin
@@ -97,8 +99,22 @@ pub(crate) fn draw_bar(
         // rides the ordinary underline machinery; spaces included, so the
         // line runs the tab's full width.
         if cell.flags & ATTR_UNDERLINE != 0 {
-            let color = if cell.flags & ATTR_UNDERLINE_COLOR != 0 { cell.underline_color } else { cell.fg };
-            draw_underline(buf, width, height, x0, y0, cw, ch, color, UnderlineStyle::from_attrs(cell.flags));
+            let color = if cell.flags & ATTR_UNDERLINE_COLOR != 0 {
+                cell.underline_color
+            } else {
+                cell.fg
+            };
+            draw_underline(
+                buf,
+                width,
+                height,
+                x0,
+                y0,
+                cw,
+                ch,
+                color,
+                UnderlineStyle::from_attrs(cell.flags),
+            );
         }
     }
     for (col, cell) in cells.iter().enumerate() {
@@ -156,23 +172,32 @@ pub(crate) fn draw_grid(
     // only the draw X position (and glyph mirroring) go through the map.
     let bidi: Vec<Option<crate::core::BidiRow>> = (0..grid.rows)
         .map(|r| {
-            if status.is_some() && r == last_row { None } else { grid.bidi_row(r) }
+            if status.is_some() && r == last_row {
+                None
+            } else {
+                grid.bidi_row(r)
+            }
         })
         .collect();
     let vis = |col: usize, row: usize| -> usize {
-        bidi[row].as_ref().and_then(|b| b.log2vis.get(col)).map_or(col, |&v| v as usize)
+        bidi[row]
+            .as_ref()
+            .and_then(|b| b.log2vis.get(col))
+            .map_or(col, |&v| v as usize)
     };
 
     // Pass 1: backgrounds (every cell, incl. wide trailers, before glyphs).
     for i in 0..grid.cols * grid.rows {
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
+        let cell = if on_status {
+            status.unwrap()[col]
+        } else {
+            grid.viewport_cell(col, row)
+        };
         let bg = if !on_status && block_cursor(col, row) {
             grid.cursor_color
-        } else if !on_status
-            && let Some(cur) = search_hl(col, row)
-        {
+        } else if !on_status && let Some(cur) = search_hl(col, row) {
             if cur { SEARCH_CUR_BG } else { SEARCH_BG }
         } else if !on_status && inverted(col, row) {
             cell.fg
@@ -199,7 +224,11 @@ pub(crate) fn draw_grid(
     for row in 0..grid.rows {
         let on_status = status.is_some() && row == last_row;
         let cell_at = |col: usize| {
-            if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) }
+            if on_status {
+                status.unwrap()[col]
+            } else {
+                grid.viewport_cell(col, row)
+            }
         };
         let eligible = |col: usize, cell: &Cell| {
             let special = !on_status
@@ -229,17 +258,14 @@ pub(crate) fn draw_grid(
                     || (cell.ch == ' ' && cell.cluster == 0)
                     || cell.ch == '\u{10EEEE}';
                 plan[row * grid.cols + col] = (!blank).then(|| {
-                    let style = Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
+                    let style =
+                        Style::new(cell.flags & ATTR_BOLD != 0, cell.flags & ATTR_ITALIC != 0);
                     // Arabic contextual form first (phase 3), then rule L4
                     // mirroring for RTL-run chars (Arabic never mirrors, so
                     // the order can't double-substitute).
                     let ch = match &bidi[row] {
                         Some(b) => {
-                            let ch = b
-                                .shaped
-                                .as_ref()
-                                .and_then(|s| s[col])
-                                .unwrap_or(cell.ch);
+                            let ch = b.shaped.as_ref().and_then(|s| s[col]).unwrap_or(cell.ch);
                             if b.rtl[col] {
                                 crate::core::bidi_mirrored(ch).unwrap_or(ch)
                             } else {
@@ -283,14 +309,16 @@ pub(crate) fn draw_grid(
         }
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
+        let cell = if on_status {
+            status.unwrap()[col]
+        } else {
+            grid.viewport_cell(col, row)
+        };
         let (fg, under_bg) = if !on_status && block_cursor(col, row) {
             (cell.bg, grid.cursor_color)
         } else if !on_status && inverted(col, row) {
             (cell.bg, cell.fg)
-        } else if !on_status
-            && let Some(cur) = search_hl(col, row)
-        {
+        } else if !on_status && let Some(cur) = search_hl(col, row) {
             (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG })
         } else {
             (cell.fg, cell.bg)
@@ -312,15 +340,19 @@ pub(crate) fn draw_grid(
     for i in 0..grid.cols * grid.rows {
         let (col, row) = (i % grid.cols, i / grid.cols);
         let on_status = status.is_some() && row == last_row;
-        let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
+        let cell = if on_status {
+            status.unwrap()[col]
+        } else {
+            grid.viewport_cell(col, row)
+        };
         if cell.flags & WIDE_TRAILER != 0 {
             continue;
         }
         // Ctrl-hovered hyperlink (G22): forces a plain underline over its
         // column span regardless of the cell's own SGR underline attribute —
         // the click affordance, not a text style.
-        let hovered = !on_status
-            && hover_link.is_some_and(|(hr, s, e)| row == hr && col >= s && col <= e);
+        let hovered =
+            !on_status && hover_link.is_some_and(|(hr, s, e)| row == hr && col >= s && col <= e);
         let underline = cell.flags & ATTR_UNDERLINE != 0 || hovered;
         let strike = cell.flags & ATTR_STRIKE != 0;
         if !underline && !strike {
@@ -341,8 +373,11 @@ pub(crate) fn draw_grid(
             } else {
                 base_fg
             };
-            let style =
-                if hovered { UnderlineStyle::Straight } else { UnderlineStyle::from_attrs(cell.flags) };
+            let style = if hovered {
+                UnderlineStyle::Straight
+            } else {
+                UnderlineStyle::from_attrs(cell.flags)
+            };
             draw_underline(buf, width, height, x0, y0, cw, ch, color, style);
         }
         if strike {
@@ -426,16 +461,28 @@ pub(crate) fn draw_grid(
     // omit them inherit from the left/top neighbor (spec inference).
     if let Some(ph) = grid.placeholder_map() {
         for (i, entry) in ph.iter().enumerate() {
-            let Some((id, prow, pcol)) = *entry else { continue };
-            let Some((iw, ihh, pixels)) = grid.kitty_frame(id) else { continue };
-            let Some((pcols, prows)) = grid.placeholder_grid(id, cw, ch) else { continue };
+            let Some((id, prow, pcol)) = *entry else {
+                continue;
+            };
+            let Some((iw, ihh, pixels)) = grid.kitty_frame(id) else {
+                continue;
+            };
+            let Some((pcols, prows)) = grid.placeholder_grid(id, cw, ch) else {
+                continue;
+            };
             let (prow, pcol) = (prow as usize, pcol as usize);
             if prow >= prows || pcol >= pcols {
                 continue; // an index past the placement grid shows nothing
             }
             let (col, row) = (i % grid.cols, i / grid.cols);
-            let (sx0, sx1) = (pcol * iw / pcols, ((pcol + 1) * iw / pcols).max(pcol * iw / pcols + 1));
-            let (sy0, sy1) = (prow * ihh / prows, ((prow + 1) * ihh / prows).max(prow * ihh / prows + 1));
+            let (sx0, sx1) = (
+                pcol * iw / pcols,
+                ((pcol + 1) * iw / pcols).max(pcol * iw / pcols + 1),
+            );
+            let (sy0, sy1) = (
+                prow * ihh / prows,
+                ((prow + 1) * ihh / prows).max(prow * ihh / prows + 1),
+            );
             let (x0, y0) = (ox + (col0 + col) * cw, oy + (row0 + row) * ch);
             for dy in 0..ch {
                 let py = y0 + dy;
@@ -504,7 +551,16 @@ pub(crate) fn draw_grid(
 
 /// Fill a `cw`-wide, `thick`-tall horizontal stripe at `(x0, y0)` in `color`.
 #[allow(clippy::too_many_arguments)]
-fn hline(buf: &mut [u32], width: usize, height: usize, x0: usize, cw: usize, y0: usize, thick: usize, color: u32) {
+fn hline(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    cw: usize,
+    y0: usize,
+    thick: usize,
+    color: u32,
+) {
     for y in y0..(y0 + thick).min(height) {
         let base = y * width;
         for x in x0..(x0 + cw).min(width) {
@@ -592,14 +648,31 @@ fn draw_underline(
 /// Draw one cell's strikethrough stripe through the vertical middle of the
 /// cell box.
 #[allow(clippy::too_many_arguments)]
-fn draw_strike(buf: &mut [u32], width: usize, height: usize, x0: usize, y0: usize, cw: usize, ch: usize, color: u32) {
+fn draw_strike(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    cw: usize,
+    ch: usize,
+    color: u32,
+) {
     let thick = (ch / 12).max(1);
     let y = (y0 + ch / 2).saturating_sub(thick / 2);
     hline(buf, width, height, x0, cw, y, thick, color);
 }
 
 /// Alpha-blend a glyph's coverage in `fg` over whatever is already in `buf`.
-fn blit(buf: &mut [u32], width: usize, height: usize, glyph: &Glyph, pen_x: i32, pen_y: i32, fg: u32) {
+fn blit(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    glyph: &Glyph,
+    pen_x: i32,
+    pen_y: i32,
+    fg: u32,
+) {
     for gy in 0..glyph.height {
         let py = pen_y + gy as i32;
         if py < 0 || py as usize >= height {
@@ -643,7 +716,6 @@ fn blend(bg: u32, fg: u32, a: u8) -> u32 {
     };
     (chan(16) << 16) | (chan(8) << 8) | chan(0)
 }
-
 
 /// Paint the command gutter marks: a 3px vertical stripe one pixel left of
 /// the pane's text edge, one per marked viewport `row`, in the mark's color
@@ -723,7 +795,6 @@ pub(crate) fn draw_trail(
     }
 }
 
-
 /// The ghost cells of a cursor trail `from -> to` at animation progress `t`
 /// (`0.0` = just moved, `1.0` = done): up to eight cells sampled along the
 /// straight line between the two positions, alpha graded toward the head and
@@ -772,14 +843,20 @@ mod tests {
     fn trail_ghosts_sample_fade_and_expire() {
         let g = trail_ghosts((0, 0), (6, 0), 0.0);
         assert!(!g.is_empty() && g.len() <= 8);
-        assert!(g.iter().all(|&(c, r, _)| r == 0 && c < 6), "between, excluding the head: {g:?}");
+        assert!(
+            g.iter().all(|&(c, r, _)| r == 0 && c < 6),
+            "between, excluding the head: {g:?}"
+        );
         assert_eq!(g[0].0, 0, "starts at the old position");
         assert!(g.last().unwrap().2 > g[0].2, "alpha grades toward the head");
         // Fading: same hop later in the animation is uniformly dimmer.
         let later = trail_ghosts((0, 0), (6, 0), 0.5);
         assert!(later[0].2 < g[0].2);
         assert!(trail_ghosts((0, 0), (6, 0), 1.0).is_empty(), "expired");
-        assert!(trail_ghosts((3, 3), (3, 3), 0.0).is_empty(), "no hop, no trail");
+        assert!(
+            trail_ghosts((3, 3), (3, 3), 0.0).is_empty(),
+            "no hop, no trail"
+        );
         // Adjacent-cell hop still leaves one ghost at the old position.
         let one = trail_ghosts((4, 2), (5, 2), 0.0);
         assert_eq!(one.len(), 1);
@@ -801,7 +878,18 @@ mod tests {
         assert!((inside >> 16) & 0xFF > 0x40, "red blended in: {inside:06x}");
         assert_eq!(buf[0], 0, "cells outside the ghost untouched");
         // Out-of-range ghosts are ignored, not panicking.
-        draw_trail(&mut buf, w, h, &grid, 0, 0, 0, 0, &[(99, 99, 1.0)], &mut font);
+        draw_trail(
+            &mut buf,
+            w,
+            h,
+            &grid,
+            0,
+            0,
+            0,
+            0,
+            &[(99, 99, 1.0)],
+            &mut font,
+        );
     }
 
     /// A deterministic 4×8 cell whose every non-space glyph is a solid 2×2 block
@@ -816,10 +904,24 @@ mod tests {
         }
         fn glyph(&mut self, ch: char, _style: Style) -> Rc<Glyph> {
             if ch == ' ' {
-                return Rc::new(Glyph { width: 0, height: 0, left: 0, top: 0, coverage: Vec::new(), color: None });
+                return Rc::new(Glyph {
+                    width: 0,
+                    height: 0,
+                    left: 0,
+                    top: 0,
+                    coverage: Vec::new(),
+                    color: None,
+                });
             }
             // top = -baseline places the bitmap's top row at the cell's top.
-            Rc::new(Glyph { width: 2, height: 2, left: 0, top: -6, coverage: vec![255; 4], color: None })
+            Rc::new(Glyph {
+                width: 2,
+                height: 2,
+                left: 0,
+                top: -6,
+                coverage: vec![255; 4],
+                color: None,
+            })
         }
     }
 
@@ -898,7 +1000,11 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         assert_eq!(buf[4 * w], 0x00FF00);
-        assert_eq!(buf[6 * w], 0x000000, "strike doesn't also draw near the bottom");
+        assert_eq!(
+            buf[6 * w],
+            0x000000,
+            "strike doesn't also draw near the bottom"
+        );
     }
 
     #[test]
@@ -921,8 +1027,25 @@ mod tests {
         let (w, h) = (4usize * 3, 8usize);
         let mut buf = vec![0u32; w * h];
         // Hover span covers cols 0..=1 ('A','B') on row 0.
-        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, true, false, Some((0, 0, 1)), &mut MockFont);
-        assert_eq!(buf[6 * w], 0xFF0000, "col 0 underlined even with no ATTR_UNDERLINE");
+        draw_grid(
+            &mut buf,
+            w,
+            h,
+            &g,
+            0,
+            0,
+            0,
+            0,
+            true,
+            false,
+            Some((0, 0, 1)),
+            &mut MockFont,
+        );
+        assert_eq!(
+            buf[6 * w],
+            0xFF0000,
+            "col 0 underlined even with no ATTR_UNDERLINE"
+        );
         assert_eq!(buf[6 * w + 4], 0xFF0000, "col 1 underlined too");
         assert_eq!(buf[6 * w + 8], 0x000000, "col 2 is outside the hover span");
     }
@@ -937,7 +1060,20 @@ mod tests {
         p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[4m\x1b[58;2;0;0;255m ");
         let (w, h) = (4usize, 8usize);
         let mut buf = vec![0u32; w * h];
-        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, true, false, Some((0, 0, 0)), &mut MockFont);
+        draw_grid(
+            &mut buf,
+            w,
+            h,
+            &g,
+            0,
+            0,
+            0,
+            0,
+            true,
+            false,
+            Some((0, 0, 0)),
+            &mut MockFont,
+        );
         assert_eq!(buf[6 * w], 0xFF0000);
     }
 
@@ -952,7 +1088,11 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         // Bottom cell-row, second cell (no glyph there) is pure status bg.
-        assert_eq!(buf[chh * w + cw + 1], 0x123456, "bottom row is the status overlay");
+        assert_eq!(
+            buf[chh * w + cw + 1],
+            0x123456,
+            "bottom row is the status overlay"
+        );
         // A non-cursor top-row cell (col 1) is untouched: default black background.
         assert_eq!(buf[cw], 0x000000, "top row not overlaid");
     }
@@ -970,7 +1110,10 @@ mod tests {
             eprintln!("no system font; skipping real-font render");
             return;
         };
-        let set = super::super::font::FontSet { regular: bytes, ..Default::default() };
+        let set = super::super::font::FontSet {
+            regular: bytes,
+            ..Default::default()
+        };
         let mut fc = super::super::font::FontCache::new(set, 16.0, false).unwrap();
         let (cw, chh) = fc.cell_size();
         let mut g = Grid::new(3, 1);
@@ -980,7 +1123,10 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut fc, &mut buf, w, h, true);
         // Glyphs were drawn: at least some pixels differ from the black bg.
-        assert!(buf.iter().any(|&px| px != 0x000000), "expected rasterized glyph pixels");
+        assert!(
+            buf.iter().any(|&px| px != 0x000000),
+            "expected rasterized glyph pixels"
+        );
     }
 
     #[test]
@@ -1035,7 +1181,11 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);
         assert_eq!(buf[0], 0x0000FF, "top of the cell keeps the cell bg");
-        assert_eq!(buf[(h - 1) * w], 0x00FF00, "bottom row is the underline cursor");
+        assert_eq!(
+            buf[(h - 1) * w],
+            0x00FF00,
+            "bottom row is the underline cursor"
+        );
     }
 
     #[test]
@@ -1060,7 +1210,10 @@ mod tests {
         let mut buf = vec![0u32; 4 * 8];
         // cursor_on == false models the blink off-phase: nothing is drawn.
         render(&g, &[], &mut MockFont, &mut buf, 4, 8, false);
-        assert!(buf.iter().all(|&px| px == 0x0000FF), "off-phase draws no cursor");
+        assert!(
+            buf.iter().all(|&px| px == 0x0000FF),
+            "off-phase draws no cursor"
+        );
     }
 
     #[test]
@@ -1126,8 +1279,21 @@ mod tests {
         assert_eq!(buf[0], 0, "unmarked rows untouched");
         // A pane flush with the window edge has no room: the stripe clips away.
         let mut flush = vec![0u32; w * h];
-        draw_marks(&mut flush, w, h, 0, 0, 0, 0, &[(0, 0xFF0000)], &mut MockFont);
-        assert!(flush.iter().all(|&p| p == 0), "no room left of the pane: nothing painted");
+        draw_marks(
+            &mut flush,
+            w,
+            h,
+            0,
+            0,
+            0,
+            0,
+            &[(0, 0xFF0000)],
+            &mut MockFont,
+        );
+        assert!(
+            flush.iter().all(|&p| p == 0),
+            "no room left of the pane: nothing painted"
+        );
     }
 
     #[test]
@@ -1139,8 +1305,25 @@ mod tests {
         let (w, h) = (3 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
         // A split pane draws its grid at a cell offset; here (1, 1).
-        draw_grid(&mut buf, w, h, &g, 1, 1, 0, 0, false, false, None, &mut MockFont);
-        assert_eq!(buf[ch * w + cw], 0x0000FF, "the cell is painted at the offset");
+        draw_grid(
+            &mut buf,
+            w,
+            h,
+            &g,
+            1,
+            1,
+            0,
+            0,
+            false,
+            false,
+            None,
+            &mut MockFont,
+        );
+        assert_eq!(
+            buf[ch * w + cw],
+            0x0000FF,
+            "the cell is painted at the offset"
+        );
         assert_eq!(buf[0], 0, "the origin is left untouched (a divider gap)");
     }
 
@@ -1151,7 +1334,20 @@ mod tests {
         let (cw, ch) = (4usize, 8usize);
         let (w, h) = (4 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
-        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
+        draw_grid(
+            &mut buf,
+            w,
+            h,
+            &g,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            None,
+            &mut MockFont,
+        );
         // The image composites as real pixels over its reserved half-block cell.
         assert_eq!(buf[0], 0xFF0000, "image pixel composited at the origin");
     }
@@ -1161,23 +1357,58 @@ mod tests {
         let mut g = Grid::new(4, 2);
         let mut p = crate::core::AnsiParser::new();
         // A 2x1 image (red|green) stored + virtually placed on a 2x1 grid.
-        p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA//8AAP8=\x1b\\");
+        p.advance(
+            &mut g,
+            b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA//8AAP8=\x1b\\",
+        );
         // Wait — payload is red|red; use two colors: ff0000ff 00ff00ff.
-        p.advance(&mut g, b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA/wD/AP8=\x1b\\");
+        p.advance(
+            &mut g,
+            b"\x1b_Gf=32,s=2,v=1,a=T,U=1,i=5,c=2,r=1;/wAA/wD/AP8=\x1b\\",
+        );
         // Two placeholder cells, row 0 cols 0/1 (diacritics 0 and 1), id in fg.
         p.advance(&mut g, b"\x1b[38;2;0;0;5m");
-        p.advance(&mut g, "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes());
+        p.advance(
+            &mut g,
+            "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}".as_bytes(),
+        );
         let (cw, ch) = (4usize, 8usize);
         let (w, h) = (4 * cw, 2 * ch);
         let mut buf = vec![0u32; w * h];
-        draw_grid(&mut buf, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
+        draw_grid(
+            &mut buf,
+            w,
+            h,
+            &g,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            None,
+            &mut MockFont,
+        );
         assert_eq!(buf[0], 0xFF0000, "cell (0,0) shows the red half");
         assert_eq!(buf[cw], 0x00FF00, "cell (1,0) shows the green half");
         // Inference: a third placeholder with no diacritics continues the
         // row; column 2 is past the 2-wide placement, so it paints nothing.
         p.advance(&mut g, "\u{10EEEE}".as_bytes());
         let mut buf2 = vec![0u32; w * h];
-        draw_grid(&mut buf2, w, h, &g, 0, 0, 0, 0, false, false, None, &mut MockFont);
+        draw_grid(
+            &mut buf2,
+            w,
+            h,
+            &g,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            None,
+            &mut MockFont,
+        );
         assert_eq!(buf2[2 * cw], 0, "index past the placement grid stays empty");
     }
 
@@ -1190,7 +1421,10 @@ mod tests {
         g.cursor_visible = false;
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
-        assert!(buf.iter().all(|&px| px == 0x0000FF), "no cursor: plain blue bg");
+        assert!(
+            buf.iter().all(|&px| px == 0x0000FF),
+            "no cursor: plain blue bg"
+        );
     }
 
     #[test]
@@ -1203,7 +1437,10 @@ mod tests {
         g.view_offset = 1; // browsing history — live cursor must not draw
         let mut buf = vec![0u32; 4 * 8];
         render(&g, &[], &mut MockFont, &mut buf, 4, 8, true);
-        assert!(buf.iter().all(|&px| px == 0x0000FF), "scrolled back: no cursor");
+        assert!(
+            buf.iter().all(|&px| px == 0x0000FF),
+            "scrolled back: no cursor"
+        );
     }
 
     #[test]
@@ -1225,8 +1462,15 @@ mod tests {
         assert!(g.scroll_view_up(1));
         let mut buf = vec![0u32; 4 * 16];
         render(&g, &[], &mut MockFont, &mut buf, 4, 16, true);
-        assert_eq!(buf[0], 0x0000FF, "scrolled back: blue history in the top row");
-        assert_eq!(buf[8 * 4], 0x008000, "row below shows the live top row (green)");
+        assert_eq!(
+            buf[0], 0x0000FF,
+            "scrolled back: blue history in the top row"
+        );
+        assert_eq!(
+            buf[8 * 4],
+            0x008000,
+            "row below shows the live top row (green)"
+        );
     }
 
     #[test]
@@ -1235,7 +1479,10 @@ mod tests {
         let mut p = AnsiParser::new();
         p.advance(&mut g, b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m  ");
         g.cursor_visible = false; // isolate selection from the cursor
-        g.selection = Some(crate::core::Selection { anchor: (0, 0), head: (0, 0) });
+        g.selection = Some(crate::core::Selection {
+            anchor: (0, 0),
+            head: (0, 0),
+        });
         let (w, h) = (8usize, 8usize); // 2 cols * 4px
         let mut buf = vec![0u32; w * h];
         render(&g, &[], &mut MockFont, &mut buf, w, h, true);
@@ -1273,12 +1520,25 @@ mod tests {
         };
         let (on, cw, chh) = render_fi(true);
         let (off, _, _) = render_fi(false);
-        assert!(nonbg(&on, cw, chh, 0) > 0, "first cell renders (ligatures on)");
-        assert!(nonbg(&off, cw, chh, 0) > 0, "first cell renders (ligatures off)");
+        assert!(
+            nonbg(&on, cw, chh, 0) > 0,
+            "first cell renders (ligatures on)"
+        );
+        assert!(
+            nonbg(&off, cw, chh, 0) > 0,
+            "first cell renders (ligatures off)"
+        );
         // With ligatures the run collapses to one glyph, leaving the 2nd cell empty.
-        assert_eq!(nonbg(&on, cw, chh, 1), 0, "ligature consumes the second cell");
+        assert_eq!(
+            nonbg(&on, cw, chh, 1),
+            0,
+            "ligature consumes the second cell"
+        );
         // Without ligatures, the second cell renders its own glyph.
-        assert!(nonbg(&off, cw, chh, 1) > 0, "no ligature: second cell renders");
+        assert!(
+            nonbg(&off, cw, chh, 1) > 0,
+            "no ligature: second cell renders"
+        );
     }
 
     #[test]
@@ -1293,7 +1553,9 @@ mod tests {
             // Opaque red, transparent, opaque green, half-alpha blue.
             color: Some(vec![0xFFFF0000, 0x00000000, 0xFF00FF00, 0x800000FF]),
         };
-        blit(&mut buf, 4, 4, &glyph, 0, 0, 0x123456 /* fg must be ignored */);
+        blit(
+            &mut buf, 4, 4, &glyph, 0, 0, 0x123456, /* fg must be ignored */
+        );
         assert_eq!(buf[0], 0xFF0000, "opaque red pixel");
         assert_eq!(buf[1], 0x000000, "transparent pixel leaves bg");
         assert_eq!(buf[4], 0x00FF00, "opaque green pixel");

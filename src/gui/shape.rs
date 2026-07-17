@@ -83,7 +83,11 @@ impl Shaper {
         if lookups.is_empty() {
             return None;
         }
-        Some(Shaper { data, lookups, cache: RefCell::new(HashMap::new()) })
+        Some(Shaper {
+            data,
+            lookups,
+            cache: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Number of memoized `shape()` runs (test-only introspection).
@@ -198,11 +202,7 @@ fn apply_single(s: &SingleSubstitution, buf: &mut [(u16, u8)], pos: usize) -> Op
 
 /// Type 4: replace a run of glyphs with a single ligature glyph, carrying the
 /// summed cell span.
-fn apply_ligature(
-    l: &LigatureSubstitution,
-    buf: &mut Vec<(u16, u8)>,
-    pos: usize,
-) -> Option<usize> {
+fn apply_ligature(l: &LigatureSubstitution, buf: &mut Vec<(u16, u8)>, pos: usize) -> Option<usize> {
     let g = buf.get(pos)?.0;
     let cov = l.coverage.get(GlyphId(g))?;
     let set = l.ligature_sets.get(cov)?;
@@ -257,7 +257,11 @@ fn apply_context(
             }
             None
         }
-        ContextLookup::Format2 { coverage, classes, sets } => {
+        ContextLookup::Format2 {
+            coverage,
+            classes,
+            sets,
+        } => {
             coverage.get(GlyphId(buf.get(pos)?.0))?;
             let set = sets.get(classes.get(GlyphId(buf[pos].0)))?;
             for ri in 0..set.len() {
@@ -269,7 +273,11 @@ fn apply_context(
             }
             None
         }
-        ContextLookup::Format3 { coverage, coverages, lookups } => {
+        ContextLookup::Format3 {
+            coverage,
+            coverages,
+            lookups,
+        } => {
             coverage.get(GlyphId(buf.get(pos)?.0))?;
             for k in 0..coverages.len() {
                 let g = buf.get(pos + 1 + k as usize)?.0;
@@ -512,7 +520,11 @@ mod tests {
         assert_eq!(s.cache_len(), 1);
         let b = s.shape(&[5, 6]);
         assert_eq!(a, b);
-        assert_eq!(s.cache_len(), 1, "repeat call must hit the cache, not add an entry");
+        assert_eq!(
+            s.cache_len(),
+            1,
+            "repeat call must hit the cache, not add an entry"
+        );
         s.shape(&[4, 2]); // a distinct run does add an entry
         assert_eq!(s.cache_len(), 2);
     }

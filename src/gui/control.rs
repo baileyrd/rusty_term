@@ -22,9 +22,17 @@ use std::path::PathBuf;
 /// One parsed control request.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CtlCommand {
-    NewTab { cwd: Option<PathBuf>, profile: Option<String>, shell: Option<String> },
+    NewTab {
+        cwd: Option<PathBuf>,
+        profile: Option<String>,
+        shell: Option<String>,
+    },
     /// Open a new top-level window (same options as `new-tab` for its first tab).
-    NewWindow { cwd: Option<PathBuf>, profile: Option<String>, shell: Option<String> },
+    NewWindow {
+        cwd: Option<PathBuf>,
+        profile: Option<String>,
+        shell: Option<String>,
+    },
     /// Toggle the quake (dropdown) window: create it on first use, then
     /// show/hide it. Bind a WM/desktop hotkey to `rusty_term ctl quake`.
     Quake,
@@ -57,7 +65,10 @@ pub(crate) fn pipe_path() -> String {
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Parse one request line. Tokens split on whitespace outside double quotes;
@@ -67,7 +78,8 @@ pub(crate) fn parse_command(line: &str) -> Result<CtlCommand, String> {
     let cmd = tokens.first().ok_or("empty command")?;
     let kv = |wanted: &str| -> Option<String> {
         tokens.iter().skip(1).find_map(|t| {
-            t.split_once('=').and_then(|(k, v)| (k == wanted).then(|| v.to_string()))
+            t.split_once('=')
+                .and_then(|(k, v)| (k == wanted).then(|| v.to_string()))
         })
     };
     match cmd.as_str() {
@@ -88,7 +100,9 @@ pub(crate) fn parse_command(line: &str) -> Result<CtlCommand, String> {
         }
         "list-tabs" => Ok(CtlCommand::ListTabs),
         "focus-tab" => {
-            let n = kv("n").and_then(|v| v.parse().ok()).ok_or("focus-tab needs n=<index>")?;
+            let n = kv("n")
+                .and_then(|v| v.parse().ok())
+                .ok_or("focus-tab needs n=<index>")?;
             Ok(CtlCommand::FocusTab(n))
         }
         "ping" => Ok(CtlCommand::Ping),
@@ -180,13 +194,23 @@ impl std::io::Read for NamedPipe {
         // SAFETY: `buf` is a valid, exclusively-borrowed slice for the
         // duration of the call; `self.0` is a pipe HANDLE we own.
         let ok = unsafe {
-            ReadFile(self.0, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut())
+            ReadFile(
+                self.0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut n,
+                std::ptr::null_mut(),
+            )
         };
         if ok == 0 {
             let e = std::io::Error::last_os_error();
             // The peer disconnecting mid-read surfaces as ERROR_BROKEN_PIPE;
             // treat it as EOF, like a closed socket.
-            return if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) { Ok(0) } else { Err(e) };
+            return if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                Ok(0)
+            } else {
+                Err(e)
+            };
         }
         Ok(n as usize)
     }
@@ -199,9 +223,20 @@ impl std::io::Write for NamedPipe {
         let mut n = 0u32;
         // SAFETY: `buf` is a valid slice for the duration of the call;
         // `self.0` is a pipe HANDLE we own.
-        let ok =
-            unsafe { WriteFile(self.0, buf.as_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut()) };
-        if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+        let ok = unsafe {
+            WriteFile(
+                self.0,
+                buf.as_ptr(),
+                buf.len() as u32,
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -226,7 +261,9 @@ impl Drop for NamedPipe {
 #[cfg(windows)]
 pub fn request(line: &str) -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+    };
     let wpath = wide(&pipe_path());
     // SAFETY: `wpath` is a valid NUL-terminated UTF-16 string; the call opens
     // an existing pipe instance for duplex I/O with no sharing/security
@@ -317,7 +354,10 @@ fn handle(
         Err(e) => format!("err {e}\n"),
         Ok(cmd) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            if proxy.send_event(super::window::UserEvent::Control(cmd, tx)).is_err() {
+            if proxy
+                .send_event(super::window::UserEvent::Control(cmd, tx))
+                .is_err()
+            {
                 "err event loop is gone\n".to_string()
             } else {
                 rx.recv_timeout(std::time::Duration::from_secs(3))
@@ -337,7 +377,9 @@ pub(crate) fn serve(
     proxy: winit::event_loop::EventLoopProxy<super::window::UserEvent>,
 ) -> std::io::Result<PathBuf> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    };
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
@@ -443,7 +485,10 @@ fn handle(pipe: NamedPipe, proxy: winit::event_loop::EventLoopProxy<super::windo
         Err(e) => format!("err {e}\n"),
         Ok(cmd) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            if proxy.send_event(super::window::UserEvent::Control(cmd, tx)).is_err() {
+            if proxy
+                .send_event(super::window::UserEvent::Control(cmd, tx))
+                .is_err()
+            {
                 "err event loop is gone\n".to_string()
             } else {
                 rx.recv_timeout(std::time::Duration::from_secs(3))
@@ -473,7 +518,10 @@ mod tests {
             parse_command(r#"send-text text="ls -la\n""#).unwrap(),
             CtlCommand::SendText("ls -la\n".into())
         );
-        assert_eq!(parse_command("focus-tab n=2").unwrap(), CtlCommand::FocusTab(2));
+        assert_eq!(
+            parse_command("focus-tab n=2").unwrap(),
+            CtlCommand::FocusTab(2)
+        );
     }
 
     #[test]
@@ -488,7 +536,11 @@ mod tests {
         );
         assert_eq!(
             parse_command("new-window").unwrap(),
-            CtlCommand::NewWindow { cwd: None, profile: None, shell: None }
+            CtlCommand::NewWindow {
+                cwd: None,
+                profile: None,
+                shell: None
+            }
         );
         assert_eq!(parse_command("quake").unwrap(), CtlCommand::Quake);
     }
@@ -538,7 +590,9 @@ mod tests {
     #[test]
     fn request_round_trips_one_line_and_reads_to_ok() {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        };
         use windows_sys::Win32::System::Pipes::{
             CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
         };

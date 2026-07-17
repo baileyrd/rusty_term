@@ -27,17 +27,30 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(col: usize, row: usize, cols: usize, rows: usize) -> Self {
-        Self { col, row, cols, rows }
+        Self {
+            col,
+            row,
+            cols,
+            rows,
+        }
     }
 
     pub(crate) fn contains(&self, col: usize, row: usize) -> bool {
-        col >= self.col && col < self.col + self.cols && row >= self.row && row < self.row + self.rows
+        col >= self.col
+            && col < self.col + self.cols
+            && row >= self.row
+            && row < self.row + self.rows
     }
 }
 
 enum Node {
     Leaf(u64),
-    Split { dir: Dir, ratio: f32, a: Box<Node>, b: Box<Node> },
+    Split {
+        dir: Dir,
+        ratio: f32,
+        a: Box<Node>,
+        b: Box<Node>,
+    },
 }
 
 impl Node {
@@ -114,7 +127,13 @@ impl Node {
     /// changed. The pane's side decides the sign: growing a first (`a`)
     /// child raises the ratio, growing a second (`b`) child lowers it.
     fn resize(&mut self, id: u64, dir: Dir, delta: f32) -> bool {
-        let Node::Split { dir: d, ratio, a, b } = self else {
+        let Node::Split {
+            dir: d,
+            ratio,
+            a,
+            b,
+        } = self
+        else {
             return false;
         };
         let (child, sign): (&mut Node, f32) = if a.contains(id) {
@@ -186,7 +205,9 @@ pub struct Layout {
 impl Layout {
     /// A layout with a single full-area pane.
     pub fn single(id: u64) -> Self {
-        Self { root: Node::Leaf(id) }
+        Self {
+            root: Node::Leaf(id),
+        }
     }
 
     /// Split the `target` pane, giving its new sibling `new`. No-op (returns
@@ -257,7 +278,10 @@ mod tests {
         assert!(l.split(1, 2, Dir::Vertical));
         let rects = l.rects(Rect::new(0, 0, 81, 24));
         // 81 cols: 1 divider, 80 usable -> 40 / 40, divider at col 40.
-        assert_eq!(rects, vec![(1, Rect::new(0, 0, 40, 24)), (2, Rect::new(41, 0, 40, 24))]);
+        assert_eq!(
+            rects,
+            vec![(1, Rect::new(0, 0, 40, 24)), (2, Rect::new(41, 0, 40, 24))]
+        );
     }
 
     #[test]
@@ -266,7 +290,10 @@ mod tests {
         assert!(l.split(1, 2, Dir::Horizontal));
         let rects = l.rects(Rect::new(0, 0, 80, 25));
         // 25 rows: 1 divider, 24 usable -> 12 / 12, divider at row 12.
-        assert_eq!(rects, vec![(1, Rect::new(0, 0, 80, 12)), (2, Rect::new(0, 13, 80, 12))]);
+        assert_eq!(
+            rects,
+            vec![(1, Rect::new(0, 0, 80, 12)), (2, Rect::new(0, 13, 80, 12))]
+        );
     }
 
     #[test]
@@ -294,10 +321,16 @@ mod tests {
         assert_eq!(l.close(3), Some(1));
         assert_eq!(l.ids(), vec![1, 2]);
         let rects = l.rects(Rect::new(0, 0, 81, 24));
-        assert_eq!(rects, vec![(1, Rect::new(0, 0, 40, 24)), (2, Rect::new(41, 0, 40, 24))]);
+        assert_eq!(
+            rects,
+            vec![(1, Rect::new(0, 0, 40, 24)), (2, Rect::new(41, 0, 40, 24))]
+        );
         // Close 1: pane 2 takes the whole area.
         assert_eq!(l.close(1), Some(2));
-        assert_eq!(l.rects(Rect::new(0, 0, 80, 24)), vec![(2, Rect::new(0, 0, 80, 24))]);
+        assert_eq!(
+            l.rects(Rect::new(0, 0, 80, 24)),
+            vec![(2, Rect::new(0, 0, 80, 24))]
+        );
         // Close the last pane: nothing left.
         assert_eq!(l.close(2), None);
     }
@@ -310,7 +343,10 @@ mod tests {
         // Hit-testing goes through rects + Rect::contains (the window's
         // zoom-aware Tab::rects wraps the same primitive).
         let at = |l: &Layout, col: usize, row: usize| {
-            l.rects(area).into_iter().find(|(_, r)| r.contains(col, row)).map(|(id, _)| id)
+            l.rects(area)
+                .into_iter()
+                .find(|(_, r)| r.contains(col, row))
+                .map(|(id, _)| id)
         };
         assert_eq!(at(&l, 0, 0), Some(1));
         assert_eq!(at(&l, 41, 0), Some(2));

@@ -26,7 +26,11 @@ pub(crate) struct Hotkey {
 /// Parse `"win+grave"`, `"ctrl+alt+f12"`, etc.: `+`-separated tokens,
 /// case-insensitive, the last of which is the key and the rest modifiers.
 pub(crate) fn parse(spec: &str) -> Result<Hotkey, String> {
-    let tokens: Vec<&str> = spec.split('+').map(str::trim).filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> = spec
+        .split('+')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
     let Some((key, mods)) = tokens.split_last() else {
         return Err("empty hotkey spec".to_string());
     };
@@ -41,7 +45,10 @@ pub(crate) fn parse(spec: &str) -> Result<Hotkey, String> {
             other => return Err(format!("unknown modifier `{other}`")),
         };
     }
-    Ok(Hotkey { modifiers, vk: parse_key(key)? })
+    Ok(Hotkey {
+        modifiers,
+        vk: parse_key(key)?,
+    })
 }
 
 /// Map a key name to its Win32 virtual-key code. Letters/digits use their
@@ -84,7 +91,8 @@ fn parse_key(key: &str) -> Result<u32, String> {
 pub(crate) fn register(hotkey: Hotkey) -> bool {
     // SAFETY: `hwnd = null` associates the hotkey with this thread's message
     // queue rather than a window; `id`/`modifiers`/`vk` are plain integers.
-    let ok = unsafe { RegisterHotKey(std::ptr::null_mut(), HOTKEY_ID, hotkey.modifiers, hotkey.vk) };
+    let ok =
+        unsafe { RegisterHotKey(std::ptr::null_mut(), HOTKEY_ID, hotkey.modifiers, hotkey.vk) };
     ok != 0
 }
 
@@ -100,7 +108,9 @@ pub(crate) fn unregister() {
 /// A `winit` `with_msg_hook` callback: sets `pressed` when `WM_HOTKEY`
 /// arrives for our id. Runs synchronously on the main thread inside winit's
 /// own message pump, so a plain `Cell` (no locking) is enough.
-pub(crate) fn make_msg_hook(pressed: Rc<Cell<bool>>) -> impl FnMut(*const std::ffi::c_void) -> bool {
+pub(crate) fn make_msg_hook(
+    pressed: Rc<Cell<bool>>,
+) -> impl FnMut(*const std::ffi::c_void) -> bool {
     move |msg_ptr| {
         if msg_ptr.is_null() {
             return false;

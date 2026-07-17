@@ -65,7 +65,12 @@ fn gather_git(cwd: &Path) -> GitInfo {
         .filter(|o| o.status.success())
         .map(|o| parse_porcelain(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or((0, 0, 0));
-    GitInfo { branch, added, modified, deleted }
+    GitInfo {
+        branch,
+        added,
+        modified,
+        deleted,
+    }
 }
 
 /// Count added / modified / deleted entries in `git status --porcelain`
@@ -105,8 +110,11 @@ fn read_git_branch(dir: &Path) -> Option<String> {
         let text = std::fs::read_to_string(&git).ok()?;
         let target = text.strip_prefix("gitdir:")?.trim();
         let target = Path::new(target);
-        let base =
-            if target.is_absolute() { target.to_path_buf() } else { git.parent()?.join(target) };
+        let base = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            git.parent()?.join(target)
+        };
         base.join("HEAD")
     } else {
         git.join("HEAD")
@@ -127,7 +135,9 @@ pub(crate) fn system_load() -> Option<f32> {
     {
         let text = std::fs::read_to_string("/proc/loadavg").ok()?;
         let one: f32 = text.split_ascii_whitespace().next()?.parse().ok()?;
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f32;
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as f32;
         Some(one / cores)
     }
     #[cfg(not(target_os = "linux"))]
@@ -225,7 +235,10 @@ mod tests {
             "{\"load\":0.250,\"mem\":null,\"cwd\":\"/tmp/x\",\"branch\":\"feat/\\\"quo\\\\ted\\\"\",\"git\":{\"added\":1,\"modified\":2,\"deleted\":3}}"
         );
         // And it must be machine-parseable: a control char escapes.
-        let git = GitInfo { branch: Some("a\nb".into()), ..GitInfo::default() };
+        let git = GitInfo {
+            branch: Some("a\nb".into()),
+            ..GitInfo::default()
+        };
         assert!(stats_json(None, None, None, &git).contains("a\\u000ab"));
     }
 

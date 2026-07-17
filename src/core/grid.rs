@@ -5,10 +5,10 @@
 //! …) that the [`AnsiParser`](super::parser::AnsiParser) drives, and produces a
 //! [`DirtyFrame`] snapshot for the renderer.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
 #[cfg(any(test, feature = "gui"))]
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::cell::{Cell, DEFAULT_BG, DEFAULT_FG, Pen, WIDE_TRAILER, char_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -148,17 +148,18 @@ const SEARCH_MAX: usize = 2000;
 /// WezTerm do.
 #[cfg(any(test, feature = "gui"))]
 fn detect_urls(text: &[char]) -> Vec<(usize, usize, String)> {
-    const SCHEMES: [&str; 6] = ["https://", "http://", "ftp://", "file://", "mailto:", "www."];
-    let is_url_char = |c: char| {
-        c.is_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
-    };
+    const SCHEMES: [&str; 6] = [
+        "https://", "http://", "ftp://", "file://", "mailto:", "www.",
+    ];
+    let is_url_char = |c: char| c.is_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
     let lower: Vec<char> = text.iter().map(|c| c.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
-        let Some(scheme) = SCHEMES.iter().find(|s| {
-            lower[i..].starts_with(&s.chars().collect::<Vec<_>>()[..])
-        }) else {
+        let Some(scheme) = SCHEMES
+            .iter()
+            .find(|s| lower[i..].starts_with(&s.chars().collect::<Vec<_>>()[..]))
+        else {
             i += 1;
             continue;
         };
@@ -176,10 +177,14 @@ fn detect_urls(text: &[char]) -> Vec<(usize, usize, String)> {
             let c = text[end - 1];
             let trim = match c {
                 '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
-                ')' => text[i..end].iter().filter(|&&x| x == '(').count()
-                    < text[i..end].iter().filter(|&&x| x == ')').count(),
-                ']' => text[i..end].iter().filter(|&&x| x == '[').count()
-                    < text[i..end].iter().filter(|&&x| x == ']').count(),
+                ')' => {
+                    text[i..end].iter().filter(|&&x| x == '(').count()
+                        < text[i..end].iter().filter(|&&x| x == ')').count()
+                }
+                ']' => {
+                    text[i..end].iter().filter(|&&x| x == '[').count()
+                        < text[i..end].iter().filter(|&&x| x == ']').count()
+                }
                 _ => false,
             };
             if !trim {
@@ -285,7 +290,13 @@ pub(crate) fn fold_char(c: char) -> char {
 /// `^`-anchored pattern matches at most once per line: find-all scans
 /// successive suffixes, where `^` would falsely re-anchor.
 #[cfg(any(test, feature = "gui"))]
-fn find_matches_rx(text: &[char], at: &[(usize, usize)], re: &rusty_regx::Regex, anchored: bool, st: &mut Search) {
+fn find_matches_rx(
+    text: &[char],
+    at: &[(usize, usize)],
+    re: &rusty_regx::Regex,
+    anchored: bool,
+    st: &mut Search,
+) {
     let len = line_len(text);
     let line: String = text[..len].iter().collect();
     // Byte offset of each char (plus the end sentinel), for offset mapping.
@@ -299,7 +310,9 @@ fn find_matches_rx(text: &[char], at: &[(usize, usize)], re: &rusty_regx::Regex,
     let mut from = 0usize; // byte offset the next scan starts at
     while from <= line.len() {
         let suffix = &line[from..];
-        let Some(caps) = re.captures(suffix) else { return };
+        let Some(caps) = re.captures(suffix) else {
+            return;
+        };
         let Some(m) = caps.get(0) else { return };
         // The engine has no positional API, but `m` borrows from `suffix`,
         // so its byte offset is plain (safe) pointer arithmetic on the same
@@ -808,7 +821,13 @@ pub(crate) struct Line {
 /// buffer, preserving the top-left overlap and blank-filling any new area. Used
 /// for the *alternate* screen, whose full-screen apps repaint on resize — there
 /// is no logical-line history there to rejoin, so a plain clip is correct.
-fn reflow_clip(old: &[Cell], old_cols: usize, old_rows: usize, cols: usize, rows: usize) -> Vec<Cell> {
+fn reflow_clip(
+    old: &[Cell],
+    old_cols: usize,
+    old_rows: usize,
+    cols: usize,
+    rows: usize,
+) -> Vec<Cell> {
     let mut new = vec![Cell::blank(); cols * rows];
     let copy_rows = rows.min(old_rows);
     let copy_cols = cols.min(old_cols);
@@ -919,7 +938,11 @@ fn reflow_history(
     // off) and may be narrower than `old_cols`; both are handled by the joiner.
     let phys = |i: usize| -> (&[Cell], bool, LineAttr) {
         if i < hist {
-            (&scrollback[i].cells, scrollback[i].wrapped, LineAttr::Single)
+            (
+                &scrollback[i].cells,
+                scrollback[i].wrapped,
+                LineAttr::Single,
+            )
         } else {
             let y = i - hist;
             (
@@ -983,7 +1006,11 @@ fn reflow_history(
     if cur_started {
         // A trailing wrapped run with no closing hard break (shouldn't normally
         // happen, since a wrap always creates the next row): keep it anyway.
-        let min_keep = if logical.len() == cursor_logical { cursor_off } else { 0 };
+        let min_keep = if logical.len() == cursor_logical {
+            cursor_off
+        } else {
+            0
+        };
         let mut end = cur.len();
         while end > min_keep && is_padding(&cur[end - 1]) {
             end -= 1;
@@ -1162,7 +1189,15 @@ impl StatusLine {
     /// by two columns with a flagged trailer, drop zero-width scalars, stop at the
     /// margin, and pad the tail with blanks in `bg`.
     fn lay_out(text: &str, fg: u32, bg: u32, cols: usize) -> Vec<Cell> {
-        let blank = Cell { ch: ' ', cluster: 0, fg, bg, flags: 0, link: 0, underline_color: fg };
+        let blank = Cell {
+            ch: ' ',
+            cluster: 0,
+            fg,
+            bg,
+            flags: 0,
+            link: 0,
+            underline_color: fg,
+        };
         let mut cells = vec![blank; cols];
         let mut x = 0;
         for ch in text.chars() {
@@ -1173,7 +1208,15 @@ impl StatusLine {
             if x + w > cols {
                 break;
             }
-            cells[x] = Cell { ch, cluster: 0, fg, bg, flags: 0, link: 0, underline_color: fg };
+            cells[x] = Cell {
+                ch,
+                cluster: 0,
+                fg,
+                bg,
+                flags: 0,
+                link: 0,
+                underline_color: fg,
+            };
             if w == 2 {
                 cells[x + 1] = Cell {
                     ch: ' ',
@@ -1193,7 +1236,12 @@ impl StatusLine {
     #[cfg(feature = "l13")]
     fn new(text: String, fg: u32, bg: u32, cols: usize) -> Self {
         let cells = Self::lay_out(&text, fg, bg, cols);
-        StatusLine { text, fg, bg, cells }
+        StatusLine {
+            text,
+            fg,
+            bg,
+            cells,
+        }
     }
 
     /// Re-lay the existing text/colors at a new width (after a resize).
@@ -1381,7 +1429,11 @@ impl Grid {
     /// The cursor home position: the top-left of the screen, or of the scroll
     /// region when origin mode is on.
     fn home_position(&self) -> (usize, usize) {
-        let x = if self.origin_mode && self.side_margins_active() { self.left_margin } else { 0 };
+        let x = if self.origin_mode && self.side_margins_active() {
+            self.left_margin
+        } else {
+            0
+        };
         (x, if self.origin_mode { self.scroll_top } else { 0 })
     }
 
@@ -1445,7 +1497,10 @@ impl Grid {
         if self.kitty_flags_stack.is_empty() {
             self.kitty_flags_stack.push(0);
         }
-        let top = self.kitty_flags_stack.last_mut().expect("just ensured non-empty");
+        let top = self
+            .kitty_flags_stack
+            .last_mut()
+            .expect("just ensured non-empty");
         *top = match mode {
             2 => *top | flags,
             3 => *top & !flags,
@@ -1468,7 +1523,10 @@ impl Grid {
         if !self.sync_output {
             return false;
         }
-        if self.sync_output_since.is_some_and(|t| t.elapsed() > SYNC_OUTPUT_TIMEOUT) {
+        if self
+            .sync_output_since
+            .is_some_and(|t| t.elapsed() > SYNC_OUTPUT_TIMEOUT)
+        {
             self.sync_output = false;
             self.sync_output_since = None;
             return false;
@@ -1636,7 +1694,11 @@ impl Grid {
             }
             (Some(cols), None) => {
                 let tw = cols.min(avail).max(1);
-                let th = if preserve_aspect { (height * tw / width).max(1) } else { height };
+                let th = if preserve_aspect {
+                    (height * tw / width).max(1)
+                } else {
+                    height
+                };
                 (tw, th)
             }
             (None, Some(rows)) => {
@@ -1705,7 +1767,15 @@ impl Grid {
     /// reserved half-block cells, anchored by serial (top cell row) so it
     /// scrolls with text. Bounded — the oldest image is dropped past the cap.
     #[cfg(any(test, feature = "gui"))]
-    fn store_image(&mut self, pw: usize, ph: usize, pixels: &[Option<u32>], col: usize, cols: usize, rows: usize) {
+    fn store_image(
+        &mut self,
+        pw: usize,
+        ph: usize,
+        pixels: &[Option<u32>],
+        col: usize,
+        cols: usize,
+        rows: usize,
+    ) {
         const MAX_IMAGES: usize = 8;
         let serial = self.total_scrolled + self.cursor.1;
         self.images.push(GridImage {
@@ -1741,20 +1811,43 @@ impl Grid {
     ) {
         /// Same total-pixel budget the Kitty store enforces.
         const MAX_STORE_PIXELS: usize = 16 * 1024 * 1024;
-        let Some((first, _)) = frames.first() else { return };
+        let Some((first, _)) = frames.first() else {
+            return;
+        };
         let over_budget =
             width.saturating_mul(height).saturating_mul(frames.len()) > MAX_STORE_PIXELS;
-        if frames.len() == 1 || over_budget || width == 0 || height == 0 || first.len() < width * height {
+        if frames.len() == 1
+            || over_budget
+            || width == 0
+            || height == 0
+            || first.len() < width * height
+        {
             if let Some((px, _)) = frames.into_iter().next() {
-                self.render_image_sized(width, height, &px, target_cols, target_rows, preserve_aspect);
+                self.render_image_sized(
+                    width,
+                    height,
+                    &px,
+                    target_cols,
+                    target_rows,
+                    preserve_aspect,
+                );
             }
             return;
         }
         let first = first.clone();
-        self.render_image_sized(width, height, &first, target_cols, target_rows, preserve_aspect);
+        self.render_image_sized(
+            width,
+            height,
+            &first,
+            target_cols,
+            target_rows,
+            preserve_aspect,
+        );
         // `render_image_sized` bails (no image stored) on degenerate input;
         // only animate an overlay that actually exists.
-        let Some(im) = self.images.last_mut() else { return };
+        let Some(im) = self.images.last_mut() else {
+            return;
+        };
         // Synthesized ids live at the top of the id space so a Kitty client's
         // own ids (typically small integers) don't collide with them.
         let id = 0xFFFF_0000u32 | (self.next_anim_id & 0xFFFF);
@@ -1767,7 +1860,10 @@ impl Grid {
             h: height,
             frames: frames
                 .into_iter()
-                .map(|(pixels, gap_ms)| KittyFrame { pixels, gap_ms: gap_ms.max(40) })
+                .map(|(pixels, gap_ms)| KittyFrame {
+                    pixels,
+                    gap_ms: gap_ms.max(40),
+                })
                 .collect(),
             current: 0,
             playing: true,
@@ -2008,12 +2104,19 @@ impl Grid {
         let sel = self.selection?;
         let total = self.scrollback.len() + self.rows;
         let clamp = |(c, r): (usize, usize)| {
-            (c.min(self.cols.saturating_sub(1)), r.min(total.saturating_sub(1)))
+            (
+                c.min(self.cols.saturating_sub(1)),
+                r.min(total.saturating_sub(1)),
+            )
         };
         let a = clamp(sel.anchor);
         let b = clamp(sel.head);
         // Row-major linear order, so a backward drag still yields start <= end.
-        if (a.1, a.0) <= (b.1, b.0) { Some((a, b)) } else { Some((b, a)) }
+        if (a.1, a.0) <= (b.1, b.0) {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
     }
 
     /// Whether the cell at `(col, row)` lies within the active selection
@@ -2162,7 +2265,9 @@ impl Grid {
     /// (a click on the summary). Returns whether one was expanded.
     #[cfg(any(test, feature = "gui"))]
     pub fn unfold_summary_at(&mut self, vr: usize) -> bool {
-        let Some(i) = self.summary_block_at(vr) else { return false };
+        let Some(i) = self.summary_block_at(vr) else {
+            return false;
+        };
         self.fold_blocks[i].folded = false;
         self.view_offset = self.view_offset.min(self.display_history_len());
         self.dirty.iter_mut().for_each(|d| *d = true);
@@ -2194,7 +2299,10 @@ impl Grid {
     #[cfg(any(test, feature = "gui"))]
     fn summary_cell(&self, block: usize, col: usize) -> Cell {
         let b = &self.fold_blocks[block];
-        let text = format!("\u{25B7} {} lines hidden \u{2014} click to expand", b.end - b.start);
+        let text = format!(
+            "\u{25B7} {} lines hidden \u{2014} click to expand",
+            b.end - b.start
+        );
         let ch = text.chars().nth(col).unwrap_or(' ');
         Cell {
             ch,
@@ -2223,7 +2331,10 @@ impl Grid {
         let (col, row) = (col.min(self.cols - 1), row.min(self.rows - 1));
         let abs = self.abs_of_view_row(row);
         let (start, end) = self.word_bounds_at(abs, col);
-        self.selection = Some(Selection { anchor: (start, abs), head: (end, abs) });
+        self.selection = Some(Selection {
+            anchor: (start, abs),
+            head: (end, abs),
+        });
     }
 
     /// Word-character bounds `(start_col, end_col)` inclusive, containing
@@ -2239,7 +2350,9 @@ impl Grid {
         let col = col.min(self.cols - 1);
         let (cells, _) = self.phys_row(abs);
         let is_word = |c: usize| {
-            let Some(cell) = cells.get(c) else { return false };
+            let Some(cell) = cells.get(c) else {
+                return false;
+            };
             if cell.flags & WIDE_TRAILER != 0 {
                 return true; // ride with its wide lead cell
             }
@@ -2282,7 +2395,10 @@ impl Grid {
         } else {
             ((a_start, a_row), (h_end, h_row))
         };
-        self.selection = Some(Selection { anchor: anchor_out, head: head_out });
+        self.selection = Some(Selection {
+            anchor: anchor_out,
+            head: head_out,
+        });
     }
 
     /// Select the whole logical line through screen `row` (triple-click):
@@ -2297,7 +2413,10 @@ impl Grid {
         }
         let abs = self.abs_of_view_row(row.min(self.rows - 1));
         let (start, end) = self.line_bounds_at(abs);
-        self.selection = Some(Selection { anchor: (0, start), head: (self.cols - 1, end) });
+        self.selection = Some(Selection {
+            anchor: (0, start),
+            head: (self.cols - 1, end),
+        });
     }
 
     /// The absolute-row span `(start_abs, end_abs)` inclusive of the
@@ -2327,9 +2446,15 @@ impl Grid {
         let (a_start, a_end) = self.line_bounds_at(anchor_row);
         let (h_start, h_end) = self.line_bounds_at(head_row);
         let dragging_back = head_row < anchor_row;
-        let (start_row, end_row) = if dragging_back { (h_start, a_end) } else { (a_start, h_end) };
-        self.selection =
-            Some(Selection { anchor: (0, start_row), head: (self.cols.saturating_sub(1), end_row) });
+        let (start_row, end_row) = if dragging_back {
+            (h_start, a_end)
+        } else {
+            (a_start, h_end)
+        };
+        self.selection = Some(Selection {
+            anchor: (0, start_row),
+            head: (self.cols.saturating_sub(1), end_row),
+        });
     }
 
     /// The selected text, or `None` when nothing is selected. Lines join with
@@ -2386,8 +2511,11 @@ impl Grid {
             } else {
                 (cell.fg, cell.bg)
             };
-            const STYLED: u16 =
-                super::cell::ATTR_BOLD | super::cell::ATTR_ITALIC | super::cell::ATTR_UNDERLINE | super::cell::ATTR_STRIKE | super::cell::ATTR_DIM;
+            const STYLED: u16 = super::cell::ATTR_BOLD
+                | super::cell::ATTR_ITALIC
+                | super::cell::ATTR_UNDERLINE
+                | super::cell::ATTR_STRIKE
+                | super::cell::ATTR_DIM;
             (fg, bg, cell.flags & STYLED)
         };
         let mut out = format!(
@@ -2418,7 +2546,10 @@ impl Grid {
                     .map(String::as_str);
                 line.push((cell.ch, suffix, style_of(cell)));
             }
-            while line.last().is_some_and(|(c, s, _)| *c == ' ' && s.is_none()) {
+            while line
+                .last()
+                .is_some_and(|(c, s, _)| *c == ' ' && s.is_none())
+            {
                 line.pop();
             }
             let mut open: Option<(u32, u32, u16)> = None;
@@ -2509,7 +2640,10 @@ impl Grid {
         let (from, to) = match mode {
             1 => (0, self.cursor.0.min(self.cols.saturating_sub(1))),
             2 => (0, self.cols.saturating_sub(1)),
-            _ => (self.cursor.0.min(self.cols.saturating_sub(1)), self.cols.saturating_sub(1)),
+            _ => (
+                self.cursor.0.min(self.cols.saturating_sub(1)),
+                self.cols.saturating_sub(1),
+            ),
         };
         self.selective_clear(self.cursor.1, self.cursor.1, Some((from, to)));
     }
@@ -2595,7 +2729,15 @@ impl Grid {
     /// DECFRA — fill the rectangle `[top, bottom] × [left, right]` (0-based,
     /// inclusive) with `ch` in `pen`'s current colors/attributes. Same
     /// bounds handling as [`Self::erase_rect`].
-    pub(crate) fn fill_rect(&mut self, ch: char, pen: Pen, top: usize, left: usize, bottom: usize, right: usize) {
+    pub(crate) fn fill_rect(
+        &mut self,
+        ch: char,
+        pen: Pen,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
         let bottom = bottom.min(self.rows.saturating_sub(1));
         let right = right.min(self.cols.saturating_sub(1));
         if top > bottom || left > right || top >= self.rows || left >= self.cols {
@@ -3134,10 +3276,12 @@ impl Grid {
         for c in &mut self.cells[first_blank..region_end] {
             *c = blank;
         }
-        self.shift_line_meta(cy + n,
-        cy,
-        count / cols,
-        (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1),);
+        self.shift_line_meta(
+            cy + n,
+            cy,
+            count / cols,
+            (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1),
+        );
         for d in &mut self.dirty[cy..=self.scroll_bottom] {
             *d = true;
         }
@@ -3515,7 +3659,8 @@ impl Grid {
                 if self.notif99_pending.len() >= 4 {
                     self.notif99_pending.remove(0);
                 }
-                self.notif99_pending.push((id.to_string(), String::new(), String::new()));
+                self.notif99_pending
+                    .push((id.to_string(), String::new(), String::new()));
                 self.notif99_pending.len() - 1
             }
         };
@@ -3561,7 +3706,10 @@ impl Grid {
         if (col, row) == self.cursor {
             return None;
         }
-        Some((col as isize - self.cursor.0 as isize, row as isize - self.cursor.1 as isize))
+        Some((
+            col as isize - self.cursor.0 as isize,
+            row as isize - self.cursor.1 as isize,
+        ))
     }
 
     /// The scrollbar overlay for the current view, or `None` at the live
@@ -3639,7 +3787,10 @@ impl Grid {
     /// renderers' placeholder path (gui/test builds) consults it.
     #[cfg(any(test, feature = "gui"))]
     pub(crate) fn kitty_virtual_geometry(&self, id: u32) -> Option<(usize, usize)> {
-        self.kitty_virtual.iter().find(|(i, _, _)| *i == id).map(|&(_, c, r)| (c, r))
+        self.kitty_virtual
+            .iter()
+            .find(|(i, _, _)| *i == id)
+            .map(|&(_, c, r)| (c, r))
     }
 
     /// Append an animation frame (`a=f`) to image `id`: the payload is
@@ -3658,11 +3809,18 @@ impl Grid {
         gap_ms: u32,
     ) -> bool {
         const MAX_FRAMES: usize = 64;
-        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else { return false };
+        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
         if img.frames.len() >= MAX_FRAMES {
             return false;
         }
-        let mut base = img.frames.last().expect("images always have a root frame").pixels.clone();
+        let mut base = img
+            .frames
+            .last()
+            .expect("images always have a root frame")
+            .pixels
+            .clone();
         for row in 0..h {
             let dy = y + row;
             if dy >= img.h {
@@ -3676,14 +3834,19 @@ impl Grid {
                 base[dy * img.w + dx] = pixels[row * w + col];
             }
         }
-        img.frames.push(KittyFrame { pixels: base, gap_ms: gap_ms.max(40) });
+        img.frames.push(KittyFrame {
+            pixels: base,
+            gap_ms: gap_ms.max(40),
+        });
         true
     }
 
     /// Start or stop an image's animation (`a=a`). Returns whether the image
     /// exists and has more than one frame.
     pub(crate) fn kitty_animate(&mut self, id: u32, run: bool) -> bool {
-        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else { return false };
+        let Some(img) = self.kitty_images.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
         img.playing = run && img.frames.len() > 1;
         img.last_advance = None;
         img.frames.len() > 1
@@ -3790,7 +3953,11 @@ impl Grid {
     /// from the first two diacritics (`None` = omitted, to be inferred from
     /// neighbors). `None` when the cell isn't a placeholder.
     #[cfg(any(test, feature = "gui"))]
-    pub fn placeholder_at(&self, col: usize, row: usize) -> Option<(u32, Option<u32>, Option<u32>)> {
+    pub fn placeholder_at(
+        &self,
+        col: usize,
+        row: usize,
+    ) -> Option<(u32, Option<u32>, Option<u32>)> {
         if col >= self.cols || row >= self.rows {
             return None;
         }
@@ -3804,7 +3971,9 @@ impl Grid {
         if cell.cluster != 0
             && let Some(suffix) = self.clusters.get((cell.cluster - 1) as usize)
         {
-            let mut vals = suffix.chars().filter_map(super::kitty_diacritics::diacritic_value);
+            let mut vals = suffix
+                .chars()
+                .filter_map(super::kitty_diacritics::diacritic_value);
             r_idx = vals.next();
             c_idx = vals.next();
             if let Some(hi) = vals.next() {
@@ -3841,7 +4010,9 @@ impl Grid {
         // path (which also records it) is compiled out. `D` without a
         // matching `C` still updates it — the exit code needs no timer.
         self.last_exit = exit;
-        let Some(began) = self.command_began.take() else { return };
+        let Some(began) = self.command_began.take() else {
+            return;
+        };
         if self.finished_commands.len() < 8 {
             self.finished_commands.push((exit, began.elapsed()));
         }
@@ -3858,13 +4029,21 @@ impl Grid {
     /// Silently drops the block once [`FOLD_BLOCKS_MAX`] is reached.
     #[cfg(any(test, feature = "gui"))]
     pub(crate) fn fold_output_end(&mut self, exit: Option<i32>) {
-        let Some(start) = self.fold_pending_start.take() else { return };
+        let Some(start) = self.fold_pending_start.take() else {
+            return;
+        };
         let end = self.scrollback.len() + self.cursor.1;
         if start < end && self.fold_blocks.len() < FOLD_BLOCKS_MAX {
             // `command_began` is still armed here — `command_timer_end`
             // (called right after us on the OSC 133;D path) takes it.
             let runtime = self.command_began.map(|t| t.elapsed());
-            self.fold_blocks.push(CommandBlock { start, end, folded: false, exit, runtime });
+            self.fold_blocks.push(CommandBlock {
+                start,
+                end,
+                folded: false,
+                exit,
+                runtime,
+            });
         }
     }
 
@@ -3886,8 +4065,9 @@ impl Grid {
         if self.in_alt_screen() {
             return vec![None; self.rows];
         }
-        let running =
-            self.fold_pending_start.map(|s| (s, self.scrollback.len() + self.cursor.1));
+        let running = self
+            .fold_pending_start
+            .map(|s| (s, self.scrollback.len() + self.cursor.1));
         (0..self.rows)
             .map(|vr| {
                 let abs = self.abs_of_view_row(vr);
@@ -3920,7 +4100,11 @@ impl Grid {
     #[cfg(any(test, feature = "gui"))]
     #[allow(dead_code)] // exercised by tests; the viewport-rendering consumer is future work
     pub(crate) fn toggle_fold_at(&mut self, line: usize) -> bool {
-        match self.fold_blocks.iter_mut().find(|b| (b.start..b.end).contains(&line)) {
+        match self
+            .fold_blocks
+            .iter_mut()
+            .find(|b| (b.start..b.end).contains(&line))
+        {
             Some(b) => {
                 b.folded = !b.folded;
                 true
@@ -4067,7 +4251,10 @@ impl Grid {
             (&self.scrollback[abs].cells, self.scrollback[abs].wrapped)
         } else {
             let y = abs - h;
-            (&self.cells[y * self.cols..(y + 1) * self.cols], self.wrapped[y])
+            (
+                &self.cells[y * self.cols..(y + 1) * self.cols],
+                self.wrapped[y],
+            )
         }
     }
 
@@ -4179,12 +4366,18 @@ impl Grid {
     #[cfg(any(test, feature = "gui"))]
     pub fn search_jump(&mut self, forward: bool) -> bool {
         let abs = {
-            let Some(s) = &mut self.search else { return false };
+            let Some(s) = &mut self.search else {
+                return false;
+            };
             if s.anchors.is_empty() {
                 return false;
             }
             let n = s.anchors.len();
-            s.current = if forward { (s.current + 1) % n } else { (s.current + n - 1) % n };
+            s.current = if forward {
+                (s.current + 1) % n
+            } else {
+                (s.current + n - 1) % n
+            };
             s.anchors[s.current].0
         };
         self.scroll_to_abs(abs);
@@ -4327,9 +4520,11 @@ impl Grid {
         let off = self.view_offset.min(dhl);
         if row < off {
             match self.history_line(dhl - off + row) {
-                HistLine::Abs(l) => {
-                    self.scrollback[l].cells.get(col).copied().unwrap_or_else(Cell::blank)
-                }
+                HistLine::Abs(l) => self.scrollback[l]
+                    .cells
+                    .get(col)
+                    .copied()
+                    .unwrap_or_else(Cell::blank),
                 HistLine::Summary(i) => self.summary_cell(i, col),
             }
         } else {
@@ -4416,7 +4611,12 @@ impl Grid {
             }
             v
         });
-        Some(BidiRow { vis2log, log2vis, rtl, shaped })
+        Some(BidiRow {
+            vis2log,
+            log2vis,
+            rtl,
+            shaped,
+        })
     }
 
     /// Map a viewport cell the *user pointed at* (visual coordinates) to the
@@ -4556,7 +4756,9 @@ impl Grid {
         let abs = self.abs_of_view_row(row);
         let (text, at) = self.logical_line_of(abs);
         let idx = at.iter().position(|&(a, c)| a == abs && c == col)?;
-        let (s, e, url) = detect_urls(&text).into_iter().find(|&(s, e, _)| idx >= s && idx < e)?;
+        let (s, e, url) = detect_urls(&text)
+            .into_iter()
+            .find(|&(s, e, _)| idx >= s && idx < e)?;
         let (mut start, mut end) = (col, col);
         for &(a, c) in &at[s..e] {
             if a == abs {
@@ -4662,8 +4864,11 @@ impl Grid {
 #[cfg(feature = "l13")]
 impl rusty_term_l13::TerminalState for Grid {
     fn screen_text(&self) -> String {
-        let mut lines: Vec<String> =
-            self.cells.chunks(self.cols).map(|row| row_text(row, &self.clusters)).collect();
+        let mut lines: Vec<String> = self
+            .cells
+            .chunks(self.cols)
+            .map(|row| row_text(row, &self.clusters))
+            .collect();
         while lines.last().is_some_and(String::is_empty) {
             lines.pop();
         }

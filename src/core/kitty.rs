@@ -190,7 +190,11 @@ pub(crate) fn feed(t: &mut Transmission, apc: &[u8], g: &mut Grid, responses: &m
 /// Decode the accumulated payload per its format into `(w, h, pixels)`.
 fn decode(t: &Transmission) -> Option<(usize, usize, Vec<Option<u32>>)> {
     let raw = base64::decode(&t.payload)?;
-    let raw = if t.compressed { inflate::zlib_decompress(&raw, MAX_DECODED)? } else { raw };
+    let raw = if t.compressed {
+        inflate::zlib_decompress(&raw, MAX_DECODED)?
+    } else {
+        raw
+    };
     match t.format {
         24 => raw_pixels(&raw, t.width, t.height, 3),
         32 => raw_pixels(&raw, t.width, t.height, 4),

@@ -378,7 +378,11 @@ impl GpuCore {
         let atlas_h = ATLAS_MAX.min(max_dim);
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
-            size: wgpu::Extent3d { width: atlas_w, height: atlas_h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: atlas_w,
+                height: atlas_h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -431,9 +435,18 @@ impl GpuCore {
             label: Some("bind group"),
             layout: &bind_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
         let img_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -593,7 +606,13 @@ impl GpuCore {
     /// Upload `glyph` as an RGBA tile spanning `span` cells and return its
     /// atlas rect. Ordinary coverage glyphs upload white×alpha (the shader
     /// tints by `fg`); color glyphs (emoji strikes) upload their own pixels.
-    fn upload_tile(&mut self, key: TileKey, glyph: &Glyph, span: usize, baseline: i32) -> (u32, u32, u32, u32) {
+    fn upload_tile(
+        &mut self,
+        key: TileKey,
+        glyph: &Glyph,
+        span: usize,
+        baseline: i32,
+    ) -> (u32, u32, u32, u32) {
         if let Some(&r) = self.tiles.get(&key) {
             return r;
         }
@@ -659,7 +678,11 @@ impl GpuCore {
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         let rect = (x, y, w, h);
         self.tiles.insert(key, rect);
@@ -668,12 +691,20 @@ impl GpuCore {
 
     /// The atlas rect for a plain character (wide chars get a two-cell tile,
     /// so CJK/emoji are no longer clipped to their lead cell).
-    fn tile_for_char(&mut self, ch: char, style: Style, font: &mut FontCache) -> ((u32, u32, u32, u32), bool) {
+    fn tile_for_char(
+        &mut self,
+        ch: char,
+        style: Style,
+        font: &mut FontCache,
+    ) -> ((u32, u32, u32, u32), bool) {
         let span = char_width(ch).max(1);
         let baseline = font.baseline();
         let glyph = font.glyph(ch, style);
         let color = glyph.color.is_some();
-        (self.upload_tile(TileKey::Char(ch, style), &glyph, span, baseline), color)
+        (
+            self.upload_tile(TileKey::Char(ch, style), &glyph, span, baseline),
+            color,
+        )
     }
 
     /// Set the window background opacity (`[window] opacity`), clamped to
@@ -687,7 +718,11 @@ impl GpuCore {
         // With a chrome bar, the bar sits `bar_inset` px below the top edge
         // and the grid shifts down by the same amount, preserving the
         // pad-sized gap between them (the bottom pad absorbs it).
-        let inset = if chrome { super::render::bar_inset(pad, self.cell_h as usize) } else { 0 };
+        let inset = if chrome {
+            super::render::bar_inset(pad, self.cell_h as usize)
+        } else {
+            0
+        };
         let uniforms = Uniforms {
             screen: [width.max(1) as f32, height.max(1) as f32],
             cell: [self.cell_w as f32, self.cell_h as f32],
@@ -696,12 +731,24 @@ impl GpuCore {
             opacity: self.opacity,
             bar_inset: inset as f32,
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
 
     /// A base (opaque) instance sampling `rect`.
     #[allow(clippy::too_many_arguments)]
-    fn base_inst(col: u32, row: u32, span: u32, rect: (u32, u32, u32, u32), fg: u32, bg: u32, curs: u32, ccol: u32, deco: u32, dcol: u32) -> Instance {
+    fn base_inst(
+        col: u32,
+        row: u32,
+        span: u32,
+        rect: (u32, u32, u32, u32),
+        fg: u32,
+        bg: u32,
+        curs: u32,
+        ccol: u32,
+        deco: u32,
+        dcol: u32,
+    ) -> Instance {
         Instance {
             col,
             row,
@@ -752,7 +799,18 @@ impl GpuCore {
             // Chrome cells carry underline state for the active tab's accent
             // line; `plain` — no cursor/selection swap happens up here.
             let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, true, false);
-            frame.base.push(Self::base_inst(col as u32, 0, char_width(cell.ch).max(1) as u32, rect, fg, cell.bg, 0, 0, deco, dcol));
+            frame.base.push(Self::base_inst(
+                col as u32,
+                0,
+                char_width(cell.ch).max(1) as u32,
+                rect,
+                fg,
+                cell.bg,
+                0,
+                0,
+                deco,
+                dcol,
+            ));
         }
     }
 
@@ -768,7 +826,18 @@ impl GpuCore {
             let (rect, color) = self.tile_for_char(cell.ch, style, font);
             let fg = if color { 0xFFFFFF } else { cell.fg };
             let (deco, dcol) = deco_for(cell.flags, cell.underline_color, fg, true, false);
-            frame.base.push(Self::base_inst(col as u32, 0, char_width(cell.ch).max(1) as u32, rect, fg, cell.bg, 0, 0, deco | 64, dcol));
+            frame.base.push(Self::base_inst(
+                col as u32,
+                0,
+                char_width(cell.ch).max(1) as u32,
+                rect,
+                fg,
+                cell.bg,
+                0,
+                0,
+                deco | 64,
+                dcol,
+            ));
         }
     }
 
@@ -791,7 +860,10 @@ impl GpuCore {
             .then_some(grid.cursor);
         let status = grid.status_row();
         let last_row = grid.rows.saturating_sub(1);
-        let blank = *self.tiles.get(&TileKey::Char(' ', Style::Regular)).unwrap_or(&(0, 0, 0, 0));
+        let blank = *self
+            .tiles
+            .get(&TileKey::Char(' ', Style::Regular))
+            .unwrap_or(&(0, 0, 0, 0));
 
         // One resolved record per column of the current row, for run planning.
         struct Resolved {
@@ -816,13 +888,29 @@ impl GpuCore {
             // X position (and glyph mirroring) go through the map.
             let bidi = if on_status { None } else { grid.bidi_row(row) };
             let vis = |col: usize| -> usize {
-                bidi.as_ref().and_then(|b| b.log2vis.get(col)).map_or(col, |&v| v as usize)
+                bidi.as_ref()
+                    .and_then(|b| b.log2vis.get(col))
+                    .map_or(col, |&v| v as usize)
             };
             let mut cols: Vec<Resolved> = Vec::with_capacity(grid.cols);
             for col in 0..grid.cols {
-                let cell = if on_status { status.unwrap()[col] } else { grid.viewport_cell(col, row) };
+                let cell = if on_status {
+                    status.unwrap()[col]
+                } else {
+                    grid.viewport_cell(col, row)
+                };
                 if cell.flags & WIDE_TRAILER != 0 {
-                    cols.push(Resolved { cell, fg: 0, bg: 0, curs: 0, ccol: 0, deco: 0, dcol: 0, run_ok: false, trailer: true });
+                    cols.push(Resolved {
+                        cell,
+                        fg: 0,
+                        bg: 0,
+                        curs: 0,
+                        ccol: 0,
+                        deco: 0,
+                        dcol: 0,
+                        run_ok: false,
+                        trailer: true,
+                    });
                     continue;
                 }
                 let (fg, bg, curs, ccol, plain) = if !on_status && cursor == Some((col, row)) {
@@ -832,10 +920,14 @@ impl GpuCore {
                         CursorShape::Bar => (cell.fg, cell.bg, 3u32, grid.cursor_color),
                     };
                     (fg, bg, curs, ccol, false)
-                } else if !on_status
-                    && let Some(cur) = grid.search_highlight(col, row)
-                {
-                    (SEARCH_FG, if cur { SEARCH_CUR_BG } else { SEARCH_BG }, 0, 0, false)
+                } else if !on_status && let Some(cur) = grid.search_highlight(col, row) {
+                    (
+                        SEARCH_FG,
+                        if cur { SEARCH_CUR_BG } else { SEARCH_BG },
+                        0,
+                        0,
+                        false,
+                    )
                 } else if !on_status && grid.is_selected(col, row) {
                     (cell.bg, cell.fg, 0, 0, false)
                 } else {
@@ -858,7 +950,17 @@ impl GpuCore {
                     // across visually non-adjacent cells would garble it.
                     && bidi.is_none()
                     && font.has_ligatures();
-                cols.push(Resolved { cell, fg, bg, curs, ccol, deco, dcol, run_ok, trailer: false });
+                cols.push(Resolved {
+                    cell,
+                    fg,
+                    bg,
+                    curs,
+                    ccol,
+                    deco,
+                    dcol,
+                    run_ok,
+                    trailer: false,
+                });
             }
 
             // Emit: shaped runs get blank-tile base cells + overlay glyph
@@ -871,8 +973,15 @@ impl GpuCore {
                     continue;
                 }
                 if !r.run_ok {
-                    let style = Style::new(r.cell.flags & ATTR_BOLD != 0, r.cell.flags & ATTR_ITALIC != 0);
-                    let ch = if r.cell.ch == '\u{10EEEE}' { ' ' } else { r.cell.ch };
+                    let style = Style::new(
+                        r.cell.flags & ATTR_BOLD != 0,
+                        r.cell.flags & ATTR_ITALIC != 0,
+                    );
+                    let ch = if r.cell.ch == '\u{10EEEE}' {
+                        ' '
+                    } else {
+                        r.cell.ch
+                    };
                     // Arabic contextual form first (phase 3), then rule L4
                     // mirroring for RTL-run chars.
                     let ch = match &bidi {
@@ -905,13 +1014,19 @@ impl GpuCore {
                     continue;
                 }
                 // A run: same style and fg, contiguous eligible cells.
-                let style = Style::new(r.cell.flags & ATTR_BOLD != 0, r.cell.flags & ATTR_ITALIC != 0);
+                let style = Style::new(
+                    r.cell.flags & ATTR_BOLD != 0,
+                    r.cell.flags & ATTR_ITALIC != 0,
+                );
                 let fg = r.fg;
                 let start = col;
                 let mut run: Vec<char> = Vec::new();
                 while col < grid.cols {
                     let c = &cols[col];
-                    let cstyle = Style::new(c.cell.flags & ATTR_BOLD != 0, c.cell.flags & ATTR_ITALIC != 0);
+                    let cstyle = Style::new(
+                        c.cell.flags & ATTR_BOLD != 0,
+                        c.cell.flags & ATTR_ITALIC != 0,
+                    );
                     if !c.run_ok || cstyle != style || c.fg != fg {
                         break;
                     }
@@ -996,9 +1111,10 @@ impl GpuCore {
             });
             let (key, pixels): (_, &[Option<u32>]) = match anim {
                 Some((id, cur, px)) => ((3u8, id as u64, cur as u64), px),
-                None => {
-                    ((1u8, im.serial as u64, ((im.pw as u64) << 32) | im.ph as u64), &im.pixels)
-                }
+                None => (
+                    (1u8, im.serial as u64, ((im.pw as u64) << 32) | im.ph as u64),
+                    &im.pixels,
+                ),
             };
             if let Some(bind) = self.image_texture(key, im.pw, im.ph, pixels) {
                 frame.images.push((
@@ -1018,8 +1134,12 @@ impl GpuCore {
         // placement grid from the image's current animation frame.
         if let Some(ph) = grid.placeholder_map() {
             for (i, entry) in ph.iter().enumerate() {
-                let Some((id, prow, pcol)) = *entry else { continue };
-                let Some((iw, ih, pixels)) = grid.kitty_frame(id) else { continue };
+                let Some((id, prow, pcol)) = *entry else {
+                    continue;
+                };
+                let Some((iw, ih, pixels)) = grid.kitty_frame(id) else {
+                    continue;
+                };
                 let Some((pcols, prows)) =
                     grid.placeholder_grid(id, self.cell_w as usize, self.cell_h as usize)
                 else {
@@ -1115,7 +1235,11 @@ impl GpuCore {
         }
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("image"),
-            size: wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w as u32,
+                height: h as u32,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1136,7 +1260,11 @@ impl GpuCore {
                 bytes_per_row: Some(w as u32 * 4),
                 rows_per_image: Some(h as u32),
             },
-            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w as u32,
+                height: h as u32,
+                depth_or_array_layers: 1,
+            },
         );
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind = Rc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1177,7 +1305,9 @@ impl GpuCore {
         if !chrome.is_empty() {
             let (rect, _) = self.tile_for_char(' ', Style::Regular, font);
             let span = width.div_ceil(self.cell_w.max(1));
-            frame.base.push(Self::base_inst(0, 0, span, rect, bar_bg, bar_bg, 0, 0, 128, 0));
+            frame.base.push(Self::base_inst(
+                0, 0, span, rect, bar_bg, bar_bg, 0, 0, 128, 0,
+            ));
         }
         self.append_chrome(&mut frame, chrome, font);
         self.append_status(&mut frame, status, font);
@@ -1192,11 +1322,22 @@ impl GpuCore {
         ) {
             let (rect, _) = self.tile_for_char(' ', Style::Regular, font);
             for row in y0..y1 {
-                frame.base.push(Self::base_inst(0, row as u32, x1 as u32, rect, divider, divider, 0, 0, 0, 0));
+                frame.base.push(Self::base_inst(
+                    0, row as u32, x1 as u32, rect, divider, divider, 0, 0, 0, 0,
+                ));
             }
         }
         for p in panes {
-            self.append_grid(&mut frame, p.grid, p.col0, p.row0, p.focused, p.cursor_on, p.hover_link, font);
+            self.append_grid(
+                &mut frame,
+                p.grid,
+                p.col0,
+                p.row0,
+                p.focused,
+                p.cursor_on,
+                p.hover_link,
+                font,
+            );
             // Cursor-trail ghosts (G36): solid cursor-colored fills on the
             // blended overlay layer, mirroring the CPU renderer's draw_trail.
             for &(col, row, alpha) in &p.trail {
@@ -1247,37 +1388,49 @@ impl GpuCore {
     /// Submit the frame: base cells (opaque), overlay glyphs (blended), then
     /// image quads (blended, grouped by texture), clearing to `clear`.
     fn draw_frame(&self, view: &wgpu::TextureView, frame: &FrameLists, clear: u32) {
-        let base_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("base instances"),
-            contents: bytemuck::cast_slice(&frame.base),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let overlay_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("overlay instances"),
-            contents: bytemuck::cast_slice(&frame.overlay),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let base_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("base instances"),
+                contents: bytemuck::cast_slice(&frame.base),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let overlay_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay instances"),
+                contents: bytemuck::cast_slice(&frame.overlay),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
         let img_insts: Vec<ImgInstance> = frame.images.iter().map(|(_, i)| *i).collect();
-        let img_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("image instances"),
-            contents: bytemuck::cast_slice(&img_insts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let img_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("image instances"),
+                contents: bytemuck::cast_slice(&img_insts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
         let c = wgpu::Color {
             r: ((clear >> 16) & 0xff) as f64 / 255.0,
             g: ((clear >> 8) & 0xff) as f64 / 255.0,
             b: (clear & 0xff) as f64 / 255.0,
             a: self.opacity as f64,
         };
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cells pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(c), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(c),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -1337,7 +1490,11 @@ fn deco_for(flags: u16, underline_color: u32, fg: u32, plain: bool, hovered: boo
             UnderlineStyle::Dashed => 5,
         };
     }
-    let dcol = if plain && !hovered && flags & ATTR_UNDERLINE_COLOR != 0 { underline_color } else { fg };
+    let dcol = if plain && !hovered && flags & ATTR_UNDERLINE_COLOR != 0 {
+        underline_color
+    } else {
+        fg
+    };
     (deco, dcol)
 }
 
@@ -1349,11 +1506,18 @@ pub(crate) struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    pub(crate) fn new(window: Arc<Window>, font: &mut FontCache) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn new(
+        window: Arc<Window>,
+        font: &mut FontCache,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window)?;
         let core = GpuCore::new(&instance, Some(&surface), font).ok_or("no GPU adapter")?;
-        Ok(GpuRenderer { core, surface, configured: (0, 0) })
+        Ok(GpuRenderer {
+            core,
+            surface,
+            configured: (0, 0),
+        })
     }
 }
 
@@ -1390,7 +1554,10 @@ impl Renderer for GpuRenderer {
                     height,
                     present_mode: wgpu::PresentMode::Fifo,
                     desired_maximum_frame_latency: 2,
-                    alpha_mode: self.core.alpha_mode.unwrap_or(wgpu::CompositeAlphaMode::Auto),
+                    alpha_mode: self
+                        .core
+                        .alpha_mode
+                        .unwrap_or(wgpu::CompositeAlphaMode::Auto),
                     view_formats: vec![],
                 },
             );
@@ -1399,8 +1566,12 @@ impl Renderer for GpuRenderer {
         let Ok(frame) = self.surface.get_current_texture() else {
             return;
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.render_panes(&view, width, height, panes, chrome, status, font, divider, bg, bar_bg, pad);
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.core.render_panes(
+            &view, width, height, panes, chrome, status, font, divider, bg, bar_bg, pad,
+        );
         frame.present();
     }
 
@@ -1424,9 +1595,15 @@ mod tests {
         // Already SGR-underlined with a colored underline (58) set — hover
         // still overrides to plain fg, not underline_color.
         let flags = ATTR_UNDERLINE | ATTR_UNDERLINE_COLOR;
-        assert_eq!(deco_for(flags, 0x0000FF, 0xFF0000, true, true), (1, 0xFF0000));
+        assert_eq!(
+            deco_for(flags, 0x0000FF, 0xFF0000, true, true),
+            (1, 0xFF0000)
+        );
         // Not hovered: ordinary SGR-underline-color behavior is unchanged.
-        assert_eq!(deco_for(flags, 0x0000FF, 0xFF0000, true, false), (1, 0x0000FF));
+        assert_eq!(
+            deco_for(flags, 0x0000FF, 0xFF0000, true, false),
+            (1, 0x0000FF)
+        );
     }
 
     /// The adapter, WGSL shader, render pipeline, and glyph atlas all build.
@@ -1439,7 +1616,15 @@ mod tests {
             eprintln!("no system font; skipping GPU core test");
             return;
         };
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
+        let mut font = FontCache::new(
+            super::super::font::FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            16.0,
+            false,
+        )
+        .unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(core) = GpuCore::new(&instance, None, &mut font) else {
             eprintln!("no wgpu adapter; skipping GPU core test");
@@ -1459,7 +1644,15 @@ mod tests {
             eprintln!("no system font; skipping GPU core test");
             return None;
         };
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
+        let mut font = FontCache::new(
+            super::super::font::FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            16.0,
+            false,
+        )
+        .unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(core) = GpuCore::new(&instance, None, &mut font) else {
             eprintln!("no wgpu adapter; skipping GPU core test");
@@ -1472,7 +1665,9 @@ mod tests {
     /// row edge, and reports exhaustion (`None`) instead of overflowing.
     #[test]
     fn shelf_allocator_packs_wraps_and_exhausts() {
-        let Some((mut core, _font)) = headless_core() else { return };
+        let Some((mut core, _font)) = headless_core() else {
+            return;
+        };
         // The blank tile is pre-reserved at the atlas origin.
         let blank = core.tiles[&TileKey::Char(' ', Style::Regular)];
         assert_eq!((blank.0, blank.1), (0, 0));
@@ -1492,15 +1687,27 @@ mod tests {
         core.shelf_y = core.atlas_h;
         assert_eq!(core.alloc_shelf(core.cell_w), None);
         // upload_tile then falls back to the pre-reserved blank rect.
-        let g = Glyph { width: 0, height: 0, left: 0, top: 0, coverage: vec![], color: None };
-        assert_eq!(core.upload_tile(TileKey::Char('q', Style::Bold), &g, 1, 0), blank);
+        let g = Glyph {
+            width: 0,
+            height: 0,
+            left: 0,
+            top: 0,
+            coverage: vec![],
+            color: None,
+        };
+        assert_eq!(
+            core.upload_tile(TileKey::Char('q', Style::Bold), &g, 1, 0),
+            blank
+        );
     }
 
     /// Wide (two-column) characters get a two-cell tile so CJK/emoji glyphs
     /// aren't clipped to their lead cell; the rect is cached per (char, style).
     #[test]
     fn wide_chars_get_two_cell_tiles_and_cache_hits() {
-        let Some((mut core, mut font)) = headless_core() else { return };
+        let Some((mut core, mut font)) = headless_core() else {
+            return;
+        };
         let (wide, _) = core.tile_for_char('好', Style::Regular, &mut font);
         assert_eq!(wide.2, 2 * core.cell_w, "wide glyph tile spans two cells");
         let (narrow, _) = core.tile_for_char('a', Style::Regular, &mut font);
@@ -1518,7 +1725,15 @@ mod tests {
             eprintln!("no system font; skipping GPU core test");
             return;
         };
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
+        let mut font = FontCache::new(
+            super::super::font::FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            16.0,
+            false,
+        )
+        .unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(mut core) = GpuCore::new(&instance, None, &mut font) else {
             eprintln!("no wgpu adapter; skipping GPU core test");
@@ -1541,7 +1756,15 @@ mod tests {
     #[ignore = "render+readback needs a working GPU adapter; lavapipe/dzn crash headless"]
     fn gpu_renders_to_texture() {
         let bytes = super::super::font::load_default_font(None).unwrap();
-        let mut font = FontCache::new(super::super::font::FontSet { regular: bytes, ..Default::default() }, 16.0, false).unwrap();
+        let mut font = FontCache::new(
+            super::super::font::FontSet {
+                regular: bytes,
+                ..Default::default()
+            },
+            16.0,
+            false,
+        )
+        .unwrap();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let mut core = GpuCore::new(&instance, None, &mut font).expect("adapter");
 
@@ -1552,7 +1775,11 @@ mod tests {
         let (w, h) = (core.cell_w, core.cell_h);
         let target = core.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1588,7 +1815,11 @@ mod tests {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         core.queue.submit([enc.finish()]);
         readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});

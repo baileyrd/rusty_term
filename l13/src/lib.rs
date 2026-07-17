@@ -149,7 +149,11 @@ pub fn handle(payload: &[u8], state: &mut impl TerminalState, responses: &mut Ve
 }
 
 /// Route a request to its protocol handler.
-fn dispatch(protocol: &str, req: &Request, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
+fn dispatch(
+    protocol: &str,
+    req: &Request,
+    state: &mut impl TerminalState,
+) -> Result<Value, ResponseError> {
     match protocol {
         "channel" => channel_request(req),
         "mcp" => mcp_request(req, state),
@@ -196,7 +200,9 @@ fn channel_initialize(params: Option<&Value>) -> Result<Value, ResponseError> {
             message: format!(
                 "unsupported channel version {client_version}; this terminal speaks {CHANNEL_VERSION_MIN}..={CHANNEL_VERSION_MAX}"
             ),
-            data: Some(json!({ "supported": { "min": CHANNEL_VERSION_MIN, "max": CHANNEL_VERSION_MAX } })),
+            data: Some(
+                json!({ "supported": { "min": CHANNEL_VERSION_MIN, "max": CHANNEL_VERSION_MAX } }),
+            ),
         });
     }
     // Intersect the client's protocol wishlist with what we offer, preserving our
@@ -282,7 +288,10 @@ fn mcp_request(req: &Request, state: &mut impl TerminalState) -> Result<Value, R
 /// updated` when this resource changes. Only [`NOTIFIABLE`] resources push
 /// updates, so subscribing to anything else is an error rather than a silent
 /// no-op the client would wait on forever.
-fn mcp_subscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
+fn mcp_subscribe(
+    params: Option<&Value>,
+    state: &mut impl TerminalState,
+) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
@@ -291,13 +300,21 @@ fn mcp_subscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Resu
         .iter()
         .copied()
         .find(|&u| u == uri)
-        .ok_or_else(|| error(codes::INVALID_PARAMS, format!("resource not subscribable: {uri}")))?;
+        .ok_or_else(|| {
+            error(
+                codes::INVALID_PARAMS,
+                format!("resource not subscribable: {uri}"),
+            )
+        })?;
     state.subscribe(canonical);
     Ok(json!({}))
 }
 
 /// Drop a `resources/subscribe`. An unknown or never-subscribed URI is a no-op.
-fn mcp_unsubscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
+fn mcp_unsubscribe(
+    params: Option<&Value>,
+    state: &mut impl TerminalState,
+) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
@@ -310,7 +327,11 @@ fn mcp_unsubscribe(params: Option<&Value>, state: &mut impl TerminalState) -> Re
 /// is subscribed — the structured channel's event half. Called from the state
 /// mutators (OSC 7 cwd, OSC 0/2 title) right after the change lands, so the
 /// notification rides the same child-bound `responses` egress as every reply.
-pub fn notify_resource_changed(state: &impl TerminalState, uri: &'static str, responses: &mut Vec<u8>) {
+pub fn notify_resource_changed(
+    state: &impl TerminalState,
+    uri: &'static str,
+    responses: &mut Vec<u8>,
+) {
     if !state.is_subscribed(uri) {
         return;
     }
@@ -325,7 +346,11 @@ pub fn notify_resource_changed(state: &impl TerminalState, uri: &'static str, re
 /// (OSC 133;D) and a client is subscribed to `terminal://exit`. Unlike a generic
 /// `resources/updated`, this carries the exit code (or `null` when the shell
 /// omitted it) in the push itself, so the client needs no follow-up read.
-pub fn notify_command_finished(state: &impl TerminalState, exit: Option<i32>, responses: &mut Vec<u8>) {
+pub fn notify_command_finished(
+    state: &impl TerminalState,
+    exit: Option<i32>,
+    responses: &mut Vec<u8>,
+) {
     if !state.is_subscribed(RES_EXIT) {
         return;
     }
@@ -389,7 +414,12 @@ fn mcp_call(params: Option<&Value>, state: &impl TerminalState) -> Result<Value,
             format!("{cols}x{rows}")
         }
         "get_cursor" => cursor_text(state),
-        other => return Err(error(codes::INVALID_PARAMS, format!("unknown tool: {other}"))),
+        other => {
+            return Err(error(
+                codes::INVALID_PARAMS,
+                format!("unknown tool: {other}"),
+            ));
+        }
     };
     Ok(json!({ "content": [ { "type": "text", "text": text } ] }))
 }
@@ -397,24 +427,57 @@ fn mcp_call(params: Option<&Value>, state: &impl TerminalState) -> Result<Value,
 /// The MCP resource catalogue: the same terminal state as addressable
 /// `terminal://` resources, the idiomatic MCP way to expose readable context.
 fn mcp_resources() -> Value {
-    let res = |uri: &str, name: &str, description: &str| {
-        json!({ "uri": uri, "name": name, "description": description, "mimeType": "text/plain" })
-    };
+    let res = |uri: &str, name: &str, description: &str| json!({ "uri": uri, "name": name, "description": description, "mimeType": "text/plain" });
     json!([
-        res("terminal://screen", "Visible screen", "The current visible screen, as text."),
-        res("terminal://scrollback", "Scrollback", "Lines that scrolled off the top, oldest first."),
-        res("terminal://cwd", "Working directory", "The child's CWD as reported via OSC 7."),
-        res("terminal://title", "Window title", "The title set by the child via OSC 0/2."),
-        res("terminal://dimensions", "Dimensions", "The terminal size in cells, as \"COLSxROWS\"."),
-        res("terminal://cursor", "Cursor", "The cursor position in cells, as \"COL,ROW\"."),
-        res("terminal://exit", "Last exit status", "Exit code of the last finished command (OSC 133;D), or empty."),
-        res("terminal://command", "Last command output", "Output text of the last finished command (between OSC 133;C and ;D)."),
+        res(
+            "terminal://screen",
+            "Visible screen",
+            "The current visible screen, as text."
+        ),
+        res(
+            "terminal://scrollback",
+            "Scrollback",
+            "Lines that scrolled off the top, oldest first."
+        ),
+        res(
+            "terminal://cwd",
+            "Working directory",
+            "The child's CWD as reported via OSC 7."
+        ),
+        res(
+            "terminal://title",
+            "Window title",
+            "The title set by the child via OSC 0/2."
+        ),
+        res(
+            "terminal://dimensions",
+            "Dimensions",
+            "The terminal size in cells, as \"COLSxROWS\"."
+        ),
+        res(
+            "terminal://cursor",
+            "Cursor",
+            "The cursor position in cells, as \"COL,ROW\"."
+        ),
+        res(
+            "terminal://exit",
+            "Last exit status",
+            "Exit code of the last finished command (OSC 133;D), or empty."
+        ),
+        res(
+            "terminal://command",
+            "Last command output",
+            "Output text of the last finished command (between OSC 133;C and ;D)."
+        ),
     ])
 }
 
 /// Read one MCP resource by `params.uri`, returning the standard
 /// `{ contents: [...] }`. Mirrors the `get_*` tools over the resource URIs.
-fn mcp_resource_read(params: Option<&Value>, state: &impl TerminalState) -> Result<Value, ResponseError> {
+fn mcp_resource_read(
+    params: Option<&Value>,
+    state: &impl TerminalState,
+) -> Result<Value, ResponseError> {
     let uri = params
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
@@ -429,9 +492,17 @@ fn mcp_resource_read(params: Option<&Value>, state: &impl TerminalState) -> Resu
             format!("{cols}x{rows}")
         }
         "terminal://cursor" => cursor_text(state),
-        "terminal://exit" => state.last_command_exit().map(|c| c.to_string()).unwrap_or_default(),
+        "terminal://exit" => state
+            .last_command_exit()
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
         "terminal://command" => state.last_command_output().unwrap_or_default().to_string(),
-        other => return Err(error(codes::INVALID_PARAMS, format!("unknown resource: {other}"))),
+        other => {
+            return Err(error(
+                codes::INVALID_PARAMS,
+                format!("unknown resource: {other}"),
+            ));
+        }
     };
     Ok(json!({ "contents": [ { "uri": uri, "mimeType": "text/plain", "text": text } ] }))
 }
@@ -507,7 +578,10 @@ fn render_request(req: &Request, state: &mut impl TerminalState) -> Result<Value
 
 /// Set the bottom-row status overlay. `text` is required; `fg`/`bg` are optional
 /// `0xRRGGBB` integers defaulting to the grid's current default colors.
-fn render_set_status(params: Option<&Value>, state: &mut impl TerminalState) -> Result<Value, ResponseError> {
+fn render_set_status(
+    params: Option<&Value>,
+    state: &mut impl TerminalState,
+) -> Result<Value, ResponseError> {
     let params = params.ok_or_else(|| error(codes::INVALID_PARAMS, "missing params"))?;
     let text = params
         .get("text")
@@ -534,7 +608,11 @@ fn send(protocol: &str, msg: &Message, responses: &mut Vec<u8>) {
 }
 
 fn error(code: i64, message: impl Into<String>) -> ResponseError {
-    ResponseError { code, message: message.into(), data: None }
+    ResponseError {
+        code,
+        message: message.into(),
+        data: None,
+    }
 }
 
 #[cfg(test)]
@@ -616,7 +694,11 @@ mod tests {
     /// response frame.
     fn extract_result(responses: &[u8]) -> Value {
         let text = std::str::from_utf8(responses).unwrap();
-        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let body = text
+            .strip_prefix("\x1b]5379;")
+            .unwrap()
+            .strip_suffix("\x1b\\")
+            .unwrap();
         let (_protocol, json) = body.split_once(';').unwrap();
         let msg: Value = serde_json::from_str(json).unwrap();
         msg["result"].clone()
@@ -628,7 +710,10 @@ mod tests {
         let result = call(&mut state, "channel", "initialize", json!({}));
         assert_eq!(result["version"], 1);
         assert_eq!(result["terminalInfo"]["name"], "rusty_term");
-        assert_eq!(result["protocols"].as_array().unwrap().len(), SUPPORTED_PROTOCOLS.len());
+        assert_eq!(
+            result["protocols"].as_array().unwrap().len(),
+            SUPPORTED_PROTOCOLS.len()
+        );
     }
 
     #[test]
@@ -641,7 +726,11 @@ mod tests {
         let mut responses = Vec::new();
         handle(payload.as_bytes(), &mut state, &mut responses);
         let text = std::str::from_utf8(&responses).unwrap();
-        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let body = text
+            .strip_prefix("\x1b]5379;")
+            .unwrap()
+            .strip_suffix("\x1b\\")
+            .unwrap();
         let (_protocol, json) = body.split_once(';').unwrap();
         let msg: Value = serde_json::from_str(json).unwrap();
         assert_eq!(msg["error"]["code"], codes::INVALID_PARAMS);
@@ -649,34 +738,74 @@ mod tests {
 
     #[test]
     fn mcp_get_cwd_and_title_tools_read_through_the_trait() {
-        let mut state = FakeTerminal { cwd: "/home/user".into(), title: "session".into(), ..Default::default() };
-        let cwd = call(&mut state, "mcp", "tools/call", json!({ "name": "get_cwd" }));
+        let mut state = FakeTerminal {
+            cwd: "/home/user".into(),
+            title: "session".into(),
+            ..Default::default()
+        };
+        let cwd = call(
+            &mut state,
+            "mcp",
+            "tools/call",
+            json!({ "name": "get_cwd" }),
+        );
         assert_eq!(cwd["content"][0]["text"], "/home/user");
-        let title = call(&mut state, "mcp", "tools/call", json!({ "name": "get_title" }));
+        let title = call(
+            &mut state,
+            "mcp",
+            "tools/call",
+            json!({ "name": "get_title" }),
+        );
         assert_eq!(title["content"][0]["text"], "session");
     }
 
     #[test]
     fn mcp_get_dimensions_and_cursor_format_correctly() {
-        let mut state = FakeTerminal { dims: (80, 24), cursor: (5, 3), ..Default::default() };
-        let dims = call(&mut state, "mcp", "tools/call", json!({ "name": "get_dimensions" }));
+        let mut state = FakeTerminal {
+            dims: (80, 24),
+            cursor: (5, 3),
+            ..Default::default()
+        };
+        let dims = call(
+            &mut state,
+            "mcp",
+            "tools/call",
+            json!({ "name": "get_dimensions" }),
+        );
         assert_eq!(dims["content"][0]["text"], "80x24");
-        let cursor = call(&mut state, "mcp", "tools/call", json!({ "name": "get_cursor" }));
+        let cursor = call(
+            &mut state,
+            "mcp",
+            "tools/call",
+            json!({ "name": "get_cursor" }),
+        );
         assert_eq!(cursor["content"][0]["text"], "5,3");
     }
 
     #[test]
     fn mcp_resource_read_mirrors_tools() {
-        let mut state = FakeTerminal { cwd: "/tmp".into(), ..Default::default() };
-        let result =
-            call(&mut state, "mcp", "resources/read", json!({ "uri": "terminal://cwd" }));
+        let mut state = FakeTerminal {
+            cwd: "/tmp".into(),
+            ..Default::default()
+        };
+        let result = call(
+            &mut state,
+            "mcp",
+            "resources/read",
+            json!({ "uri": "terminal://cwd" }),
+        );
         assert_eq!(result["contents"][0]["text"], "/tmp");
     }
 
     #[test]
     fn mcp_subscribe_then_notify_pushes_update() {
         let mut state = FakeTerminal::default();
-        call(&mut state, "mcp", "resources/subscribe", json!({ "uri": RES_CWD }));
+        call(
+            &mut state,
+            "mcp",
+            "resources/subscribe",
+            json!({ "uri": RES_CWD }),
+        );
         assert!(state.is_subscribed(RES_CWD));
 
         let mut responses = Vec::new();
@@ -704,7 +833,11 @@ mod tests {
         let mut responses = Vec::new();
         handle(payload.as_bytes(), &mut state, &mut responses);
         let text = std::str::from_utf8(&responses).unwrap();
-        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let body = text
+            .strip_prefix("\x1b]5379;")
+            .unwrap()
+            .strip_suffix("\x1b\\")
+            .unwrap();
         let (_protocol, json) = body.split_once(';').unwrap();
         let msg: Value = serde_json::from_str(json).unwrap();
         assert_eq!(msg["error"]["code"], codes::INVALID_PARAMS);
@@ -713,7 +846,12 @@ mod tests {
     #[test]
     fn render_set_and_clear_status_round_trip_through_the_trait() {
         let mut state = FakeTerminal::default();
-        call(&mut state, "render", "set_status", json!({ "text": "building..." }));
+        call(
+            &mut state,
+            "render",
+            "set_status",
+            json!({ "text": "building..." }),
+        );
         assert_eq!(state.status.as_ref().unwrap().0, "building...");
         call(&mut state, "render", "clear_status", json!({}));
         assert!(state.status.is_none());
@@ -746,7 +884,11 @@ mod tests {
 
     fn extract_result_notification(responses: &[u8]) -> Value {
         let text = std::str::from_utf8(responses).unwrap();
-        let body = text.strip_prefix("\x1b]5379;").unwrap().strip_suffix("\x1b\\").unwrap();
+        let body = text
+            .strip_prefix("\x1b]5379;")
+            .unwrap()
+            .strip_suffix("\x1b\\")
+            .unwrap();
         let (_protocol, json) = body.split_once(';').unwrap();
         serde_json::from_str(json).unwrap()
     }

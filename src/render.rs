@@ -329,13 +329,22 @@ mod tests {
         // terminal stuck in that mode — the next keystroke at the host's own
         // prompt could come through Kitty-encoded instead of as plain bytes.
         let s = String::from_utf8_lossy(RESTORE_HOST_MODES);
-        assert!(s.contains("\x1b[<128u"), "must pop the Kitty keyboard flag stack: {s:?}");
+        assert!(
+            s.contains("\x1b[<128u"),
+            "must pop the Kitty keyboard flag stack: {s:?}"
+        );
         assert!(
             s.contains("\x1b[=0;1u"),
             "must force Kitty flags to 0 regardless of stack depth: {s:?}"
         );
-        assert!(s.contains("\x1b[>4;0m"), "must reset xterm modifyOtherKeys: {s:?}");
-        assert!(s.contains("\x1b[0 q"), "must reset the cursor shape (DECSCUSR default): {s:?}");
+        assert!(
+            s.contains("\x1b[>4;0m"),
+            "must reset xterm modifyOtherKeys: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[0 q"),
+            "must reset the cursor shape (DECSCUSR default): {s:?}"
+        );
     }
 
     #[test]
@@ -343,8 +352,9 @@ mod tests {
         // Regression guard for the modes this already handled before adding
         // the Kitty/modifyOtherKeys/DECSCUSR resets above.
         let s = String::from_utf8_lossy(RESTORE_HOST_MODES);
-        for mode in ["?1000l", "?1002l", "?1003l", "?1004l", "?1006l", "?1015l", "?1016l", "?2004l"]
-        {
+        for mode in [
+            "?1000l", "?1002l", "?1003l", "?1004l", "?1006l", "?1015l", "?1016l", "?2004l",
+        ] {
             assert!(s.contains(mode), "must reset {mode}: {s:?}");
         }
         assert!(s.contains("?25h"), "must leave the cursor visible: {s:?}");

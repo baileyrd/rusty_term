@@ -289,16 +289,19 @@ impl Settings {
         let shell = cfg
             .shell
             .as_deref()
-            .and_then(|s| shells.iter().position(|(n, p)| n == s || p == s).map(|i| i + 1))
+            .and_then(|s| {
+                shells
+                    .iter()
+                    .position(|(n, p)| n == s || p == s)
+                    .map(|i| i + 1)
+            })
             .unwrap_or(0);
         // A custom contrast ratio seeds to the nearest step.
         let ratio = cfg.minimum_contrast.unwrap_or(1.0);
         let min_contrast = CONTRAST_STEPS
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (*a - ratio).abs().partial_cmp(&(*b - ratio).abs()).unwrap()
-            })
+            .min_by(|(_, a), (_, b)| (*a - ratio).abs().partial_cmp(&(*b - ratio).abs()).unwrap())
             .map(|(i, _)| i)
             .unwrap_or(0);
         Settings {
@@ -353,9 +356,7 @@ impl Settings {
                 let q = q.to_lowercase();
                 CATEGORIES
                     .iter()
-                    .flat_map(|&(c, name)| {
-                        Field::in_category(c).iter().map(move |&f| (f, name))
-                    })
+                    .flat_map(|&(c, name)| Field::in_category(c).iter().map(move |&f| (f, name)))
                     .filter(|(f, _)| {
                         q.is_empty()
                             || f.label().to_lowercase().contains(&q)
@@ -423,7 +424,9 @@ impl Settings {
     /// the buffer with `seed` (a typed digit) or, when `None`, the current
     /// value's bare text. Returns whether an edit started.
     pub(crate) fn begin_edit(&mut self, seed: Option<char>) -> bool {
-        let Some(field) = self.field() else { return false };
+        let Some(field) = self.field() else {
+            return false;
+        };
         if self.is_disabled(field) || !matches!(self.widget(field), Widget::Number(_)) {
             return false;
         }
@@ -669,8 +672,11 @@ impl Settings {
             }
             Field::CopyHtml => self.copy_html = !self.copy_html,
             Field::Clipboard => {
-                const ORDER: [ClipboardPolicy; 3] =
-                    [ClipboardPolicy::Off, ClipboardPolicy::WriteOnly, ClipboardPolicy::ReadWrite];
+                const ORDER: [ClipboardPolicy; 3] = [
+                    ClipboardPolicy::Off,
+                    ClipboardPolicy::WriteOnly,
+                    ClipboardPolicy::ReadWrite,
+                ];
                 let i = ORDER.iter().position(|&c| c == self.clipboard).unwrap_or(1);
                 self.clipboard = ORDER[wrap(i, ORDER.len(), forward)];
             }
@@ -700,9 +706,15 @@ impl Settings {
                 self.opacity = pct.clamp(floor, 100) as f32 / 100.0;
             }
             Field::LaunchMode => {
-                const ORDER: [Option<LaunchMode>; 3] =
-                    [None, Some(LaunchMode::Maximized), Some(LaunchMode::Fullscreen)];
-                let i = ORDER.iter().position(|&m| m == self.launch_mode).unwrap_or(0);
+                const ORDER: [Option<LaunchMode>; 3] = [
+                    None,
+                    Some(LaunchMode::Maximized),
+                    Some(LaunchMode::Fullscreen),
+                ];
+                let i = ORDER
+                    .iter()
+                    .position(|&m| m == self.launch_mode)
+                    .unwrap_or(0);
                 self.launch_mode = ORDER[wrap(i, ORDER.len(), forward)];
             }
             Field::Cols => {
@@ -1004,7 +1016,12 @@ impl Settings {
                 value: Some(config::toml_string(&path)),
                 insert: true,
             },
-            None => SettingEdit { section: "", key: "shell", value: None, insert: false },
+            None => SettingEdit {
+                section: "",
+                key: "shell",
+                value: None,
+                insert: false,
+            },
         });
         edits
     }
@@ -1051,7 +1068,11 @@ fn launch_mode_name(m: Option<LaunchMode>) -> &'static str {
 
 /// Format a font size: an integral value as a bare integer, else one decimal.
 fn fmt_px(px: f32) -> String {
-    if px.fract() == 0.0 { format!("{}", px as i32) } else { format!("{px:.1}") }
+    if px.fract() == 0.0 {
+        format!("{}", px as i32)
+    } else {
+        format!("{px:.1}")
+    }
 }
 
 /// Group digits with commas ("10,000") — display only; the config file
@@ -1075,8 +1096,14 @@ mod tests {
 
     fn shells() -> Vec<DetectedShell> {
         vec![
-            DetectedShell { name: "pwsh", path: PathBuf::from("/x/pwsh") },
-            DetectedShell { name: "bash", path: PathBuf::from("/bin/bash") },
+            DetectedShell {
+                name: "pwsh",
+                path: PathBuf::from("/x/pwsh"),
+            },
+            DetectedShell {
+                name: "bash",
+                path: PathBuf::from("/bin/bash"),
+            },
         ]
     }
 
@@ -1115,18 +1142,31 @@ mod tests {
     #[test]
     fn new_matches_configured_theme_and_shell() {
         let dracula = config::preset("dracula").unwrap();
-        let cfg = Config { shell: Some("bash".into()), ..Config::default() };
+        let cfg = Config {
+            shell: Some("bash".into()),
+            ..Config::default()
+        };
         let s = Settings::new(&cfg, &dracula, 18.0, &shells(), true);
         assert_eq!(s.theme_name(), "dracula", "theme matched by color");
-        assert_eq!(s.shell_path().as_deref(), Some("/bin/bash"), "shell matched by name");
+        assert_eq!(
+            s.shell_path().as_deref(),
+            Some("/bin/bash"),
+            "shell matched by name"
+        );
     }
 
     #[test]
     fn unknown_theme_and_shell_fall_back_to_defaults() {
         // A custom (non-preset) theme shows as "default"; an unrecognized shell
         // resolves to "(default)".
-        let custom = Theme { fg: 0x123456, ..Theme::default() };
-        let cfg = Config { shell: Some("zsh".into()), ..Config::default() };
+        let custom = Theme {
+            fg: 0x123456,
+            ..Theme::default()
+        };
+        let cfg = Config {
+            shell: Some("zsh".into()),
+            ..Config::default()
+        };
         let s = Settings::new(&cfg, &custom, 18.0, &shells(), true);
         assert_eq!(s.theme_name(), "default");
         assert_eq!(s.shell_path(), None);
@@ -1198,7 +1238,11 @@ mod tests {
         for _ in 0..10_000 {
             s.change(false);
         }
-        assert_eq!(s.scrollback(), 0, "scrollback floors at 0 without underflow");
+        assert_eq!(
+            s.scrollback(),
+            0,
+            "scrollback floors at 0 without underflow"
+        );
     }
 
     #[test]
@@ -1218,10 +1262,18 @@ mod tests {
     fn clipboard_cycles_and_persists_the_config_spelling() {
         let mut s = seeded();
         select_field(&mut s, Field::Clipboard);
-        assert_eq!(s.clipboard(), ClipboardPolicy::WriteOnly, "seeds to the default");
+        assert_eq!(
+            s.clipboard(),
+            ClipboardPolicy::WriteOnly,
+            "seeds to the default"
+        );
         s.change(true);
         assert_eq!(s.clipboard(), ClipboardPolicy::ReadWrite);
-        let edit = s.edits().into_iter().find(|e| e.key == "clipboard").unwrap();
+        let edit = s
+            .edits()
+            .into_iter()
+            .find(|e| e.key == "clipboard")
+            .unwrap();
         assert!(edit.insert);
         assert_eq!(edit.value.as_deref(), Some("\"read-write\""));
     }
@@ -1231,17 +1283,31 @@ mod tests {
         let mut s = seeded();
         select_field(&mut s, Field::LaunchMode);
         s.change(true); // normal -> maximized
-        let edit = s.edits().into_iter().find(|e| e.key == "launch_mode").unwrap();
+        let edit = s
+            .edits()
+            .into_iter()
+            .find(|e| e.key == "launch_mode")
+            .unwrap();
         assert!(edit.insert && edit.value.as_deref() == Some("\"maximized\""));
         s.change(true); // -> fullscreen
         s.change(true); // wraps -> normal
-        let edit = s.edits().into_iter().find(|e| e.key == "launch_mode").unwrap();
-        assert!(edit.value.is_none() && !edit.insert, "normal removes the key");
+        let edit = s
+            .edits()
+            .into_iter()
+            .find(|e| e.key == "launch_mode")
+            .unwrap();
+        assert!(
+            edit.value.is_none() && !edit.insert,
+            "normal removes the key"
+        );
     }
 
     #[test]
     fn opacity_snaps_to_the_step_grid_and_floors_above_zero() {
-        let cfg = Config { opacity: Some(0.87), ..Config::default() };
+        let cfg = Config {
+            opacity: Some(0.87),
+            ..Config::default()
+        };
         let mut s = Settings::new(&cfg, &Theme::default(), 18.0, &shells(), true);
         select_field(&mut s, Field::Opacity);
         s.change(true);
@@ -1249,12 +1315,19 @@ mod tests {
         for _ in 0..100 {
             s.change(false);
         }
-        assert_eq!(s.opacity(), OPACITY_MIN, "floors above zero so the window stays visible");
+        assert_eq!(
+            s.opacity(),
+            OPACITY_MIN,
+            "floors above zero so the window stays visible"
+        );
     }
 
     #[test]
     fn min_contrast_off_removes_the_key() {
-        let cfg = Config { minimum_contrast: Some(4.5), ..Config::default() };
+        let cfg = Config {
+            minimum_contrast: Some(4.5),
+            ..Config::default()
+        };
         let mut s = Settings::new(&cfg, &Theme::default(), 18.0, &shells(), true);
         assert_eq!(s.min_contrast(), Some(4.5), "seeds to the configured step");
         select_field(&mut s, Field::MinContrast);
@@ -1262,7 +1335,11 @@ mod tests {
         assert_eq!(s.min_contrast(), Some(7.0));
         s.change(true); // wraps -> off
         assert_eq!(s.min_contrast(), None);
-        let edit = s.edits().into_iter().find(|e| e.key == "minimum_contrast").unwrap();
+        let edit = s
+            .edits()
+            .into_iter()
+            .find(|e| e.key == "minimum_contrast")
+            .unwrap();
         assert!(edit.value.is_none() && !edit.insert, "off removes the key");
     }
 
@@ -1357,18 +1434,26 @@ mod tests {
     #[test]
     fn disabled_opacity_refuses_changes_and_says_why() {
         // CPU renderer: opacity is inert, so the row is disabled.
-        let mut s =
-            Settings::new(&Config::default(), &Theme::default(), 18.0, &shells(), false);
+        let mut s = Settings::new(
+            &Config::default(),
+            &Theme::default(),
+            18.0,
+            &shells(),
+            false,
+        );
         select_field(&mut s, Field::Opacity);
         let row = &s.rows()[s.sel];
         assert!(row.disabled);
-        assert!(row.description.contains("GPU"), "description says why: {}", row.description);
+        assert!(
+            row.description.contains("GPU"),
+            "description says why: {}",
+            row.description
+        );
         s.change(true);
         assert_eq!(s.opacity(), 1.0, "the value refuses to move");
         assert!(!s.dirty, "a refused change is not a modification");
         // GPU renderer: same field is live.
-        let mut s =
-            Settings::new(&Config::default(), &Theme::default(), 18.0, &shells(), true);
+        let mut s = Settings::new(&Config::default(), &Theme::default(), 18.0, &shells(), true);
         select_field(&mut s, Field::Opacity);
         assert!(!s.rows()[s.sel].disabled);
         s.change(false);
@@ -1413,7 +1498,10 @@ mod tests {
     fn scrollback_displays_with_thousands_separators() {
         let mut s = seeded();
         select_field(&mut s, Field::Scrollback);
-        assert_eq!(s.rows()[s.sel].widget, Widget::Number(fmt_thousands(SCROLLBACK_MAX)));
+        assert_eq!(
+            s.rows()[s.sel].widget,
+            Widget::Number(fmt_thousands(SCROLLBACK_MAX))
+        );
         assert_eq!(fmt_thousands(0), "0");
         assert_eq!(fmt_thousands(999), "999");
         assert_eq!(fmt_thousands(10_000), "10,000");
@@ -1425,8 +1513,11 @@ mod tests {
         let mut s = seeded();
         s.set_category(2); // Window
         let rows = s.rows();
-        let tagged: Vec<&str> =
-            rows.iter().filter(|r| r.next_launch).map(|r| r.label).collect();
+        let tagged: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.next_launch)
+            .map(|r| r.label)
+            .collect();
         assert_eq!(tagged, vec!["Launch mode", "Columns", "Rows"]);
         // And their descriptions no longer duplicate the caveat.
         for r in rows.iter().filter(|r| r.next_launch) {
@@ -1443,8 +1534,15 @@ mod tests {
         // Matches span Appearance (shape/blink/trail) and Terminal
         // (click-to-move mentions "cursor" in label).
         let rows = s.rows();
-        assert!(rows.len() >= 4, "shape, blink, trail, click-to-move: {}", rows.len());
-        assert!(rows.iter().all(|r| r.category.is_some()), "results carry category tags");
+        assert!(
+            rows.len() >= 4,
+            "shape, blink, trail, click-to-move: {}",
+            rows.len()
+        );
+        assert!(
+            rows.iter().all(|r| r.category.is_some()),
+            "results carry category tags"
+        );
         assert!(
             rows.iter().any(|r| r.category == Some("Terminal")),
             "results cross category boundaries",
@@ -1477,7 +1575,10 @@ mod tests {
         assert_eq!(s.field(), Some(Field::Bell));
         assert!(s.bell());
         assert_eq!(s.change(true), Some(Field::Bell));
-        assert!(!s.bell(), "the toggle flipped even though Bell lives in another category");
+        assert!(
+            !s.bell(),
+            "the toggle flipped even though Bell lives in another category"
+        );
     }
 
     #[test]
@@ -1510,7 +1611,11 @@ mod tests {
         select_field(&mut s, Field::Cols);
         s.begin_edit(Some('3'));
         assert_eq!(s.commit_edit(), Some(Field::Cols));
-        assert_eq!(s.cols_value(), 20, "a bare '3' clamps up to the 20-column floor");
+        assert_eq!(
+            s.cols_value(),
+            20,
+            "a bare '3' clamps up to the 20-column floor"
+        );
     }
 
     #[test]
@@ -1518,7 +1623,11 @@ mod tests {
         let mut s = seeded();
         select_field(&mut s, Field::FontSize);
         assert!(s.begin_edit(None));
-        assert_eq!(s.editing.as_deref(), Some("18"), "Enter seeds the current value");
+        assert_eq!(
+            s.editing.as_deref(),
+            Some("18"),
+            "Enter seeds the current value"
+        );
         s.edit_input('x'); // non-digit: ignored
         assert_eq!(s.editing.as_deref(), Some("18"));
         s.edit_backspace();
@@ -1540,8 +1649,13 @@ mod tests {
         select_field(&mut s, Field::Theme);
         assert!(!s.begin_edit(None), "a choice is not typable");
         // Disabled opacity refuses an edit too.
-        let mut s =
-            Settings::new(&Config::default(), &Theme::default(), 18.0, &shells(), false);
+        let mut s = Settings::new(
+            &Config::default(),
+            &Theme::default(),
+            18.0,
+            &shells(),
+            false,
+        );
         select_field(&mut s, Field::Opacity);
         assert!(!s.begin_edit(Some('5')));
     }
@@ -1584,17 +1698,29 @@ mod tests {
     fn cursor_choice_previews_its_shape() {
         let mut s = seeded();
         select_field(&mut s, Field::Cursor);
-        assert_eq!(s.rows()[s.sel].widget, Widget::Choice("\u{2588} block".into()));
+        assert_eq!(
+            s.rows()[s.sel].widget,
+            Widget::Choice("\u{2588} block".into())
+        );
         s.change(true);
-        assert_eq!(s.rows()[s.sel].widget, Widget::Choice("\u{2581} underline".into()));
+        assert_eq!(
+            s.rows()[s.sel].widget,
+            Widget::Choice("\u{2581} underline".into())
+        );
         s.change(true);
-        assert_eq!(s.rows()[s.sel].widget, Widget::Choice("\u{258F} bar".into()));
+        assert_eq!(
+            s.rows()[s.sel].widget,
+            Widget::Choice("\u{258F} bar".into())
+        );
     }
 
     #[test]
     fn default_shell_edit_removes_the_key() {
         let s = seeded(); // shell at "(default)"
         let shell = s.edits().into_iter().find(|e| e.key == "shell").unwrap();
-        assert!(shell.value.is_none() && !shell.insert, "default shell removes any existing line");
+        assert!(
+            shell.value.is_none() && !shell.insert,
+            "default shell removes any existing line"
+        );
     }
 }
