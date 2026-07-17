@@ -164,6 +164,11 @@ Real (with the bridge running, `?ws`):
   `localStorage` (`nebula.session` + `nebula.panes`, debounced writes).
   Live PTY sessions can't be resurrected — each pane reconnects to the
   bridge as a fresh shell under the restored layout and history.
+- **Tab activity badges**: a command finishing in a background tab puts
+  an amber unseen-count badge on that tab, cleared the moment it's
+  activated. Restored history starts fully seen, so old tabs don't light
+  up on load; the active tab never badges. (Live mode only in practice —
+  only OSC 133 events can finish a command in a background tab.)
 - **Session tabs**: the center column has a tab strip — each tab is an
   independent workspace with its own command cards, its own transport (a
   separate PTY session in live mode), and its own pane layout. Inactive

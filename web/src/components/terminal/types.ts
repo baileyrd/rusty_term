@@ -105,4 +105,6 @@ export interface TerminalShellProps {
    * means "search only what `commands` shows".
    */
   searchSessions?: { id: string; title: string; commands: CommandCardProps[] }[];
+  /** Unseen finished commands per tab — the tab strip's activity badges. */
+  tabBadges?: Record<string, number>;
 }
