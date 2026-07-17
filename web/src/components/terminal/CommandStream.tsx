@@ -205,7 +205,7 @@ export default function CommandStream({
             {!collapsed.has(group.id) &&
               group.cards.map((c, i) => (
                 <CommandCard
-                  key={c.id ?? `cmd-${i}`}
+                  key={c.id ?? `${c.command}-${c.startedAt ?? i}`}
                   {...c}
                   onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
                   onRerun={onCommandSubmit ? () => onCommandSubmit(c.command) : undefined}
