@@ -117,19 +117,29 @@ export default function SettingsSheet({
 
           <Section title="Assist">
             {apiKeyConnected ? (
-              <div className="flex items-center justify-between">
-                <p className="font-nebula-meta text-xs text-nebula-text/70">
-                  Connected · {ASSIST_MODEL}
-                </p>
-                <button
-                  type="button"
-                  data-testid="settings-disconnect"
-                  onClick={onDisconnectAssist}
-                  className="rounded-nebula-sm border border-white/10 px-2 py-1 font-nebula-meta text-[11px] text-nebula-text/60 transition-colors duration-nebula-fast ease-nebula hover:bg-white/5 hover:text-nebula-error"
+              <>
+                <div className="flex items-center justify-between">
+                  <p className="font-nebula-meta text-xs text-nebula-text/70">
+                    Connected · {ASSIST_MODEL}
+                  </p>
+                  <button
+                    type="button"
+                    data-testid="settings-disconnect"
+                    onClick={onDisconnectAssist}
+                    className="rounded-nebula-sm border border-white/10 px-2 py-1 font-nebula-meta text-[11px] text-nebula-text/60 transition-colors duration-nebula-fast ease-nebula hover:bg-white/5 hover:text-nebula-error"
+                  >
+                    disconnect
+                  </button>
+                </div>
+                <p
+                  data-testid="settings-key-exposure-warning"
+                  className="rounded-nebula-sm border border-nebula-error/30 bg-nebula-error/5 px-2 py-1.5 font-nebula-meta text-[10px] text-nebula-error/80"
                 >
-                  disconnect
-                </button>
-              </div>
+                  This key is sent directly from your browser to the Anthropic API — anyone with
+                  page access could read it. Use a scoped/disposable key; a production deployment
+                  should proxy the Messages API server-side instead.
+                </p>
+              </>
             ) : (
               <form
                 data-testid="settings-connect"
