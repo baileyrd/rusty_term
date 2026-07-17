@@ -641,14 +641,14 @@ mod tests {
             }
         }
         let mods = ModifiersState::empty();
-        let mut press_release = |h: &mut Box<dyn BackendHandle>, code: KeyCode, key: &Key| {
+        let press_release = |h: &mut Box<dyn BackendHandle>, code: KeyCode, key: &Key| {
             for down in [true, false] {
                 let bytes =
                     encode_win32(PhysicalKey::Code(code), key, mods, down).expect("encodable key");
                 h.write(&bytes).expect("write to child");
             }
         };
-        let mut type_line = |h: &mut Box<dyn BackendHandle>, line: &str| {
+        let type_line = |h: &mut Box<dyn BackendHandle>, line: &str| {
             for c in line.chars() {
                 press_release(h, keycode(c), &Key::Character(c.to_string().into()));
             }
