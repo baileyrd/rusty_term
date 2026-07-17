@@ -29,6 +29,8 @@ export interface CommandStreamProps {
   onTabClose?: (id: string) => void;
   /** Close a secondary pane (the primary has no close affordance). */
   onClosePane?: (tabId: string, paneId: string) => void;
+  /** Card to scroll into view and flash (a history-search jump target). */
+  highlightCardId?: string | null;
 }
 
 /**
@@ -47,6 +49,7 @@ export default function CommandStream({
   onTabAdd,
   onTabClose,
   onClosePane,
+  highlightCardId,
 }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -55,6 +58,14 @@ export default function CommandStream({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [commands.length]);
+
+  // Bring a search-jump target into view once it's rendered.
+  useEffect(() => {
+    if (!highlightCardId) return;
+    scrollRef.current
+      ?.querySelector(`[data-card-id="${CSS.escape(highlightCardId)}"]`)
+      ?.scrollIntoView({ block: 'center' });
+  }, [highlightCardId]);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -112,6 +123,7 @@ export default function CommandStream({
             key={c.id ?? `cmd-${i}`}
             {...c}
             onPin={onPinCommand ? () => onPinCommand(c.command) : undefined}
+            highlighted={highlightCardId !== null && highlightCardId === c.id}
           />
         ))}
 

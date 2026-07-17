@@ -5,6 +5,7 @@ import SideDock from './SideDock';
 import AiOrb from './AiOrb';
 import AssistPanel, { type AiAssistState, type ChatState } from './AssistPanel';
 import CommandPalette from './CommandPalette';
+import SearchOverlay from './SearchOverlay';
 import { localHeuristics } from '../../assist/heuristics';
 import {
   createLlmProvider,
@@ -125,6 +126,7 @@ export default function TerminalShell({
   onTabAdd,
   onTabClose,
   liveStats,
+  searchSessions,
 }: TerminalShellProps) {
   const currentTab = activeTabId ?? tabs[0].id;
   // The active preset: stored choice wins over the prop, which stays the
@@ -320,9 +322,11 @@ export default function TerminalShell({
     });
   }, [failures]);
 
-  // The Ctrl/Cmd+K command palette. The listener runs in the capture phase
-  // and swallows the chord so a focused xterm never writes \v to the pty.
+  // The Ctrl/Cmd+K command palette and Ctrl/Cmd+Shift+F history search.
+  // Listeners run in the capture phase and swallow the chords so a focused
+  // xterm never writes them into the pty.
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [assistTab, setAssistTab] = useState<'insights' | 'chat'>('insights');
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -330,11 +334,31 @@ export default function TerminalShell({
         e.preventDefault();
         e.stopPropagation();
         setPaletteOpen((open) => !open);
+      } else if (e.key.toLowerCase() === 'f' && (e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        setSearchOpen((open) => !open);
       }
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, []);
+
+  // A search hit was jumped to: its card gets scrolled into view and
+  // flashed by the stream; the flash clears itself.
+  const [highlightCardId, setHighlightCardId] = useState<string | null>(null);
+  useEffect(() => {
+    if (highlightCardId === null) return;
+    const timer = setTimeout(() => setHighlightCardId(null), 2000);
+    return () => clearTimeout(timer);
+  }, [highlightCardId]);
+  const jumpToCard = useCallback(
+    (tabId: string, cardId: string) => {
+      if (tabId !== currentTab) onTabSelect?.(tabId);
+      setHighlightCardId(cardId);
+    },
+    [currentTab, onTabSelect],
+  );
 
   const openAssistFromPalette = useCallback(
     (tab: 'insights' | 'chat') => {
@@ -375,6 +399,7 @@ export default function TerminalShell({
           onTabAdd={onTabAdd}
           onTabClose={tabs.length > 1 ? handleTabClose : undefined}
           onClosePane={closePane}
+          highlightCardId={highlightCardId}
         />
         <SideDock
           cpu={live ? (live.cpu ?? 0) : 0.34}
@@ -386,6 +411,17 @@ export default function TerminalShell({
           onRecentCommandClick={(cmd) => onCommandSubmit?.(cmd)}
         />
       </div>
+
+      <SearchOverlay
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        sessions={
+          searchSessions ?? [
+            { id: currentTab, title: tabs.find((t) => t.id === currentTab)?.title ?? 'session', commands },
+          ]
+        }
+        onJump={jumpToCard}
+      />
 
       <CommandPalette
         open={paletteOpen}
@@ -404,6 +440,7 @@ export default function TerminalShell({
         onTabSelect={onTabSelect}
         onTabAdd={onTabAdd}
         onTabClose={tabs.length > 1 ? () => handleTabClose(currentTab) : undefined}
+        onSearchHistory={() => setSearchOpen(true)}
       />
 
       {assistOpen && (
