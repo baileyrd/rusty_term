@@ -23,6 +23,7 @@ and the implemented-feature catalog (per-feature notes + test names) in
 Ghostty, WezTerm, Alacritty, Windows Terminal, and peers — 28 capabilities
 evaluated, 27 recommended and sequenced, 1 explicitly rejected — lives in
 [`docs/research/capability-assessment-2026.md`](docs/research/capability-assessment-2026.md).
+See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for what shipped and when.
 
 > **Platform support.** Unix (Linux/macOS) is the primary, fully exercised
 > target. The Windows ConPTY backend has been run and verified on Windows 11
@@ -59,6 +60,7 @@ relays it through the parser into the host terminal. Before spawning, it sets
 | `gui`          |         | Native window backend: a `winit` window with a `softbuffer` CPU renderer, `ab_glyph` glyph rasterization, and `ttf-parser`-driven GSUB ligature shaping. |
 | `gui-gpu`      |         | Adds a `wgpu` GPU renderer (glyph atlas + instanced quads) alongside the CPU one. Implies `gui`. |
 | `l13`          |         | L13 structured side-channel: a private-OSC JSON-RPC transport hosting MCP plus LSP/ACP negotiation. Lives in its own crate (`l13/`, see below). |
+| `web-bridge`   |         | `rusty_term_web_bridge`: a hand-rolled WebSocket PTY bridge (RFC 6455 handshake + framing, zero new dependencies) for the [web frontend prototype](web/README.md). Binds `127.0.0.1` only. |
 
 The runtime is always **tokio** — a single async reactor. On Unix it registers
 the PTY master + `/dev/tty` with the reactor (`AsyncFd` → mio → epoll) and takes
