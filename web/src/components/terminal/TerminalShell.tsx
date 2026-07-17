@@ -101,7 +101,9 @@ export default function TerminalShell({
     const requestId = ++aiRequest.current;
     setAiState({ phase: 'loading' });
     createLlmProvider(apiKey)
-      .analyze(commands)
+      .analyze(commands, (partial) => {
+        if (aiRequest.current === requestId) setAiState({ phase: 'streaming', insights: partial });
+      })
       .then((aiInsights) => {
         if (aiRequest.current === requestId) setAiState({ phase: 'ready', insights: aiInsights });
       })

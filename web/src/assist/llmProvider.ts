@@ -23,9 +23,17 @@ export const BASE_URL_STORAGE = 'nebula.assistBaseUrl';
 
 export const ASSIST_MODEL = 'claude-opus-4-8';
 
-/** The async twin of `AssistProvider` — network calls can't be sync. */
+/**
+ * The async twin of `AssistProvider` — network calls can't be sync. The
+ * response streams: `onPartial` fires with the insights completed so far
+ * (a fresh array each time, ids assigned), and the returned promise
+ * resolves with the final validated set.
+ */
 export interface AsyncAssistProvider {
-  analyze(commands: CommandCardProps[]): Promise<AssistInsight[]>;
+  analyze(
+    commands: CommandCardProps[],
+    onPartial?: (insights: AssistInsight[]) => void,
+  ): Promise<AssistInsight[]>;
 }
 
 export function loadApiKey(): string | null {
@@ -106,24 +114,76 @@ function sessionPayload(commands: CommandCardProps[]): string {
   return JSON.stringify({ commands: cards }, null, 1);
 }
 
-function isInsightArray(value: unknown): value is Omit<AssistInsight, 'id'>[] {
+function isInsight(v: unknown): v is Omit<AssistInsight, 'id'> {
   return (
-    Array.isArray(value) &&
-    value.every(
-      (v) =>
-        typeof v === 'object' &&
-        v !== null &&
-        ['summary', 'failure', 'tip'].includes((v as AssistInsight).kind) &&
-        typeof (v as AssistInsight).title === 'string' &&
-        typeof (v as AssistInsight).body === 'string',
-    )
+    typeof v === 'object' &&
+    v !== null &&
+    ['summary', 'failure', 'tip'].includes((v as AssistInsight).kind) &&
+    typeof (v as AssistInsight).title === 'string' &&
+    typeof (v as AssistInsight).body === 'string'
   );
 }
 
 /**
- * A provider bound to one API key. Each analyze() is a single Messages call.
- * The SDK itself is imported lazily so its ~300 kB never loads for users
- * who never connect a key.
+ * Extract every *completed* insight object from a partial response.
+ *
+ * The model streams `{"insights": [ {...}, {...}, ... ]}` as text deltas
+ * that can cut off anywhere — mid-string, mid-object. Rather than JSON.parse
+ * the (invalid) prefix, scan it: find the array, then walk it with plain
+ * string/escape/brace bookkeeping and parse each element the moment its
+ * closing brace arrives. Structured output guarantees the shape, so a
+ * completed element is always a parseable insight.
+ */
+export function parsePartialInsights(text: string): Omit<AssistInsight, 'id'>[] {
+  const arrayStart = text.indexOf('[', text.indexOf('"insights"'));
+  if (text.indexOf('"insights"') === -1 || arrayStart === -1) return [];
+
+  const insights: Omit<AssistInsight, 'id'>[] = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let objectStart = -1;
+  for (let i = arrayStart + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') {
+      if (depth === 0) objectStart = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objectStart !== -1) {
+        try {
+          const candidate: unknown = JSON.parse(text.slice(objectStart, i + 1));
+          if (isInsight(candidate)) insights.push(candidate);
+        } catch {
+          // A malformed element (shouldn't happen under structured output):
+          // skip it rather than lose the stream.
+        }
+        objectStart = -1;
+      }
+    } else if (ch === ']' && depth === 0) break;
+  }
+  return insights;
+}
+
+function withIds(insights: Omit<AssistInsight, 'id'>[]): AssistInsight[] {
+  return insights.map((insight, i) => ({ ...insight, id: `ai-${i}-${insight.title}` }));
+}
+
+function isInsightArray(value: unknown): value is Omit<AssistInsight, 'id'>[] {
+  return Array.isArray(value) && value.every(isInsight);
+}
+
+/**
+ * A provider bound to one API key. Each analyze() is a single streaming
+ * Messages call. The SDK itself is imported lazily so its ~300 kB never
+ * loads for users who never connect a key.
  */
 export function createLlmProvider(apiKey: string): AsyncAssistProvider {
   const clientPromise = import('@anthropic-ai/sdk').then(
@@ -138,9 +198,12 @@ export function createLlmProvider(apiKey: string): AsyncAssistProvider {
   );
 
   return {
-    async analyze(commands: CommandCardProps[]): Promise<AssistInsight[]> {
+    async analyze(
+      commands: CommandCardProps[],
+      onPartial?: (insights: AssistInsight[]) => void,
+    ): Promise<AssistInsight[]> {
       const client = await clientPromise;
-      const response = await client.messages.create({
+      const stream = client.messages.stream({
         model: ASSIST_MODEL,
         max_tokens: 2048,
         thinking: { type: 'adaptive' },
@@ -154,6 +217,19 @@ export function createLlmProvider(apiKey: string): AsyncAssistProvider {
         ],
       });
 
+      // Surface each insight the moment its closing brace streams in.
+      let emitted = 0;
+      if (onPartial) {
+        stream.on('text', (_delta, snapshot) => {
+          const done = parsePartialInsights(snapshot);
+          if (done.length > emitted) {
+            emitted = done.length;
+            onPartial(withIds(done));
+          }
+        });
+      }
+
+      const response = await stream.finalMessage();
       const text = response.content
         .filter((block): block is Anthropic.TextBlock => block.type === 'text')
         .map((block) => block.text)
@@ -162,10 +238,7 @@ export function createLlmProvider(apiKey: string): AsyncAssistProvider {
       if (!isInsightArray(parsed.insights)) {
         throw new Error('Assist response did not match the insight schema');
       }
-      return parsed.insights.map((insight, i) => ({
-        ...insight,
-        id: `ai-${i}-${insight.title}`,
-      }));
+      return withIds(parsed.insights);
     },
   };
 }
