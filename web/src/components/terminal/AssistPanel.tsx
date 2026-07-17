@@ -8,10 +8,15 @@ const KIND_ACCENT: Record<AssistInsight['kind'], string> = {
   tip: 'border-nebula-warning/40 text-nebula-warning',
 };
 
-/** Where the panel's AI half currently stands. */
+/**
+ * Where the panel's AI half currently stands. `streaming` carries the
+ * insights completed so far — cards appear one by one as the response
+ * streams, then the state settles to `ready` with the validated final set.
+ */
 export type AiAssistState =
   | { phase: 'disconnected' }
   | { phase: 'loading' }
+  | { phase: 'streaming'; insights: AssistInsight[] }
   | { phase: 'ready'; insights: AssistInsight[] }
   | { phase: 'error'; message: string };
 
@@ -172,9 +177,10 @@ export default function AssistPanel({
       </header>
 
       <div className="flex flex-col gap-2 overflow-y-auto p-3">
-        {ai.phase === 'loading' && (
+        {(ai.phase === 'loading' || ai.phase === 'streaming') && (
           <p
             data-testid="assist-ai-status"
+            data-phase={ai.phase}
             className="animate-pulse font-nebula-meta text-xs text-nebula-accent/70"
           >
             Claude is reading the session…
@@ -185,7 +191,7 @@ export default function AssistPanel({
             Assist request failed: {ai.message}
           </p>
         )}
-        {ai.phase === 'ready' &&
+        {(ai.phase === 'ready' || ai.phase === 'streaming') &&
           ai.insights.map((insight) => (
             <InsightCard key={insight.id} insight={insight} source="ai" onRun={onRun} />
           ))}

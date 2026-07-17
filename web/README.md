@@ -156,7 +156,10 @@ Real (with the bridge running, `?ws`):
   Claude-generated section (model `claude-opus-4-8`, adaptive thinking,
   JSON-schema structured output so the reply is always renderable insights)
   appears above the local rules, re-analyzing whenever a command finishes
-  while the sheet is open. The key is held in `sessionStorage` only —
+  while the sheet is open. The response **streams**: each insight card
+  renders the moment its object completes in the SSE stream (an incremental
+  scanner in `llmProvider.ts` pulls finished array elements out of the
+  partial JSON), with a pulse line marking the in-flight tail. The key is held in `sessionStorage` only —
   never `localStorage`, never the bundle — and *disconnect* wipes it. The
   `@anthropic-ai/sdk` chunk is lazy-loaded, so nothing is fetched until a
   key is connected. For tests, `sessionStorage["nebula.assistBaseUrl"]`
