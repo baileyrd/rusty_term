@@ -3421,7 +3421,10 @@ impl WindowState<'_> {
     /// deliberately does not touch `self.config.font_size` — a DPI move is
     /// not a user preference change.
     fn on_scale_factor_changed(&mut self, new_scale: f64) {
-        if !(new_scale > 0.0) || (new_scale - self.scale_factor).abs() < 1e-9 {
+        // Equivalent to `!(new_scale > 0.0)` but spelled without a negated
+        // partial-order comparison: reject NaN explicitly rather than
+        // leaning on "not greater than" to catch it.
+        if new_scale.is_nan() || new_scale <= 0.0 || (new_scale - self.scale_factor).abs() < 1e-9 {
             return;
         }
         let ratio = new_scale / self.scale_factor;
@@ -3943,8 +3946,7 @@ fn build_dock_grid(
         write_row(&mut d, 5, 1, "integration.", dim, bg);
         return (d, items);
     }
-    let mut row = 2;
-    for (glyph, color, dur, start) in entries {
+    for (row, (glyph, color, dur, start)) in (2..).zip(entries) {
         if row >= rows {
             break;
         }
@@ -3961,7 +3963,6 @@ fn build_dock_grid(
         let dcol = cols.saturating_sub(dur.chars().count() + 1);
         write_row(&mut d, row, dcol, &dur, dim, bg);
         items[row] = Some(start);
-        row += 1;
     }
     (d, items)
 }
@@ -5541,7 +5542,7 @@ fn osc52_reply(sel: char, text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, ImeCommitTarget, MenuKind, OVERLAY_ITEMS_TOP, SETTINGS_CARDS_TOP, SETTINGS_FOOTER_H,
+        Hit, ImeCommitTarget, MenuKind, SETTINGS_CARDS_TOP, SETTINGS_FOOTER_H,
         SETTINGS_ROW_H, SETTINGS_SIDEBAR_W, SettingsHit, Widget, accumulate_scroll_lines,
         SETTINGS_SEARCH_W, arrow_presses, drag_scroll_direction, encode_paste,
         ime_commit_target, ime_cursor_area_origin, is_openable_url, mix, osc52_reply,

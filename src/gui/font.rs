@@ -162,6 +162,9 @@ impl FontCache {
     /// Whether any face has an active GSUB shaper — i.e. ligatures are enabled
     /// in config and the font actually carries `liga`/`calt` lookups. Renderers
     /// use this to skip run planning entirely when shaping is a 1:1 no-op.
+    /// Only the GPU renderer (`gpu.rs`) calls this today, so a `gui`-without-
+    /// `gui-gpu` build (CI's default combo) sees it as unused.
+    #[cfg_attr(not(feature = "gui-gpu"), allow(dead_code))]
     pub(crate) fn has_ligatures(&self) -> bool {
         self.shapers.iter().any(|s| s.is_some())
     }

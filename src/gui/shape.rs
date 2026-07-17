@@ -32,6 +32,13 @@ const MAX_DEPTH: u8 = 8;
 /// frame with no per-row dirty tracking yet — stays cheap either way.
 const SHAPE_CACHE_MAX: usize = 4096;
 
+/// A shaped run: each output glyph id paired with the number of input glyphs
+/// (terminal cells) it spans.
+type ShapedRun = Vec<(u16, u8)>;
+
+/// Memoized `shape()` results, keyed by the input glyph-id run.
+type ShapeCache = RefCell<HashMap<Vec<u16>, ShapedRun>>;
+
 /// One face's ligature shaper: the font bytes (re-parsed per call, since
 /// `ttf-parser` borrows the data and a self-referential `Face` can't be
 /// stored without unsafe code) plus the GSUB lookup indices enabled by the
@@ -47,7 +54,7 @@ pub(crate) struct Shaper {
     /// repeated/unchanged runs (blank padding, prompts, a static buffer
     /// between keystrokes), so this alone removes most of the redundant work
     /// even before dirty-row tracking lands.
-    cache: RefCell<HashMap<Vec<u16>, Vec<(u16, u8)>>>,
+    cache: ShapeCache,
 }
 
 impl Shaper {
