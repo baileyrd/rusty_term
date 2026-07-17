@@ -131,12 +131,47 @@ const clickAction = (page, text) =>
     .first()
     .click();
 
-const preview = spawn('npx', ['vite', 'preview', '--port', String(PREVIEW_PORT), '--strictPort'], {
-  cwd: new URL('..', import.meta.url), // web/, regardless of the caller's cwd
-  stdio: 'ignore',
-  detached: true, // own process group, so cleanup kills the vite child too
-});
-await new Promise((r) => setTimeout(r, 2500));
+const webRoot = new URL('..', import.meta.url);
+let previewOutput = '';
+const preview = spawn(
+  process.execPath,
+  [
+    new URL('node_modules/vite/bin/vite.js', webRoot).pathname,
+    'preview',
+    '--port',
+    String(PREVIEW_PORT),
+    '--strictPort',
+    '--host',
+    '127.0.0.1',
+  ],
+  {
+    cwd: webRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true, // own process group, so cleanup kills the vite child too
+  },
+);
+preview.stdout.on('data', (d) => (previewOutput += d));
+preview.stderr.on('data', (d) => (previewOutput += d));
+
+// Poll instead of a fixed sleep: a slower CI runner can take longer than a
+// couple seconds to get vite preview accepting connections. Invoke vite's
+// bin directly (not via `npx`) to skip npm's package-resolution overhead,
+// which ate the whole budget on a CI runner in practice.
+async function waitForServer(url, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  throw new Error(
+    `Server at ${url} never came up within ${timeoutMs}ms. vite preview output:\n${previewOutput}`,
+  );
+}
+await waitForServer(`http://127.0.0.1:${PREVIEW_PORT}/`);
 
 const browser = await chromium.launch();
 try {
