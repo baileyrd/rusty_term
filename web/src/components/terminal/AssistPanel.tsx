@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AssistInsight } from '../../assist/heuristics';
 import { ASSIST_MODEL, type ChatMessage } from '../../assist/llmProvider';
+import { parseChatSegments } from '../../assist/chatSegments';
 
 const KIND_ACCENT: Record<AssistInsight['kind'], string> = {
   summary: 'border-nebula-accent/30 text-nebula-accent',
@@ -36,6 +37,8 @@ export interface AssistPanelProps {
   ai: AiAssistState;
   chat: ChatState;
   onChatSend: (text: string) => void;
+  /** Run a chat code block in the terminal; unlike `onRun`, keeps the sheet open. */
+  onChatRun?: (command: string) => void;
   onConnect: (apiKey: string) => void;
   onDisconnect: () => void;
   onRun?: (command: string) => void;
@@ -89,15 +92,70 @@ function InsightCard({
   );
 }
 
+/**
+ * An assistant turn, with fenced code blocks rendered as runnable command
+ * blocks: run submits into the terminal (the sheet stays open — the
+ * conversation continues), copy goes to the clipboard.
+ */
+function AssistantText({ text, onRun }: { text: string; onRun?: (command: string) => void }) {
+  return (
+    <>
+      {parseChatSegments(text).map((seg, i) =>
+        seg.type === 'text' ? (
+          <span key={i} className="block">
+            {seg.content}
+          </span>
+        ) : (
+          <div
+            key={i}
+            data-testid="assist-chat-code"
+            className="my-1.5 overflow-hidden rounded-nebula-sm border border-white/10 bg-black/40"
+          >
+            <pre className="overflow-x-auto px-2 py-1.5 font-nebula-command text-xs text-nebula-text/90">
+              {seg.content}
+            </pre>
+            <div className="flex items-center justify-end gap-1.5 border-t border-white/5 px-1.5 py-1">
+              {seg.lang && (
+                <span className="mr-auto font-nebula-meta text-[10px] text-nebula-text/30">
+                  {seg.lang}
+                </span>
+              )}
+              {onRun && (
+                <button
+                  type="button"
+                  data-testid="assist-chat-run"
+                  onClick={() => onRun(seg.content.trim())}
+                  className="rounded-nebula-sm border border-nebula-accent/40 px-2 py-0.5 font-nebula-meta text-[11px] text-nebula-accent transition-colors duration-nebula-fast ease-nebula hover:bg-nebula-accent/10"
+                >
+                  run
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(seg.content.trim())}
+                className="rounded-nebula-sm border border-white/10 px-2 py-0.5 font-nebula-meta text-[11px] text-nebula-text/60 transition-colors duration-nebula-fast ease-nebula hover:bg-white/5"
+              >
+                copy
+              </button>
+            </div>
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
 /** The Chat tab: thread of turns + input line. Needs a connected key. */
 function ChatView({
   chat,
   connected,
   onChatSend,
+  onRun,
 }: {
   chat: ChatState;
   connected: boolean;
   onChatSend: (text: string) => void;
+  onRun?: (command: string) => void;
 }) {
   const [draft, setDraft] = useState('');
   const logRef = useRef<HTMLDivElement>(null);
@@ -137,7 +195,7 @@ function ChatView({
                 : 'self-start border-white/10 bg-nebula-surface text-nebula-text/85'
             }`}
           >
-            {m.text}
+            {m.role === 'assistant' ? <AssistantText text={m.text} onRun={onRun} /> : m.text}
             {chat.busy && m.role === 'assistant' && i === chat.messages.length - 1 && (
               <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-nebula-accent align-text-bottom" />
             )}
@@ -252,6 +310,7 @@ export default function AssistPanel({
   ai,
   chat,
   onChatSend,
+  onChatRun,
   onConnect,
   onDisconnect,
   onRun,
@@ -307,7 +366,12 @@ export default function AssistPanel({
       </nav>
 
       {tab === 'chat' ? (
-        <ChatView chat={chat} connected={ai.phase !== 'disconnected'} onChatSend={onChatSend} />
+        <ChatView
+          chat={chat}
+          connected={ai.phase !== 'disconnected'}
+          onChatSend={onChatSend}
+          onRun={onChatRun}
+        />
       ) : (
       <div className="flex flex-col gap-2 overflow-y-auto p-3">
         {(ai.phase === 'loading' || ai.phase === 'streaming') && (
