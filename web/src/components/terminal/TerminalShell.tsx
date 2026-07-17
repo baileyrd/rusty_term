@@ -27,6 +27,36 @@ const THEME_KEY = 'nebula.theme';
 /** Ceiling for side-by-side terminal panes — beyond this they get too thin. */
 const MAX_PANES = 4;
 
+/** localStorage key for the per-tab pane layouts (tabs/cards live with the app). */
+const PANES_KEY = 'nebula.panes';
+
+function loadPanes(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(PANES_KEY);
+    if (raw === null) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      Object.values(parsed).every(
+        (v) => Array.isArray(v) && v.every((p) => typeof p === 'string'),
+      )
+    ) {
+      return parsed as Record<string, string[]>;
+    }
+  } catch {
+    // Corrupt or unavailable storage: start with single-pane layouts.
+  }
+  return {};
+}
+
+/** The next free `pane-N` counter given the restored layouts. */
+function nextPaneCounter(panesByTab: Record<string, string[]>): number {
+  const ids = Object.values(panesByTab).flat();
+  const max = Math.max(0, ...ids.map((id) => Number(/^pane-(\d+)$/.exec(id)?.[1] ?? 0)));
+  return max + 1;
+}
+
 function loadTheme(): ThemeName | null {
   try {
     const stored = localStorage.getItem(THEME_KEY);
@@ -113,8 +143,25 @@ export default function TerminalShell({
   // Split panes, per tab: primary first, up to MAX_PANES side-by-side
   // terminals. Each split is its own transport session; ids only ever grow
   // so React never remounts (and thus never reconnects) a surviving pane.
-  const [panesByTab, setPanesByTab] = useState<Record<string, string[]>>({});
-  const paneCounter = useRef(1);
+  const [panesByTab, setPanesByTab] = useState<Record<string, string[]>>(loadPanes);
+  const paneCounter = useRef(nextPaneCounter(panesByTab));
+
+  // Persist the layouts, pruned to tabs that still exist (stale keys can
+  // linger from workspaces closed in other circumstances).
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        PANES_KEY,
+        JSON.stringify(
+          Object.fromEntries(
+            tabs.filter((t) => panesByTab[t.id]).map((t) => [t.id, panesByTab[t.id]]),
+          ),
+        ),
+      );
+    } catch {
+      // Blocked storage: the layout just doesn't survive a reload.
+    }
+  }, [panesByTab, tabs]);
   const panesFor = useCallback(
     (tabId: string) => panesByTab[tabId] ?? ['primary'],
     [panesByTab],

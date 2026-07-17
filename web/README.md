@@ -139,6 +139,13 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Session restore**: the workspace survives a reload — tabs, the active
+  tab, each tab's command cards (output trimmed to the last 30 lines per
+  card; a card still running when the page went away comes back as
+  *interrupted*), and each tab's pane layout, all persisted to
+  `localStorage` (`nebula.session` + `nebula.panes`, debounced writes).
+  Live PTY sessions can't be resurrected — each pane reconnects to the
+  bridge as a fresh shell under the restored layout and history.
 - **Session tabs**: the center column has a tab strip — each tab is an
   independent workspace with its own command cards, its own transport (a
   separate PTY session in live mode), and its own pane layout. Inactive
