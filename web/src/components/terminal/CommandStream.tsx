@@ -32,6 +32,9 @@ export interface CommandStreamProps {
   onClosePane?: (tabId: string, paneId: string) => void;
   /** Card to scroll into view and flash (a history-search jump target). */
   highlightCardId?: string | null;
+  /** Show only error cards, with a dismissible chip above the stream. */
+  failuresOnly?: boolean;
+  onClearFilter?: () => void;
 }
 
 /**
@@ -51,6 +54,8 @@ export default function CommandStream({
   onTabClose,
   onClosePane,
   highlightCardId,
+  failuresOnly = false,
+  onClearFilter,
 }: CommandStreamProps) {
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -58,7 +63,11 @@ export default function CommandStream({
   // Card groups: bursts of activity separated by idle gaps. Collapsed
   // group ids live here (memory only — a reload reopens everything);
   // headers only render once there's more than one group to fold.
-  const groups = useMemo(() => groupCards(commands), [commands]);
+  const visibleCommands = useMemo(
+    () => (failuresOnly ? commands.filter((c) => c.status === 'error') : commands),
+    [commands, failuresOnly],
+  );
+  const groups = useMemo(() => groupCards(visibleCommands), [visibleCommands]);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggleGroup = (id: string) =>
     setCollapsed((prev) => {
@@ -147,6 +156,22 @@ export default function CommandStream({
         )}
       </div>
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
+        {failuresOnly && (
+          <div
+            data-testid="failures-filter-chip"
+            className="flex items-center gap-2 rounded-full border border-nebula-error/40 bg-nebula-error/10 px-3 py-1 font-nebula-meta text-[11px] text-nebula-error"
+          >
+            failures only · {visibleCommands.length} of {commands.length} commands
+            <button
+              type="button"
+              aria-label="Clear failures filter"
+              onClick={onClearFilter}
+              className="ml-auto rounded-nebula-sm px-1 transition-colors duration-nebula-fast ease-nebula hover:bg-white/10"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         {groups.map((group) => (
           <section key={group.id} className="space-y-3">
             {groups.length > 1 && (
