@@ -196,6 +196,9 @@ Real (with the bridge running, `?ws`):
   shortcut is captured before xterm sees it, so the chord never reaches
   the PTY. Running from the palette goes through the same submit path as
   cards and snippets.
+- **Failures filter** (palette: *Show failures only*): trims the stream
+  to error cards, with a dismissible chip showing the ratio; a history-
+  search jump clears the filter so its target can render.
 - **Card quick actions**: hovering a card reveals re-run (↻ — submits the
   command through the same path as the input line), copy output (⧉ — the
   card's output to the clipboard), and pin (⌖).

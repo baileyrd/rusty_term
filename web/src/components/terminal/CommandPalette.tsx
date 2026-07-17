@@ -38,6 +38,9 @@ export interface CommandPaletteProps {
   onSearchHistory?: () => void;
   /** Download the active session's transcript in the given format. */
   onExportTranscript?: (format: 'md' | 'json') => void;
+  /** Toggle the failures-only stream filter. */
+  failuresOnly?: boolean;
+  onToggleFailuresOnly?: () => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -92,6 +95,8 @@ export default function CommandPalette({
   onTabClose,
   onSearchHistory,
   onExportTranscript,
+  failuresOnly = false,
+  onToggleFailuresOnly,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -184,6 +189,14 @@ export default function CommandPalette({
         action: onSearchHistory,
       });
     }
+    if (onToggleFailuresOnly) {
+      candidates.push({
+        id: 'failures-filter',
+        group: 'actions',
+        title: failuresOnly ? 'Show all commands' : 'Show failures only',
+        action: onToggleFailuresOnly,
+      });
+    }
     if (onExportTranscript) {
       candidates.push(
         {
@@ -271,7 +284,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory, onExportTranscript]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory, onExportTranscript, failuresOnly, onToggleFailuresOnly]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

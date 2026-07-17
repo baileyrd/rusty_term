@@ -202,6 +202,9 @@ export default function TerminalShell({
     [onTabClose],
   );
 
+  // Failures-only view of the card stream (per-sitting, palette-toggled).
+  const [failuresOnly, setFailuresOnly] = useState(false);
+
   const [snippets, setSnippets] = useState<SnippetItem[]>(loadSnippets);
   const [assistOpen, setAssistOpen] = useState(false);
   const [seenFailures, setSeenFailures] = useState(0);
@@ -356,6 +359,8 @@ export default function TerminalShell({
   const jumpToCard = useCallback(
     (tabId: string, cardId: string) => {
       if (tabId !== currentTab) onTabSelect?.(tabId);
+      // The target may not be a failure — drop the filter so it can render.
+      setFailuresOnly(false);
       setHighlightCardId(cardId);
     },
     [currentTab, onTabSelect],
@@ -401,6 +406,8 @@ export default function TerminalShell({
           onTabClose={tabs.length > 1 ? handleTabClose : undefined}
           onClosePane={closePane}
           highlightCardId={highlightCardId}
+          failuresOnly={failuresOnly}
+          onClearFilter={() => setFailuresOnly(false)}
         />
         <SideDock
           cpu={live ? (live.cpu ?? 0) : 0.34}
@@ -442,6 +449,8 @@ export default function TerminalShell({
         onTabAdd={onTabAdd}
         onTabClose={tabs.length > 1 ? () => handleTabClose(currentTab) : undefined}
         onSearchHistory={() => setSearchOpen(true)}
+        failuresOnly={failuresOnly}
+        onToggleFailuresOnly={() => setFailuresOnly((v) => !v)}
         onExportTranscript={(format) =>
           exportTranscript(
             tabs.find((t) => t.id === currentTab)?.title ?? 'session',
