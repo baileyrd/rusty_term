@@ -3,9 +3,14 @@ import StatusRibbon from './StatusRibbon';
 import CommandStream from './CommandStream';
 import SideDock from './SideDock';
 import AiOrb from './AiOrb';
-import AssistPanel, { type AiAssistState } from './AssistPanel';
+import AssistPanel, { type AiAssistState, type ChatState } from './AssistPanel';
 import { localHeuristics } from '../../assist/heuristics';
-import { createLlmProvider, loadApiKey, storeApiKey } from '../../assist/llmProvider';
+import {
+  createLlmProvider,
+  loadApiKey,
+  storeApiKey,
+  type ChatMessage,
+} from '../../assist/llmProvider';
 import type { SnippetItem, TerminalShellProps } from './types';
 
 /** localStorage key for the pinned snippets. */
@@ -123,6 +128,44 @@ export default function TerminalShell({
   const disconnectAssist = useCallback(() => {
     storeApiKey(null);
     setApiKey(null);
+    setChat({ messages: [], busy: false });
+  }, []);
+
+  // The chat thread. The last assistant message is appended empty when a
+  // send starts and grows with each streamed delta; refs give the async
+  // handler the current thread and cards without re-creating the callback.
+  const [chat, setChat] = useState<ChatState>({ messages: [], busy: false });
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
+  const commandsRef = useRef(commands);
+  commandsRef.current = commands;
+  const apiKeyRef = useRef(apiKey);
+  apiKeyRef.current = apiKey;
+
+  const sendChat = useCallback((text: string) => {
+    const key = apiKeyRef.current;
+    if (key === null || chatRef.current.busy) return;
+    const history: ChatMessage[] = [...chatRef.current.messages, { role: 'user', text }];
+    setChat({ messages: [...history, { role: 'assistant', text: '' }], busy: true });
+    const patchReply = (reply: string) =>
+      setChat((prev) => ({
+        ...prev,
+        messages: [...prev.messages.slice(0, -1), { role: 'assistant', text: reply }],
+      }));
+    createLlmProvider(key)
+      .chat(history, commandsRef.current, patchReply)
+      .then((reply) => {
+        patchReply(reply);
+        setChat((prev) => ({ ...prev, busy: false, error: undefined }));
+      })
+      .catch((err: unknown) => {
+        setChat({
+          // Drop the empty assistant stub; keep the user's turn for a retry.
+          messages: history,
+          busy: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }, []);
   const failures = useMemo(
     () => commands.filter((c) => c.status === 'error').length,
@@ -189,6 +232,8 @@ export default function TerminalShell({
         <AssistPanel
           insights={insights}
           ai={aiState}
+          chat={chat}
+          onChatSend={sendChat}
           onConnect={connectAssist}
           onDisconnect={disconnectAssist}
           onRun={

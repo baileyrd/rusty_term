@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AssistInsight } from '../../assist/heuristics';
-import { ASSIST_MODEL } from '../../assist/llmProvider';
+import { ASSIST_MODEL, type ChatMessage } from '../../assist/llmProvider';
 
 const KIND_ACCENT: Record<AssistInsight['kind'], string> = {
   summary: 'border-nebula-accent/30 text-nebula-accent',
@@ -20,9 +20,22 @@ export type AiAssistState =
   | { phase: 'ready'; insights: AssistInsight[] }
   | { phase: 'error'; message: string };
 
+/**
+ * The chat thread as the shell owns it: past turns (the last assistant
+ * message grows while `busy` — it's the streaming reply), plus any error
+ * from the most recent send.
+ */
+export interface ChatState {
+  messages: ChatMessage[];
+  busy: boolean;
+  error?: string;
+}
+
 export interface AssistPanelProps {
   insights: AssistInsight[];
   ai: AiAssistState;
+  chat: ChatState;
+  onChatSend: (text: string) => void;
   onConnect: (apiKey: string) => void;
   onDisconnect: () => void;
   onRun?: (command: string) => void;
@@ -73,6 +86,99 @@ function InsightCard({
         </div>
       )}
     </section>
+  );
+}
+
+/** The Chat tab: thread of turns + input line. Needs a connected key. */
+function ChatView({
+  chat,
+  connected,
+  onChatSend,
+}: {
+  chat: ChatState;
+  connected: boolean;
+  onChatSend: (text: string) => void;
+}) {
+  const [draft, setDraft] = useState('');
+  const logRef = useRef<HTMLDivElement>(null);
+
+  // Keep the newest turn in view as replies stream in.
+  useEffect(() => {
+    const log = logRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [chat.messages]);
+
+  if (!connected) {
+    return (
+      <p className="p-4 font-nebula-meta text-xs text-nebula-text/50">
+        Connect an Anthropic API key below to chat with Claude about this
+        session.
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div ref={logRef} data-testid="assist-chat-log" className="flex flex-col gap-2 overflow-y-auto p-3">
+        {chat.messages.length === 0 && (
+          <p className="font-nebula-meta text-xs text-nebula-text/40">
+            Ask about the session — failures, next steps, what a command did.
+            Claude sees the recent command cards.
+          </p>
+        )}
+        {chat.messages.map((m, i) => (
+          <div
+            key={i}
+            data-testid="assist-chat-message"
+            data-role={m.role}
+            className={`max-w-[90%] whitespace-pre-wrap rounded-nebula-md border p-2.5 font-nebula-meta text-xs leading-relaxed ${
+              m.role === 'user'
+                ? 'self-end border-nebula-accent/30 bg-nebula-accent/10 text-nebula-text'
+                : 'self-start border-white/10 bg-nebula-surface text-nebula-text/85'
+            }`}
+          >
+            {m.text}
+            {chat.busy && m.role === 'assistant' && i === chat.messages.length - 1 && (
+              <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-nebula-accent align-text-bottom" />
+            )}
+          </div>
+        ))}
+        {chat.error !== undefined && (
+          <p data-testid="assist-chat-error" className="font-nebula-meta text-xs text-nebula-error/80">
+            Chat request failed: {chat.error}
+          </p>
+        )}
+      </div>
+      <form
+        className="flex items-center gap-2 border-t border-white/5 px-3 py-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const text = draft.trim();
+          if (text.length === 0 || chat.busy) return;
+          onChatSend(text);
+          setDraft('');
+        }}
+      >
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={chat.busy ? 'Claude is replying…' : 'Ask about this session…'}
+          aria-label="Chat message"
+          data-testid="assist-chat-input"
+          disabled={chat.busy}
+          className="min-w-0 flex-1 rounded-nebula-sm border border-white/10 bg-black/30 px-2 py-1 font-nebula-command text-xs text-nebula-text placeholder:text-nebula-text/30 focus:border-nebula-accent/50 focus:outline-none disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          data-testid="assist-chat-send"
+          disabled={chat.busy || draft.trim().length === 0}
+          className="rounded-nebula-sm border border-nebula-accent/40 px-2 py-1 font-nebula-meta text-[11px] text-nebula-accent transition-colors duration-nebula-fast ease-nebula hover:bg-nebula-accent/10 disabled:opacity-40"
+        >
+          send
+        </button>
+      </form>
+    </div>
   );
 }
 
@@ -135,18 +241,23 @@ function ConnectionBar({
 
 /**
  * The AI orb's sheet: slides up from the bottom-right (the design system's
- * "modal sheets slide up" rule). Always shows the local-heuristics insights;
- * when the user connects an Anthropic API key (session-scoped, never
- * persisted to disk), a Claude-generated section appears above them.
+ * "modal sheets slide up" rule). Two tabs: *insights* always shows the
+ * local-heuristics cards, with a Claude-generated section above them once
+ * an Anthropic API key is connected (session-scoped, never persisted to
+ * disk); *chat* is a streaming conversation with Claude about the session,
+ * available with the same key.
  */
 export default function AssistPanel({
   insights,
   ai,
+  chat,
+  onChatSend,
   onConnect,
   onDisconnect,
   onRun,
   onClose,
 }: AssistPanelProps) {
+  const [tab, setTab] = useState<'insights' | 'chat'>('insights');
   const subtitle =
     ai.phase === 'disconnected'
       ? 'local heuristics · no AI provider connected'
@@ -176,6 +287,28 @@ export default function AssistPanel({
         </button>
       </header>
 
+      <nav className="flex border-b border-white/5 bg-nebula-surface/50">
+        {(['insights', 'chat'] as const).map((t) => (
+          <button
+            key={t}
+            type="button"
+            data-testid={`assist-tab-${t}`}
+            aria-selected={tab === t}
+            onClick={() => setTab(t)}
+            className={`px-4 py-1.5 font-nebula-meta text-xs transition-colors duration-nebula-fast ease-nebula ${
+              tab === t
+                ? 'border-b-2 border-nebula-accent text-nebula-accent'
+                : 'text-nebula-text/50 hover:text-nebula-text'
+            }`}
+          >
+            {t}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'chat' ? (
+        <ChatView chat={chat} connected={ai.phase !== 'disconnected'} onChatSend={onChatSend} />
+      ) : (
       <div className="flex flex-col gap-2 overflow-y-auto p-3">
         {(ai.phase === 'loading' || ai.phase === 'streaming') && (
           <p
@@ -199,6 +332,7 @@ export default function AssistPanel({
           <InsightCard key={insight.id} insight={insight} source="local" onRun={onRun} />
         ))}
       </div>
+      )}
 
       <ConnectionBar ai={ai} onConnect={onConnect} onDisconnect={onDisconnect} />
     </div>
