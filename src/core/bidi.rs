@@ -107,6 +107,27 @@ struct Status {
     isolate: bool,
 }
 
+/// The active status frame. `resolve_levels` always keeps at least the base
+/// (non-isolate) entry it pushes at the start — every place that pops
+/// guards against removing it (see the PDI/PDF branches below) — so this
+/// should never actually see an empty stack. It's still worth being
+/// defensive here rather than trusting that invariant with a bare
+/// `.unwrap()`: the push/pop bookkeeping is hand-maintained across several
+/// branches, and a future edit that desyncs it would otherwise turn
+/// arbitrary PTY/file bytes (crafted isolate/embedding control-character
+/// sequences) into a panic instead of a rendering glitch. Debug builds
+/// (which is what the test suite runs under) still assert immediately so a
+/// regression is caught in CI rather than silently degrading in the field.
+fn top_status(stack: &[Status], para: u8) -> Status {
+    match stack.last() {
+        Some(&s) => s,
+        None => {
+            debug_assert!(false, "bidi status stack was unexpectedly empty");
+            Status { level: para, over: None, isolate: false }
+        }
+    }
+}
+
 /// Resolved embedding levels for `text` at paragraph level `para`
 /// (rules X1–I2; L1 applies in [`visual_map`], which owns line context).
 pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
@@ -122,7 +143,7 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
         if rtl { (cur + 1) | 1 } else { (cur + 2) & !1 }
     };
     for i in 0..n {
-        let top = *stack.last().unwrap();
+        let top = top_status(&stack, para);
         match orig[i] {
             RLE | LRE | RLO | LRO => {
                 levels[i] = top.level;
@@ -163,13 +184,24 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
                 if overflow_iso > 0 {
                     overflow_iso -= 1;
                 } else if valid_iso > 0 {
-                    while !stack.last().unwrap().isolate {
+                    // `stack.len() > 1` guards against ever popping the base
+                    // frame away, even if valid_iso (which should track the
+                    // stack's isolate-frame count exactly) somehow desynced
+                    // from the stack's actual contents.
+                    while stack.len() > 1 && !stack.last().unwrap().isolate {
                         stack.pop();
                     }
-                    stack.pop();
+                    if stack.len() > 1 {
+                        stack.pop();
+                    } else {
+                        debug_assert!(
+                            false,
+                            "bidi: valid_iso > 0 but no isolate frame found on the stack"
+                        );
+                    }
                     valid_iso -= 1;
                 }
-                let top = *stack.last().unwrap();
+                let top = top_status(&stack, para);
                 levels[i] = top.level;
                 if let Some(o) = top.over {
                     types[i] = o;
@@ -260,13 +292,26 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
         loop {
             used[cur] = true;
             seq.extend(runs[cur].iter().copied());
-            let &last_k = runs[cur].last().unwrap();
+            // Every run built by the X10 grouping loop above holds at least
+            // one kept position — an empty one here would mean that
+            // invariant broke, not a real possibility this input can
+            // trigger. End the sequence rather than panic if it ever did.
+            let Some(&last_k) = runs[cur].last() else {
+                debug_assert!(false, "bidi: an empty level run — X10 run-building invariant violated");
+                break;
+            };
             let last_i = kept[last_k];
             if matches!(orig[last_i], LRI | RLI | FSI)
                 && let Some(&(_, Some(pdi_i))) =
                     matching_pdi.iter().find(|&&(ini, _)| ini == last_i)
             {
-                let pdi_k = kept.iter().position(|&i| i == pdi_i).unwrap();
+                // A matched PDI is never removed by X9, so it's always
+                // present in `kept` — defensive fallback (stop chaining
+                // rather than panic) if that ever stopped holding.
+                let Some(pdi_k) = kept.iter().position(|&i| i == pdi_i) else {
+                    debug_assert!(false, "bidi: an isolate's matching PDI vanished from `kept`");
+                    break;
+                };
                 let nxt = run_of_kpos[pdi_k];
                 if !used[nxt] {
                     cur = nxt;
@@ -280,6 +325,11 @@ pub(crate) fn resolve_levels(text: &[char], para: u8) -> Vec<u8> {
 
     // W and N rules per isolating run sequence.
     for seq in &sequences {
+        // Every sequence is built from at least one non-empty run before
+        // being pushed above, so this always holds — a tripwire in case a
+        // future edit to that construction ever breaks it (the code below
+        // indexes seq[0]/seq.last() directly on the strength of this).
+        debug_assert!(!seq.is_empty(), "bidi: an empty isolating run sequence");
         let seq_level = levels[kept[seq[0]]];
         // sos/eos: compare against the adjacent retained char outside the
         // sequence (paragraph level at the edges; eos uses the paragraph
@@ -656,6 +706,82 @@ pub(crate) fn reorder(text: &[char], para: u8) -> (Vec<u8>, Vec<u16>) {
 mod tests {
     use super::*;
     use crate::core::base64;
+
+    /// Adversarial isolate/embedding control-character sequences — the kind
+    /// a crafted file or hostile process output could feed the terminal —
+    /// exercised against `resolve_levels`'s hand-maintained status-stack
+    /// bookkeeping (X1-X8/PDI). None of these are handled specially; they
+    /// just must not panic, and must return one level per input char. Debug
+    /// builds (what the test suite runs under) also have the function's
+    /// internal debug_asserts armed, so a bookkeeping regression that
+    /// desyncs valid_iso/overflow_iso/overflow_emb from the stack's actual
+    /// contents fails these tests immediately rather than only showing up
+    /// as a wrong (but non-crashing) render.
+    mod adversarial_isolate_sequences {
+        use super::*;
+
+        fn no_panic(text: &[char]) {
+            let levels = resolve_levels(text, 0);
+            assert_eq!(levels.len(), text.len());
+        }
+
+        #[test]
+        fn many_unmatched_pdis_with_no_initiators() {
+            let t: Vec<char> = std::iter::repeat_n('\u{2069}', 200).collect(); // PDI
+            no_panic(&t);
+        }
+
+        #[test]
+        fn isolates_nested_far_past_max_depth() {
+            // MAX_DEPTH is 125; push well past it so most of these overflow,
+            // then close them all — exactly the overflow/valid_iso boundary
+            // the PDI branch's stack-popping logic has to get right.
+            let mut t: Vec<char> = std::iter::repeat_n('\u{2066}', 300).collect(); // LRI
+            t.extend(std::iter::repeat_n('\u{2069}', 300)); // PDI
+            no_panic(&t);
+        }
+
+        #[test]
+        fn pdf_without_a_matching_embedding() {
+            let t: Vec<char> = "a\u{202C}\u{202C}\u{202C}b".chars().collect(); // PDF x3
+            no_panic(&t);
+        }
+
+        #[test]
+        fn pdi_before_any_isolate_then_a_real_one() {
+            let t: Vec<char> = "\u{2069}\u{2069}x\u{2066}y\u{2069}".chars().collect();
+            no_panic(&t);
+        }
+
+        #[test]
+        fn interleaved_embeddings_and_isolates_unbalanced() {
+            // RLE, LRI, PDF (mismatched — closes the embedding, not the
+            // isolate), PDI, PDI (extra), more content after.
+            let t: Vec<char> =
+                "\u{202B}a\u{2066}b\u{202C}\u{2069}\u{2069}c".chars().collect();
+            no_panic(&t);
+        }
+
+        #[test]
+        fn random_soup_of_every_control_char_is_panic_free() {
+            // A denser mix, repeated, so overflow/valid/embedding counters
+            // all cycle through non-trivial states many times over.
+            let controls = [
+                '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
+                '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
+            ];
+            let mut t = Vec::new();
+            for i in 0..500 {
+                t.push(controls[i % controls.len()]);
+                if i % 7 == 0 {
+                    t.push('a');
+                } else if i % 11 == 0 {
+                    t.push('\u{5D0}'); // Hebrew alef, an R char
+                }
+            }
+            no_panic(&t);
+        }
+    }
 
     #[test]
     fn class_lookup_covers_the_majors() {
