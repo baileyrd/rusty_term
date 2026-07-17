@@ -3,9 +3,9 @@
  * client-side from the session's real command cards — no network, no model,
  * no fabricated intelligence. The design docs' orb promises "contextual
  * summaries and next-command suggestions"; this provider delivers the
- * honest subset that pattern rules can, and the `AssistProvider` shape
- * leaves a socket for a real LLM provider later (the architecture doc lists
- * assistant providers as an extension surface).
+ * honest subset that pattern rules can. Its async twin lives in
+ * `llmProvider.ts` — the Claude-backed provider the panel adds when the
+ * user connects an API key; these local rules keep running either way.
  */
 
 import type { CommandCardProps } from '../components/terminal/types';

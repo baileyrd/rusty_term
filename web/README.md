@@ -148,11 +148,23 @@ Real (with the bridge running, `?ws`):
   (permission denied → suggest `sudo`, command not found → suggest
   `command -v`, missing paths, plain non-zero exits) with runnable/copyable
   suggested commands, and a repeated-failure nudge. The badge counts
-  failures that arrived since the sheet was last opened. It is deliberately
-  labeled "no AI provider connected": the panel is honest pattern rules
-  behind an `AssistProvider` interface
-  ([`assist/heuristics.ts`](src/assist/heuristics.ts)) that a real LLM
-  provider can implement later.
+  failures that arrived since the sheet was last opened. The local rules
+  live behind the `AssistProvider` interface in
+  [`assist/heuristics.ts`](src/assist/heuristics.ts) and always run.
+- **Claude assist** ([`assist/llmProvider.ts`](src/assist/llmProvider.ts)):
+  paste an Anthropic API key into the sheet's *connect* bar and a
+  Claude-generated section (model `claude-opus-4-8`, adaptive thinking,
+  JSON-schema structured output so the reply is always renderable insights)
+  appears above the local rules, re-analyzing whenever a command finishes
+  while the sheet is open. The key is held in `sessionStorage` only —
+  never `localStorage`, never the bundle — and *disconnect* wipes it. The
+  `@anthropic-ai/sdk` chunk is lazy-loaded, so nothing is fetched until a
+  key is connected. For tests, `sessionStorage["nebula.assistBaseUrl"]`
+  points the SDK at a mock Messages endpoint.
+
+  > A key pasted into a browser page is visible to that page; use a
+  > scoped/disposable key. A production deployment should proxy the
+  > Messages API server-side instead of shipping keys to the client.
 
 To emit the marks from bash, drop this in the profile of the shell the
 bridge spawns (zsh/fish equivalents exist; VS Code and WezTerm ship the
@@ -175,8 +187,7 @@ Demo/stub:
 - Without `?ws`, the ribbon's load/latency/git numbers and the dock's
   CPU/RAM bars are hardcoded (they're live with the bridge — see above),
   and cards/submits are the loopback fakes.
-- The assist panel's insights are pattern rules, not a model — by design,
-  until an LLM `AssistProvider` is plugged in.
-- The AI orb is presentational; clicking it only clears the badge.
+- Without a connected API key the assist panel is pattern rules, not a
+  model — and says so in its header.
 - `theme="cyberpunk" | "minimal"` are accepted per the spec but currently
   render the Nebula skin.
