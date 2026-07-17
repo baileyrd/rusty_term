@@ -262,7 +262,17 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else { return true };
     let rest = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"));
     let Some(rest) = rest else { return false };
-    let host = rest.split(':').next().unwrap_or("");
+    // A bracketed IPv6 literal ("[::1]" or "[::1]:5173") has colons inside
+    // the brackets, so a naive split(':') never reaches the host — take
+    // everything through the closing bracket instead.
+    let host = if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..=end],
+            None => rest, // malformed; won't match any allowed host below
+        }
+    } else {
+        rest.split(':').next().unwrap_or("")
+    };
     matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
@@ -386,5 +396,17 @@ mod tests {
         assert!(!origin_allowed(Some("https://evil.example.com")));
         assert!(!origin_allowed(Some("http://localhost.evil.com")));
         assert!(!origin_allowed(Some("file://whatever")));
+    }
+
+    #[test]
+    fn origin_policy_admits_bracketed_ipv6_loopback() {
+        // A naive `rest.split(':').next()` sees the colons inside the
+        // brackets and never reaches the host — these must still match.
+        assert!(origin_allowed(Some("http://[::1]:5173")));
+        assert!(origin_allowed(Some("https://[::1]")));
+        assert!(!origin_allowed(Some("http://[::2]:5173")), "not the loopback address");
+        // A malformed/unterminated bracket must not panic and must be
+        // refused rather than accidentally matching.
+        assert!(!origin_allowed(Some("http://[::1")));
     }
 }
