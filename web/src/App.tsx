@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CommandEvent } from './components/terminal/commandTracker';
 import TerminalShell from './components/terminal/TerminalShell';
 import type { CommandCardProps, LiveShellStats } from './components/terminal/types';
+import { loadJson, saveJson } from './storage';
 import type { TerminalTransport } from './transport/bridge';
 
 /**
@@ -102,6 +103,7 @@ interface SessionTab {
 
 /** localStorage key for the tab/card workspace (pane layouts live with the shell). */
 const SESSION_KEY = 'nebula.session';
+const SESSION_VERSION = 1;
 
 /** Lines of output retained per card in the saved session. */
 const SAVED_OUTPUT_LINES = 30;
@@ -110,6 +112,19 @@ interface SavedSession {
   tabs: SessionTab[];
   activeTabId: string;
   commandsByTab: Record<string, CommandCardProps[]>;
+}
+
+function isRawSavedSession(v: unknown): v is SavedSession {
+  if (typeof v !== 'object' || v === null) return false;
+  const parsed = v as Partial<SavedSession>;
+  return (
+    Array.isArray(parsed.tabs) &&
+    parsed.tabs.length > 0 &&
+    parsed.tabs.every((t) => typeof t?.id === 'string' && typeof t?.title === 'string') &&
+    typeof parsed.activeTabId === 'string' &&
+    typeof parsed.commandsByTab === 'object' &&
+    parsed.commandsByTab !== null
+  );
 }
 
 /**
@@ -122,37 +137,22 @@ function reviveCard(card: CommandCardProps): CommandCardProps {
 }
 
 function loadSession(): SavedSession | null {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as SavedSession;
-    if (
-      !Array.isArray(parsed.tabs) ||
-      parsed.tabs.length === 0 ||
-      !parsed.tabs.every((t) => typeof t?.id === 'string' && typeof t?.title === 'string') ||
-      typeof parsed.activeTabId !== 'string' ||
-      typeof parsed.commandsByTab !== 'object' ||
-      parsed.commandsByTab === null
-    ) {
-      return null;
-    }
-    return {
-      tabs: parsed.tabs,
-      activeTabId: parsed.tabs.some((t) => t.id === parsed.activeTabId)
-        ? parsed.activeTabId
-        : parsed.tabs[0].id,
-      commandsByTab: Object.fromEntries(
-        parsed.tabs.map((t) => [
-          t.id,
-          (Array.isArray(parsed.commandsByTab[t.id]) ? parsed.commandsByTab[t.id] : []).map(
-            reviveCard,
-          ),
-        ]),
-      ),
-    };
-  } catch {
-    return null;
-  }
+  const parsed = loadJson(localStorage, SESSION_KEY, SESSION_VERSION, isRawSavedSession);
+  if (parsed === null) return null;
+  return {
+    tabs: parsed.tabs,
+    activeTabId: parsed.tabs.some((t) => t.id === parsed.activeTabId)
+      ? parsed.activeTabId
+      : parsed.tabs[0].id,
+    commandsByTab: Object.fromEntries(
+      parsed.tabs.map((t) => [
+        t.id,
+        (Array.isArray(parsed.commandsByTab[t.id]) ? parsed.commandsByTab[t.id] : []).map(
+          reviveCard,
+        ),
+      ]),
+    ),
+  };
 }
 
 /** Finished (success or error) cards in a list. */
@@ -199,26 +199,19 @@ export default function App() {
   // writes; output is trimmed per card to bound what storage holds.
   useEffect(() => {
     const timer = setTimeout(() => {
-      try {
-        localStorage.setItem(
-          SESSION_KEY,
-          JSON.stringify({
-            tabs,
-            activeTabId,
-            commandsByTab: Object.fromEntries(
-              tabs.map((t) => [
-                t.id,
-                (commandsByTab[t.id] ?? []).map((c) => ({
-                  ...c,
-                  output: c.output.slice(-SAVED_OUTPUT_LINES),
-                })),
-              ]),
-            ),
-          } satisfies SavedSession),
-        );
-      } catch {
-        // Storage full/blocked: the workspace just won't survive a reload.
-      }
+      saveJson(localStorage, SESSION_KEY, SESSION_VERSION, {
+        tabs,
+        activeTabId,
+        commandsByTab: Object.fromEntries(
+          tabs.map((t) => [
+            t.id,
+            (commandsByTab[t.id] ?? []).map((c) => ({
+              ...c,
+              output: c.output.slice(-SAVED_OUTPUT_LINES),
+            })),
+          ]),
+        ),
+      } satisfies SavedSession);
     }, 400);
     return () => clearTimeout(timer);
   }, [tabs, activeTabId, commandsByTab]);

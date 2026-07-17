@@ -17,12 +17,14 @@ import {
 } from '../../assist/llmProvider';
 import { THEME_NAMES, type ThemeName } from '../../theme/tokens';
 import { applyTheme } from '../../theme/apply';
+import { loadJson, saveJson } from '../../storage';
 import type { SnippetItem, TerminalShellProps } from './types';
 
 const DEFAULT_TABS = [{ id: 'main', title: 'session 1' }];
 
 /** localStorage key for the pinned snippets. */
 const SNIPPETS_KEY = 'nebula.pinnedSnippets';
+const SNIPPETS_VERSION = 1;
 
 /** localStorage key for the chosen theme preset. */
 const THEME_KEY = 'nebula.theme';
@@ -32,25 +34,18 @@ const MAX_PANES = 4;
 
 /** localStorage key for the per-tab pane layouts (tabs/cards live with the app). */
 const PANES_KEY = 'nebula.panes';
+const PANES_VERSION = 1;
+
+function isPaneLayouts(v: unknown): v is Record<string, string[]> {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    Object.values(v).every((p) => Array.isArray(p) && p.every((id) => typeof id === 'string'))
+  );
+}
 
 function loadPanes(): Record<string, string[]> {
-  try {
-    const raw = localStorage.getItem(PANES_KEY);
-    if (raw === null) return {};
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      Object.values(parsed).every(
-        (v) => Array.isArray(v) && v.every((p) => typeof p === 'string'),
-      )
-    ) {
-      return parsed as Record<string, string[]>;
-    }
-  } catch {
-    // Corrupt or unavailable storage: start with single-pane layouts.
-  }
-  return {};
+  return loadJson(localStorage, PANES_KEY, PANES_VERSION, isPaneLayouts) ?? {};
 }
 
 /** The next free `pane-N` counter given the restored layouts. */
@@ -74,27 +69,21 @@ const DEFAULT_SNIPPETS: SnippetItem[] = [
   { title: 'Tail logs', command: 'journalctl -fu rusty-term-bridge' },
 ];
 
+function isSnippetList(v: unknown): v is SnippetItem[] {
+  return (
+    Array.isArray(v) &&
+    v.every(
+      (s) =>
+        typeof s === 'object' &&
+        s !== null &&
+        typeof (s as SnippetItem).title === 'string' &&
+        typeof (s as SnippetItem).command === 'string',
+    )
+  );
+}
+
 function loadSnippets(): SnippetItem[] {
-  try {
-    const raw = localStorage.getItem(SNIPPETS_KEY);
-    if (raw === null) return DEFAULT_SNIPPETS;
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      Array.isArray(parsed) &&
-      parsed.every(
-        (s) =>
-          typeof s === 'object' &&
-          s !== null &&
-          typeof (s as SnippetItem).title === 'string' &&
-          typeof (s as SnippetItem).command === 'string',
-      )
-    ) {
-      return parsed as SnippetItem[];
-    }
-  } catch {
-    // Corrupt or unavailable storage: fall through to defaults.
-  }
-  return DEFAULT_SNIPPETS;
+  return loadJson(localStorage, SNIPPETS_KEY, SNIPPETS_VERSION, isSnippetList) ?? DEFAULT_SNIPPETS;
 }
 
 /** A dock title for a pinned command: its first couple of words. */
@@ -154,18 +143,12 @@ export default function TerminalShell({
   // Persist the layouts, pruned to tabs that still exist (stale keys can
   // linger from workspaces closed in other circumstances).
   useEffect(() => {
-    try {
-      localStorage.setItem(
-        PANES_KEY,
-        JSON.stringify(
-          Object.fromEntries(
-            tabs.filter((t) => panesByTab[t.id]).map((t) => [t.id, panesByTab[t.id]]),
-          ),
-        ),
-      );
-    } catch {
-      // Blocked storage: the layout just doesn't survive a reload.
-    }
+    saveJson(
+      localStorage,
+      PANES_KEY,
+      PANES_VERSION,
+      Object.fromEntries(tabs.filter((t) => panesByTab[t.id]).map((t) => [t.id, panesByTab[t.id]])),
+    );
   }, [panesByTab, tabs]);
   const panesFor = useCallback(
     (tabId: string) => panesByTab[tabId] ?? ['primary'],
@@ -216,11 +199,7 @@ export default function TerminalShell({
   const aiRequest = useRef(0);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(SNIPPETS_KEY, JSON.stringify(snippets));
-    } catch {
-      // Storage full/blocked: pins simply don't persist this session.
-    }
+    saveJson(localStorage, SNIPPETS_KEY, SNIPPETS_VERSION, snippets);
   }, [snippets]);
 
   const insights = useMemo(() => localHeuristics.analyze(commands), [commands]);
