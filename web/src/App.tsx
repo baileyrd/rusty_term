@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CommandEvent } from './components/terminal/commandTracker';
 import TerminalShell from './components/terminal/TerminalShell';
 import type { CommandCardProps, LiveShellStats } from './components/terminal/types';
@@ -99,19 +99,113 @@ interface SessionTab {
   title: string;
 }
 
+/** localStorage key for the tab/card workspace (pane layouts live with the shell). */
+const SESSION_KEY = 'nebula.session';
+
+/** Lines of output retained per card in the saved session. */
+const SAVED_OUTPUT_LINES = 30;
+
+interface SavedSession {
+  tabs: SessionTab[];
+  activeTabId: string;
+  commandsByTab: Record<string, CommandCardProps[]>;
+}
+
+/**
+ * A card as it comes back from storage: a command that was still running
+ * when the page went away can't be resumed — it reads as interrupted.
+ */
+function reviveCard(card: CommandCardProps): CommandCardProps {
+  if (card.status !== 'running') return card;
+  return { ...card, status: 'idle', meta: 'interrupted' };
+}
+
+function loadSession(): SavedSession | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as SavedSession;
+    if (
+      !Array.isArray(parsed.tabs) ||
+      parsed.tabs.length === 0 ||
+      !parsed.tabs.every((t) => typeof t?.id === 'string' && typeof t?.title === 'string') ||
+      typeof parsed.activeTabId !== 'string' ||
+      typeof parsed.commandsByTab !== 'object' ||
+      parsed.commandsByTab === null
+    ) {
+      return null;
+    }
+    return {
+      tabs: parsed.tabs,
+      activeTabId: parsed.tabs.some((t) => t.id === parsed.activeTabId)
+        ? parsed.activeTabId
+        : parsed.tabs[0].id,
+      commandsByTab: Object.fromEntries(
+        parsed.tabs.map((t) => [
+          t.id,
+          (Array.isArray(parsed.commandsByTab[t.id]) ? parsed.commandsByTab[t.id] : []).map(
+            reviveCard,
+          ),
+        ]),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** The next free `tab-N` counter given the restored tabs. */
+function nextTabCounter(tabs: SessionTab[]): number {
+  const max = Math.max(0, ...tabs.map((t) => Number(/^tab-(\d+)$/.exec(t.id)?.[1] ?? 0)));
+  return max + 1;
+}
+
 export default function App() {
   // Session tabs: each is an independent workspace — its own command cards,
   // its own transport (and thus its own PTY session in live mode), its own
   // pane set (owned by the shell). Tab 1 gets the demo cards; new tabs
   // start clean.
-  const [tabs, setTabs] = useState<SessionTab[]>([{ id: 'tab-1', title: 'session 1' }]);
-  const [activeTabId, setActiveTabId] = useState('tab-1');
-  const [commandsByTab, setCommandsByTab] = useState<Record<string, CommandCardProps[]>>({
-    'tab-1': LIVE ? [] : DEMO_COMMANDS,
-  });
+  // Restored workspace, when one was saved. The card history and layout
+  // come back; live PTY sessions cannot — each tab reconnects fresh.
+  const [saved] = useState(loadSession);
+  const [tabs, setTabs] = useState<SessionTab[]>(
+    saved?.tabs ?? [{ id: 'tab-1', title: 'session 1' }],
+  );
+  const [activeTabId, setActiveTabId] = useState(saved?.activeTabId ?? 'tab-1');
+  const [commandsByTab, setCommandsByTab] = useState<Record<string, CommandCardProps[]>>(
+    saved?.commandsByTab ?? { 'tab-1': LIVE ? [] : DEMO_COMMANDS },
+  );
   const [liveStats, setLiveStats] = useState<LiveShellStats | undefined>(undefined);
   const transportsRef = useRef(new Map<string, TerminalTransport>());
-  const tabCounter = useRef(2);
+  const tabCounter = useRef(saved ? nextTabCounter(saved.tabs) : 2);
+
+  // Debounced save: card streams update on every OSC 133 event, so batch
+  // writes; output is trimmed per card to bound what storage holds.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          SESSION_KEY,
+          JSON.stringify({
+            tabs,
+            activeTabId,
+            commandsByTab: Object.fromEntries(
+              tabs.map((t) => [
+                t.id,
+                (commandsByTab[t.id] ?? []).map((c) => ({
+                  ...c,
+                  output: c.output.slice(-SAVED_OUTPUT_LINES),
+                })),
+              ]),
+            ),
+          } satisfies SavedSession),
+        );
+      } catch {
+        // Storage full/blocked: the workspace just won't survive a reload.
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [tabs, activeTabId, commandsByTab]);
 
   /** OSC 133 events from a tab's live session → that tab's command cards. */
   const handleCommandEvent = useCallback((tabId: string, event: CommandEvent) => {
