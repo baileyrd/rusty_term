@@ -34,6 +34,8 @@ export interface CommandPaletteProps {
   onTabAdd?: () => void;
   /** Close the active tab; absent when only one tab remains. */
   onTabClose?: () => void;
+  /** Open the Ctrl+Shift+F history search. */
+  onSearchHistory?: () => void;
 }
 
 const GROUP_LABEL: Record<PaletteItem['group'], string> = {
@@ -86,6 +88,7 @@ export default function CommandPalette({
   onTabSelect,
   onTabAdd,
   onTabClose,
+  onSearchHistory,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -169,6 +172,15 @@ export default function CommandPalette({
         },
       );
     }
+    if (onSearchHistory) {
+      candidates.push({
+        id: 'search-history',
+        group: 'actions',
+        title: 'Search session history',
+        detail: 'Ctrl+Shift+F',
+        action: onSearchHistory,
+      });
+    }
     if (onTabAdd) {
       candidates.push({
         id: 'tab-new',
@@ -240,7 +252,7 @@ export default function CommandPalette({
       .filter((r): r is { item: PaletteItem; rank: number } => r.rank !== null)
       .sort((a, b) => a.rank - b.rank)
       .map((r) => r.item);
-  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose]);
+  }, [open, query, snippets, recentCommands, onRunCommand, onOpenAssist, onSetTheme, activeTheme, paneCount, onSplitPane, onCloseLastPane, tabs, activeTabId, onTabSelect, onTabAdd, onTabClose, onSearchHistory]);
 
   useEffect(() => {
     if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));

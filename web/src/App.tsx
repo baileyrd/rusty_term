@@ -333,6 +333,11 @@ export default function App() {
       onTabAdd={addTab}
       onTabClose={closeTab}
       liveStats={liveStats}
+      searchSessions={tabs.map((t) => ({
+        id: t.id,
+        title: t.title,
+        commands: commandsByTab[t.id] ?? [],
+      }))}
     />
   );
 }

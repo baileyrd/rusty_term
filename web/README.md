@@ -139,6 +139,13 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **History search** (`Ctrl+Shift+F`, or the palette's *Search session
+  history*): searches every tab's command cards — commands, output, and
+  meta — case-insensitively, newest hits first, with the matching fragment
+  highlighted and each hit labeled with its session. Enter (or click)
+  jumps: the hit's tab activates and its card scrolls into view with a
+  brief amber flash. Because cards persist (see below), this searches
+  history from before the last reload too.
 - **Session restore**: the workspace survives a reload — tabs, the active
   tab, each tab's command cards (output trimmed to the last 30 lines per
   card; a card still running when the page went away comes back as

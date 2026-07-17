@@ -34,6 +34,7 @@ function formatDuration(startedAt?: number, finishedAt?: number): string | null 
  * Fades in over 80ms per the spec.
  */
 export default function CommandCard({
+  id,
   command,
   status,
   output,
@@ -41,14 +42,19 @@ export default function CommandCard({
   startedAt,
   finishedAt,
   onPin,
-}: CommandCardProps & { onPin?: () => void }) {
+  highlighted = false,
+}: CommandCardProps & { onPin?: () => void; highlighted?: boolean }) {
   const duration = formatDuration(startedAt, finishedAt);
 
   return (
     <article
       data-testid="command-card"
       data-status={status}
-      className={`group animate-nebula-fade-in rounded-nebula-md border ${STATUS_BORDER[status]} bg-nebula-surface shadow-nebula-soft transition-colors duration-nebula-base ease-nebula`}
+      data-card-id={id}
+      data-highlighted={highlighted || undefined}
+      className={`group animate-nebula-fade-in rounded-nebula-md border ${STATUS_BORDER[status]} bg-nebula-surface shadow-nebula-soft transition-all duration-nebula-base ease-nebula ${
+        highlighted ? 'ring-2 ring-nebula-accent2/70' : ''
+      }`}
     >
       <header className="flex items-baseline gap-2 px-4 pt-3 pb-2">
         <span className="select-none font-nebula-command text-sm text-nebula-accent2">❯</span>

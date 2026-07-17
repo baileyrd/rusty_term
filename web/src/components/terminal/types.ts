@@ -100,4 +100,9 @@ export interface TerminalShellProps {
   onTabClose?: (id: string) => void;
   /** Live ribbon/dock stats; absent (demo mode) keeps the hardcoded values. */
   liveStats?: LiveShellStats;
+  /**
+   * Every tab's card history, for the Ctrl+Shift+F search overlay. Absent
+   * means "search only what `commands` shows".
+   */
+  searchSessions?: { id: string; title: string; commands: CommandCardProps[] }[];
 }
