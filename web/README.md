@@ -29,6 +29,11 @@ npm run dev      # dev server at http://localhost:5173
 npm run build    # type-check + production bundle in dist/
 ```
 
+The production build splits `react`/`react-dom`, `@xterm/*`, and
+`@anthropic-ai/sdk` into their own vendor chunks (`vite.config.ts`'s
+`manualChunks`), so an app-code deploy doesn't bust the cache for
+dependencies that didn't change.
+
 Without URL parameters the page runs the offline loopback demo. To attach it
 to a **real shell**, build and start the websocket PTY bridge from the repo
 root, then open the page with `?ws`:
@@ -59,6 +64,9 @@ shell finishing a command via genuine OSC 133 marks, which only the actual
 bridge can produce. Build the bridge first (`cargo build --features
 web-bridge` from the repo root) — the script spawns it with a bash whose
 rcfile emits the marks, so it's otherwise self-contained.
+
+CI runs the demo-mode suite on every push/PR (`.github/workflows/ci.yml`'s
+`web` job: Node 20, `npm ci`, a pinned Chromium install, then `npm test`).
 
 ## Layout
 
@@ -184,7 +192,11 @@ Real (with the bridge running, `?ws`):
   *interrupted*), and each tab's pane layout, all persisted to
   `localStorage` (`nebula.session` + `nebula.panes`, debounced writes).
   Live PTY sessions can't be resurrected — each pane reconnects to the
-  bridge as a fresh shell under the restored layout and history.
+  bridge as a fresh shell under the restored layout and history. Every
+  structured key (session, panes, pinned snippets) is wrapped in a small
+  versioned envelope ([`storage.ts`](src/storage.ts)'s `loadJson`/`saveJson`):
+  a future shape change is a clean reset for that one key instead of a
+  validator half-accepting a shape it wasn't written for.
 - **Settings sheet** (`Ctrl+,` / `Cmd+,`, or the palette's *Open settings*):
   a single place for the cross-cutting preferences the palette otherwise
   scatters across one-shot actions — the theme picker (same three
@@ -278,6 +290,8 @@ Real (with the bridge running, `?ws`):
   > A key pasted into a browser page is visible to that page; use a
   > scoped/disposable key. A production deployment should proxy the
   > Messages API server-side instead of shipping keys to the client.
+  > The settings sheet shows this same warning in-app once a key is
+  > connected, right where it was pasted in.
 
 To emit the marks from bash, drop this in the profile of the shell the
 bridge spawns (zsh/fish equivalents exist; VS Code and WezTerm ship the
