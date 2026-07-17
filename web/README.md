@@ -139,6 +139,20 @@ Real (with the bridge running, `?ws`):
   real load samples, and latency is a measured app-level ping RTT.
 - The input line: submits write into the same PTY, and the resulting card
   arrives through the same OSC 133 path as a hand-typed command.
+- **Pinned snippets**: hover a command card and hit its pin (⌖) to keep the
+  command in the dock; clicking a snippet (or a *recent commands* row) runs
+  it through the same submit path. Pins persist in `localStorage` and can
+  be unpinned with the row's ✕.
+- **The AI orb**: opens an assist sheet fed by *local heuristics* over the
+  real session — a session summary, diagnoses of the latest failures
+  (permission denied → suggest `sudo`, command not found → suggest
+  `command -v`, missing paths, plain non-zero exits) with runnable/copyable
+  suggested commands, and a repeated-failure nudge. The badge counts
+  failures that arrived since the sheet was last opened. It is deliberately
+  labeled "no AI provider connected": the panel is honest pattern rules
+  behind an `AssistProvider` interface
+  ([`assist/heuristics.ts`](src/assist/heuristics.ts)) that a real LLM
+  provider can implement later.
 
 To emit the marks from bash, drop this in the profile of the shell the
 bridge spawns (zsh/fish equivalents exist; VS Code and WezTerm ship the
@@ -159,8 +173,10 @@ Demo/stub:
 - Without `?ws`, the command cards in `App.tsx` are hardcoded demo data and
   the input line appends a fake "executed locally" card.
 - Without `?ws`, the ribbon's load/latency/git numbers and the dock's
-  CPU/RAM bars are hardcoded (they're live with the bridge — see above).
-- The pinned snippets are hardcoded in both modes.
+  CPU/RAM bars are hardcoded (they're live with the bridge — see above),
+  and cards/submits are the loopback fakes.
+- The assist panel's insights are pattern rules, not a model — by design,
+  until an LLM `AssistProvider` is plugged in.
 - The AI orb is presentational; clicking it only clears the badge.
 - `theme="cyberpunk" | "minimal"` are accepted per the spec but currently
   render the Nebula skin.

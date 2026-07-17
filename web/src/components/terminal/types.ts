@@ -39,6 +39,12 @@ export interface SideDockProps {
   ram: number;
   recentCommands?: string[];
   pinnedSnippets?: SnippetItem[];
+  /** Run a snippet (the design spec's snippet-clicked event). */
+  onSnippetClick?: (snippet: SnippetItem) => void;
+  /** Unpin a snippet from the dock. */
+  onSnippetRemove?: (snippet: SnippetItem) => void;
+  /** Re-run a recent command. */
+  onRecentCommandClick?: (command: string) => void;
 }
 
 export interface AiOrbProps {
