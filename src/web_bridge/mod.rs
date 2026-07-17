@@ -147,6 +147,9 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
     let (mut rd, mut wr) = stream.into_split();
     let mut buf: Vec<u8> = Vec::new();
     let mut handle: Option<Box<dyn BackendHandle>> = None;
+    // Keystrokes/pastes are handed off to spawn_writer's dedicated thread
+    // rather than written here directly — see its doc comment.
+    let mut write_tx: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
     let (tx, mut rx) = mpsc::unbounded_channel::<PtyEvent>();
     // Stats side-channel state: the cwd the client relays from OSC 7, and
     // the per-session git cache behind it.
@@ -166,6 +169,9 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
                         Some(Command::Start(cols, rows)) if handle.is_none() => {
                             let h = spawn_session_shell(&cfg, cols, rows)?;
                             spawn_reader(h.try_clone()?, tx.clone());
+                            let (wtx, wrx) = mpsc::unbounded_channel::<Vec<u8>>();
+                            spawn_writer(h.try_clone()?, wrx);
+                            write_tx = Some(wtx);
                             handle = Some(h);
                         }
                         Some(Command::Resize(cols, rows)) => {
@@ -188,12 +194,15 @@ async fn session(mut stream: TcpStream, cfg: BridgeConfig) -> Result<(), Error> 
                     }
                 }
                 ws::Opcode::Binary => {
-                    if let Some(h) = handle.as_mut() {
-                        // PTY writes are keystroke-sized and the kernel-side
-                        // buffer absorbs them; blocking here is the same
-                        // trade the windowed front-end makes on its event
-                        // loop.
-                        h.write(&frame.payload)?;
+                    // Handed off to spawn_writer's dedicated thread rather
+                    // than written here: frames run up to MAX_FRAME (1 MB —
+                    // a large paste, not just a keystroke), and writing that
+                    // directly would block whichever tokio worker thread
+                    // services this session, stalling any other session
+                    // sharing it. A write failure surfaces independently
+                    // through the reader thread's EOF once the PTY is gone.
+                    if let Some(tx) = write_tx.as_ref() {
+                        let _ = tx.send(frame.payload);
                     }
                 }
                 ws::Opcode::Ping => {
@@ -319,6 +328,25 @@ fn spawn_reader(mut clone: Box<dyn BackendHandle>, tx: mpsc::UnboundedSender<Pty
     });
 }
 
+/// Blocking PTY writer on its own thread, fed by a channel from the async
+/// session task (mirrors [`spawn_reader`]'s split). A single frame can carry
+/// up to `MAX_FRAME` (1 MB — a large paste, not just a keystroke), and
+/// writing that inline in the session task's `select!` would block whichever
+/// tokio worker thread services it for the duration, stalling any other
+/// session sharing that thread. Ends quietly once the channel closes (the
+/// session task is done with this connection) or a write fails (the PTY
+/// went away — the reader thread's EOF already tells the session task that
+/// independently).
+fn spawn_writer(mut clone: Box<dyn BackendHandle>, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    std::thread::spawn(move || {
+        while let Some(data) = rx.blocking_recv() {
+            if clone.write(&data).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// A parsed client control message (text frame).
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -369,6 +397,65 @@ fn parse_command(text: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A [`BackendHandle`] double for the writer-thread test: `write`
+    /// simulates a slow PTY (a sleep) and records what arrived, in order,
+    /// into a shared log — no real child process involved.
+    struct MockHandle {
+        log: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        write_delay: std::time::Duration,
+    }
+
+    impl BackendHandle for MockHandle {
+        fn read(&mut self) -> Result<Vec<u8>, Error> {
+            Ok(Vec::new())
+        }
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            std::thread::sleep(self.write_delay);
+            self.log.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+        fn try_clone(&self) -> Result<Box<dyn BackendHandle>, Error> {
+            Ok(Box::new(MockHandle { log: self.log.clone(), write_delay: self.write_delay }))
+        }
+        fn set_winsize(&mut self, _cols: u16, _rows: u16) -> Result<(), Error> {
+            Ok(())
+        }
+        #[cfg(unix)]
+        fn pty_fd(&self) -> std::os::unix::io::RawFd {
+            -1
+        }
+    }
+
+    /// Routing writes through spawn_writer's channel must decouple the
+    /// caller from a slow underlying write — the exact property this fix
+    /// exists for (a large paste's write no longer blocks the tokio worker
+    /// thread the async session task runs on).
+    #[tokio::test]
+    async fn writer_thread_decouples_slow_writes_from_the_caller() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle: Box<dyn BackendHandle> = Box::new(MockHandle {
+            log: log.clone(),
+            write_delay: std::time::Duration::from_millis(200),
+        });
+        let (wtx, wrx) = mpsc::unbounded_channel::<Vec<u8>>();
+        spawn_writer(handle, wrx);
+
+        let start = std::time::Instant::now();
+        wtx.send(b"hello".to_vec()).unwrap();
+        wtx.send(b"world".to_vec()).unwrap();
+        // Sending must return immediately regardless of how long the
+        // background thread's writes take.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "send() blocked on the (200ms-per-write) mock"
+        );
+
+        // Give the background thread time to drain both writes, then check
+        // they arrived, and in order.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(*log.lock().unwrap(), vec![b"hello".to_vec(), b"world".to_vec()]);
+    }
 
     /// A peer that never finishes the header block must eventually be cut
     /// off rather than holding the read open forever — the mechanism
