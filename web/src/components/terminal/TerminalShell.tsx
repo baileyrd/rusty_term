@@ -234,6 +234,7 @@ export default function TerminalShell({
           ai={aiState}
           chat={chat}
           onChatSend={sendChat}
+          onChatRun={onCommandSubmit}
           onConnect={connectAssist}
           onDisconnect={disconnectAssist}
           onRun={

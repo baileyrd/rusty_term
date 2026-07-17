@@ -165,8 +165,13 @@ Real (with the bridge running, `?ws`):
   of the recent command cards on the latest turn (earlier turns stay plain
   text, so the model always reasons over the cards as they are *now*); the
   reply streams token-by-token into the assistant bubble and the input
-  locks until it settles. The thread lives in memory only — closing the
-  sheet keeps it, disconnecting or reloading clears it. The key is held in `sessionStorage` only —
+  locks until it settles. Fenced code blocks in replies render as
+  **runnable command blocks** — *run* submits straight into the terminal
+  (the sheet stays open, unlike an insight's run) and *copy* hits the
+  clipboard; the parser (`assist/chatSegments.ts`) is streaming-safe, so
+  an unterminated fence renders as code from its first line instead of
+  flashing as prose. The thread lives in memory only — closing the sheet
+  keeps it, disconnecting or reloading clears it. The key is held in `sessionStorage` only —
   never `localStorage`, never the bundle — and *disconnect* wipes it. The
   `@anthropic-ai/sdk` chunk is lazy-loaded, so nothing is fetched until a
   key is connected. For tests, `sessionStorage["nebula.assistBaseUrl"]`
