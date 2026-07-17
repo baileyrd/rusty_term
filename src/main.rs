@@ -178,152 +178,6 @@ fn apply_cli_overrides(
     warnings
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn s(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn all_known_flags_pass_through_unrecognized_flags_cleanly() {
-        let args = s(&[
-            "--cwd", "/tmp", "--title", "hi", "--fullscreen", "--opacity", "0.5", "--profile",
-            "dev", "--session", "/x", "--gui", "--single-instance", "--list-shells", "--help",
-            "-h", "--version",
-        ]);
-        assert!(unrecognized_flags(&args).is_empty());
-    }
-
-    #[test]
-    fn typo_d_flag_is_reported() {
-        let args = s(&["--fullscren"]);
-        assert_eq!(unrecognized_flags(&args), vec!["--fullscren"]);
-    }
-
-    #[test]
-    fn value_token_of_a_known_flag_is_not_mistaken_for_a_flag() {
-        // `--cwd` consumes the next token; `--title` looks like a flag but is
-        // really the *value* of `--cwd` here, so it must not be misdetected as
-        // an unknown flag in its own right nor its own value skipped.
-        let args = s(&["--cwd", "--title", "--title", "hi"]);
-        assert!(unrecognized_flags(&args).is_empty());
-    }
-
-    #[test]
-    fn equals_form_does_not_swallow_the_next_token() {
-        // `--opacity=0.5` carries its value inline, so the following
-        // `--fullscreen` is a separate flag, not a consumed value.
-        let args = s(&["--opacity=0.5", "--fullscreen"]);
-        assert!(unrecognized_flags(&args).is_empty());
-    }
-
-    #[test]
-    fn multiple_typos_are_all_reported_in_order() {
-        let args = s(&["--fulscreen", "--cwd", "/tmp", "--tittle", "x"]);
-        assert_eq!(unrecognized_flags(&args), vec!["--fulscreen", "--tittle"]);
-    }
-
-    #[test]
-    fn split_command_still_hides_child_args_from_the_flag_scan() {
-        // A child command that happens to look like our flags (even
-        // literally `--config`) must never reach the "our flags" scan.
-        let all = s(&["--fullscreen", "--", "--config", "--bogus"]);
-        let (ours, command) = split_command(&all);
-        assert!(unrecognized_flags(ours).is_empty());
-        assert_eq!(command, Some(("--config".to_string(), s(&["--bogus"]))));
-    }
-
-    #[test]
-    fn cli_overrides_cwd_title_and_opacity() {
-        let args = s(&["--cwd", "/work", "--title", "hi", "--opacity", "0.5"]);
-        let mut config = Config::default();
-        let warnings = apply_cli_overrides(&mut config, &args, None);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(config.cwd, Some(PathBuf::from("/work")));
-        assert_eq!(config.title.as_deref(), Some("hi"));
-        assert_eq!(config.opacity, Some(0.5));
-    }
-
-    #[test]
-    fn cli_overrides_prefers_cwd_over_starting_directory() {
-        let args = s(&["--cwd", "/a", "--starting-directory", "/b"]);
-        let mut config = Config::default();
-        apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(config.cwd, Some(PathBuf::from("/a")));
-    }
-
-    #[test]
-    fn cli_overrides_falls_back_to_starting_directory_when_cwd_is_absent() {
-        let args = s(&["--starting-directory", "/b"]);
-        let mut config = Config::default();
-        apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(config.cwd, Some(PathBuf::from("/b")));
-    }
-
-    #[test]
-    fn cli_overrides_fullscreen_wins_over_maximized_when_both_given() {
-        let args = s(&["--maximized", "--fullscreen"]);
-        let mut config = Config::default();
-        apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(config.launch_mode, Some(LaunchMode::Fullscreen));
-    }
-
-    #[test]
-    fn cli_overrides_maximized_alone_applies() {
-        let args = s(&["--maximized"]);
-        let mut config = Config::default();
-        apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(config.launch_mode, Some(LaunchMode::Maximized));
-    }
-
-    #[test]
-    fn cli_overrides_invalid_opacity_warns_and_leaves_opacity_unset() {
-        let args = s(&["--opacity", "not-a-number"]);
-        let mut config = Config::default();
-        let warnings = apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--opacity"), "{warnings:?}");
-        assert_eq!(config.opacity, None);
-    }
-
-    #[test]
-    fn cli_overrides_opacity_is_clamped_to_the_unit_range() {
-        let args = s(&["--opacity", "5.0"]);
-        let mut config = Config::default();
-        assert!(apply_cli_overrides(&mut config, &args, None).is_empty());
-        assert_eq!(config.opacity, Some(1.0));
-    }
-
-    #[test]
-    fn cli_overrides_unknown_profile_warns_and_leaves_config_untouched() {
-        let args = s(&["--profile", "nope"]);
-        let mut config = Config::default();
-        let warnings = apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("nope"), "{warnings:?}");
-    }
-
-    #[test]
-    fn cli_overrides_session_sets_the_session_path() {
-        let args = s(&["--session", "/tabs.toml"]);
-        let mut config = Config::default();
-        apply_cli_overrides(&mut config, &args, None);
-        assert_eq!(config.session, Some(PathBuf::from("/tabs.toml")));
-    }
-
-    #[test]
-    fn cli_overrides_trailing_command_replaces_shell_and_args() {
-        let mut config = Config::default();
-        config.shell = Some("/bin/bash".to_string());
-        let command = Some(("htop".to_string(), s(&["-d", "10"])));
-        apply_cli_overrides(&mut config, &[], command);
-        assert_eq!(config.shell.as_deref(), Some("htop"));
-        assert_eq!(config.command_args, s(&["-d", "10"]));
-    }
-}
-
 fn main() -> Result<(), std::io::Error> {
     // Load the config file (`--config <path>` > `$RUSTY_TERM_CONFIG` > the
     // platform default location). Warnings (unknown keys, bad values, an
@@ -506,5 +360,152 @@ fn run_ctl(args: &[String]) -> std::io::Result<()> {
         let _ = args;
         eprintln!("rusty_term: `ctl` needs the `gui` feature");
         Err(std::io::Error::other("ctl unsupported on this build"))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn all_known_flags_pass_through_unrecognized_flags_cleanly() {
+        let args = s(&[
+            "--cwd", "/tmp", "--title", "hi", "--fullscreen", "--opacity", "0.5", "--profile",
+            "dev", "--session", "/x", "--gui", "--single-instance", "--list-shells", "--help",
+            "-h", "--version",
+        ]);
+        assert!(unrecognized_flags(&args).is_empty());
+    }
+
+    #[test]
+    fn typo_d_flag_is_reported() {
+        let args = s(&["--fullscren"]);
+        assert_eq!(unrecognized_flags(&args), vec!["--fullscren"]);
+    }
+
+    #[test]
+    fn value_token_of_a_known_flag_is_not_mistaken_for_a_flag() {
+        // `--cwd` consumes the next token; `--title` looks like a flag but is
+        // really the *value* of `--cwd` here, so it must not be misdetected as
+        // an unknown flag in its own right nor its own value skipped.
+        let args = s(&["--cwd", "--title", "--title", "hi"]);
+        assert!(unrecognized_flags(&args).is_empty());
+    }
+
+    #[test]
+    fn equals_form_does_not_swallow_the_next_token() {
+        // `--opacity=0.5` carries its value inline, so the following
+        // `--fullscreen` is a separate flag, not a consumed value.
+        let args = s(&["--opacity=0.5", "--fullscreen"]);
+        assert!(unrecognized_flags(&args).is_empty());
+    }
+
+    #[test]
+    fn multiple_typos_are_all_reported_in_order() {
+        let args = s(&["--fulscreen", "--cwd", "/tmp", "--tittle", "x"]);
+        assert_eq!(unrecognized_flags(&args), vec!["--fulscreen", "--tittle"]);
+    }
+
+    #[test]
+    fn split_command_still_hides_child_args_from_the_flag_scan() {
+        // A child command that happens to look like our flags (even
+        // literally `--config`) must never reach the "our flags" scan.
+        let all = s(&["--fullscreen", "--", "--config", "--bogus"]);
+        let (ours, command) = split_command(&all);
+        assert!(unrecognized_flags(ours).is_empty());
+        assert_eq!(command, Some(("--config".to_string(), s(&["--bogus"]))));
+    }
+
+    #[test]
+    fn cli_overrides_cwd_title_and_opacity() {
+        let args = s(&["--cwd", "/work", "--title", "hi", "--opacity", "0.5"]);
+        let mut config = Config::default();
+        let warnings = apply_cli_overrides(&mut config, &args, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.cwd, Some(PathBuf::from("/work")));
+        assert_eq!(config.title.as_deref(), Some("hi"));
+        assert_eq!(config.opacity, Some(0.5));
+    }
+
+    #[test]
+    fn cli_overrides_prefers_cwd_over_starting_directory() {
+        let args = s(&["--cwd", "/a", "--starting-directory", "/b"]);
+        let mut config = Config::default();
+        apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(config.cwd, Some(PathBuf::from("/a")));
+    }
+
+    #[test]
+    fn cli_overrides_falls_back_to_starting_directory_when_cwd_is_absent() {
+        let args = s(&["--starting-directory", "/b"]);
+        let mut config = Config::default();
+        apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(config.cwd, Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn cli_overrides_fullscreen_wins_over_maximized_when_both_given() {
+        let args = s(&["--maximized", "--fullscreen"]);
+        let mut config = Config::default();
+        apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(config.launch_mode, Some(LaunchMode::Fullscreen));
+    }
+
+    #[test]
+    fn cli_overrides_maximized_alone_applies() {
+        let args = s(&["--maximized"]);
+        let mut config = Config::default();
+        apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(config.launch_mode, Some(LaunchMode::Maximized));
+    }
+
+    #[test]
+    fn cli_overrides_invalid_opacity_warns_and_leaves_opacity_unset() {
+        let args = s(&["--opacity", "not-a-number"]);
+        let mut config = Config::default();
+        let warnings = apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--opacity"), "{warnings:?}");
+        assert_eq!(config.opacity, None);
+    }
+
+    #[test]
+    fn cli_overrides_opacity_is_clamped_to_the_unit_range() {
+        let args = s(&["--opacity", "5.0"]);
+        let mut config = Config::default();
+        assert!(apply_cli_overrides(&mut config, &args, None).is_empty());
+        assert_eq!(config.opacity, Some(1.0));
+    }
+
+    #[test]
+    fn cli_overrides_unknown_profile_warns_and_leaves_config_untouched() {
+        let args = s(&["--profile", "nope"]);
+        let mut config = Config::default();
+        let warnings = apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("nope"), "{warnings:?}");
+    }
+
+    #[test]
+    fn cli_overrides_session_sets_the_session_path() {
+        let args = s(&["--session", "/tabs.toml"]);
+        let mut config = Config::default();
+        apply_cli_overrides(&mut config, &args, None);
+        assert_eq!(config.session, Some(PathBuf::from("/tabs.toml")));
+    }
+
+    #[test]
+    fn cli_overrides_trailing_command_replaces_shell_and_args() {
+        let mut config =
+            Config { shell: Some("/bin/bash".to_string()), ..Default::default() };
+        let command = Some(("htop".to_string(), s(&["-d", "10"])));
+        apply_cli_overrides(&mut config, &[], command);
+        assert_eq!(config.shell.as_deref(), Some("htop"));
+        assert_eq!(config.command_args, s(&["-d", "10"]));
     }
 }
