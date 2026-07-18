@@ -31,6 +31,12 @@ Methodology (read this before trusting the numbers):
   when $DISPLAY/$WAYLAND_DISPLAY isn't set and `xvfb-run` is available, X11
   terminals are automatically wrapped in it.
 
+  Every iteration's exit status is checked: a terminal that exits non-zero
+  or dies to a signal is reported as a crash (with a short diagnostic —
+  exit code plus the last line of stderr/output), not as a fast successful
+  run. Without this, a terminal that panics on startup would be timed like
+  any other run and its near-instant exit would read as a win.
+
   Alongside wall-clock time, each iteration also samples the child's peak
   resident set size (RSS) by polling `/proc/<pid>/status` from a background
   thread every 5ms — Linux only; on other platforms RSS is reported as "—"
@@ -72,6 +78,15 @@ DEFAULT_TERMINALS_FILE = os.path.join(BENCH_DIR, "terminals.json")
 
 class Skip(Exception):
     """Raised to skip a terminal entirely (missing binary, no display, ...)."""
+
+
+class ProcessFailed(Exception):
+    """Raised when the terminal process exits non-zero or dies to a signal.
+    Without this, a terminal that crashes on startup gets timed like any
+    other run and reported as a fast 'ok' result — a crash silently reads
+    as a win. Carries a short diagnostic (exit code + last line of
+    stderr/output, where available) so the failure is debuggable, not just
+    a bare "it failed"."""
 
 
 def load_terminals(path):
@@ -163,24 +178,70 @@ class PeakRssTracker:
         return self._peak_kb
 
 
+def _append_bounded(buf, chunk, cap):
+    """Append chunk to bytearray buf in place, keeping only the last `cap`
+    bytes (a rolling tail, for crash diagnostics — not a full capture)."""
+    buf.extend(chunk)
+    if len(buf) > cap:
+        del buf[: len(buf) - cap]
+
+
+def _tail_snippet(buf, max_chars=300):
+    text = bytes(buf).decode("utf-8", "replace").strip()
+    if not text:
+        return ""
+    return text.splitlines()[-1][:max_chars]
+
+
 def run_subprocess(argv, timeout):
     t0 = time.perf_counter()
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     tracker = PeakRssTracker(proc.pid).start()
+    # Exit code is always the wrapped command's own — a shell script's exit
+    # status is its last command's, regardless of redirections — so
+    # non-zero detection below is reliable even through xvfb-run. The
+    # stderr *tail* can come back empty specifically for xvfb-run, though:
+    # its wrapper script does `"$@" 2>&1`, folding the wrapped command's
+    # stderr into the wrapper's own stdout, which we discard as DEVNULL.
+    stderr_tail = bytearray()
+    stop = threading.Event()
+
+    def drain_stderr():
+        while not stop.is_set():
+            chunk = proc.stderr.read(4096)
+            if not chunk:
+                return
+            _append_bounded(stderr_tail, chunk, 4096)
+
+    drainer = threading.Thread(target=drain_stderr, daemon=True)
+    drainer.start()
+
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+        stop.set()
         tracker.stop()
         raise TimeoutError(f"timed out after {timeout}s")
+
     elapsed = time.perf_counter() - t0
-    return elapsed, tracker.stop()
+    stop.set()
+    drainer.join(timeout=1.0)
+    peak_rss_kb = tracker.stop()
+
+    if proc.returncode != 0:
+        detail = f"exit code {proc.returncode}"
+        tail = _tail_snippet(stderr_tail)
+        if tail:
+            detail += f": {tail}"
+        raise ProcessFailed(detail)
+    return elapsed, peak_rss_kb
 
 
 def run_pty(argv, timeout):
@@ -200,6 +261,7 @@ def run_pty(argv, timeout):
         os._exit(127)
 
     stop = threading.Event()
+    output_tail = bytearray()
 
     def drain():
         while not stop.is_set():
@@ -207,6 +269,7 @@ def run_pty(argv, timeout):
                 chunk = os.read(master_fd, 65536)
                 if not chunk:
                     return
+                _append_bounded(output_tail, chunk, 4096)
             except OSError:
                 return
 
@@ -217,8 +280,9 @@ def run_pty(argv, timeout):
     tracker.start()
 
     deadline = t0 + timeout
+    status = None
     while True:
-        done_pid, _status = os.waitpid(pid, os.WNOHANG)
+        done_pid, status = os.waitpid(pid, os.WNOHANG)
         if done_pid == pid:
             break
         if time.perf_counter() > deadline:
@@ -238,11 +302,21 @@ def run_pty(argv, timeout):
 
     elapsed = time.perf_counter() - t0
     stop.set()
+    drainer.join(timeout=1.0)
     peak_rss_kb = tracker.stop()
     try:
         os.close(master_fd)
     except OSError:
         pass
+
+    if os.WIFSIGNALED(status):
+        raise ProcessFailed(f"killed by signal {os.WTERMSIG(status)}")
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+        detail = f"exit code {os.WEXITSTATUS(status)}"
+        tail = _tail_snippet(output_tail)
+        if tail:
+            detail += f": {tail}"
+        raise ProcessFailed(detail)
     return elapsed, peak_rss_kb
 
 
@@ -286,11 +360,17 @@ def fmt_ms(seconds):
 def bench_terminal_workload(term, binary, wrapper, workload_path, iterations, warmup, timeout, log):
     samples = []
     rss_samples = []
+    last_error = None
     for i in range(warmup + iterations):
         try:
             elapsed, peak_rss_kb = run_once(term, binary, wrapper, workload_path, timeout)
         except TimeoutError as e:
             log(f"    iter {i + 1}: TIMEOUT ({e})")
+            last_error = str(e)
+            continue
+        except ProcessFailed as e:
+            log(f"    iter {i + 1}: CRASHED ({e})")
+            last_error = str(e)
             continue
         kind = "warmup" if i < warmup else "timed"
         rss_note = f", peak RSS {peak_rss_kb / 1024:.1f} MB" if peak_rss_kb is not None else ""
@@ -300,7 +380,8 @@ def bench_terminal_workload(term, binary, wrapper, workload_path, iterations, wa
             if peak_rss_kb is not None:
                 rss_samples.append(peak_rss_kb)
     if not samples:
-        return {"ok": False, "error": "all iterations failed/timed out"}
+        error = f"all iterations failed/timed out/crashed (last: {last_error})" if last_error else "all iterations failed/timed out"
+        return {"ok": False, "error": error}
     size = os.path.getsize(workload_path)
     result = {
         "ok": True,

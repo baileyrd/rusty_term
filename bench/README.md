@@ -108,6 +108,18 @@ screen (double-buffered/vsync-throttled paint loops), and two terminals
 finishing in the same time didn't necessarily look identical while getting
 there. Treat this as a throughput benchmark, not a frame-latency one.
 
+Every iteration's exit status is checked, not just its wall-clock time: a
+terminal that exits non-zero or dies to a signal is reported as a crash
+(with a short diagnostic — exit code plus the last line of stderr/output,
+where available), not as a fast successful run. Without this a crashing
+terminal — one that panics immediately on startup, say — would be timed
+like any other run and its near-instant exit would read as a win. (One
+gap: for `xvfb-run`-wrapped terminals, the diagnostic's stderr snippet can
+come back empty — `xvfb-run`'s own wrapper script does `"$@" 2>&1`, which
+folds the wrapped command's stderr into a stream this harness discards.
+The exit-code detection itself is unaffected; only the extra diagnostic
+text is sometimes missing in that case.)
+
 Two run modes, chosen per terminal in `terminals.json`:
 
 - **`mode: "pty"`** — the harness allocates its own PTY and runs the
