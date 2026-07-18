@@ -127,7 +127,16 @@ WORKLOADS = {
     "alt_screen_flicker": gen_alt_screen_flicker,
 }
 
-SIZES = {"quick": 200_000, "default": 4_000_000, "large": 16_000_000}
+SIZES = {
+    "quick": 200_000,
+    "default": 4_000_000,
+    "large": 16_000_000,
+    # Matches the ~150MB single-file size commonly used in published
+    # terminal cat-throughput comparisons. Not run in CI (bench-smoke uses
+    # "quick") — generate and run this tier manually for that kind of
+    # comparison; budget real time and disk for it (~150MB x 6 workloads).
+    "xlarge": 150_000_000,
+}
 SEED_BASE = 1337
 
 

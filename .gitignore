@@ -4,6 +4,7 @@
 /bench/workloads/
 /bench/results.json
 /bench/results.md
+/bench/__pycache__/
 # Serena MCP tool metadata
 .serena/
 # WSL/NTFS download metadata (alternate data streams)
