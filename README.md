@@ -275,6 +275,21 @@ desktop notifications are forwarded to the OS; and Sixel / Kitty / iTerm2
 (`OSC 1337`) images render over the grid — pixel-for-pixel in the CPU renderer,
 with a half-block fallback in the GPU and TUI paths.
 
+## Benchmarks
+
+[`bench/`](bench/README.md) has two complementary pieces: a pure-Rust
+throughput microbenchmark for rusty_term's own parser+grid (`cargo run
+--release --bin bench_vt_throughput`, no process spawn — safe to run in CI
+as a regression smoke test), and a cross-terminal harness
+(`python3 bench/run_bench.py`) that drives rusty_term and any installed
+terminal emulators — Ghostty, Alacritty, kitty, WezTerm, foot, xterm,
+Konsole — as black-box processes over deterministic VT/ANSI workloads
+(plain-text throughput, Unicode-heavy text, SGR churn, cursor thrashing,
+scroll-heavy output, alt-screen flicker), timing each end to end. Terminals
+that aren't installed (or, for windowed ones, have no display available)
+are skipped rather than failing the run. See `bench/README.md` for
+methodology and its caveats before trusting the numbers.
+
 ## Shell integration (OSC 133)
 
 `rusty_term` recognizes OSC 133 semantic prompt marks and uses them for
@@ -373,12 +388,14 @@ src/
     mouse.rs           pointer → SGR mouse-report encoding
     window.rs          winit event loop
   bin/bench_metrics.rs   grid-handoff microbenchmark
+  bin/bench_vt_throughput.rs  parser+grid throughput bench (see bench/)
 l13/                 the `rusty_term_l13` workspace crate (feature `l13`)
   src/lib.rs           L13 structured side-channel, against a TerminalState trait
 extra/
   rusty_term.terminfo
   shell-integration/   bash / zsh / fish / pwsh OSC 133 emitters
   gen_ligtest_font.py  regenerates the GSUB shaper test fixture
+bench/                benchmark harness: rusty_term-only + cross-terminal (see bench/README.md)
 docs/
   FEATURES.md          implemented-feature catalog
   research/            spec tree, synthesis, implementation status

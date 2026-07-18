@@ -1,5 +1,9 @@
 /target
 .gitnexus
+# Generated benchmark workloads + results (bench/gen_workloads.py, bench/run_bench.py)
+/bench/workloads/
+/bench/results.json
+/bench/results.md
 # Serena MCP tool metadata
 .serena/
 # WSL/NTFS download metadata (alternate data streams)
