@@ -1611,6 +1611,7 @@ dependencies = [
  "pollster",
  "rusty_regx",
  "rusty_term_l13",
+ "simdutf8",
  "softbuffer",
  "tokio",
  "ttf-parser",
