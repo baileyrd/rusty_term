@@ -71,6 +71,9 @@ arboard = { version = "3", optional = true, default-features = false }
 wgpu = { version = "22", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 pollster = { version = "0.3", optional = true }
+# SIMD UTF-8 validation (temporary for vectorization exploration).
+# Roadmap: replace with custom SIMD lead-byte path to keep dep surface minimal.
+simdutf8 = "0.1"
 
 # ConPTY backend: Windows-only, so the Linux/macOS build never pulls it in.
 [target.'cfg(windows)'.dependencies]
