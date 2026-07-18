@@ -1,14 +1,15 @@
 # Aether Terminal
 
-Full standalone alternative UI implementation for rusty_term.
+**Standalone alternative UI** for rusty_term.
 
-This folder contains a complete, self-contained modern cutting-edge terminal UI.
+Located in its own `aether/` folder — completely independent of `web/` and core themes.
 
-## Goals
-- Independent of core UI
-- Opt-in via config or flag
-- Premium glassmorphism + neon aesthetic
-- AI-native features
-- Block-based command execution
+## Structure
+- `src/` — Rust core (lib + modules for UI, AI, blocks)
+- `demo/` — Interactive HTML reference & prototypes
+- `ui/` — Glassmorphism, neon, command blocks, AI sidebar
 
-See the main project README for integration instructions.
+## Activation
+`rusty_term --ui aether` or config flag.
+
+Full implementation standing alone while integrable.
