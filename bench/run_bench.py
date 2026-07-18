@@ -31,6 +31,14 @@ Methodology (read this before trusting the numbers):
   when $DISPLAY/$WAYLAND_DISPLAY isn't set and `xvfb-run` is available, X11
   terminals are automatically wrapped in it.
 
+  Alongside wall-clock time, each iteration also samples the child's peak
+  resident set size (RSS) by polling `/proc/<pid>/status` from a background
+  thread every 5ms — Linux only; on other platforms RSS is reported as "—"
+  rather than a made-up number. This is a sampled approximation, not a true
+  high-water-mark read (which would need the process to still exist after
+  it exits, which it doesn't): a short spike between polls can be missed.
+  Treat it as directional, not precise to the KB.
+
 Usage:
     python3 bench/gen_workloads.py            # once, or after editing workloads
     python3 bench/run_bench.py                # run everything installed
@@ -110,6 +118,51 @@ def build_argv(term, binary, wrapper, shell_cmd):
     return wrapper + [binary] + filled
 
 
+def sample_rss_kb(pid):
+    """Current RSS for pid, in KB, read from /proc/<pid>/status. Linux
+    only — returns None on any other platform, or once the process is
+    gone (already exited, or a PID we don't have permission to read)."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+class PeakRssTracker:
+    """Polls sample_rss_kb(pid) from a background thread and keeps the max
+    seen. Started once the child's PID is known, stopped once it exits —
+    started too late or polled too coarsely, a short-lived spike can be
+    missed, so treat the result as a sampled approximation (see the
+    module-level methodology note), not a precise high-water mark."""
+
+    def __init__(self, pid, interval=0.005):
+        self._pid = pid
+        self._interval = interval
+        self._stop = threading.Event()
+        self._peak_kb = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.is_set():
+            rss = sample_rss_kb(self._pid)
+            if rss is not None:
+                self._peak_kb = rss if self._peak_kb is None else max(self._peak_kb, rss)
+            self._stop.wait(self._interval)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        return self._peak_kb
+
+
 def run_subprocess(argv, timeout):
     t0 = time.perf_counter()
     proc = subprocess.Popen(
@@ -118,13 +171,16 @@ def run_subprocess(argv, timeout):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    tracker = PeakRssTracker(proc.pid).start()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+        tracker.stop()
         raise TimeoutError(f"timed out after {timeout}s")
-    return time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+    return elapsed, tracker.stop()
 
 
 def run_pty(argv, timeout):
@@ -155,8 +211,10 @@ def run_pty(argv, timeout):
                 return
 
     drainer = threading.Thread(target=drain, daemon=True)
+    tracker = PeakRssTracker(pid)
     t0 = time.perf_counter()
     drainer.start()
+    tracker.start()
 
     deadline = t0 + timeout
     while True:
@@ -170,6 +228,7 @@ def run_pty(argv, timeout):
             except OSError:
                 pass
             stop.set()
+            tracker.stop()
             try:
                 os.close(master_fd)
             except OSError:
@@ -179,11 +238,12 @@ def run_pty(argv, timeout):
 
     elapsed = time.perf_counter() - t0
     stop.set()
+    peak_rss_kb = tracker.stop()
     try:
         os.close(master_fd)
     except OSError:
         pass
-    return elapsed
+    return elapsed, peak_rss_kb
 
 
 def run_direct(binary, workload_path, timeout):
@@ -193,6 +253,8 @@ def run_direct(binary, workload_path, timeout):
 
 
 def run_once(term, binary, wrapper, workload_path, timeout):
+    """Returns (elapsed_seconds, peak_rss_kb). peak_rss_kb is None where
+    RSS sampling isn't available (non-Linux)."""
     mode = term["mode"]
     if mode == "direct":
         return run_direct(binary, workload_path, timeout)
@@ -223,20 +285,24 @@ def fmt_ms(seconds):
 
 def bench_terminal_workload(term, binary, wrapper, workload_path, iterations, warmup, timeout, log):
     samples = []
+    rss_samples = []
     for i in range(warmup + iterations):
         try:
-            elapsed = run_once(term, binary, wrapper, workload_path, timeout)
+            elapsed, peak_rss_kb = run_once(term, binary, wrapper, workload_path, timeout)
         except TimeoutError as e:
             log(f"    iter {i + 1}: TIMEOUT ({e})")
             continue
         kind = "warmup" if i < warmup else "timed"
-        log(f"    iter {i + 1} [{kind}]: {fmt_ms(elapsed)} ms")
+        rss_note = f", peak RSS {peak_rss_kb / 1024:.1f} MB" if peak_rss_kb is not None else ""
+        log(f"    iter {i + 1} [{kind}]: {fmt_ms(elapsed)} ms{rss_note}")
         if i >= warmup:
             samples.append(elapsed)
+            if peak_rss_kb is not None:
+                rss_samples.append(peak_rss_kb)
     if not samples:
         return {"ok": False, "error": "all iterations failed/timed out"}
     size = os.path.getsize(workload_path)
-    return {
+    result = {
         "ok": True,
         "samples_s": samples,
         "median_s": statistics.median(samples),
@@ -245,6 +311,10 @@ def bench_terminal_workload(term, binary, wrapper, workload_path, iterations, wa
         "bytes": size,
         "mb_per_s": (size / 1_000_000) / statistics.median(samples) if statistics.median(samples) > 0 else float("inf"),
     }
+    if rss_samples:
+        # Sampled peak, not a true high-water mark — see PeakRssTracker.
+        result["peak_rss_kb_median"] = statistics.median(rss_samples)
+    return result
 
 
 def write_json(results, path):
@@ -287,6 +357,26 @@ def write_markdown(results, terminal_order, workload_order, path):
         ]
         if rates:
             lines.append(f"| {tid} | {statistics.median(rates):.1f} |")
+        else:
+            lines.append(f"| {tid} | — |")
+    lines.append("")
+    lines.append("## Peak memory summary (median sampled peak RSS across workloads, MB)\n")
+    lines.append(
+        "Linux only (`—` elsewhere or where no sample landed on a spike); "
+        "sampled every 5ms, so this is directional, not a precise "
+        "high-water mark. See the methodology note at the top of "
+        "`run_bench.py`.\n"
+    )
+    lines.append("| Terminal | Peak RSS (MB) |")
+    lines.append("|---|---|")
+    for tid in terminal_order:
+        rss_mb = [
+            results[tid][wl]["peak_rss_kb_median"] / 1024
+            for wl in workload_order
+            if results.get(tid, {}).get(wl, {}).get("ok") and "peak_rss_kb_median" in results[tid][wl]
+        ]
+        if rss_mb:
+            lines.append(f"| {tid} | {statistics.median(rss_mb):.1f} |")
         else:
             lines.append(f"| {tid} | — |")
     with open(path, "w") as f:
@@ -368,10 +458,13 @@ def main():
             )
             results[tid][wl] = outcome
             if outcome["ok"]:
+                rss_note = ""
+                if "peak_rss_kb_median" in outcome:
+                    rss_note = f"  peak RSS {outcome['peak_rss_kb_median'] / 1024:.1f} MB"
                 print(
                     f"  {wl:22s} median {fmt_ms(outcome['median_s']):>8} ms "
                     f"± {fmt_ms(outcome['stdev_s']):>6} ms  "
-                    f"({outcome['mb_per_s']:.1f} MB/s)"
+                    f"({outcome['mb_per_s']:.1f} MB/s){rss_note}"
                 )
             else:
                 print(f"  {wl:22s} FAILED: {outcome['error']}")

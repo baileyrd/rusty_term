@@ -2,11 +2,17 @@
 //!
 //! Feeds pre-generated VT/ANSI byte-stream workloads (see
 //! `bench/gen_workloads.py`) through `AnsiParser::advance` in realistic
-//! PTY-read-sized chunks and reports MB/s. No process spawn, no PTY, no
+//! PTY-read-sized chunks and reports MB/s, plus the per-chunk processing
+//! latency distribution (p50/p95/p99/p99.9). No process spawn, no PTY, no
 //! display — this is the rusty_term-only half of the benchmark harness in
 //! `bench/`, useful as a fast regression signal in CI. The other half
 //! (`bench/run_bench.py`) drives rusty_term and other terminal emulators as
 //! black-box processes for cross-terminal comparison.
+//!
+//! The latency numbers are per `advance()` call on one CHUNK-sized read,
+//! i.e. "how long does rusty_term take to process one PTY read", not
+//! end-to-end keystroke-to-pixel input latency — that would require driving
+//! a real render, which this binary deliberately doesn't do.
 //!
 //! Usage:
 //!   python3 bench/gen_workloads.py
@@ -37,6 +43,35 @@ fn feed(data: &[u8], iterations: u32) {
         }
         std::hint::black_box(&grid);
     }
+}
+
+/// Same work as `feed`, but timed per chunk instead of once for the whole
+/// run. Kept as a separate pass (not folded into `feed`'s hot loop) so the
+/// `Instant::now()` call per chunk never perturbs the MB/s number above —
+/// this exists purely to characterize the latency *distribution* of one
+/// PTY-read-sized `advance()` call, not to replace the throughput figure.
+fn feed_with_latencies(data: &[u8], iterations: u32, latencies_ns: &mut Vec<u64>) {
+    for _ in 0..iterations {
+        let mut grid = Grid::new(COLS, ROWS);
+        let mut parser = AnsiParser::new();
+        for chunk in data.chunks(CHUNK) {
+            let t0 = Instant::now();
+            parser.advance(&mut grid, chunk);
+            parser.take_responses();
+            grid.take_host_out();
+            latencies_ns.push(t0.elapsed().as_nanos() as u64);
+        }
+        std::hint::black_box(&grid);
+    }
+}
+
+/// Nearest-rank percentile over an already-sorted slice.
+fn percentile_ns(sorted_ns: &[u64], p: f64) -> u64 {
+    if sorted_ns.is_empty() {
+        return 0;
+    }
+    let idx = ((p / 100.0) * (sorted_ns.len() as f64 - 1.0)).round() as usize;
+    sorted_ns[idx.min(sorted_ns.len() - 1)]
 }
 
 fn bench_one(path: &str, iterations: u32) {
@@ -71,6 +106,24 @@ fn bench_one(path: &str, iterations: u32) {
         data.len(),
         elapsed.as_secs_f64() * 1000.0,
         mb_per_s,
+    );
+
+    // Latency-distribution pass, capped independently of `iterations` so a
+    // large `-- 1000` throughput run doesn't also multiply this pass by
+    // 1000x — the percentiles converge well below that sample count.
+    let latency_iterations = iterations.min(50);
+    let mut latencies_ns = Vec::new();
+    feed_with_latencies(&data, latency_iterations, &mut latencies_ns);
+    latencies_ns.sort_unstable();
+
+    println!(
+        "{:22} chunk latency (n={:<6}) p50={:>7} p95={:>7} p99={:>7} p99.9={:>7} (ns/{CHUNK}B chunk)",
+        "",
+        latencies_ns.len(),
+        percentile_ns(&latencies_ns, 50.0),
+        percentile_ns(&latencies_ns, 95.0),
+        percentile_ns(&latencies_ns, 99.0),
+        percentile_ns(&latencies_ns, 99.9),
     );
 }
 

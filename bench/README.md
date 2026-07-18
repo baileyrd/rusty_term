@@ -4,8 +4,8 @@ Two complementary pieces, both driven off the same generated workloads:
 
 | | What it measures | Needs other terminals installed? | Needs a display? |
 |---|---|:---:|:---:|
-| `cargo run --release --bin bench_vt_throughput` | rusty_term's own parser+grid throughput (MB/s) | no | no |
-| `python3 run_bench.py` | end-to-end wall-clock time across rusty_term *and* other terminal emulators | no (skips what's missing) | only for windowed terminals |
+| `cargo run --release --bin bench_vt_throughput` | rusty_term's own parser+grid throughput (MB/s) + per-chunk latency percentiles | no | no |
+| `python3 run_bench.py` | end-to-end wall-clock time (+ sampled peak RSS on Linux) across rusty_term *and* other terminal emulators | no (skips what's missing) | only for windowed terminals |
 
 Start here:
 
@@ -31,11 +31,17 @@ stream targeting a different part of the terminal pipeline:
 - **`scroll_heavy`** — many short lines: continuous line-at-a-time scroll.
 - **`alt_screen_flicker`** — repeated alt-screen enter/clear/exit: full-screen apps flipping in and out (less, fzf, editors).
 
-`--size {quick,default,large}` controls file size (200 KB / 4 MB / 16 MB);
-`--only NAME [NAME...]` regenerates a subset. Regeneration is deterministic
-— same size, same bytes — so numbers are comparable across runs as long as
-you don't change the size. Generated files aren't committed (see
-`.gitignore`); the generator is the source of truth.
+`--size {quick,default,large,xlarge}` controls file size (200 KB / 4 MB /
+16 MB / 150 MB); `--only NAME [NAME...]` regenerates a subset. Regeneration
+is deterministic — same size, same bytes — so numbers are comparable across
+runs as long as you don't change the size. Generated files aren't committed
+(see `.gitignore`); the generator is the source of truth.
+
+`xlarge` (150 MB per workload, ~900 MB total across all six) matches the
+single-file size commonly used in published terminal cat-throughput
+comparisons. It's **not** run in CI or by default — generate it explicitly
+when you want that scale of comparison, and expect it to take a while and
+use real disk.
 
 ## `bench_vt_throughput` (Rust, rusty_term-only)
 
@@ -51,6 +57,15 @@ cargo run --release --bin bench_vt_throughput                 # all workloads, 2
 cargo run --release --bin bench_vt_throughput -- 200          # 200 iterations each
 cargo run --release --bin bench_vt_throughput -- 50 bench/workloads/sgr_churn.vt
 ```
+
+Each workload also prints a per-chunk processing-latency distribution
+(p50/p95/p99/p99.9, in ns per `advance()` call on one 4 KB chunk), timed in
+a separate pass — capped at 50 iterations regardless of the `-- N` argument,
+so a large throughput run doesn't also blow up the latency pass — so
+`Instant::now()` overhead never touches the MB/s number above it. This is
+"how long one PTY-read-sized chunk takes to parse", not end-to-end
+keystroke-to-pixel input latency; there's no render in this binary to
+measure that against.
 
 ## `run_bench.py` (cross-terminal)
 
@@ -107,6 +122,23 @@ Two run modes, chosen per terminal in `terminals.json`:
 - **`mode: "direct"`** — no shell wrapper at all; used only for the
   `cat-baseline` reference entry.
 
+### Peak memory (RSS)
+
+Alongside wall-clock time, each iteration also samples the child's resident
+set size (RSS) — a background thread polls `/proc/<pid>/status` every 5ms
+and keeps the max. **Linux only**: on any other platform (or if `/proc`
+isn't readable for some other reason) it's reported as `None`/`—` rather
+than a guessed number.
+
+This is a *sampled* peak, not a true high-water mark: a short-lived spike
+between two 5ms polls can be missed entirely, and a fast `cat`-scale run may
+not get sampled at all before it exits (you'll see `—` for that cell in
+that case — a small, fast-exiting process, not a memory-free one). Treat
+the numbers as directional — "which terminal's memory footprint is in a
+different league" — not precise to the KB. If you need a rigorous number,
+use `/usr/bin/time -v` or `valgrind --tool=massif` on a single terminal
+directly.
+
 ### Headless / CI environments
 
 Windowed terminals need a display. If `$DISPLAY` and `$WAYLAND_DISPLAY` are
@@ -135,9 +167,10 @@ gotchas already documented inline there:
 ### Output
 
 `--out` (default `bench/results.json`) gets the raw per-iteration samples
-plus median/mean/stdev/MB⁄s for every terminal × workload pair that ran.
-`--report` (default `bench/results.md`) gets a human-readable Markdown
-table plus a per-terminal MB/s summary. Both are gitignored — generate them
-fresh for each comparison you care about, and note in your write-up which
-terminal *versions* you tested (`ghostty --version`, etc.), since none of
-that is captured automatically.
+plus median/mean/stdev/MB⁄s (and, where sampled, `peak_rss_kb_median`) for
+every terminal × workload pair that ran. `--report` (default
+`bench/results.md`) gets a human-readable Markdown table plus per-terminal
+MB/s and peak-RSS summaries. Both are gitignored — generate them fresh for
+each comparison you care about, and note in your write-up which terminal
+*versions* you tested (`ghostty --version`, etc.), since none of that is
+captured automatically.
