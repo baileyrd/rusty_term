@@ -1,95 +1,85 @@
 # rusty_term — parity-loop gap analysis
 
-**Reference:** `docs/research/capability-assessment-2026.md` (the repo's own
-hand-curated competitive audit against kitty, Ghostty, WezTerm, Alacritty,
-Windows Terminal, Konsole/VTE, iTerm2, Contour, Warp — 28 items, pinned as of
-its own last update). Cross-checked against `docs/research/implementation-status.md`
-(14-layer stack scorecard) for consistency; the two docs agree.
+**Reference:** `docs/research/gap-analysis-2026-07.md` — the current, most
+recent hand-curated roadmap doc in this repo. It **supersedes**
+`docs/research/capability-assessment-2026.md` (28-item audit, most items now
+landed) with 37 additional gaps found against the mid-2026 terminal
+landscape (kitty 0.43+, Ghostty 1.3, WezTerm, Alacritty, Windows Terminal,
+iTerm2, foot, Contour, Konsole/VTE, Rio, Warp), and it carries forward and
+re-audits the 13 items that were still open in the earlier document.
 
-**Source path used:** roadmap (step 0 found an existing, current, hand-curated
-scope doc — no mechanical diff or spec extraction was needed or used).
+**Source path used:** roadmap (step 0 found an existing hand-curated scope
+doc — no mechanical diff or spec extraction was needed).
 
 **Run date:** 2026-07-23.
 
-Of the 28 evaluated items, **20 are already done** (C01–C07, C10, C11, C15,
-C16, C21, C22 fully; C12/C14/C17 partially — the done portion of each is
-excluded below). R01 was investigated and explicitly rejected by the roadmap
-itself (not a gap). C18/C19 are explicitly "watch, don't build yet" per the
-roadmap's own recommendation — excluded as out of scope for this run, not
-silently dropped.
+## Correction (read this first)
 
-What's left is the remainder — **11 rows**, all sized L or XL. Every M/S item
-in the roadmap has already shipped; nothing "small" is left to mechanically
-auto-implement under this skill's normal small-issue loop.
+The first pass of this run read only `capability-assessment-2026.md` and
+`implementation-status.md`, missed `gap-analysis-2026-07.md` sitting in the
+same `docs/research/` directory, and filed 11 issues (#125–#135) against the
+older document's stale gap list. **9 of those 11 turned out to already be
+implemented** — landed in commits the older document was never updated to
+reflect. All 9 have been closed as `not_planned` with a comment on each
+explaining what shipped and pointing at the specific section of
+`gap-analysis-2026-07.md` that confirms it:
 
-| Symbol | Category | Source | Platforms | Reference | Breaking? | Est. size | Issue | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GPU renderer ligature shaping (C08) | fn (existing, GPU path only) | roadmap | both (gui-gpu) | `docs/research/capability-assessment-2026.md#c08` | no | L | [#125](https://github.com/baileyrd/rusty_term/issues/125) — `blocked` | Blocked on the GPU multi-cell-quad pipeline, which doesn't exist yet and isn't itself a sized item — building it is a prerequisite project, not a subtask. |
-| GPU renderer pixel image compositing (C09) | fn (existing, GPU path only) | roadmap | both (gui-gpu) | `...#c09` | no | L | [#126](https://github.com/baileyrd/rusty_term/issues/126) — `blocked` | Same multi-cell-quad-pipeline blocker as C08. |
-| iTerm2 GIF decode (C12 remainder) | fn | roadmap | both (gui) | `...#c12` | no | L | [#127](https://github.com/baileyrd/rusty_term/issues/127) — `needs-human` | Hand-rolled per repo convention (no image crates) — animated-GIF needs a frame-timer hook the current synchronous decode-and-place path doesn't have. |
-| iTerm2 WebP decode (C12 remainder) | fn | roadmap | both (gui) | `...#c12` | no | L | [#128](https://github.com/baileyrd/rusty_term/issues/128) — `needs-human` | Hand-rolled; a materially bigger decoder than PNG/JPEG were — "on par with a second image codec project" per the roadmap's own sizing. |
-| iTerm2 progressive JPEG decode (C12 remainder) | fn (existing, extends baseline JPEG decoder) | roadmap | both (gui) | `...#c12` | no | L | [#129](https://github.com/baileyrd/rusty_term/issues/129) — `needs-human` | Needs multi-scan coefficient accumulation the current single-scan decoder isn't structured for. |
-| Multiple top-level OS windows (C13) | fn | roadmap | both (gui) | `...#c13` | **yes (arch.)** | L | [#130](https://github.com/baileyrd/rusty_term/issues/130) — `needs-human` | Roadmap already investigated this: `App`/`gui/window.rs` (~2,270 lines) is built entirely around one implicit window; ~80 call sites assume single-window state. Not additive — a data-model rewrite. Roadmap's own verdict: "left for a dedicated pass with its own design + review." |
-| CPU-renderer window transparency (C14 remainder) | fn (existing, CPU path only) | roadmap | both (gui) | `...#c14` | no | L | [#131](https://github.com/baileyrd/rusty_term/issues/131) — `needs-human` | `softbuffer` 0.4's buffer format has no alpha channel at all (confirmed by the roadmap's own inspection) — needs a different presentation path, not a bolt-on. May require a new/replacement rendering dependency. |
-| Platform window blur (C14 remainder) | fn | roadmap | macOS, Linux/KDE | `...#c14` | no | L | [#132](https://github.com/baileyrd/rusty_term/issues/132) — `needs-human` | Needs unsafe platform-specific FFI (`NSVisualEffectView`, KDE blur-behind X11 property) outside winit's cross-platform surface — flagged by the roadmap as unverifiable in this sandbox (no macOS/KDE to build or test against). |
-| Command-output fold render-path integration (C17 remainder) | fn (existing data model, no renderer consumer) | roadmap | both (gui) | `...#c17` | **yes (risk)** | L | [#133](https://github.com/baileyrd/rusty_term/issues/133) — `needs-human` | Data model (`Grid::fold_blocks` etc.) already landed and tested. Rendering it means changing `viewport_cell`/`snapshot_viewport`'s row↔logical-line mapping, which selection, search, and click-hit-testing all key off directly — roadmap explicitly declined to bolt this on to avoid regressing well-tested, currently-correct subsystems. |
-| Accessibility / screen-reader support (C20) | fn | roadmap | both (gui) | `...#c20` | no | L | [#134](https://github.com/baileyrd/rusty_term/issues/134) — loop-eligible | Needs `accesskit` — a new third-party dependency, approved by the repo owner for this run. |
-| Bidi text + Unicode normalization (C25) | fn | roadmap | both | `...#c25` | no | XL | [#135](https://github.com/baileyrd/rusty_term/issues/135) — loop-eligible | Needs `unicode-bidi` + `unicode-normalization` (both new deps, confirmed absent from the dependency tree, approved by the repo owner for this run). Touches the grid's cell-layout model broadly enough that the roadmap itself says it needs its own scoping pass before it can even be sequenced. |
+| Issue | Item | Resolution |
+| --- | --- | --- |
+| [#125](https://github.com/baileyrd/rusty_term/issues/125) | GPU renderer ligature shaping (C08) | done — GPU atlas rebuild, see "C08 + C09 status (2026-07)" |
+| [#126](https://github.com/baileyrd/rusty_term/issues/126) | GPU renderer pixel image compositing (C09) | done — same section |
+| [#127](https://github.com/baileyrd/rusty_term/issues/127) | iTerm2 GIF decode (C12) | done — `src/core/gif.rs`, "C12′ status (2026-07)" |
+| [#128](https://github.com/baileyrd/rusty_term/issues/128) | iTerm2 WebP decode (C12) | done (VP8L lossless) — `src/core/webp.rs`; lossy VP8 deliberately out of scope |
+| [#129](https://github.com/baileyrd/rusty_term/issues/129) | iTerm2 progressive JPEG decode (C12) | done — `src/core/jpeg.rs` reworked |
+| [#130](https://github.com/baileyrd/rusty_term/issues/130) | Multiple top-level OS windows (C13) | done — `App` router + per-window `WindowState`, "C13 status (2026-07)" |
+| [#131](https://github.com/baileyrd/rusty_term/issues/131) | CPU-renderer window transparency (C14) | resolved, not implemented — closed **GPU-only by design** (`softbuffer` has no alpha channel), "C14′ resolution (2026-07)" |
+| [#132](https://github.com/baileyrd/rusty_term/issues/132) | Platform window blur (C14) | resolved alongside #131 — same GPU-only-by-design call |
+| [#133](https://github.com/baileyrd/rusty_term/issues/133) | Command-output fold render-path integration (C17) | done — "C17′ status (2026-07)"; the regression risk this issue flagged was addressed via a display-line remap layer, not avoided |
+| [#135](https://github.com/baileyrd/rusty_term/issues/135) | Bidi text + Unicode normalization (C25) | done, all 5 phases — see `docs/research/bidi-scoping-2026-07.md`; the new-dependency approval for this issue turned out to be moot |
 
-**Excluded from the table (checked, not missing):**
-- **C18, C19** — real protocols, but the roadmap explicitly recommends
-  watch-and-wait (field hasn't converged / too early to build against a
-  settled reference). Not a gap for this run.
-- **C23 (io_uring), C24 (IOCP-native)** — Tier 7, performance-only refinements
-  to an already-correct I/O path (not features), each platform-specific and
-  each **L**, each likely needing a new dependency (`io-uring`/`tokio-uring`,
-  or a Windows IOCP crate). Left out of the table rather than filed as
-  "parity gaps" since they're not capability gaps at all — no visible
-  behavior differs.
-- **C26 (DAP/Jupyter), C27 (full LSP/ACP backends)** — Tier 9, rusty_term's
-  own protocol invention with "no external comparison" and, per the roadmap,
-  "unclear what the terminal itself would be a language server *for*" — no
-  known client asking for either. Speculative, not a parity gap against a
-  competitor.
-- **R01** — investigated and rejected by the roadmap itself (alt-screen
-  resize reflow); xterm/kitty/Alacritty all behave the way rusty_term already
-  does.
+**[#134](https://github.com/baileyrd/rusty_term/issues/134) (accessibility,
+C20) is the only issue from the first pass that's still valid** — confirmed
+still open both in `gap-analysis-2026-07.md`'s Section B and by a direct
+`grep` of `src/`/`Cargo.toml` (no `accesskit` anywhere). It stays open and is
+being implemented this run.
 
-## Why nothing here is a normal "file it and go" issue
+## Current assessment (corrected)
 
-This skill's loop is built for small, additive, no-new-dependency gaps that
-can be implemented unattended. Every one of the 11 rows above fails at least
-one of those tests:
+Cross-referencing `gap-analysis-2026-07.md`'s summary tables (Section A's 37
+new gaps + Section B's 13 carried-forward items from the older document)
+against the source tree:
 
-- **2 are blocked on an unbuilt prerequisite** (C08, C09 — the GPU
-  multi-cell-quad pipeline).
-- **3 are each their own project-sized decoder** (C12's GIF/WebP/progressive
-  JPEG), sized L individually by the roadmap's own honest accounting, not
-  bundleable into one "wave."
-- **3 were already investigated by the roadmap's own author and explicitly
-  deferred** with stated reasoning — one as an architectural rewrite (C13),
-  two as "not a bolt-on, needs a dedicated pass" to avoid regressing tested
-  subsystems (C14's CPU-transparency remainder, C17's render integration).
-  Auto-implementing these on a fresh pass would either redo that judgment
-  call or risk exactly the regression it warned about.
-- **2 need a new third-party dependency** (C20 → `accesskit`, C25 →
-  `unicode-bidi`/`unicode-normalization`) — per this skill's own rules, a new
-  dependency is a stop-and-ask, not an auto-implement, same as a breaking
-  change.
-- **1 is XL** and self-describes as needing its own scoping pass before it
-  can even be sequenced (C25).
-
-No row is a clean "small, pure-addition, no-new-dep" issue as-is.
+- **Section A (37 new gaps): 36 done**, 1 explicitly watch-listed (see
+  below). No open, actionable gap remains here.
+- **Section B (13 carried-forward items):**
+  - Done as of 2026-07: C03′ (→ G11), C08, C09, C12′, C13, C17′, C25.
+  - Resolved-not-implemented by design: C14′ (GPU-only, softbuffer has no
+    alpha — see #131/#132 above).
+  - Deliberately watch-listed, not gaps: C18 (Unicode width mode 2027), C19
+    (OSC 66 text-sizing protocol) — both explicitly "wait for the field to
+    converge," same posture as G35 below.
+  - **Still open: C20 (accessibility) — the one item this run is
+    implementing** (#134).
+  - Still open but **excluded from this run as not real capability gaps**:
+    C23 (io_uring, Linux-only perf refinement to an already-correct I/O
+    path), C24 (IOCP-native async, Windows-only perf refinement), C26/C27
+    (DAP/Jupyter bridges, full LSP/ACP backends — speculative extensions of
+    rusty_term's own protocol invention, "no external comparison," no known
+    client asking for either). Each is L, none change any user-visible
+    behavior competitors are measured against — same reasoning as the first
+    pass's exclusion of these four, which the newer document's own framing
+    ("open, perf-only" / "open, speculative") confirms rather than
+    contradicts.
+- **G35 (multiple-cursors protocol)** — explicitly watch-listed ("single
+  implementation for now... track; don't build"), same posture as C18/C19.
 
 ## Resolution for this run
 
-Presented to the repo owner as a checkpoint (per this skill's step 1). Decision:
-approve `accesskit` (C20) and `unicode-bidi`/`unicode-normalization` (C25) as
-allowed new dependencies, file all 11 rows as tracked issues, and only attempt
-C20 (#134) and C25 (#135) automatically this run. The other 9 are filed and
-labeled `blocked` (C08/C09, waiting on the GPU multi-cell-quad pipeline) or
-`needs-human` (everything else — architectural rewrites, project-sized
-decoders, or subsystems the roadmap's own author already declined to bolt
-things onto without a dedicated design pass) so `next_issue.sh` skips them
-automatically and they surface in the wrap-up report instead of being
-silently attempted or dropped.
+| Symbol | Category | Source | Platforms | Reference | Breaking? | Est. size | Issue | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Accessibility / screen-reader support (C20) | fn | roadmap | both (gui) | `docs/research/gap-analysis-2026-07.md` §Section B | no | L | [#134](https://github.com/baileyrd/rusty_term/issues/134) — loop-eligible | Needs `accesskit` (new dependency, approved by the repo owner for this run). Still a field-wide gap per the roadmap — no competitor has meaningful screen-reader support either — so this is differentiation, not catch-up. **Only item this run implements.** |
+
+Everything else surviving either doc's own gap lists is done, deliberately
+watch-listed, resolved-not-implemented by design, or excluded as
+perf-only/speculative non-capability work (see above) — no further issues
+filed this run.
