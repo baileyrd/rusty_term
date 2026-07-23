@@ -51,7 +51,7 @@ in one case — investigated and rejected outright.
 | C17 | Command-output folding (OSC 133) | T4 | Warp-inspired | M |
 | C18 | Unicode width mode (2027) | T5 | Contour, ~10 others | M |
 | C19 | Text-sizing protocol / OSC 66 | T5 | kitty, Ghostty (partial) | L |
-| C20 | Accessibility / screen readers | T6 | industry-wide gap | L |
+| ✅ C20 | Accessibility / screen readers | T6 | industry-wide gap | L |
 | ✅ C21 | Rectangular-area ops (VT420) | T6 | legacy VT420 | S–M |
 | ✅ C22 | Line/New Line mode (LNM) | T6 | legacy ECMA-48 | S |
 | C23 | io_uring backend (Linux) | T7 | kitty (explored) | L |
@@ -591,7 +591,19 @@ opportunity nobody in the field has claimed; C21 and C22 are legacy VT/
 ECMA-48 completeness with a small, real user base.
 
 ### C20 — Accessibility (screen readers / assistive tech)
-**Current.** No accessibility integration in the native GUI backend;
+**Status: done (2026-07-23).** `src/gui/access.rs` wires an `accesskit`
+accessibility tree into the `gui` window backend: a `Terminal`-role root
+node carries the focused pane's full visible screen as text, and a `Status`
+child announces the cursor's 1-based row/column as a polite live region,
+refreshed on redraw only when the content/cursor/title actually changed.
+The AccessKit adapter is created before each window is first shown (as the
+library requires) and fed every winit window event alongside existing input
+handling. New dependencies: `accesskit`, `accesskit_winit`. Not yet done:
+acting on AT-driven actions (e.g. a screen reader's scroll/focus requests)
+— content exposure only, tracked as a known scope limit rather than a
+silent gap.
+
+**Current (before).** No accessibility integration in the native GUI backend;
 current research turned up no evidence that kitty, WezTerm, Alacritty, or
 Ghostty have meaningful screen-reader support either.
 

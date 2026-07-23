@@ -595,7 +595,7 @@ Carried forward unchanged (see that document for full write-ups):
 | C17′ | Command-output folding — render path | ✅ done 2026-07 (see below) | M–L |
 | C18 | Unicode width mode 2027 | watch | M |
 | C19 | Text-sizing protocol (OSC 66) | watch | L |
-| C20 | Accessibility (accesskit) | open — still a field-wide gap, still a differentiator | L |
+| C20 | Accessibility (accesskit) | ✅ done 2026-07-23 (see below) | L |
 | C23 | io_uring backend (Linux) | open, perf-only | L |
 | C24 | IOCP-native async (Windows) | open, perf-only | L |
 | C25 | Bidi + normalization | ✅ done 2026-07, all 5 phases (UAX #9 + render/mouse integration + Arabic shaping + BDSM/SCP/2501 modes + canonical-fold search) → [bidi-scoping-2026-07.md](bidi-scoping-2026-07.md) | XL→done |
@@ -664,6 +664,17 @@ new-window` (accepting the same `cwd=`/`profile=`/`shell=` options as
 control commands act on the last-focused window. This also unblocked G30
 (quake window, see Section A) and gives G31's single instance its full
 startup-latency value.
+
+**C20 status (2026-07-23):** `src/gui/access.rs` wires an `accesskit`
+accessibility tree into the `gui` window backend — a `Terminal`-role root
+node carrying the focused pane's full visible screen as text, plus a
+`Status` child announcing the cursor's 1-based row/column as a polite live
+region, resynced on redraw only when content/cursor/title actually change
+(diffed against the last-pushed state so a blink-only redraw doesn't
+re-announce). The adapter is created before each window is first shown (an
+AccessKit requirement) and fed every winit window event. Content exposure
+only — acting on AT-driven actions (scroll/focus requests from the screen
+reader) is left as a documented follow-up, not silently dropped.
 
 **C08 + C09 status (2026-07):** the GPU renderer (`src/gui/gpu.rs`) was
 rebuilt around a variable-width RGBA8 shelf-packed atlas (up to 2048²,

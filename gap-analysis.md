@@ -77,7 +77,7 @@ against the source tree:
 
 | Symbol | Category | Source | Platforms | Reference | Breaking? | Est. size | Issue | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Accessibility / screen-reader support (C20) | fn | roadmap | both (gui) | `docs/research/gap-analysis-2026-07.md` §Section B | no | L | [#134](https://github.com/baileyrd/rusty_term/issues/134) — loop-eligible | Needs `accesskit` (new dependency, approved by the repo owner for this run). Still a field-wide gap per the roadmap — no competitor has meaningful screen-reader support either — so this is differentiation, not catch-up. **Only item this run implements.** |
+| Accessibility / screen-reader support (C20) | fn | roadmap | both (gui) | `docs/research/gap-analysis-2026-07.md` §Section B | no | L | [#134](https://github.com/baileyrd/rusty_term/issues/134) — **implemented** | `src/gui/access.rs`: an `accesskit` accessibility tree exposing the focused pane's visible text + cursor position. New deps `accesskit`/`accesskit_winit`, approved by the repo owner for this run. Both source docs updated with a "done" status note. |
 
 Everything else surviving either doc's own gap lists is done, deliberately
 watch-listed, resolved-not-implemented by design, or excluded as

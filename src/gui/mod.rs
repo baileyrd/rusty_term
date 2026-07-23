@@ -5,6 +5,8 @@
 //! behind the `gui` feature so the default terminal stays library-light.
 //!
 //! Layers:
+//! - [`access`] — AccessKit accessibility-tree integration (C20): exposes the
+//!   visible screen text and cursor position to assistive technology.
 //! - [`font`] — monospace glyph rasterization (`ab_glyph`), shared by renderers.
 //! - [`cpu`] — software compositor: a [`crate::core::Grid`] into a pixel buffer
 //!   (presented via `softbuffer`); pure and headless-testable.
@@ -14,6 +16,7 @@
 //! - [`input`] — native key encoding (winit key → terminal bytes).
 //! - [`window`] — the `winit` event loop + window tying it together.
 
+mod access;
 mod boxdraw;
 pub mod control;
 mod cpu;

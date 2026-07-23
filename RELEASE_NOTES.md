@@ -7,6 +7,28 @@ test; nothing below is aspirational.
 
 ---
 
+## 2026-07-23 — Accessibility tree (C20)
+
+### ✨ Added
+- **Screen-reader accessibility (C20)** — the native GUI window (`gui`
+  feature) now exposes its visible screen text and cursor position through
+  an `accesskit`-backed accessibility tree, feeding the platform's real
+  assistive-tech API (AT-SPI/UIA/AX) rather than an in-house overlay. A new
+  `gui/access.rs` module builds a `Terminal`-role root node carrying the
+  full visible grid as text plus a polite live-region child announcing the
+  cursor's 1-based row/column, refreshed on redraw only when the content,
+  cursor, or title actually changed (a blink-only redraw doesn't
+  re-announce). The AccessKit adapter is created before each window is
+  first shown, as the library requires, and every window event is forwarded
+  to it alongside the existing input handling. New dependencies:
+  `accesskit`, `accesskit_winit`. Per the roadmap's own research, no major
+  competitor (kitty/Ghostty/WezTerm/Alacritty) has meaningful screen-reader
+  support either — this is differentiation, not catch-up. Known scope
+  limit: AT-driven actions (e.g. a screen reader's scroll/focus requests)
+  aren't yet acted on, only content exposure.
+
+---
+
 ## 2026-07-17 — Web frontend hardening & CI
 
 A full pass over the Nebula web frontend and its bridge: the review that
