@@ -126,6 +126,15 @@ pub(crate) enum UserEvent {
     #[cfg_attr(windows, allow(dead_code))]
     // constructed once the Windows named-pipe transport lands (G31)
     Control(super::control::CtlCommand, std::sync::mpsc::Sender<String>),
+    /// An AccessKit event (initial-tree request, AT action, deactivation)
+    /// routed back through the winit loop (C20).
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        UserEvent::Accessibility(event)
+    }
 }
 
 /// An in-flight cursor-trail hop (G36): from where, to where, started when.
@@ -555,6 +564,9 @@ struct WindowState<'a> {
     /// row, the absolute scrollback line a click jumps the focused pane to
     /// (`None` for headers/blank rows).
     dock_items: Vec<Option<usize>>,
+    /// AccessKit accessibility-tree state (C20), created alongside the OS
+    /// window in `ensure_window`. `None` before the window exists.
+    access: Option<super::access::AccessState>,
 }
 
 impl WindowState<'_> {
@@ -1260,14 +1272,21 @@ impl WindowState<'_> {
         if let Some(p) = tab.focused() {
             let g = p.grid.lock();
             let fallback = self.config.title.as_deref().unwrap_or("rusty_term");
-            window.set_title(if g.title.is_empty() {
+            let title = if g.title.is_empty() {
                 fallback
             } else {
                 &g.title
-            });
+            };
+            window.set_title(title);
             #[cfg(windows)]
             if let Some(hwnd) = hwnd {
                 super::taskbar::sync(hwnd, g.progress);
+            }
+            // Screen-reader tree (C20): cheap to call every frame — the
+            // extraction is grid-sized and the actual platform update
+            // no-ops unless assistive tech is attached (see `AccessState`).
+            if let Some(access) = self.access.as_mut() {
+                access.sync(title, &g);
             }
         }
         // Lock each pane's grid for the frame, then hand the renderer offset views
@@ -4648,6 +4667,10 @@ impl WindowState<'_> {
             .with_title(self.config.title.as_deref().unwrap_or("rusty_term"))
             .with_decorations(false)
             .with_transparent(transparent)
+            // Created hidden and shown below, after the AccessKit adapter is
+            // attached (C20) — the adapter must be created before the window
+            // is first shown, or it panics.
+            .with_visible(false)
             .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
         // Keep the DWM drop shadow so the borderless window still reads as
         // raised above the desktop.
@@ -4707,6 +4730,16 @@ impl WindowState<'_> {
             }
         }
         self.apply_opacity();
+        // Must be created before the window is shown (see the `with_visible`
+        // note above); `with_event_loop_proxy` routes AccessKit's own events
+        // back through the ordinary winit event loop as `UserEvent::Accessibility`.
+        let adapter = accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            self.proxy.clone(),
+        );
+        self.access = Some(super::access::AccessState::new(adapter));
+        window.set_visible(true);
         window.request_redraw();
         true
     }
@@ -4716,6 +4749,19 @@ impl WindowState<'_> {
         self.window.as_ref().map(|w| w.id())
     }
 
+    /// Handle an AccessKit event routed back through the winit loop (C20).
+    /// `ActionRequested` (e.g. a screen reader's scroll/focus request) is
+    /// acknowledged implicitly by AccessKit already having the node — this
+    /// terminal doesn't yet act on requested actions beyond exposing content,
+    /// a documented limitation rather than a silent no-op.
+    fn on_accessibility_event(&mut self, event: accesskit_winit::WindowEvent) {
+        if let accesskit_winit::WindowEvent::InitialTreeRequested = event
+            && let Some(access) = self.access.as_mut()
+        {
+            access.push_initial();
+        }
+    }
+
     /// Whether pane `id` (a reader-thread wakeup tag) belongs to this window.
     fn has_pane(&self, id: u64) -> bool {
         self.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == id))
@@ -4723,6 +4769,9 @@ impl WindowState<'_> {
 
     /// Handle one winit event addressed to this window.
     fn on_window_event(&mut self, event: WindowEvent) {
+        if let (Some(access), Some(window)) = (self.access.as_mut(), self.window.as_ref()) {
+            access.process_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => self.closed = true,
             WindowEvent::ThemeChanged(t) => {
@@ -5425,6 +5474,7 @@ impl<'a> App<'a> {
             git_branch: None,
             dock_open: false,
             dock_items: Vec::new(),
+            access: None,
         })
     }
 
@@ -5600,6 +5650,15 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                     },
                 };
                 let _ = reply.send(text);
+            }
+            UserEvent::Accessibility(event) => {
+                if let Some(w) = self
+                    .windows
+                    .iter_mut()
+                    .find(|w| w.window_id() == Some(event.window_id))
+                {
+                    w.on_accessibility_event(event.window_event);
+                }
             }
         }
         self.reap_and_spawn(event_loop);
