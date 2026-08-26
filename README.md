@@ -1,3 +1,22 @@
+# rusty_term — archived, moved to Rusty Mill
+
+**This repository is archived.** `rusty_term` now lives in the
+[Rusty Mill monorepo](https://github.com/Rusty-Mill/rusty_mill) as
+[`crates/rusty_term`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_term)
+(and its `l13` side-channel crate as
+[`crates/rusty_term/l13`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_term/l13)),
+with full commit history preserved via `git subtree`. Please file issues
+and pull requests against the new location — this repo is read-only.
+
+If you depend on this crate via a `git` dependency, repoint it at
+`https://github.com/Rusty-Mill/rusty_mill.git` (the crate name is
+unchanged, so Cargo's git dependency resolution still finds it).
+
+---
+
+*The README below is preserved as it was at the time of the merge, for
+historical reference.*
+
 # rusty_term
 
 A terminal emulator written from scratch in Rust, with a deliberately small
